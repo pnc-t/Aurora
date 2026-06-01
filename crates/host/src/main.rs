@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use ddd_common::noise::psk_from_password;
-use ddd_common::proto::Display;
+use ddd_common::proto::{Display, InputEvent};
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use std::time::Duration;
@@ -11,10 +11,12 @@ use tracing_subscriber::EnvFilter;
 
 mod capture;
 mod encode;
+mod input;
 mod net;
 
 use capture::{Frame, PlatformCapturer, ScreenCapturer};
 use encode::{EncodedNal, PlatformEncoder, VideoEncoder};
+use input::{InputInjector, PlatformInjector};
 use net::{EncoderCommand, ServerConfig};
 
 #[derive(Debug, Default)]
@@ -118,6 +120,14 @@ fn run_server() -> Result<()> {
     let (frame_tx, frame_rx) = mpsc::channel::<Frame>(2);
     let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
     let (enc_cmd_tx, enc_cmd_rx) = mpsc::channel::<EncoderCommand>(8);
+    let (input_tx, input_rx) = mpsc::channel::<InputEvent>(256);
+
+    let display = Display {
+        id: 0,
+        width: 1920,
+        height: 1080,
+        name: "primary".to_string(),
+    };
 
     // capture スレッド
     std::thread::Builder::new()
@@ -137,20 +147,25 @@ fn run_server() -> Result<()> {
             }
         })?;
 
+    // input 注入スレッド (SendInput は同期APIなので tokio の外で実行)
+    let inject_display = display.clone();
+    std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || {
+            if let Err(e) = input_loop(input_rx, inject_display) {
+                tracing::error!(error = %e, "input loop ended");
+            }
+        })?;
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let cfg = ServerConfig {
             tcp_addr: "0.0.0.0:7000".parse().unwrap(),
             udp_addr: "0.0.0.0:7000".parse().unwrap(),
             psk,
-            display: Display {
-                id: 0,
-                width: 1920,
-                height: 1080,
-                name: "primary".to_string(),
-            },
+            display,
         };
-        net::run_server(cfg, nal_rx, enc_cmd_tx).await
+        net::run_server(cfg, nal_rx, enc_cmd_tx, input_tx).await
     })
 }
 
@@ -162,6 +177,16 @@ fn capture_loop(tx: mpsc::Sender<Frame>) -> Result<()> {
             let _ = tx.try_send(f);
         }
     }
+}
+
+fn input_loop(mut rx: mpsc::Receiver<InputEvent>, display: Display) -> Result<()> {
+    let mut injector = PlatformInjector::new(display.width, display.height);
+    while let Some(ev) = rx.blocking_recv() {
+        if let Err(e) = injector.inject(&ev) {
+            tracing::warn!(error = %e, ?ev, "input inject failed");
+        }
+    }
+    Ok(())
 }
 
 fn encode_loop(
