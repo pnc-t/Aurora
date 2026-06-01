@@ -9,11 +9,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+mod audio;
 mod capture;
 mod encode;
 mod input;
 mod net;
 
+use audio::EncodedAudio;
 use capture::{Frame, PlatformCapturer, ScreenCapturer};
 use encode::{EncodedNal, PlatformEncoder, VideoEncoder};
 use input::{InputInjector, PlatformInjector};
@@ -121,8 +123,21 @@ fn run_server() -> Result<()> {
     let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
     let (enc_cmd_tx, enc_cmd_rx) = mpsc::channel::<EncoderCommand>(8);
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(256);
+    let (audio_tx, audio_rx) = mpsc::channel::<EncodedAudio>(64);
     let (clip_handle, clip_change_rx) = ddd_common::clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
+
+    // 音声ループバック取り込み。失敗してもホストは映像のみで継続する。
+    let audio_enabled = match audio::spawn_capture(audio_tx) {
+        Ok(()) => {
+            tracing::info!("audio loopback capture started");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "audio capture disabled");
+            false
+        }
+    };
 
     let display = Display {
         id: 0,
@@ -166,10 +181,12 @@ fn run_server() -> Result<()> {
             udp_addr: "0.0.0.0:7000".parse().unwrap(),
             psk,
             display,
+            audio: audio_enabled,
         };
         net::run_server(
             cfg,
             nal_rx,
+            audio_rx,
             enc_cmd_tx,
             input_tx,
             clip_apply_tx,
