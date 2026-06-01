@@ -21,3 +21,13 @@ pub trait ScreenCapturer: Send {
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::DxgiCapturer as PlatformCapturer;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::PipewireCapturer as PlatformCapturer;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::ScreenCaptureKitCapturer as PlatformCapturer;

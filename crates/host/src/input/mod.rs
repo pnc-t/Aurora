@@ -11,3 +11,13 @@ pub trait InputInjector: Send {
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::WinInjector as PlatformInjector;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::UinputInjector as PlatformInjector;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::CgEventInjector as PlatformInjector;
