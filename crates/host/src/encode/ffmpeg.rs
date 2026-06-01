@@ -6,11 +6,10 @@
 //!   - macOS: `h264_videotoolbox`
 //!   - VAAPI はハードウェアフレーム (hwframe upload) の構築が必要で、本 MVP の
 //!     CPU フレーム経路から外れるため対象外。将来 hwframe を導入する際に追加する。
+//! - 解像度は最初のフレームに追従し、変化したらエンコーダを作り直す
 //! - 入力 BGRA (キャプチャ) → NV12 へ swscale 変換し、CPU フレームを送る
-//! - 出力は Annex-B (start code 付き)。SPS/PPS をキーフレーム毎に再送させ、
-//!   クライアントの WebCodecs が途中接続でも復号できるようにする
-//! - ビットレート変更はエンコーダを作り直して反映する (適応制御の頻度なら許容)。
-//!   作り直し時は新しい SPS/PPS と IDR が自然に出るため復号は途切れない。
+//! - 出力は Annex-B。SPS/PPS をキーフレーム毎に再送させ途中接続でも復号可能にする
+//! - ビットレート変更はエンコーダを作り直して反映する (適応制御の頻度なら許容)
 
 use std::collections::VecDeque;
 
@@ -23,8 +22,6 @@ use ffmpeg_next::util::frame::video::Video as VideoFrame;
 use crate::capture::Frame;
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
 const FPS: u32 = 60;
 /// キーフレーム間隔 (フレーム数)。約 2 秒。
 const GOP: u32 = FPS * 2;
@@ -36,39 +33,85 @@ const ENCODER_CANDIDATES: &[&str] = &["h264_nvenc", "libx264"];
 const ENCODER_CANDIDATES: &[&str] = &["h264_videotoolbox"];
 
 pub struct FfmpegH264Encoder {
-    encoder: ffmpeg::encoder::video::Encoder,
-    scaler: Scaler,
-    /// 選択されたエンコーダ名 (作り直し時に再利用)。
-    codec_name: String,
+    /// 実エンコーダは最初のフレーム解像度が分かってから構築する。
+    inner: Option<Inner>,
+    /// 一度選択したエンコーダ名 (再構築時に再利用)。
+    codec_name: Option<String>,
     bitrate_bps: u32,
     frame_id: u16,
+    force_keyframe: bool,
+}
+
+/// 特定解像度に紐づくエンコーダ + スケーラ。
+struct Inner {
+    encoder: ffmpeg::encoder::video::Encoder,
+    scaler: Scaler,
+    width: u32,
+    height: u32,
     pts: i64,
     out_queue: VecDeque<EncodedNal>,
-    force_keyframe: bool,
 }
 
 impl FfmpegH264Encoder {
     pub fn new() -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
-
-        let (encoder, codec_name) = build_encoder(DEFAULT_BITRATE_BPS)?;
-        let scaler = build_scaler()?;
-
-        tracing::info!(encoder = %codec_name, "ffmpeg H.264 encoder selected");
-
         Ok(Self {
-            encoder,
-            scaler,
-            codec_name,
+            inner: None,
+            codec_name: None,
             bitrate_bps: DEFAULT_BITRATE_BPS,
             frame_id: 0,
-            pts: 0,
-            out_queue: VecDeque::new(),
             force_keyframe: true,
         })
     }
 
-    /// 現在の `out_queue` に溜まっていないパケットをエンコーダから吸い出す。
+    /// 指定解像度の Inner を保証する。未構築または解像度変化時に作り直す。
+    fn ensure_inner(&mut self, width: u32, height: u32) -> Result<()> {
+        let need_new = match &self.inner {
+            Some(inner) => inner.width != width || inner.height != height,
+            None => true,
+        };
+        if need_new {
+            let (inner, name) =
+                Inner::new(width, height, self.bitrate_bps, self.codec_name.as_deref())?;
+            tracing::info!(width, height, encoder = %name, "ffmpeg H.264 encoder built");
+            self.codec_name = Some(name);
+            self.inner = Some(inner);
+            self.force_keyframe = true;
+        }
+        Ok(())
+    }
+}
+
+impl Inner {
+    /// `preferred` が指定されればそのエンコーダを使い、無ければ候補から探索する。
+    fn new(
+        width: u32,
+        height: u32,
+        bitrate_bps: u32,
+        preferred: Option<&str>,
+    ) -> Result<(Self, String)> {
+        let (encoder, name) = match preferred {
+            Some(name) => (
+                build_encoder_named(name, width, height, bitrate_bps)?,
+                name.to_string(),
+            ),
+            None => build_encoder(width, height, bitrate_bps)?,
+        };
+        let scaler = build_scaler(width, height)?;
+        Ok((
+            Self {
+                encoder,
+                scaler,
+                width,
+                height,
+                pts: 0,
+                out_queue: VecDeque::new(),
+            },
+            name,
+        ))
+    }
+
+    /// エンコーダから取り出せるパケットを全て out_queue へ移す。
     fn drain_packets(&mut self, frame_id: u16) -> Result<()> {
         let mut packet = ffmpeg::Packet::empty();
         loop {
@@ -95,44 +138,41 @@ impl FfmpegH264Encoder {
 
 impl VideoEncoder for FfmpegH264Encoder {
     fn push_frame(&mut self, frame: &Frame) -> Result<()> {
-        if frame.width != WIDTH || frame.height != HEIGHT {
-            return Err(anyhow!(
-                "frame {}x{} != expected {}x{}",
-                frame.width,
-                frame.height,
-                WIDTH,
-                HEIGHT
-            ));
-        }
+        let fid = self.frame_id;
+        self.frame_id = self.frame_id.wrapping_add(1);
+
+        // ensure_inner は再構築時に force_keyframe を立てるので、その後に読む。
+        self.ensure_inner(frame.width, frame.height)?;
+        let force_keyframe = self.force_keyframe;
+        self.force_keyframe = false;
+        let inner = self.inner.as_mut().unwrap();
+        let (w, h) = (inner.width, inner.height);
 
         // BGRA 入力フレームを作り、キャプチャの stride を尊重して行ごとにコピーする。
-        let mut src = VideoFrame::new(Pixel::BGRA, WIDTH, HEIGHT);
-        copy_bgra_into(&mut src, &frame.bgra, frame.stride as usize);
+        let mut src = VideoFrame::new(Pixel::BGRA, w, h);
+        copy_bgra_into(&mut src, &frame.bgra, frame.stride as usize, w, h);
 
         // NV12 へ変換。
-        let mut dst = VideoFrame::new(Pixel::NV12, WIDTH, HEIGHT);
-        self.scaler
+        let mut dst = VideoFrame::new(Pixel::NV12, w, h);
+        inner
+            .scaler
             .run(&src, &mut dst)
             .context("swscale BGRA->NV12")?;
 
-        dst.set_pts(Some(self.pts));
-        self.pts += 1;
-        if self.force_keyframe {
+        dst.set_pts(Some(inner.pts));
+        inner.pts += 1;
+        if force_keyframe {
             // キーフレームを強制 (IDR)。エンコーダはこれを見て SPS/PPS を再送する。
             dst.set_kind(ffmpeg::picture::Type::I);
-            self.force_keyframe = false;
         }
 
-        self.encoder.send_frame(&dst).context("send_frame")?;
-
-        let fid = self.frame_id;
-        self.frame_id = self.frame_id.wrapping_add(1);
-        self.drain_packets(fid)?;
+        inner.encoder.send_frame(&dst).context("send_frame")?;
+        inner.drain_packets(fid)?;
         Ok(())
     }
 
     fn poll_nal(&mut self) -> Result<Option<EncodedNal>> {
-        Ok(self.out_queue.pop_front())
+        Ok(self.inner.as_mut().and_then(|i| i.out_queue.pop_front()))
     }
 
     fn request_keyframe(&mut self) {
@@ -143,23 +183,25 @@ impl VideoEncoder for FfmpegH264Encoder {
         if bitrate_bps == self.bitrate_bps {
             return Ok(());
         }
-        // ffmpeg のエンコーダは open 後のビットレート変更を多くが無視するため、
-        // 同名エンコーダを目標ビットレートで作り直す。新規 SPS/PPS + IDR が出る。
-        let (encoder, _name) = build_encoder_named(&self.codec_name, bitrate_bps)?;
-        self.encoder = encoder;
-        self.scaler = build_scaler()?;
         self.bitrate_bps = bitrate_bps;
-        self.pts = 0;
-        self.force_keyframe = true;
-        tracing::info!(bitrate_bps, "ffmpeg encoder rebuilt for new bitrate");
+        // ffmpeg のエンコーダは open 後のビットレート変更を多くが無視するため、
+        // 現在の解像度で作り直す。新規 SPS/PPS + IDR が出る。
+        if let Some(inner) = &self.inner {
+            let (w, h) = (inner.width, inner.height);
+            let name = self.codec_name.clone();
+            let (rebuilt, _name) = Inner::new(w, h, bitrate_bps, name.as_deref())?;
+            self.inner = Some(rebuilt);
+            self.force_keyframe = true;
+            tracing::info!(bitrate_bps, "ffmpeg encoder rebuilt for new bitrate");
+        }
         Ok(())
     }
 }
 
 /// BGRA バイト列を `dst` フレームへ stride を考慮して行コピーする。
-fn copy_bgra_into(dst: &mut VideoFrame, bgra: &[u8], src_stride: usize) {
-    let w = WIDTH as usize;
-    let h = HEIGHT as usize;
+fn copy_bgra_into(dst: &mut VideoFrame, bgra: &[u8], src_stride: usize, w: u32, h: u32) {
+    let w = w as usize;
+    let h = h as usize;
     let dst_stride = dst.stride(0);
     let dst_data = dst.data_mut(0);
     let row_bytes = w * 4;
@@ -173,25 +215,29 @@ fn copy_bgra_into(dst: &mut VideoFrame, bgra: &[u8], src_stride: usize) {
     }
 }
 
-fn build_scaler() -> Result<Scaler> {
+fn build_scaler(width: u32, height: u32) -> Result<Scaler> {
     Scaler::get(
         Pixel::BGRA,
-        WIDTH,
-        HEIGHT,
+        width,
+        height,
         Pixel::NV12,
-        WIDTH,
-        HEIGHT,
+        width,
+        height,
         Flags::BILINEAR,
     )
     .context("create swscale context")
 }
 
 /// 候補リストの先頭から利用可能なエンコーダを選んで構築する。
-fn build_encoder(bitrate_bps: u32) -> Result<(ffmpeg::encoder::video::Encoder, String)> {
+fn build_encoder(
+    width: u32,
+    height: u32,
+    bitrate_bps: u32,
+) -> Result<(ffmpeg::encoder::video::Encoder, String)> {
     let mut last_err: Option<anyhow::Error> = None;
     for name in ENCODER_CANDIDATES {
-        match build_encoder_named(name, bitrate_bps) {
-            Ok((enc, n)) => return Ok((enc, n)),
+        match build_encoder_named(name, width, height, bitrate_bps) {
+            Ok(enc) => return Ok((enc, name.to_string())),
             Err(e) => {
                 tracing::warn!(encoder = name, error = %e, "encoder unavailable, trying next");
                 last_err = Some(e);
@@ -203,16 +249,18 @@ fn build_encoder(bitrate_bps: u32) -> Result<(ffmpeg::encoder::video::Encoder, S
 
 fn build_encoder_named(
     name: &str,
+    width: u32,
+    height: u32,
     bitrate_bps: u32,
-) -> Result<(ffmpeg::encoder::video::Encoder, String)> {
+) -> Result<ffmpeg::encoder::video::Encoder> {
     let codec = ffmpeg::encoder::find_by_name(name)
         .ok_or_else(|| anyhow!("encoder '{name}' not found in this ffmpeg build"))?;
 
     let context = ffmpeg::codec::context::Context::new_with_codec(codec);
     let mut video = context.encoder().video().context("encoder().video()")?;
 
-    video.set_width(WIDTH);
-    video.set_height(HEIGHT);
+    video.set_width(width);
+    video.set_height(height);
     video.set_format(Pixel::NV12);
     video.set_time_base(ffmpeg::Rational(1, FPS as i32));
     video.set_frame_rate(Some(ffmpeg::Rational(FPS as i32, 1)));
@@ -226,7 +274,7 @@ fn build_encoder_named(
     let encoder = video
         .open_as_with(codec, opts)
         .with_context(|| format!("open encoder '{name}'"))?;
-    Ok((encoder, name.to_string()))
+    Ok(encoder)
 }
 
 /// エンコーダ毎の低遅延 / Annex-B ヘッダ再送オプション。
@@ -244,7 +292,7 @@ fn encoder_options(name: &str) -> ffmpeg::Dictionary<'static> {
             d.set("tune", "ll"); // low latency
             d.set("rc", "cbr");
             d.set("zerolatency", "1");
-            // キーフレーム毎に SPS/PPS/VPS を再送。
+            // キーフレーム毎に SPS/PPS を再送。
             d.set("repeat-headers", "1");
         }
         "h264_videotoolbox" => {

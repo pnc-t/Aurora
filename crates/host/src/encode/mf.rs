@@ -3,7 +3,8 @@
 //! MVP 方針:
 //! - 同期 (SW) MFT を使い、HW MFT のメッセージシーケンスを避ける
 //! - 入力 NV12 / 出力 H.264 (Annex-B start code 付き、MF のデフォルト)
-//! - 1080p / 60fps / Baseline。ビットレートは初期 8Mbps、`ICodecAPI` で実行時可変
+//! - 解像度は最初のフレームに追従し、変化したら MFT を作り直す
+//! - 60fps / Baseline。ビットレートは初期 8Mbps、`ICodecAPI` で実行時可変
 //! - BGRA→NV12 変換は CPU。GPU 化は将来課題
 
 use std::collections::VecDeque;
@@ -35,10 +36,7 @@ const MF_VERSION_CONST: u32 = (2u32 << 16) | 0x0070;
 use crate::capture::Frame;
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
 const FPS: u32 = 60;
-const BITRATE: u32 = DEFAULT_BITRATE_BPS;
 const FRAME_DURATION_100NS: i64 = (10_000_000i64) / FPS as i64;
 
 /// VARIANT 型タグ VT_UI4 (unsigned long)。`windows::Win32::System::Variant` の
@@ -46,13 +44,24 @@ const FRAME_DURATION_100NS: i64 = (10_000_000i64) / FPS as i64;
 const VT_UI4: u16 = 19;
 
 pub struct MfH264Encoder {
+    /// 実 MFT は最初のフレーム解像度が分かってから構築する。
+    inner: Option<Inner>,
+    /// 目標平均ビットレート (bps)。inner 構築時・set_bitrate 時に反映。
+    bitrate: u32,
+    frame_id: u16,
+    /// 次フレームを強制 keyframe にするフラグ (初回 / 再構築 / 明示要求)。
+    force_keyframe: bool,
+}
+
+/// 特定解像度に紐づく MFT 一式。
+struct Inner {
     transform: IMFTransform,
     /// 実行時パラメータ変更用インターフェース。ビットレート適応で使う。
     codec_api: ICodecAPI,
-    frame_id: u16,
+    width: u32,
+    height: u32,
     sample_time_100ns: i64,
     out_queue: VecDeque<EncodedNal>,
-    force_keyframe: bool,
     nv12_buf: Vec<u8>,
 }
 
@@ -63,7 +72,32 @@ impl MfH264Encoder {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION_CONST, MFSTARTUP_LITE).context("MFStartup")?;
         }
+        Ok(Self {
+            inner: None,
+            bitrate: DEFAULT_BITRATE_BPS,
+            frame_id: 0,
+            force_keyframe: true,
+        })
+    }
 
+    /// 指定解像度の Inner を保証する。未構築または解像度変化時に作り直す。
+    fn ensure_inner(&mut self, width: u32, height: u32) -> Result<()> {
+        let need_new = match &self.inner {
+            Some(inner) => inner.width != width || inner.height != height,
+            None => true,
+        };
+        if need_new {
+            tracing::info!(width, height, bitrate = self.bitrate, "building H.264 MFT");
+            self.inner = Some(Inner::new(width, height, self.bitrate)?);
+            // 新しい MFT の最初の出力は keyframe にする。
+            self.force_keyframe = true;
+        }
+        Ok(())
+    }
+}
+
+impl Inner {
+    fn new(width: u32, height: u32, bitrate: u32) -> Result<Self> {
         // SAFETY: CoCreateInstance は OUT param を初期化。CLSID は MS H.264 encoder。
         let transform: IMFTransform = unsafe {
             CoCreateInstance(&CLSID_CMSH264_ENCODER_MFT, None, CLSCTX_INPROC_SERVER)
@@ -71,7 +105,7 @@ impl MfH264Encoder {
         };
 
         // 出力メディアタイプを先に設定 (MFT の規約)
-        let out_type = make_h264_output_type()?;
+        let out_type = make_h264_output_type(width, height, bitrate)?;
         // SAFETY: transform live, type live
         unsafe {
             transform
@@ -79,7 +113,7 @@ impl MfH264Encoder {
                 .context("SetOutputType")?
         };
 
-        let in_type = make_nv12_input_type()?;
+        let in_type = make_nv12_input_type(width, height)?;
         // SAFETY: as above
         unsafe {
             transform
@@ -103,11 +137,11 @@ impl MfH264Encoder {
         Ok(Self {
             transform,
             codec_api,
-            frame_id: 0,
+            width,
+            height,
             sample_time_100ns: 0,
             out_queue: VecDeque::new(),
-            force_keyframe: true, // 最初のフレームは強制 keyframe
-            nv12_buf: vec![0u8; (WIDTH * HEIGHT * 3 / 2) as usize],
+            nv12_buf: vec![0u8; (width * height * 3 / 2) as usize],
         })
     }
 
@@ -186,19 +220,19 @@ impl MfH264Encoder {
 
 impl VideoEncoder for MfH264Encoder {
     fn push_frame(&mut self, frame: &Frame) -> Result<()> {
-        if frame.width != WIDTH || frame.height != HEIGHT {
-            return Err(anyhow!(
-                "frame {}x{} != expected {}x{}",
-                frame.width,
-                frame.height,
-                WIDTH,
-                HEIGHT
-            ));
-        }
-        bgra_to_nv12(&frame.bgra, frame.stride, WIDTH, HEIGHT, &mut self.nv12_buf);
+        let fid = self.frame_id;
+        self.frame_id = self.frame_id.wrapping_add(1);
+
+        // ensure_inner は再構築時に force_keyframe を立てるので、その後に読む。
+        self.ensure_inner(frame.width, frame.height)?;
+        let force_keyframe = self.force_keyframe;
+        self.force_keyframe = false;
+        let inner = self.inner.as_mut().unwrap();
+        let (w, h) = (inner.width, inner.height);
+        bgra_to_nv12(&frame.bgra, frame.stride, w, h, &mut inner.nv12_buf);
 
         // IMFSample 生成
-        let nv12_size = self.nv12_buf.len() as u32;
+        let nv12_size = inner.nv12_buf.len() as u32;
         // SAFETY: MF API; out params 初期化される。
         let (sample, buffer) = unsafe {
             let buffer = MFCreateMemoryBuffer(nv12_size).context("MFCreateMemoryBuffer (in)")?;
@@ -212,42 +246,40 @@ impl VideoEncoder for MfH264Encoder {
             buffer
                 .Lock(&mut ptr, None, None)
                 .context("Lock (in buffer)")?;
-            std::ptr::copy_nonoverlapping(self.nv12_buf.as_ptr(), ptr, self.nv12_buf.len());
+            std::ptr::copy_nonoverlapping(inner.nv12_buf.as_ptr(), ptr, inner.nv12_buf.len());
             buffer.Unlock().context("Unlock (in buffer)")?;
             buffer
                 .SetCurrentLength(nv12_size)
                 .context("SetCurrentLength")?;
             sample.AddBuffer(&buffer).context("AddBuffer (in)")?;
             sample
-                .SetSampleTime(self.sample_time_100ns)
+                .SetSampleTime(inner.sample_time_100ns)
                 .context("SetSampleTime")?;
             sample
                 .SetSampleDuration(FRAME_DURATION_100NS)
                 .context("SetSampleDuration")?;
 
-            if self.force_keyframe {
+            if force_keyframe {
                 use windows::Win32::Media::MediaFoundation::MFSampleExtension_CleanPoint;
                 let _ = sample.SetUINT32(&MFSampleExtension_CleanPoint, 1);
-                self.force_keyframe = false;
             }
         }
-        self.sample_time_100ns += FRAME_DURATION_100NS;
+        inner.sample_time_100ns += FRAME_DURATION_100NS;
 
         // SAFETY: MFT は sample を ref する。
         unsafe {
-            self.transform
+            inner
+                .transform
                 .ProcessInput(0, &sample, 0)
                 .context("ProcessInput")?;
         }
 
-        let fid = self.frame_id;
-        self.frame_id = self.frame_id.wrapping_add(1);
-        self.drain_outputs(fid)?;
+        inner.drain_outputs(fid)?;
         Ok(())
     }
 
     fn poll_nal(&mut self) -> Result<Option<EncodedNal>> {
-        Ok(self.out_queue.pop_front())
+        Ok(self.inner.as_mut().and_then(|i| i.out_queue.pop_front()))
     }
 
     fn request_keyframe(&mut self) {
@@ -255,12 +287,16 @@ impl VideoEncoder for MfH264Encoder {
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
-        let v = variant_u32(bitrate_bps);
-        // SAFETY: codec_api は生存しており、VARIANT は VT_UI4 で有効。SetValue は値をコピーする。
-        unsafe {
-            self.codec_api
-                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v)
-                .context("ICodecAPI::SetValue(MeanBitRate)")?;
+        self.bitrate = bitrate_bps;
+        if let Some(inner) = &self.inner {
+            let v = variant_u32(bitrate_bps);
+            // SAFETY: codec_api は生存しており、VARIANT は VT_UI4 で有効。SetValue は値をコピーする。
+            unsafe {
+                inner
+                    .codec_api
+                    .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v)
+                    .context("ICodecAPI::SetValue(MeanBitRate)")?;
+            }
         }
         Ok(())
     }
@@ -293,7 +329,7 @@ fn variant_u32(value: u32) -> windows::core::VARIANT {
     unsafe { std::mem::transmute::<RawVariant, windows::core::VARIANT>(raw) }
 }
 
-impl Drop for MfH264Encoder {
+impl Drop for Inner {
     fn drop(&mut self) {
         // SAFETY: cleanup; errors ignored.
         unsafe {
@@ -312,14 +348,14 @@ impl Drop for MfH264Encoder {
 // IMFTransform は MTA で COM 初期化されており、別スレッドへの move は安全。
 unsafe impl Send for MfH264Encoder {}
 
-fn make_h264_output_type() -> Result<IMFMediaType> {
+fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Result<IMFMediaType> {
     // SAFETY: all API are OUT/SETTER.
     unsafe {
         let t = MFCreateMediaType().context("MFCreateMediaType (out)")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-        t.SetUINT32(&MF_MT_AVG_BITRATE, BITRATE)?;
-        t.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(WIDTH, HEIGHT))?;
+        t.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+        t.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
         t.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(FPS, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
@@ -328,12 +364,12 @@ fn make_h264_output_type() -> Result<IMFMediaType> {
     }
 }
 
-fn make_nv12_input_type() -> Result<IMFMediaType> {
+fn make_nv12_input_type(width: u32, height: u32) -> Result<IMFMediaType> {
     unsafe {
         let t = MFCreateMediaType().context("MFCreateMediaType (in)")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
-        t.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(WIDTH, HEIGHT))?;
+        t.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
         t.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(FPS, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
