@@ -1,6 +1,31 @@
-[package]
-name = "DDD"
+[workspace]
+resolver = "3"
+members = [
+    "crates/common",
+    "crates/host",
+    "crates/client/src-tauri",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
 
-[dependencies]
+[workspace.dependencies]
+# 共有依存。バージョンはワイルドカード禁止 (CLAUDE.md参照)
+tokio = { version = "1.41", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+bincode = { version = "1.3" }
+bytes = { version = "1.8" }
+thiserror = { version = "2.0" }
+anyhow = { version = "1.0" }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+snow = { version = "0.9" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

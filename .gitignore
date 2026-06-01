@@ -1,1 +1,11 @@
 /target
+**/node_modules
+crates/client/dist
+crates/client/src-tauri/gen
+*.log
+.env
+.env.*
+*.key
+*.pem
+.idea/
+CLAUDE.md

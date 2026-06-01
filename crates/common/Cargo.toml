@@ -1,0 +1,19 @@
+[package]
+name = "ddd-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+snow = { workspace = true }
+tracing = { workspace = true }
+bitflags = "2.6"
+blake2s_simd = "1.0"
