@@ -1,0 +1,43 @@
+// Tauri IPC ラッパー。Rust 側コマンドの薄い型付け窓口。
+import { invoke, Channel } from "@tauri-apps/api/core";
+
+export type DisplayDto = {
+  id: number;
+  width: number;
+  height: number;
+  name: string;
+};
+
+export type ClientEvent =
+  | { kind: "connected" }
+  | { kind: "host_info"; displays: DisplayDto[]; audio: boolean }
+  | { kind: "pong"; rtt_us: number }
+  | { kind: "stats"; bitrate_kbps: number; fps: number; rtt_us: number; loss_permille: number }
+  | { kind: "disconnected"; reason: string };
+
+export type InputEvent =
+  | { MouseMove: { x: number; y: number } }
+  | { MouseButton: { button: "Left" | "Right" | "Middle"; down: boolean } }
+  | { MouseWheel: { delta: number; horizontal: boolean } }
+  | { Key: { vk: number; down: boolean } };
+
+export async function connectToHost(
+  host: string,
+  password: string,
+  eventChannel: Channel<ClientEvent>,
+  videoChannel: Channel<ArrayBuffer>,
+): Promise<void> {
+  await invoke("connect_to_host", { host, password, eventChannel, videoChannel });
+}
+
+export async function disconnect(): Promise<void> {
+  await invoke("disconnect");
+}
+
+export async function sendInput(event: InputEvent): Promise<void> {
+  await invoke("send_input", { event });
+}
+
+export async function requestKeyframe(): Promise<void> {
+  await invoke("request_keyframe");
+}

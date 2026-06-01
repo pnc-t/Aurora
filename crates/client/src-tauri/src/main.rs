@@ -7,6 +7,8 @@
 
 mod net;
 
+use net::SessionState;
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -16,7 +18,13 @@ fn main() {
         .init();
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![net::connect_to_host])
+        .manage(SessionState::default())
+        .invoke_handler(tauri::generate_handler![
+            net::connect_to_host,
+            net::disconnect,
+            net::send_input,
+            net::request_keyframe,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
