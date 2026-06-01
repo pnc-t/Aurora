@@ -9,3 +9,4 @@ crates/client/src-tauri/gen
 *.pem
 .idea/
 CLAUDE.md
+PLAN.md
