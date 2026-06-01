@@ -19,6 +19,7 @@ use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::audio::{self, AudioPlayer};
+use crate::stats::{StatsCollector, StatsWindow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc};
@@ -199,6 +200,10 @@ pub async fn connect_to_host(
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
 
+    // 受信品質メトリクス。Ping の基準時刻と共有して RTT を算出する。
+    let stats = StatsCollector::new();
+    let session_start = Instant::now();
+
     let evt_clone = event_channel.clone();
     let sess_w = session.clone();
     let writer_task = tokio::spawn(async move {
@@ -211,9 +216,17 @@ pub async fn connect_to_host(
     let evt_clone = event_channel.clone();
     let sess_r = session.clone();
     let clip_apply_for_reader = clip_apply_tx.clone();
+    let stats_for_reader = stats.clone();
     let reader_task = tokio::spawn(async move {
-        let res =
-            tcp_reader_loop(read_half, sess_r, evt_clone.clone(), clip_apply_for_reader).await;
+        let res = tcp_reader_loop(
+            read_half,
+            sess_r,
+            evt_clone.clone(),
+            clip_apply_for_reader,
+            stats_for_reader,
+            session_start,
+        )
+        .await;
         let reason = match res {
             Ok(()) => "server closed".to_string(),
             Err(e) => format!("read error: {e}"),
@@ -232,8 +245,9 @@ pub async fn connect_to_host(
     let audio_tx = audio_player.as_ref().map(|p| p.sender());
 
     let sess_u = session.clone();
+    let stats_for_udp = stats.clone();
     let udp_task = tokio::spawn(async move {
-        if let Err(e) = udp_reader_loop(udp, sess_u, video_channel, audio_tx).await {
+        if let Err(e) = udp_reader_loop(udp, sess_u, video_channel, audio_tx, stats_for_udp).await {
             tracing::warn!(error = %e, "UDP reader ended");
         }
     });
@@ -248,18 +262,43 @@ pub async fn connect_to_host(
         }
     });
 
-    // ping ループ (5 秒)
+    // ping ループ (1 秒)。RTT を細かく取り、適応制御の応答性を上げる。
     let ctrl_for_ping = ctrl_tx.clone();
     let ping_task = tokio::spawn(async move {
-        let start = Instant::now();
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.tick().await;
         loop {
             interval.tick().await;
-            let ts_us = start.elapsed().as_micros() as u64;
+            let ts_us = session_start.elapsed().as_micros() as u64;
             if ctrl_for_ping.send(ControlMsg::Ping { ts_us }).is_err() {
                 break;
             }
+        }
+    });
+
+    // 統計タスク (1 秒窓)。計測結果をホスト (適応制御用) とフロント (表示用) に送る。
+    let ctrl_for_stats = ctrl_tx.clone();
+    let evt_for_stats = event_channel.clone();
+    let stats_for_task = stats.clone();
+    let stats_task = tokio::spawn(async move {
+        let mut window = StatsWindow::new(&stats_for_task);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let s = window.sample(&stats_for_task);
+            let _ = ctrl_for_stats.send(ControlMsg::Stats {
+                bitrate_kbps: s.bitrate_kbps,
+                fps: s.fps,
+                rtt_us: s.rtt_us,
+                loss_permille: s.loss_permille,
+            });
+            let _ = evt_for_stats.send(ClientEvent::Stats {
+                bitrate_kbps: s.bitrate_kbps,
+                fps: s.fps,
+                rtt_us: s.rtt_us,
+                loss_permille: s.loss_permille,
+            });
         }
     });
 
@@ -271,6 +310,7 @@ pub async fn connect_to_host(
             reader_task,
             udp_task,
             ping_task,
+            stats_task,
             clip_forward_task,
         ],
         clipboard: clip_handle,
@@ -389,6 +429,8 @@ async fn tcp_reader_loop(
     session: Arc<Mutex<TransportSession>>,
     event_channel: Channel<ClientEvent>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
+    stats: Arc<StatsCollector>,
+    session_start: Instant,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
@@ -400,25 +442,12 @@ async fn tcp_reader_loop(
         let msg: ControlMsg = opts.deserialize(&plain)?;
         match msg {
             ControlMsg::Pong { ts_us } => {
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as i64)
-                    .unwrap_or(0);
-                let _ = ts_us;
-                // RTT は呼び出し側で算出するのが本来だが、MVP はホスト echo を信用してそのまま流す
-                let _ = event_channel.send(ClientEvent::Pong { rtt_us: now_us });
-            }
-            ControlMsg::Stats {
-                bitrate_kbps,
-                fps,
-                rtt_us,
-                loss_permille,
-            } => {
-                let _ = event_channel.send(ClientEvent::Stats {
-                    bitrate_kbps,
-                    fps,
-                    rtt_us,
-                    loss_permille,
+                // ts_us は Ping 送信時の session_start からの経過。往復差で RTT を得る。
+                let now_us = session_start.elapsed().as_micros() as u64;
+                let rtt_us = now_us.saturating_sub(ts_us);
+                stats.set_rtt_us(rtt_us.min(u32::MAX as u64) as u32);
+                let _ = event_channel.send(ClientEvent::Pong {
+                    rtt_us: rtt_us as i64,
                 });
             }
             ControlMsg::HostInfo { displays, audio } => {
@@ -450,6 +479,7 @@ async fn udp_reader_loop(
     session: Arc<Mutex<TransportSession>>,
     video_channel: Channel<InvokeResponseBody>,
     audio_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    stats: Arc<StatsCollector>,
 ) -> anyhow::Result<()> {
     let mut recv_buf = vec![0u8; 2048];
     let mut plain = Vec::new();
@@ -463,6 +493,8 @@ async fn udp_reader_loop(
 
     loop {
         let n = udp.recv(&mut recv_buf).await?;
+        // 受信スループット (映像 + 音声、暗号文サイズ) を計測。
+        stats.add_bytes(n as u64);
         plain.clear();
         if session
             .lock()
@@ -498,10 +530,15 @@ async fn udp_reader_loop(
             Err(_) => continue,
         };
 
+        // 損失率算出のため受信した映像パケットを計上。
+        stats.add_video_pkt();
+
         // seq 連続性チェック
         if let Some(prev) = last_seq {
             if pkt.seq != prev.wrapping_add(1) {
-                // ロス検出: 現フレームを破棄し次のフレーム開始まで dropping
+                // ロス検出: 欠落数を推定して計上し、現フレームを破棄して次の開始まで dropping
+                let missing = pkt.seq.wrapping_sub(prev).wrapping_sub(1);
+                stats.add_lost(missing as u64);
                 cur_payload.clear();
                 cur_frame_id = None;
                 dropping = true;
@@ -538,6 +575,7 @@ async fn udp_reader_loop(
             out.extend_from_slice(&cur_payload);
             // バイナリで送信
             let _ = video_channel.send(InvokeResponseBody::Raw(out));
+            stats.add_frame();
             cur_payload.clear();
             cur_frame_id = None;
         }

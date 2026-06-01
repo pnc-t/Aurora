@@ -3,18 +3,18 @@
 //! MVP 方針:
 //! - 同期 (SW) MFT を使い、HW MFT のメッセージシーケンスを避ける
 //! - 入力 NV12 / 出力 H.264 (Annex-B start code 付き、MF のデフォルト)
-//! - 1080p / 60fps / 8Mbps / Baseline 固定 (Step 9 で可変)
-//! - BGRA→NV12 変換は CPU。GPU 化は Step 9
+//! - 1080p / 60fps / Baseline。ビットレートは初期 8Mbps、`ICodecAPI` で実行時可変
+//! - BGRA→NV12 変換は CPU。GPU 化は将来課題
 
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Media::MediaFoundation::{
-    IMFMediaBuffer, IMFMediaType, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_LITE, MFStartup,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    CODECAPI_AVEncCommonMeanBitRate, ICodecAPI, IMFMediaBuffer, IMFMediaType, IMFTransform,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFSTARTUP_LITE, MFStartup, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Base,
@@ -23,6 +23,7 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::core::GUID;
+use windows::core::Interface;
 
 /// MS H.264 Encoder MFT CLSID (CLSID_CMSH264EncoderMFT)。
 /// windows-rs 0.58 では未エクスポートのため手定義。
@@ -32,16 +33,22 @@ const CLSID_CMSH264_ENCODER_MFT: GUID = GUID::from_u128(0x6ca50344_051a_4ded_977
 const MF_VERSION_CONST: u32 = (2u32 << 16) | 0x0070;
 
 use crate::capture::Frame;
-use crate::encode::{EncodedNal, VideoEncoder};
+use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const FPS: u32 = 60;
-const BITRATE: u32 = 8_000_000;
+const BITRATE: u32 = DEFAULT_BITRATE_BPS;
 const FRAME_DURATION_100NS: i64 = (10_000_000i64) / FPS as i64;
+
+/// VARIANT 型タグ VT_UI4 (unsigned long)。`windows::Win32::System::Variant` の
+/// 追加 feature を避けるため数値を直接定義する。
+const VT_UI4: u16 = 19;
 
 pub struct MfH264Encoder {
     transform: IMFTransform,
+    /// 実行時パラメータ変更用インターフェース。ビットレート適応で使う。
+    codec_api: ICodecAPI,
     frame_id: u16,
     sample_time_100ns: i64,
     out_queue: VecDeque<EncodedNal>,
@@ -80,6 +87,9 @@ impl MfH264Encoder {
                 .context("SetInputType")?
         };
 
+        // 実行時ビットレート変更用に ICodecAPI を取得 (MS H.264 encoder は対応)。
+        let codec_api: ICodecAPI = transform.cast().context("QueryInterface ICodecAPI")?;
+
         // SAFETY: メッセージ送信は副作用のみ。
         unsafe {
             transform
@@ -92,6 +102,7 @@ impl MfH264Encoder {
 
         Ok(Self {
             transform,
+            codec_api,
             frame_id: 0,
             sample_time_100ns: 0,
             out_queue: VecDeque::new(),
@@ -242,6 +253,44 @@ impl VideoEncoder for MfH264Encoder {
     fn request_keyframe(&mut self) {
         self.force_keyframe = true;
     }
+
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
+        let v = variant_u32(bitrate_bps);
+        // SAFETY: codec_api は生存しており、VARIANT は VT_UI4 で有効。SetValue は値をコピーする。
+        unsafe {
+            self.codec_api
+                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v)
+                .context("ICodecAPI::SetValue(MeanBitRate)")?;
+        }
+        Ok(())
+    }
+}
+
+/// VT_UI4 の VARIANT を組み立てる。windows-core 0.58 は VARIANT 内部を非公開にしており
+/// 整数からの構築 API が無いため、メモリレイアウトを手動で再現して transmute する。
+fn variant_u32(value: u32) -> windows::core::VARIANT {
+    // 64bit Windows の VARIANT レイアウト: vt(u16) + 予約 3*u16 + 16B 共用体。
+    // VT_UI4 は共用体先頭 (offset 8) の ulVal(u32) に値を置く。
+    #[repr(C)]
+    struct RawVariant {
+        vt: u16,
+        r1: u16,
+        r2: u16,
+        r3: u16,
+        val: u64,
+        pad: u64,
+    }
+    let raw = RawVariant {
+        vt: VT_UI4,
+        r1: 0,
+        r2: 0,
+        r3: 0,
+        val: value as u64,
+        pad: 0,
+    };
+    // SAFETY: RawVariant は x86_64 Windows の VARIANT と同一レイアウト (24B)。サイズ不一致なら
+    // transmute がコンパイルエラーになる。VT_UI4 は非ポインタ型なので Drop (VariantClear) も安全。
+    unsafe { std::mem::transmute::<RawVariant, windows::core::VARIANT>(raw) }
 }
 
 impl Drop for MfH264Encoder {

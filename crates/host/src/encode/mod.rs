@@ -14,7 +14,15 @@ pub trait VideoEncoder: Send {
     fn push_frame(&mut self, frame: &Frame) -> anyhow::Result<()>;
     fn poll_nal(&mut self) -> anyhow::Result<Option<EncodedNal>>;
     fn request_keyframe(&mut self);
+    /// 平均ビットレート (bps) を実行時に変更する。適応制御から呼ばれる。
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> anyhow::Result<()>;
 }
+
+/// エンコーダ初期ビットレート (bps)。適応制御の開始点。
+pub const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
+/// 適応制御で許容する下限 / 上限ビットレート (bps)。PLAN.md の帯域目標に基づく。
+pub const MIN_BITRATE_BPS: u32 = 1_000_000;
+pub const MAX_BITRATE_BPS: u32 = 15_000_000;
 
 #[cfg(target_os = "windows")]
 mod mf;

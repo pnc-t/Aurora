@@ -9,7 +9,7 @@ pub struct Frame {
     /// BGRA8 行間隔 (バイト)。`width * 4` と一致するとは限らない。
     pub stride: u32,
     pub bgra: Vec<u8>,
-    #[allow(dead_code)] // Step 9 で RTT 計測に使う
+    #[allow(dead_code)] // 取得時刻。遅延計測用に保持 (現状未使用)
     pub captured_at: Instant,
 }
 

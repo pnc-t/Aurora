@@ -7,6 +7,7 @@
 
 mod audio;
 mod net;
+mod stats;
 
 use net::SessionState;
 
