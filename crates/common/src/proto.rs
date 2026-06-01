@@ -42,11 +42,23 @@ pub enum ControlMsg {
         id: u32,
         path: String,
     },
+    /// 送信側 → 受信側。ファイル転送の開始を告知する (チャンク列の前に 1 回)。
+    FileOffer {
+        id: u32,
+        name: String,
+        size: u64,
+    },
     FileChunk {
         id: u32,
         offset: u64,
         data: Vec<u8>,
         last: bool,
+    },
+    /// 受信側 → 送信側。転送完了 (ok=true) もしくはエラー (ok=false) を返す。
+    FileResult {
+        id: u32,
+        ok: bool,
+        message: String,
     },
     RequestKeyframe,
     Ping {

@@ -13,6 +13,7 @@ export type ClientEvent =
   | { kind: "host_info"; displays: DisplayDto[]; audio: boolean }
   | { kind: "pong"; rtt_us: number }
   | { kind: "stats"; bitrate_kbps: number; fps: number; rtt_us: number; loss_permille: number }
+  | { kind: "file_result"; id: number; ok: boolean; message: string }
   | { kind: "disconnected"; reason: string };
 
 export type InputEvent =
@@ -40,4 +41,17 @@ export async function sendInput(event: InputEvent): Promise<void> {
 
 export async function requestKeyframe(): Promise<void> {
   await invoke("request_keyframe");
+}
+
+export async function sendFileOffer(id: number, name: string, size: number): Promise<void> {
+  await invoke("send_file_offer", { id, name, size });
+}
+
+export async function sendFileChunk(
+  id: number,
+  offset: number,
+  data: number[],
+  last: boolean,
+): Promise<void> {
+  await invoke("send_file_chunk", { id, offset, data, last });
 }

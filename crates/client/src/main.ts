@@ -3,6 +3,7 @@ import { connectToHost, disconnect, type ClientEvent } from "./ipc";
 import { handleVideoChunk, initDecoder, resetDecoder } from "./decoder";
 import { attachInput, detachInput } from "./input";
 import { mountConnectionUi, setHostInfo, setStatus } from "./connection-ui";
+import { handleFileResult, mountFileTransfer } from "./file-transfer";
 
 const toolbar = document.getElementById("toolbar") as HTMLElement;
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
@@ -30,6 +31,10 @@ mountConnectionUi({
   },
 });
 
+// 接続フォーム上にファイル送信 UI を追加する。
+const connForm = document.getElementById("conn-form");
+if (connForm) mountFileTransfer(connForm);
+
 function handleClientEvent(ev: ClientEvent): void {
   switch (ev.kind) {
     case "connected":
@@ -49,6 +54,9 @@ function handleClientEvent(ev: ClientEvent): void {
       break;
     case "pong":
       // RTT 表示は stats 側でやる想定 (MVP は無視)
+      break;
+    case "file_result":
+      handleFileResult(ev.id, ev.ok, ev.message);
       break;
     case "disconnected":
       detachInput();

@@ -25,6 +25,8 @@ fn main() {
             net::disconnect,
             net::send_input,
             net::request_keyframe,
+            net::send_file_offer,
+            net::send_file_chunk,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
