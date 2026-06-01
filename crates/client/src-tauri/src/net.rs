@@ -28,10 +28,22 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientEvent {
     Connected,
-    HostInfo { displays: Vec<DisplayDto>, audio: bool },
-    Pong { rtt_us: i64 },
-    Stats { bitrate_kbps: u32, fps: u8, rtt_us: u32, loss_permille: u16 },
-    Disconnected { reason: String },
+    HostInfo {
+        displays: Vec<DisplayDto>,
+        audio: bool,
+    },
+    Pong {
+        rtt_us: i64,
+    },
+    Stats {
+        bitrate_kbps: u32,
+        fps: u8,
+        rtt_us: u32,
+        loss_permille: u16,
+    },
+    Disconnected {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,7 +56,12 @@ pub struct DisplayDto {
 
 impl From<Display> for DisplayDto {
     fn from(d: Display) -> Self {
-        Self { id: d.id, width: d.width, height: d.height, name: d.name }
+        Self {
+            id: d.id,
+            width: d.width,
+            height: d.height,
+            name: d.name,
+        }
     }
 }
 
@@ -73,7 +90,9 @@ pub async fn connect_to_host(
     {
         let mut guard = state.inner.lock().await;
         if let Some(s) = guard.take() {
-            for t in s.tasks { t.abort(); }
+            for t in s.tasks {
+                t.abort();
+            }
         }
     }
 
@@ -111,7 +130,11 @@ pub async fn connect_to_host(
     // 最初の制御メッセージ (HostInfo) を受け取る
     read_tcp_frame(&mut tcp, &mut buf).await.map_err(err)?;
     let mut plain = Vec::new();
-    session.lock().await.decrypt(&buf, &mut plain).map_err(err)?;
+    session
+        .lock()
+        .await
+        .decrypt(&buf, &mut plain)
+        .map_err(err)?;
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let host_info: ControlMsg = opts.deserialize(&plain).map_err(err)?;
 
@@ -147,7 +170,9 @@ pub async fn connect_to_host(
     let sess_w = session.clone();
     let writer_task = tokio::spawn(async move {
         let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx).await;
-        let _ = evt_clone.send(ClientEvent::Disconnected { reason: "writer closed".into() });
+        let _ = evt_clone.send(ClientEvent::Disconnected {
+            reason: "writer closed".into(),
+        });
     });
 
     let evt_clone = event_channel.clone();
@@ -263,7 +288,12 @@ async fn tcp_reader_loop(
                 // RTT は呼び出し側で算出するのが本来だが、MVP はホスト echo を信用してそのまま流す
                 let _ = event_channel.send(ClientEvent::Pong { rtt_us: now_us });
             }
-            ControlMsg::Stats { bitrate_kbps, fps, rtt_us, loss_permille } => {
+            ControlMsg::Stats {
+                bitrate_kbps,
+                fps,
+                rtt_us,
+                loss_permille,
+            } => {
                 let _ = event_channel.send(ClientEvent::Stats {
                     bitrate_kbps,
                     fps,
@@ -305,7 +335,12 @@ async fn udp_reader_loop(
     loop {
         let n = udp.recv(&mut recv_buf).await?;
         plain.clear();
-        if session.lock().await.decrypt(&recv_buf[..n], &mut plain).is_err() {
+        if session
+            .lock()
+            .await
+            .decrypt(&recv_buf[..n], &mut plain)
+            .is_err()
+        {
             // 復号失敗パケットは捨てる
             continue;
         }

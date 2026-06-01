@@ -17,8 +17,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    eAVEncH264VProfile_Base,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Base,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -67,11 +66,19 @@ impl MfH264Encoder {
         // 出力メディアタイプを先に設定 (MFT の規約)
         let out_type = make_h264_output_type()?;
         // SAFETY: transform live, type live
-        unsafe { transform.SetOutputType(0, &out_type, 0).context("SetOutputType")? };
+        unsafe {
+            transform
+                .SetOutputType(0, &out_type, 0)
+                .context("SetOutputType")?
+        };
 
         let in_type = make_nv12_input_type()?;
         // SAFETY: as above
-        unsafe { transform.SetInputType(0, &in_type, 0).context("SetInputType")? };
+        unsafe {
+            transform
+                .SetInputType(0, &in_type, 0)
+                .context("SetInputType")?
+        };
 
         // SAFETY: メッセージ送信は副作用のみ。
         unsafe {
@@ -95,8 +102,7 @@ impl MfH264Encoder {
 
     fn drain_outputs(&mut self, current_frame_id: u16) -> Result<()> {
         // SAFETY: MFT live, out param 初期化される。
-        let stream_info: MFT_OUTPUT_STREAM_INFO =
-            unsafe { self.transform.GetOutputStreamInfo(0)? };
+        let stream_info: MFT_OUTPUT_STREAM_INFO = unsafe { self.transform.GetOutputStreamInfo(0)? };
 
         loop {
             // MFT は自前で sample を作るパターン (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) と
@@ -245,9 +251,7 @@ impl Drop for MfH264Encoder {
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);

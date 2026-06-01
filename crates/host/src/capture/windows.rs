@@ -56,8 +56,7 @@ impl DxgiCapturer {
 
         // SAFETY: 取得した device は live。cast は同 COM オブジェクトの別 IID。
         let dxgi_device: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
-        let adapter: IDXGIAdapter =
-            unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
+        let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
         let output: IDXGIOutput =
             unsafe { adapter.EnumOutputs(0) }.context("EnumOutputs(0) -- no primary display?")?;
         let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
@@ -123,8 +122,10 @@ impl ScreenCapturer for DxgiCapturer {
         let mut resource: Option<IDXGIResource> = None;
 
         // SAFETY: out param は OK の場合のみ初期化される。
-        let acquire_result =
-            unsafe { self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) };
+        let acquire_result = unsafe {
+            self.duplication
+                .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
+        };
 
         match acquire_result {
             Ok(()) => {}
@@ -132,7 +133,8 @@ impl ScreenCapturer for DxgiCapturer {
             Err(e) => return Err(anyhow!("AcquireNextFrame: {e}")),
         }
 
-        let resource = resource.ok_or_else(|| anyhow!("AcquireNextFrame returned null resource"))?;
+        let resource =
+            resource.ok_or_else(|| anyhow!("AcquireNextFrame returned null resource"))?;
         let src_tex: ID3D11Texture2D = resource.cast().context("cast ID3D11Texture2D")?;
 
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();

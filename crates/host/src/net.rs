@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use bincode::Options;
 use ddd_common::framing::{MAX_PAYLOAD, VideoPacket, VideoPacketFlags};
 use ddd_common::noise::{HandshakeState, TransportSession};
-use ddd_common::proto::{ControlMsg, Display};
+use ddd_common::proto::{ControlMsg, Display, InputEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
@@ -30,6 +30,7 @@ pub async fn run_server(
     cfg: ServerConfig,
     mut nal_rx: mpsc::Receiver<EncodedNal>,
     enc_tx: mpsc::Sender<EncoderCommand>,
+    input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<()> {
     let tcp = TcpListener::bind(cfg.tcp_addr)
         .await
@@ -48,15 +49,21 @@ pub async fn run_server(
         let display = cfg.display.clone();
         let udp = udp.clone();
         let enc_tx2 = enc_tx.clone();
+        let input_tx2 = input_tx.clone();
         // nal_rx は単一所有なので、新規セッション開始時に既存セッションを置き換える設計にするには
         // チャネルを share する必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
         let nal_rx_ref = &mut nal_rx;
-        if let Err(e) = handle_client(stream, peer, psk, display, udp, enc_tx2, nal_rx_ref).await {
+        if let Err(e) = handle_client(
+            stream, peer, psk, display, udp, enc_tx2, input_tx2, nal_rx_ref,
+        )
+        .await
+        {
             tracing::warn!(error = %e, "client session ended");
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -64,6 +71,7 @@ async fn handle_client(
     display: Display,
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
+    input_tx: mpsc::Sender<InputEvent>,
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
 ) -> Result<()> {
     // Noise XX-PSK レスポンダ
@@ -114,6 +122,11 @@ async fn handle_client(
                     }
                     ControlMsg::RequestKeyframe => {
                         let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                    }
+                    ControlMsg::Input(ev) => {
+                        if input_tx.send(ev).await.is_err() {
+                            tracing::warn!("input channel closed");
+                        }
                     }
                     other => {
                         tracing::debug!(?other, "received control msg (ignored in MVP)");
