@@ -28,3 +28,10 @@ pub const MAX_BITRATE_BPS: u32 = 15_000_000;
 mod mf;
 #[cfg(target_os = "windows")]
 pub use mf::MfH264Encoder as PlatformEncoder;
+
+// Linux / macOS は ffmpeg-next 経由の H.264 エンコーダを共有する
+// (Linux: nvenc/libx264, macOS: videotoolbox)。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod ffmpeg;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use ffmpeg::FfmpegH264Encoder as PlatformEncoder;
