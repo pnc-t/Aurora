@@ -22,6 +22,35 @@ pub enum EncoderCommand {
     RequestKeyframe,
 }
 
+/// 受信中のファイルアップロード状態 (クライアント → ホスト)。1 セッション 1 転送のみ。
+struct UploadState {
+    id: u32,
+    file: tokio::fs::File,
+    written: u64,
+    total: u64,
+    path: String,
+}
+
+/// `ddd-received/` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
+async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
+    use std::path::Path;
+    let dir = Path::new("ddd-received");
+    tokio::fs::create_dir_all(dir)
+        .await
+        .context("create ddd-received dir")?;
+    // パス区切りを含む名前を弾き、ファイル名成分のみを採用する
+    let safe = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("upload.bin");
+    let path = dir.join(safe);
+    let file = tokio::fs::File::create(&path)
+        .await
+        .with_context(|| format!("create {}", path.display()))?;
+    Ok((file, path.display().to_string()))
+}
+
 pub struct ServerConfig {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
@@ -132,6 +161,7 @@ async fn handle_client(
 
     let mut seq: u32 = 0;
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
+    let mut upload: Option<UploadState> = None;
 
     loop {
         tokio::select! {
@@ -157,6 +187,53 @@ async fn handle_client(
                     ControlMsg::Clipboard { text } => {
                         if clip_apply_tx.send(text).is_err() {
                             tracing::warn!("clipboard apply channel closed");
+                        }
+                    }
+                    ControlMsg::FileOffer { id, name, size } => {
+                        match open_upload(&name).await {
+                            Ok((file, path)) => {
+                                tracing::info!(id, name = %name, size, path = %path, "file upload start");
+                                upload = Some(UploadState { id, file, written: 0, total: size, path });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "open upload failed");
+                                let msg = ControlMsg::FileResult { id, ok: false, message: e.to_string() };
+                                send_control_msg(&mut stream, &session, &msg).await?;
+                            }
+                        }
+                    }
+                    ControlMsg::FileChunk { id, offset, data, last } => {
+                        match upload.as_mut() {
+                            Some(u) if u.id == id => {
+                                if offset != u.written {
+                                    tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch");
+                                }
+                                if let Err(e) = u.file.write_all(&data).await {
+                                    let message = format!("write failed: {e}");
+                                    tracing::warn!(id, error = %e, "file write failed");
+                                    upload = None;
+                                    let msg = ControlMsg::FileResult { id, ok: false, message };
+                                    send_control_msg(&mut stream, &session, &msg).await?;
+                                } else {
+                                    u.written += data.len() as u64;
+                                    if last {
+                                        let (written, total, path) = (u.written, u.total, u.path.clone());
+                                        let res = u.file.flush().await;
+                                        upload = None;
+                                        let msg = match res {
+                                            Ok(()) => {
+                                                tracing::info!(id, written, total, path = %path, "file upload complete");
+                                                ControlMsg::FileResult { id, ok: true, message: path }
+                                            }
+                                            Err(e) => ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") },
+                                        };
+                                        send_control_msg(&mut stream, &session, &msg).await?;
+                                    }
+                                }
+                            }
+                            _ => {
+                                tracing::warn!(id, "file chunk without matching offer, ignored");
+                            }
                         }
                     }
                     other => {

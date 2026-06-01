@@ -46,6 +46,11 @@ pub enum ClientEvent {
         rtt_us: u32,
         loss_permille: u16,
     },
+    FileResult {
+        id: u32,
+        ok: bool,
+        message: String,
+    },
     Disconnected {
         reason: String,
     },
@@ -74,6 +79,9 @@ impl From<Display> for DisplayDto {
 pub struct SessionHandle {
     /// 制御メッセージを書き込み側タスクに投げる
     pub ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
+    /// ファイル転送チャンク専用の bounded チャネル。満杯時に送信が待つことで
+    /// JS 側の読み込みにバックプレッシャがかかり、入力など他の制御を詰まらせない。
+    pub file_tx: mpsc::Sender<ControlMsg>,
     /// 読み書き両タスクをまとめて止める
     pub tasks: Vec<JoinHandle<()>>,
     /// クリップボード同期ハンドル
@@ -185,6 +193,7 @@ pub async fn connect_to_host(
 
     let (read_half, write_half) = tcp.into_split();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let (file_tx, file_rx) = mpsc::channel::<ControlMsg>(32);
 
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
@@ -193,7 +202,7 @@ pub async fn connect_to_host(
     let evt_clone = event_channel.clone();
     let sess_w = session.clone();
     let writer_task = tokio::spawn(async move {
-        let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx).await;
+        let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
         let _ = evt_clone.send(ClientEvent::Disconnected {
             reason: "writer closed".into(),
         });
@@ -256,6 +265,7 @@ pub async fn connect_to_host(
 
     let handle = SessionHandle {
         ctrl_tx,
+        file_tx,
         tasks: vec![
             writer_task,
             reader_task,
@@ -302,15 +312,70 @@ pub async fn request_keyframe(state: tauri::State<'_, SessionState>) -> Result<(
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
+/// ファイル転送開始の告知。チャンク列の前に 1 回だけ呼ぶ。
+#[tauri::command]
+pub async fn send_file_offer(
+    id: u32,
+    name: String,
+    size: u64,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let msg = ControlMsg::FileOffer { id, name, size };
+    send_file_msg(&state, msg).await
+}
+
+/// ファイルチャンクを 1 つ送る。bounded チャネル経由なので満杯時はここで待つ
+/// (= JS 側 invoke が待ち、読み込みにバックプレッシャがかかる)。
+#[tauri::command]
+pub async fn send_file_chunk(
+    id: u32,
+    offset: u64,
+    data: Vec<u8>,
+    last: bool,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let msg = ControlMsg::FileChunk {
+        id,
+        offset,
+        data,
+        last,
+    };
+    send_file_msg(&state, msg).await
+}
+
+/// bounded file チャネルへ送る共通処理。ロックは send の await をまたがないよう
+/// Sender を clone してから解放する。
+async fn send_file_msg(
+    state: &tauri::State<'_, SessionState>,
+    msg: ControlMsg,
+) -> Result<(), String> {
+    let file_tx = {
+        let guard = state.inner.lock().await;
+        let s = guard.as_ref().ok_or("not connected")?;
+        s.file_tx.clone()
+    };
+    file_tx
+        .send(msg)
+        .await
+        .map_err(|_| "file channel closed".to_string())
+}
+
 // -------- internal loops --------
 
 async fn tcp_writer_loop(
     mut write_half: OwnedWriteHalf,
     session: Arc<Mutex<TransportSession>>,
-    mut rx: mpsc::UnboundedReceiver<ControlMsg>,
+    mut ctrl_rx: mpsc::UnboundedReceiver<ControlMsg>,
+    mut file_rx: mpsc::Receiver<ControlMsg>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
-    while let Some(msg) = rx.recv().await {
+    loop {
+        // 制御チャネルとファイルチャネルの両方を待つ。どちらかが閉じたら終了。
+        let msg = tokio::select! {
+            m = ctrl_rx.recv() => m,
+            m = file_rx.recv() => m,
+        };
+        let Some(msg) = msg else { break };
         let plain = opts.serialize(&msg)?;
         let mut cipher = Vec::new();
         session.lock().await.encrypt(&plain, &mut cipher)?;
@@ -366,6 +431,9 @@ async fn tcp_reader_loop(
                 if clip_apply_tx.send(text).is_err() {
                     tracing::debug!("clipboard apply channel closed");
                 }
+            }
+            ControlMsg::FileResult { id, ok, message } => {
+                let _ = event_channel.send(ClientEvent::FileResult { id, ok, message });
             }
             other => tracing::debug!(?other, "ignored control msg"),
         }
