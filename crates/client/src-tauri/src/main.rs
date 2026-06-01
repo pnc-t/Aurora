@@ -5,6 +5,7 @@
     windows_subsystem = "windows"
 )]
 
+mod audio;
 mod net;
 
 use net::SessionState;
