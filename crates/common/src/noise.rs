@@ -77,7 +77,10 @@ impl HandshakeState {
     }
 
     pub fn is_handshake_finished(&self) -> bool {
-        self.inner.as_ref().map(|h| h.is_handshake_finished()).unwrap_or(false)
+        self.inner
+            .as_ref()
+            .map(|h| h.is_handshake_finished())
+            .unwrap_or(false)
     }
 
     pub fn into_transport(mut self) -> Result<TransportSession, NoiseError> {
