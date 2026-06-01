@@ -14,6 +14,8 @@ bincode = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 snow = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+arboard = { workspace = true }
 bitflags = "2.6"
 blake2s_simd = "1.0"

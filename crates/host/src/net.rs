@@ -31,6 +31,8 @@ pub async fn run_server(
     mut nal_rx: mpsc::Receiver<EncodedNal>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputEvent>,
+    clip_apply_tx: mpsc::UnboundedSender<String>,
+    mut clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let tcp = TcpListener::bind(cfg.tcp_addr)
         .await
@@ -50,11 +52,22 @@ pub async fn run_server(
         let udp = udp.clone();
         let enc_tx2 = enc_tx.clone();
         let input_tx2 = input_tx.clone();
-        // nal_rx は単一所有なので、新規セッション開始時に既存セッションを置き換える設計にするには
-        // チャネルを share する必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
+        let clip_apply_tx2 = clip_apply_tx.clone();
+        // nal_rx と clip_change_rx は単一所有のため、新規セッション開始時は既存セッションを
+        // 置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
         let nal_rx_ref = &mut nal_rx;
+        let clip_change_rx_ref = &mut clip_change_rx;
         if let Err(e) = handle_client(
-            stream, peer, psk, display, udp, enc_tx2, input_tx2, nal_rx_ref,
+            stream,
+            peer,
+            psk,
+            display,
+            udp,
+            enc_tx2,
+            input_tx2,
+            clip_apply_tx2,
+            nal_rx_ref,
+            clip_change_rx_ref,
         )
         .await
         {
@@ -72,7 +85,9 @@ async fn handle_client(
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputEvent>,
+    clip_apply_tx: mpsc::UnboundedSender<String>,
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
+    clip_change_rx: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     // Noise XX-PSK レスポンダ
     let mut hs = HandshakeState::new_responder(&psk)?;
@@ -128,10 +143,19 @@ async fn handle_client(
                             tracing::warn!("input channel closed");
                         }
                     }
+                    ControlMsg::Clipboard { text } => {
+                        if clip_apply_tx.send(text).is_err() {
+                            tracing::warn!("clipboard apply channel closed");
+                        }
+                    }
                     other => {
                         tracing::debug!(?other, "received control msg (ignored in MVP)");
                     }
                 }
+            }
+            // ローカルクリップボード変化 → 制御チャネルで送信
+            Some(text) = clip_change_rx.recv() => {
+                send_control_msg(&mut stream, &session, &ControlMsg::Clipboard { text }).await?;
             }
             // NAL 受信 → UDP 送信
             Some(nal) = nal_rx.recv() => {

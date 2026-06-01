@@ -1,5 +1,6 @@
 //! 共有プロトコル・暗号化・フレーミング層。
 
+pub mod clipboard;
 pub mod framing;
 pub mod noise;
 pub mod proto;

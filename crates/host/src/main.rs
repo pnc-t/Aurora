@@ -121,6 +121,8 @@ fn run_server() -> Result<()> {
     let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
     let (enc_cmd_tx, enc_cmd_rx) = mpsc::channel::<EncoderCommand>(8);
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(256);
+    let (clip_handle, clip_change_rx) = ddd_common::clipboard::spawn();
+    let clip_apply_tx = clip_handle.apply_tx.clone();
 
     let display = Display {
         id: 0,
@@ -165,7 +167,15 @@ fn run_server() -> Result<()> {
             psk,
             display,
         };
-        net::run_server(cfg, nal_rx, enc_cmd_tx, input_tx).await
+        net::run_server(
+            cfg,
+            nal_rx,
+            enc_cmd_tx,
+            input_tx,
+            clip_apply_tx,
+            clip_change_rx,
+        )
+        .await
     })
 }
 

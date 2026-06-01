@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bincode::Options;
+use ddd_common::clipboard::{self, ClipboardHandle};
 use ddd_common::framing::{HEADER_LEN, VideoPacket, VideoPacketFlags};
 use ddd_common::noise::{HandshakeState, TransportSession, psk_from_password};
 use ddd_common::proto::{ControlMsg, Display, InputEvent};
@@ -71,6 +72,18 @@ pub struct SessionHandle {
     pub ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
     /// 読み書き両タスクをまとめて止める
     pub tasks: Vec<JoinHandle<()>>,
+    /// クリップボード同期ハンドル
+    pub clipboard: ClipboardHandle,
+}
+
+impl SessionHandle {
+    /// セッションを停止する: クリップボードスレッドへ shutdown 通知 + tokio タスク abort。
+    pub fn shutdown(mut self) {
+        self.clipboard.shutdown();
+        for t in std::mem::take(&mut self.tasks) {
+            t.abort();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -90,9 +103,7 @@ pub async fn connect_to_host(
     {
         let mut guard = state.inner.lock().await;
         if let Some(s) = guard.take() {
-            for t in s.tasks {
-                t.abort();
-            }
+            s.shutdown();
         }
     }
 
@@ -166,6 +177,10 @@ pub async fn connect_to_host(
     let (read_half, write_half) = tcp.into_split();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
 
+    // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
+    let (clip_handle, mut clip_change_rx) = clipboard::spawn();
+    let clip_apply_tx = clip_handle.apply_tx.clone();
+
     let evt_clone = event_channel.clone();
     let sess_w = session.clone();
     let writer_task = tokio::spawn(async move {
@@ -177,8 +192,10 @@ pub async fn connect_to_host(
 
     let evt_clone = event_channel.clone();
     let sess_r = session.clone();
+    let clip_apply_for_reader = clip_apply_tx.clone();
     let reader_task = tokio::spawn(async move {
-        let res = tcp_reader_loop(read_half, sess_r, evt_clone.clone()).await;
+        let res =
+            tcp_reader_loop(read_half, sess_r, evt_clone.clone(), clip_apply_for_reader).await;
         let reason = match res {
             Ok(()) => "server closed".to_string(),
             Err(e) => format!("read error: {e}"),
@@ -190,6 +207,16 @@ pub async fn connect_to_host(
     let udp_task = tokio::spawn(async move {
         if let Err(e) = udp_reader_loop(udp, sess_u, video_channel).await {
             tracing::warn!(error = %e, "UDP reader ended");
+        }
+    });
+
+    // クリップボード変化 → ControlMsg::Clipboard 送信
+    let ctrl_for_clip = ctrl_tx.clone();
+    let clip_forward_task = tokio::spawn(async move {
+        while let Some(text) = clip_change_rx.recv().await {
+            if ctrl_for_clip.send(ControlMsg::Clipboard { text }).is_err() {
+                break;
+            }
         }
     });
 
@@ -210,7 +237,14 @@ pub async fn connect_to_host(
 
     let handle = SessionHandle {
         ctrl_tx,
-        tasks: vec![writer_task, reader_task, udp_task, ping_task],
+        tasks: vec![
+            writer_task,
+            reader_task,
+            udp_task,
+            ping_task,
+            clip_forward_task,
+        ],
+        clipboard: clip_handle,
     };
     *state.inner.lock().await = Some(handle);
     Ok(())
@@ -269,6 +303,7 @@ async fn tcp_reader_loop(
     mut read_half: OwnedReadHalf,
     session: Arc<Mutex<TransportSession>>,
     event_channel: Channel<ClientEvent>,
+    clip_apply_tx: mpsc::UnboundedSender<String>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
@@ -306,6 +341,11 @@ async fn tcp_reader_loop(
                     displays: displays.into_iter().map(Into::into).collect(),
                     audio,
                 });
+            }
+            ControlMsg::Clipboard { text } => {
+                if clip_apply_tx.send(text).is_err() {
+                    tracing::debug!("clipboard apply channel closed");
+                }
             }
             other => tracing::debug!(?other, "ignored control msg"),
         }
