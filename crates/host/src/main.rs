@@ -139,21 +139,31 @@ fn run_server() -> Result<()> {
         }
     };
 
-    let display = Display {
-        id: 0,
-        width: 1920,
-        height: 1080,
-        name: "primary".to_string(),
-    };
-
-    // capture スレッド
+    // capture スレッド: 最初のフレームで実解像度を確定し res_tx で通知する。
+    let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(frame_tx) {
+            if let Err(e) = capture_loop(frame_tx, res_tx) {
                 tracing::error!(error = %e, "capture loop ended");
             }
         })?;
+
+    // 実ディスプレイ解像度を待つ (取得できなければ 1080p で続行)。
+    let (width, height) = match res_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(res) => res,
+        Err(_) => {
+            tracing::warn!("capture resolution unknown, defaulting to 1920x1080");
+            (1920, 1080)
+        }
+    };
+    tracing::info!(width, height, "primary display resolution");
+    let display = Display {
+        id: 0,
+        width,
+        height,
+        name: "primary".to_string(),
+    };
 
     // encode スレッド
     std::thread::Builder::new()
@@ -196,10 +206,19 @@ fn run_server() -> Result<()> {
     })
 }
 
-fn capture_loop(tx: mpsc::Sender<Frame>) -> Result<()> {
+fn capture_loop(
+    tx: mpsc::Sender<Frame>,
+    res_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
+) -> Result<()> {
     let mut cap = PlatformCapturer::new_primary()?;
+    let mut reported = false;
     loop {
         if let Some(f) = cap.next_frame(Duration::from_millis(100))? {
+            // 最初に取れたフレームの寸法を実解像度として一度だけ通知する。
+            if !reported {
+                let _ = res_tx.try_send((f.width, f.height));
+                reported = true;
+            }
             // try_send: バックプレッシャ。詰まったら捨てる。更新なしのときは None
             let _ = tx.try_send(f);
         }
