@@ -227,6 +227,11 @@ fn encode_loop(
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 EncoderCommand::RequestKeyframe => enc.request_keyframe(),
+                EncoderCommand::SetBitrate(bps) => {
+                    if let Err(e) = enc.set_bitrate(bps) {
+                        tracing::warn!(error = %e, bps, "set_bitrate failed");
+                    }
+                }
             }
         }
         match frame_rx.blocking_recv() {

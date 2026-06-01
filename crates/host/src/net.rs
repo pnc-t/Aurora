@@ -17,9 +17,55 @@ use tokio::sync::{Mutex, mpsc};
 use crate::audio::EncodedAudio;
 use crate::encode::EncodedNal;
 
+use crate::encode::{DEFAULT_BITRATE_BPS, MAX_BITRATE_BPS, MIN_BITRATE_BPS};
+
 /// 制御ループ → encode スレッドへの通知。
 pub enum EncoderCommand {
     RequestKeyframe,
+    /// 適応制御による平均ビットレート変更 (bps)。
+    SetBitrate(u32),
+}
+
+/// クライアント Stats を元にしたビットレート適応制御 (AIMD)。
+///
+/// - 損失率が高い → 乗算的に下げる (Multiplicative Decrease)
+/// - 損失が少なく RTT も良好 → 加算的に上げる (Additive Increase)
+///
+/// 制御は `MIN_BITRATE_BPS`..=`MAX_BITRATE_BPS` にクランプする。
+struct BitrateController {
+    current_bps: u32,
+}
+
+impl BitrateController {
+    fn new() -> Self {
+        Self {
+            current_bps: DEFAULT_BITRATE_BPS,
+        }
+    }
+
+    /// 新しい Stats を反映し、ビットレートを変更すべきなら新しい値 (bps) を返す。
+    fn on_stats(&mut self, loss_permille: u16, rtt_us: u32) -> Option<u32> {
+        const LOSS_HIGH: u16 = 50; // 5% 超で輻輳とみなす
+        const LOSS_LOW: u16 = 10; // 1% 未満なら余裕あり
+        const RTT_OK_US: u32 = 80_000; // 80ms 未満なら増速を許可
+        const STEP_UP_BPS: u32 = 1_000_000;
+
+        let next = if loss_permille > LOSS_HIGH {
+            (self.current_bps as f32 * 0.7) as u32
+        } else if loss_permille < LOSS_LOW && rtt_us < RTT_OK_US {
+            self.current_bps.saturating_add(STEP_UP_BPS)
+        } else {
+            self.current_bps
+        }
+        .clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS);
+
+        if next != self.current_bps {
+            self.current_bps = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
 }
 
 /// 受信中のファイルアップロード状態 (クライアント → ホスト)。1 セッション 1 転送のみ。
@@ -162,6 +208,7 @@ async fn handle_client(
     let mut seq: u32 = 0;
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
+    let mut bitrate = BitrateController::new();
 
     loop {
         tokio::select! {
@@ -178,6 +225,13 @@ async fn handle_client(
                     }
                     ControlMsg::RequestKeyframe => {
                         let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                    }
+                    ControlMsg::Stats { bitrate_kbps, fps, rtt_us, loss_permille } => {
+                        tracing::debug!(bitrate_kbps, fps, rtt_us, loss_permille, "client stats");
+                        if let Some(new_bps) = bitrate.on_stats(loss_permille, rtt_us) {
+                            tracing::info!(new_bps, loss_permille, rtt_us, "adapt bitrate");
+                            let _ = enc_tx.send(EncoderCommand::SetBitrate(new_bps)).await;
+                        }
                     }
                     ControlMsg::Input(ev) => {
                         if input_tx.send(ev).await.is_err() {
