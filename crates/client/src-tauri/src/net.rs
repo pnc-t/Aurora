@@ -10,11 +10,15 @@ use std::time::Duration;
 
 use bincode::Options;
 use ddd_common::clipboard::{self, ClipboardHandle};
-use ddd_common::framing::{HEADER_LEN, VideoPacket, VideoPacketFlags};
+use ddd_common::framing::{
+    AudioPacket, HEADER_LEN, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+};
 use ddd_common::noise::{HandshakeState, TransportSession, psk_from_password};
 use ddd_common::proto::{ControlMsg, Display, InputEvent};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
+
+use crate::audio::{self, AudioPlayer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc};
@@ -74,10 +78,15 @@ pub struct SessionHandle {
     pub tasks: Vec<JoinHandle<()>>,
     /// クリップボード同期ハンドル
     pub clipboard: ClipboardHandle,
+    /// 音声再生 (ホストが音声非対応なら None)。保持目的は RAII: SessionHandle の drop で
+    /// 再生スレッドへ EOF が伝わり停止する。直接読み出すことはない。
+    #[allow(dead_code)]
+    pub audio: Option<AudioPlayer>,
 }
 
 impl SessionHandle {
     /// セッションを停止する: クリップボードスレッドへ shutdown 通知 + tokio タスク abort。
+    /// `audio` は self の drop で再生スレッドへ EOF が伝わり停止する。
     pub fn shutdown(mut self) {
         self.clipboard.shutdown();
         for t in std::mem::take(&mut self.tasks) {
@@ -203,9 +212,19 @@ pub async fn connect_to_host(
         let _ = evt_clone.send(ClientEvent::Disconnected { reason });
     });
 
+    // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。
+    let audio_player = match audio::spawn() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "audio playback disabled");
+            None
+        }
+    };
+    let audio_tx = audio_player.as_ref().map(|p| p.sender());
+
     let sess_u = session.clone();
     let udp_task = tokio::spawn(async move {
-        if let Err(e) = udp_reader_loop(udp, sess_u, video_channel).await {
+        if let Err(e) = udp_reader_loop(udp, sess_u, video_channel, audio_tx).await {
             tracing::warn!(error = %e, "UDP reader ended");
         }
     });
@@ -245,6 +264,7 @@ pub async fn connect_to_host(
             clip_forward_task,
         ],
         clipboard: clip_handle,
+        audio: audio_player,
     };
     *state.inner.lock().await = Some(handle);
     Ok(())
@@ -361,11 +381,12 @@ async fn udp_reader_loop(
     udp: Arc<UdpSocket>,
     session: Arc<Mutex<TransportSession>>,
     video_channel: Channel<InvokeResponseBody>,
+    audio_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 ) -> anyhow::Result<()> {
     let mut recv_buf = vec![0u8; 2048];
     let mut plain = Vec::new();
 
-    // フレーム組立状態
+    // 映像フレーム組立状態 (STREAM_VIDEO のみで使う)
     let mut cur_frame_id: Option<u16> = None;
     let mut cur_keyframe = false;
     let mut cur_payload: Vec<u8> = Vec::new();
@@ -384,7 +405,27 @@ async fn udp_reader_loop(
             // 復号失敗パケットは捨てる
             continue;
         }
-        let pkt = match VideoPacket::decode(&plain) {
+
+        // 先頭 1B のストリームタグで映像 / 音声を振り分ける
+        let (&tag, body) = match plain.split_first() {
+            Some(x) => x,
+            None => continue,
+        };
+
+        if tag == STREAM_AUDIO {
+            if let Some(tx) = &audio_tx {
+                if let Ok(pkt) = AudioPacket::decode(body) {
+                    // 再生スレッドへ Opus フレームを渡す (seq は MVP では未使用)
+                    let _ = tx.send(pkt.payload.to_vec());
+                }
+            }
+            continue;
+        }
+        if tag != STREAM_VIDEO {
+            continue;
+        }
+
+        let pkt = match VideoPacket::decode(body) {
             Ok(p) => p,
             Err(_) => continue,
         };

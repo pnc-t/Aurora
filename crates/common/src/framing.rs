@@ -6,6 +6,14 @@ pub const HEADER_LEN: usize = 7;
 pub const MAX_MTU: usize = 1200;
 pub const MAX_PAYLOAD: usize = MAX_MTU - HEADER_LEN;
 
+/// UDP メディア多重化のストリーム種別タグ。暗号化前 plaintext の先頭 1B に付ける。
+/// 映像と音声は同一 UDP ソケット・同一 Noise セッションに相乗りする。
+pub const STREAM_VIDEO: u8 = 0;
+pub const STREAM_AUDIO: u8 = 1;
+
+/// 音声パケットヘッダ長 (4B seq)。
+pub const AUDIO_HEADER_LEN: usize = 4;
+
 #[derive(Debug, Error)]
 pub enum FramingError {
     #[error("packet too short")]
@@ -60,6 +68,38 @@ impl<'a> VideoPacket<'a> {
     }
 }
 
+/// 音声 (Opus) パケット。1 パケット = 1 Opus フレーム (20ms)。
+/// Opus フレームは MTU 内に収まるため分割しない。`seq` は欠落検出用。
+#[derive(Debug, Clone)]
+pub struct AudioPacket<'a> {
+    pub seq: u32,
+    /// Opus エンコード済みフレーム。
+    pub payload: &'a [u8],
+}
+
+impl<'a> AudioPacket<'a> {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), FramingError> {
+        if self.payload.len() > MAX_PAYLOAD {
+            return Err(FramingError::TooLarge(self.payload.len()));
+        }
+        out.clear();
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(self.payload);
+        Ok(())
+    }
+
+    pub fn decode(buf: &'a [u8]) -> Result<Self, FramingError> {
+        if buf.len() < AUDIO_HEADER_LEN {
+            return Err(FramingError::TooShort);
+        }
+        let seq = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        Ok(Self {
+            seq,
+            payload: &buf[AUDIO_HEADER_LEN..],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +120,20 @@ mod tests {
         assert!(dec.flags.contains(VideoPacketFlags::KEYFRAME));
         assert!(dec.flags.contains(VideoPacketFlags::FRAME_START));
         assert_eq!(dec.frame_id, 0x1234);
+        assert_eq!(dec.payload, &payload[..]);
+    }
+
+    #[test]
+    fn audio_roundtrip() {
+        let payload = vec![0x7f; 240];
+        let pkt = AudioPacket {
+            seq: 0x0102_0304,
+            payload: &payload,
+        };
+        let mut buf = Vec::new();
+        pkt.encode(&mut buf).unwrap();
+        let dec = AudioPacket::decode(&buf).unwrap();
+        assert_eq!(dec.seq, 0x0102_0304);
         assert_eq!(dec.payload, &payload[..]);
     }
 

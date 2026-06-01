@@ -5,13 +5,16 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use bincode::Options;
-use ddd_common::framing::{MAX_PAYLOAD, VideoPacket, VideoPacketFlags};
+use ddd_common::framing::{
+    AudioPacket, MAX_PAYLOAD, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+};
 use ddd_common::noise::{HandshakeState, TransportSession};
 use ddd_common::proto::{ControlMsg, Display, InputEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::audio::EncodedAudio;
 use crate::encode::EncodedNal;
 
 /// 制御ループ → encode スレッドへの通知。
@@ -24,11 +27,13 @@ pub struct ServerConfig {
     pub udp_addr: SocketAddr,
     pub psk: [u8; 32],
     pub display: Display,
+    pub audio: bool,
 }
 
 pub async fn run_server(
     cfg: ServerConfig,
     mut nal_rx: mpsc::Receiver<EncodedNal>,
+    mut audio_rx: mpsc::Receiver<EncodedAudio>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputEvent>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
@@ -49,24 +54,28 @@ pub async fn run_server(
         tracing::info!(peer = %peer, "TCP client connected");
         let psk = cfg.psk;
         let display = cfg.display.clone();
+        let audio = cfg.audio;
         let udp = udp.clone();
         let enc_tx2 = enc_tx.clone();
         let input_tx2 = input_tx.clone();
         let clip_apply_tx2 = clip_apply_tx.clone();
-        // nal_rx と clip_change_rx は単一所有のため、新規セッション開始時は既存セッションを
-        // 置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
+        // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
+        // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
         let nal_rx_ref = &mut nal_rx;
+        let audio_rx_ref = &mut audio_rx;
         let clip_change_rx_ref = &mut clip_change_rx;
         if let Err(e) = handle_client(
             stream,
             peer,
             psk,
             display,
+            audio,
             udp,
             enc_tx2,
             input_tx2,
             clip_apply_tx2,
             nal_rx_ref,
+            audio_rx_ref,
             clip_change_rx_ref,
         )
         .await
@@ -82,11 +91,13 @@ async fn handle_client(
     peer: SocketAddr,
     psk: [u8; 32],
     display: Display,
+    audio: bool,
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputEvent>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
+    audio_rx: &mut mpsc::Receiver<EncodedAudio>,
     clip_change_rx: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     // Noise XX-PSK レスポンダ
@@ -111,7 +122,7 @@ async fn handle_client(
     // HostInfo を即時送信
     let host_info = ControlMsg::HostInfo {
         displays: vec![display.clone()],
-        audio: false,
+        audio,
     };
     send_control_msg(&mut stream, &session, &host_info).await?;
 
@@ -157,7 +168,7 @@ async fn handle_client(
             Some(text) = clip_change_rx.recv() => {
                 send_control_msg(&mut stream, &session, &ControlMsg::Clipboard { text }).await?;
             }
-            // NAL 受信 → UDP 送信
+            // NAL 受信 → UDP 送信 (STREAM_VIDEO)
             Some(nal) = nal_rx.recv() => {
                 let frame_id = nal.frame_id;
                 let keyframe = nal.keyframe;
@@ -173,14 +184,31 @@ async fn handle_client(
                     let mut framed = Vec::with_capacity(chunk.len() + 7);
                     pkt.encode(&mut framed).context("encode VideoPacket")?;
                     let mut ct = Vec::new();
-                    session.lock().await.encrypt(&framed, &mut ct)?;
+                    session.lock().await.encrypt(&tagged(STREAM_VIDEO, &framed), &mut ct)?;
                     udp.send_to(&ct, peer_udp).await.context("UDP send")?;
                     seq = seq.wrapping_add(1);
                     first = false;
                 }
             }
+            // 音声フレーム受信 → UDP 送信 (STREAM_AUDIO)
+            Some(au) = audio_rx.recv() => {
+                let pkt = AudioPacket { seq: au.seq, payload: &au.data };
+                let mut framed = Vec::with_capacity(au.data.len() + 4);
+                pkt.encode(&mut framed).context("encode AudioPacket")?;
+                let mut ct = Vec::new();
+                session.lock().await.encrypt(&tagged(STREAM_AUDIO, &framed), &mut ct)?;
+                udp.send_to(&ct, peer_udp).await.context("UDP send audio")?;
+            }
         }
     }
+}
+
+/// ストリーム種別タグを先頭に付けた plaintext を作る。
+fn tagged(stream: u8, framed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + framed.len());
+    out.push(stream);
+    out.extend_from_slice(framed);
+    out
 }
 
 async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {

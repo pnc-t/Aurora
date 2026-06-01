@@ -1,0 +1,6 @@
+# audiopus_sys (opus 依存) が同梱する libopus の CMakeLists は古い
+# cmake_minimum_required を宣言しており、CMake 4.x は互換性を削除したため
+# そのままでは configure に失敗する。policy 最小バージョンを 3.5 に固定して回避する。
+# (cmake は winget で導入し、PATH に通っている前提)
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
