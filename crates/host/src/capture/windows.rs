@@ -256,9 +256,7 @@ impl ScreenCapturer for DxgiCapturer {
         let height = src_desc.Height;
         let src_format = src_desc.Format;
 
-        let staging = self
-            .ensure_staging(width, height, src_format)?
-            .clone();
+        let staging = self.ensure_staging(width, height, src_format)?.clone();
 
         // SAFETY: 同 device・同フォーマット・同サイズの 2 texture 間で CopyResource。
         unsafe { self.context.CopyResource(&staging, &src_tex) };
@@ -402,8 +400,9 @@ fn hdr_info(gdi_device_name: &str) -> (bool, f32) {
         DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
         DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
         DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-        DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
-        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+        DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+        QueryDisplayConfig,
     };
     use windows::Win32::Foundation::ERROR_SUCCESS;
 

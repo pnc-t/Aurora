@@ -14,9 +14,7 @@ use ddd_common::clipboard::{self, ClipboardHandle};
 use ddd_common::framing::{
     AudioPacket, HEADER_LEN, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
-use ddd_common::noise::{
-    HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password,
-};
+use ddd_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password};
 use ddd_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -286,8 +284,15 @@ pub async fn connect_to_host(
     // ロス検出時にキーフレームを要求して映像を即時回復させるための送信口。
     let keyframe_tx = ctrl_tx.clone();
     let udp_task = tokio::spawn(async move {
-        if let Err(e) =
-            udp_reader_loop(udp, sess_u, video_channel, audio_tx, stats_for_udp, keyframe_tx).await
+        if let Err(e) = udp_reader_loop(
+            udp,
+            sess_u,
+            video_channel,
+            audio_tx,
+            stats_for_udp,
+            keyframe_tx,
+        )
+        .await
         {
             tracing::warn!(error = %e, "UDP reader ended");
         }
