@@ -8,7 +8,9 @@ use bincode::Options;
 use ddd_common::framing::{
     AudioPacket, MAX_PAYLOAD, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
-use ddd_common::noise::{HandshakeState, TransportSession};
+use ddd_common::noise::{
+    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_VIDEO, TransportSession,
+};
 use ddd_common::proto::{ControlMsg, Display, InputEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -281,12 +283,17 @@ async fn handle_client(
     let session = Arc::new(Mutex::new(hs.into_transport()?));
     tracing::info!(peer = %peer, "noise handshake complete");
 
+    // TCP 制御チャネルの nonce カウンタ (CTRL ドメイン)。送受で別カウンタを持ち、
+    // TCP の順序保証により対向と歩調が合う。UDP メディアとは別ドメインなので衝突しない。
+    let mut tcp_tx_nonce: u64 = 0;
+    let mut tcp_rx_nonce: u64 = 0;
+
     // HostInfo を即時送信 (全ディスプレイを提示)
     let host_info = ControlMsg::HostInfo {
         displays: displays.iter().map(Display::from).collect(),
         audio,
     };
-    send_control_msg(&mut stream, &session, &host_info).await?;
+    send_control_msg(&mut stream, &session, &host_info, &mut tcp_tx_nonce).await?;
 
     // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "DDDHELLO" を送る想定。
     let peer_udp = wait_udp_hello(&udp).await?;
@@ -318,12 +325,14 @@ async fn handle_client(
             res = read_tcp_frame_into(&mut stream, &mut buf) => {
                 res?;
                 let mut plain = Vec::new();
-                session.lock().await.decrypt(&buf, &mut plain)?;
+                let rx_nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
+                tcp_rx_nonce += 1;
+                session.lock().await.decrypt(rx_nonce, &buf, &mut plain)?;
                 let msg: ControlMsg = bincode_opts.deserialize(&plain)
                     .context("decode ControlMsg")?;
                 match msg {
                     ControlMsg::Ping { ts_us } => {
-                        send_control_msg(&mut stream, &session, &ControlMsg::Pong { ts_us }).await?;
+                        send_control_msg(&mut stream, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
                     }
                     ControlMsg::RequestKeyframe => {
                         let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
@@ -374,7 +383,7 @@ async fn handle_client(
                             Err(e) => {
                                 tracing::warn!(error = %e, "open upload failed");
                                 let msg = ControlMsg::FileResult { id, ok: false, message: e.to_string() };
-                                send_control_msg(&mut stream, &session, &msg).await?;
+                                send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
                             }
                         }
                     }
@@ -389,7 +398,7 @@ async fn handle_client(
                                     tracing::warn!(id, error = %e, "file write failed");
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
-                                    send_control_msg(&mut stream, &session, &msg).await?;
+                                    send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else {
                                     u.written += data.len() as u64;
                                     if last {
@@ -403,7 +412,7 @@ async fn handle_client(
                                             }
                                             Err(e) => ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") },
                                         };
-                                        send_control_msg(&mut stream, &session, &msg).await?;
+                                        send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
                                     }
                                 }
                             }
@@ -433,15 +442,15 @@ async fn handle_client(
             }
             // ダウンロード送信タスクからのメッセージ (FileOffer/FileChunk/FileResult)
             Some(msg) = out_rx.recv() => {
-                send_control_msg(&mut stream, &session, &msg).await?;
+                send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
             }
             // ProjFS コールバックからの FS RPC 要求 (FsList/FsRead) を TCP へ送る
             Some(msg) = fs_req_rx.recv() => {
-                send_control_msg(&mut stream, &session, &msg).await?;
+                send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
             }
             // ローカルクリップボード変化 → 制御チャネルで送信
             Some(text) = clip_change_rx.recv() => {
-                send_control_msg(&mut stream, &session, &ControlMsg::Clipboard { text }).await?;
+                send_control_msg(&mut stream, &session, &ControlMsg::Clipboard { text }, &mut tcp_tx_nonce).await?;
             }
             // NAL 受信 → UDP 送信 (STREAM_VIDEO)
             Some(nal) = nal_rx.recv() => {
@@ -458,9 +467,9 @@ async fn handle_client(
                     let pkt = VideoPacket { seq, flags, frame_id, payload: chunk };
                     let mut framed = Vec::with_capacity(chunk.len() + 7);
                     pkt.encode(&mut framed).context("encode VideoPacket")?;
-                    let mut ct = Vec::new();
-                    session.lock().await.encrypt(&tagged(STREAM_VIDEO, &framed), &mut ct)?;
-                    udp.send_to(&ct, peer_udp).await.context("UDP send")?;
+                    let nonce = NONCE_DOMAIN_VIDEO | seq as u64;
+                    let dgram = encrypt_udp(&session, nonce, STREAM_VIDEO, &framed).await?;
+                    udp.send_to(&dgram, peer_udp).await.context("UDP send")?;
                     seq = seq.wrapping_add(1);
                     first = false;
                 }
@@ -470,20 +479,32 @@ async fn handle_client(
                 let pkt = AudioPacket { seq: au.seq, payload: &au.data };
                 let mut framed = Vec::with_capacity(au.data.len() + 4);
                 pkt.encode(&mut framed).context("encode AudioPacket")?;
-                let mut ct = Vec::new();
-                session.lock().await.encrypt(&tagged(STREAM_AUDIO, &framed), &mut ct)?;
-                udp.send_to(&ct, peer_udp).await.context("UDP send audio")?;
+                let nonce = NONCE_DOMAIN_AUDIO | au.seq as u64;
+                let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed).await?;
+                udp.send_to(&dgram, peer_udp).await.context("UDP send audio")?;
             }
         }
     }
 }
 
-/// ストリーム種別タグを先頭に付けた plaintext を作る。
-fn tagged(stream: u8, framed: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + framed.len());
-    out.push(stream);
-    out.extend_from_slice(framed);
-    out
+/// UDP メディアデータグラムを構築する。
+///
+/// plaintext は `[stream tag(1B)] + framed` を `nonce` で暗号化し、受信側が復号前に
+/// nonce を知れるよう **暗号文の前に nonce を 8B (BE) 平文で付与**する。
+/// 出力: `[nonce(8B BE)] + [ciphertext]`。
+async fn encrypt_udp(
+    session: &Arc<Mutex<TransportSession>>,
+    nonce: u64,
+    stream: u8,
+    framed: &[u8],
+) -> Result<Vec<u8>> {
+    let mut plain = Vec::with_capacity(1 + framed.len());
+    plain.push(stream);
+    plain.extend_from_slice(framed);
+    let mut dgram = Vec::with_capacity(8 + plain.len() + 16);
+    dgram.extend_from_slice(&nonce.to_be_bytes());
+    session.lock().await.encrypt(nonce, &plain, &mut dgram)?;
+    Ok(dgram)
 }
 
 async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
@@ -501,11 +522,14 @@ async fn send_control_msg(
     stream: &mut TcpStream,
     session: &Arc<Mutex<TransportSession>>,
     msg: &ControlMsg,
+    tcp_tx_nonce: &mut u64,
 ) -> Result<()> {
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let plain = bincode_opts.serialize(msg).context("encode ControlMsg")?;
+    let nonce = NONCE_DOMAIN_CTRL | *tcp_tx_nonce;
+    *tcp_tx_nonce += 1;
     let mut cipher = Vec::new();
-    session.lock().await.encrypt(&plain, &mut cipher)?;
+    session.lock().await.encrypt(nonce, &plain, &mut cipher)?;
     write_tcp_frame(stream, &cipher).await?;
     Ok(())
 }

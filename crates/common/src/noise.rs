@@ -10,10 +10,23 @@
 //! session.encrypt(b"hi", &mut out)?;
 //! ```
 
-use snow::{Builder, HandshakeState as SnowHandshake, TransportState as SnowTransport};
+use snow::{Builder, HandshakeState as SnowHandshake, StatelessTransportState};
 use thiserror::Error;
 
 pub const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
+
+/// Nonce 空間のドメイン分割。
+///
+/// TCP 制御・UDP 映像・UDP 音声は同一 UDP/TCP 接続上で **同一 Noise 方向 (= 同一鍵)**
+/// を共有する。ChaChaPoly は nonce 再利用が致命的なため、各ストリームを上位ビットで
+/// 別ドメインに隔離し、ストリーム内のカウンタ (制御は連番、映像/音声は seq) だけが
+/// 下位ビットを使う。これにより 3 ストリームを跨いだ nonce 衝突を防ぐ。
+///
+/// 注意: 映像/音声は seq (u32) を nonce 下位に使うため、seq 一周 (約 42 億パケット) で
+/// nonce が一巡する。MVP の 1 セッション長では到達しない前提。
+pub const NONCE_DOMAIN_VIDEO: u64 = 0;
+pub const NONCE_DOMAIN_AUDIO: u64 = 1 << 62;
+pub const NONCE_DOMAIN_CTRL: u64 = 1 << 63;
 
 #[derive(Debug, Error)]
 pub enum NoiseError {
@@ -88,29 +101,37 @@ impl HandshakeState {
         if !hs.is_handshake_finished() {
             return Err(NoiseError::NotFinished);
         }
-        let t = hs.into_transport_mode()?;
+        let t = hs.into_stateless_transport_mode()?;
         Ok(TransportSession { inner: t })
     }
 }
 
+/// 明示 nonce 方式のセッション暗号。
+///
+/// snow の **stateless transport** を使い、各メッセージの nonce を呼び出し側が指定する。
+/// これにより 1 本のハンドシェイク鍵を、信頼順序のある TCP 制御と、ロス・再順序のある
+/// UDP メディアで安全に共有できる (暗黙カウンタ方式だと TCP/UDP 間で nonce がズレて
+/// 復号が全滅する)。nonce は [`NONCE_DOMAIN_CTRL`] / [`NONCE_DOMAIN_VIDEO`] /
+/// [`NONCE_DOMAIN_AUDIO`] でドメイン分割して再利用を防ぐこと。
 pub struct TransportSession {
-    inner: SnowTransport,
+    inner: StatelessTransportState,
 }
 
 impl TransportSession {
-    /// 暗号文を `out` の末尾に追記する (out は呼び出し側でクリア)。戻り値は書き込んだバイト数。
-    pub fn encrypt(&mut self, plain: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
+    /// `nonce` で暗号化し、暗号文を `out` の末尾に追記する。戻り値は書き込んだバイト数。
+    pub fn encrypt(&self, nonce: u64, plain: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
         let start = out.len();
         out.resize(start + plain.len() + 16, 0);
-        let n = self.inner.write_message(plain, &mut out[start..])?;
+        let n = self.inner.write_message(nonce, plain, &mut out[start..])?;
         out.truncate(start + n);
         Ok(n)
     }
 
-    pub fn decrypt(&mut self, cipher: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
+    /// `nonce` で復号する。暗号化時と同じ nonce でなければ失敗する。
+    pub fn decrypt(&self, nonce: u64, cipher: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
         let start = out.len();
         out.resize(start + cipher.len(), 0);
-        let n = self.inner.read_message(cipher, &mut out[start..])?;
+        let n = self.inner.read_message(nonce, cipher, &mut out[start..])?;
         out.truncate(start + n);
         Ok(n)
     }
@@ -142,20 +163,29 @@ mod tests {
         assert!(ini.is_handshake_finished());
         assert!(res.is_handshake_finished());
 
-        let mut ini_t = ini.into_transport().unwrap();
-        let mut res_t = res.into_transport().unwrap();
+        let ini_t = ini.into_transport().unwrap();
+        let res_t = res.into_transport().unwrap();
 
+        // 同一 nonce で暗号化/復号できる (方向ごとに鍵が異なる)。
         let mut ct = Vec::new();
-        ini_t.encrypt(b"hello", &mut ct).unwrap();
+        ini_t.encrypt(NONCE_DOMAIN_CTRL, b"hello", &mut ct).unwrap();
         let mut pt = Vec::new();
-        res_t.decrypt(&ct, &mut pt).unwrap();
+        res_t.decrypt(NONCE_DOMAIN_CTRL, &ct, &mut pt).unwrap();
         assert_eq!(pt, b"hello");
 
         let mut ct2 = Vec::new();
-        res_t.encrypt(b"world", &mut ct2).unwrap();
+        res_t
+            .encrypt(NONCE_DOMAIN_VIDEO | 7, b"world", &mut ct2)
+            .unwrap();
         let mut pt2 = Vec::new();
-        ini_t.decrypt(&ct2, &mut pt2).unwrap();
+        ini_t
+            .decrypt(NONCE_DOMAIN_VIDEO | 7, &ct2, &mut pt2)
+            .unwrap();
         assert_eq!(pt2, b"world");
+
+        // nonce が違えば復号は失敗する。
+        let mut bad = Vec::new();
+        assert!(ini_t.decrypt(NONCE_DOMAIN_VIDEO | 8, &ct2, &mut bad).is_err());
     }
 
     #[test]

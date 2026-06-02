@@ -1077,6 +1077,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
+ "socket2 0.5.10",
  "tauri",
  "tauri-build",
  "thiserror 2.0.18",
@@ -2107,7 +2108,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.4",
  "tokio",
  "tower-service",
  "tracing",
@@ -4140,6 +4141,16 @@ dependencies = [
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
@@ -4710,7 +4721,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.4",
  "tokio-macros",
  "tracing",
  "windows-sys 0.61.2",

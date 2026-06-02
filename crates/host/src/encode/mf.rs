@@ -360,6 +360,10 @@ fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Result<IMFMed
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+        // 色 VUI (matrix / nominal range) はあえて設定しない。MS H.264 エンコーダの
+        // 挙動とデコーダ (WebCodecs) の解釈が噛み合わず、付けると色/明るさが破綻する。
+        // VUI 無指定のとき WebCodecs は BT.601 limited と解釈するので、bgra_to_nv12 も
+        // それに揃えてある (= ほぼ無損失なラウンドトリップ)。
         Ok(t)
     }
 }
@@ -381,7 +385,15 @@ fn pack_u64(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// BGRA8 (DXGI) → NV12 (BT.601 Limited)。MVP 用の素朴な実装。
+/// BGRA8 (DXGI) → NV12 (BT.601 Limited)。
+///
+/// クライアントの WebCodecs デコーダは VUI 無指定のストリームを BT.601 limited として
+/// 解釈する (実測)。RGB→YUV→RGB はエンコードとデコードで同じ matrix/range を使えば
+/// ほぼ無損失で戻るため、ここを 601 limited に揃え、出力には余計な色 VUI を付けない
+/// (付けるとデコーダの解釈とズレて色/明るさが破綻する)。係数は 8bit 固定小数 (<<8):
+///   Y  =  0.257R + 0.504G + 0.098B + 16    -> 66,129,25
+///   Cb = -0.148R - 0.291G + 0.439B + 128   -> -38,-74,112
+///   Cr =  0.439R - 0.368G - 0.071B + 128   -> 112,-94,-18
 fn bgra_to_nv12(bgra: &[u8], src_stride: u32, w: u32, h: u32, out: &mut [u8]) {
     let w = w as usize;
     let h = h as usize;
@@ -395,7 +407,7 @@ fn bgra_to_nv12(bgra: &[u8], src_stride: u32, w: u32, h: u32, out: &mut [u8]) {
             let b = src_row[i * 4] as i32;
             let g = src_row[i * 4 + 1] as i32;
             let r = src_row[i * 4 + 2] as i32;
-            // BT.601
+            // BT.601 limited
             let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
             y_plane[j * w + i] = y.clamp(0, 255) as u8;
         }
@@ -418,6 +430,7 @@ fn bgra_to_nv12(bgra: &[u8], src_stride: u32, w: u32, h: u32, out: &mut [u8]) {
             let b = sb / 4;
             let g = sg / 4;
             let r = sr / 4;
+            // BT.601 limited
             let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
             let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
             let uv_row = j / 2;
