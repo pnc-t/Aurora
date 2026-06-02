@@ -106,6 +106,78 @@ async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
     Ok((file, path.display().to_string()))
 }
 
+/// 要求されたファイルを開き、FileOffer + FileChunk 列を `out_tx` 経由でクライアントへ送る。
+/// 読み取りエラーは FileResult(ok=false) で通知する。成功完了は last=true のチャンクで示す
+/// (受信側がローカル保存の成否を判断するため、成功時の FileResult はホストからは送らない)。
+async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<ControlMsg>) {
+    const CHUNK: usize = 32 * 1024;
+
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = out_tx
+                .send(ControlMsg::FileResult {
+                    id,
+                    ok: false,
+                    message: format!("open failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+    let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download.bin")
+        .to_string();
+
+    if out_tx
+        .send(ControlMsg::FileOffer { id, name, size })
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = match file.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = out_tx
+                    .send(ControlMsg::FileResult {
+                        id,
+                        ok: false,
+                        message: format!("read failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let last = n == 0 || offset + n as u64 >= size;
+        if out_tx
+            .send(ControlMsg::FileChunk {
+                id,
+                offset,
+                data: buf[..n].to_vec(),
+                last,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        offset += n as u64;
+        if last {
+            break;
+        }
+    }
+    tracing::info!(id, size, "file download streamed");
+}
+
 pub struct ServerConfig {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
@@ -223,6 +295,9 @@ async fn handle_client(
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
     let mut bitrate = BitrateController::new();
+    // ダウンロード (ホスト → クライアント) のチャンクを select ループへ流す出口。
+    // 送信タスクがここに積み、ループが TCP へ書く (stream への書き込みは単一箇所に集約)。
+    let (out_tx, mut out_rx) = mpsc::channel::<ControlMsg>(64);
 
     loop {
         tokio::select! {
@@ -324,10 +399,21 @@ async fn handle_client(
                             }
                         }
                     }
+                    ControlMsg::FileRequest { id, path } => {
+                        tracing::info!(id, path = %path, "file download requested");
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            stream_file_to_client(id, &path, out_tx).await;
+                        });
+                    }
                     other => {
                         tracing::debug!(?other, "received control msg (ignored in MVP)");
                     }
                 }
+            }
+            // ダウンロード送信タスクからのメッセージ (FileOffer/FileChunk/FileResult)
+            Some(msg) = out_rx.recv() => {
+                send_control_msg(&mut stream, &session, &msg).await?;
             }
             // ローカルクリップボード変化 → 制御チャネルで送信
             Some(text) = clip_change_rx.recv() => {

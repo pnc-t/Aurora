@@ -1,57 +1,79 @@
-// ファイル送信 UI (クライアント → ホスト)。
-// ファイルを選んで「send file」を押すと、チャンク分割して制御チャネル経由で送る。
-// 進捗は送信側で算出して表示する。完了 / エラーは host からの FileResult で更新する。
+// ファイル転送 UI。
+// - アップロード (クライアント → ホスト): ファイルを選んでチャンク送信。
+// - ダウンロード (ホスト → クライアント): ホスト上のパスを指定して取得。
+//   受信ファイルはクライアント側の ddd-downloads/ に自動保存される。
+// 完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
 
-import { sendFileChunk, sendFileOffer } from "./ipc";
+import { requestFile, sendFileChunk, sendFileOffer } from "./ipc";
 
 // TCP フレーム上限 (64KB) と bincode オーバーヘッドに収まるサイズ。
 const CHUNK = 32 * 1024;
 
-let progressEl: HTMLElement | null = null;
+let uploadProgressEl: HTMLElement | null = null;
+let downloadProgressEl: HTMLElement | null = null;
 // 進行中転送の id (FileResult 照合用)。
-let activeId: number | null = null;
+let activeUploadId: number | null = null;
+let activeDownloadId: number | null = null;
 
 export function mountFileTransfer(form: HTMLElement): void {
   const wrap = document.createElement("span");
   wrap.style.cssText = "display:flex;gap:6px;align-items:center;margin-left:12px";
   wrap.innerHTML = `
-    <input id="file-input" type="file" style="max-width:180px;color:#eee" />
-    <button type="button" id="send-file-btn">send file</button>
-    <span id="file-progress" style="font-family:monospace;min-width:90px"></span>
+    <input id="file-input" type="file" style="max-width:160px;color:#eee" />
+    <button type="button" id="send-file-btn">send</button>
+    <span id="file-progress" style="font-family:monospace;min-width:80px"></span>
+    <input id="download-path" type="text" placeholder="host file path" style="width:160px" />
+    <button type="button" id="download-file-btn">download</button>
+    <span id="download-progress" style="font-family:monospace;min-width:80px"></span>
   `;
   form.appendChild(wrap);
 
-  progressEl = wrap.querySelector<HTMLElement>("#file-progress");
+  uploadProgressEl = wrap.querySelector<HTMLElement>("#file-progress");
+  downloadProgressEl = wrap.querySelector<HTMLElement>("#download-progress");
   const input = wrap.querySelector<HTMLInputElement>("#file-input");
-  const btn = wrap.querySelector<HTMLButtonElement>("#send-file-btn");
+  const sendBtn = wrap.querySelector<HTMLButtonElement>("#send-file-btn");
+  const pathInput = wrap.querySelector<HTMLInputElement>("#download-path");
+  const dlBtn = wrap.querySelector<HTMLButtonElement>("#download-file-btn");
 
-  btn?.addEventListener("click", () => {
+  sendBtn?.addEventListener("click", () => {
     const file = input?.files?.[0];
     if (!file) {
-      setProgress("no file");
+      setUploadProgress("no file");
       return;
     }
-    btn.disabled = true;
+    sendBtn.disabled = true;
     void sendFile(file)
-      .catch((err) => setProgress(`error: ${String(err)}`))
+      .catch((err) => setUploadProgress(`error: ${String(err)}`))
       .finally(() => {
-        btn.disabled = false;
+        sendBtn.disabled = false;
       });
+  });
+
+  dlBtn?.addEventListener("click", () => {
+    const path = pathInput?.value?.trim();
+    if (!path) {
+      setDownloadProgress("no path");
+      return;
+    }
+    const id = Date.now() >>> 0;
+    activeDownloadId = id;
+    setDownloadProgress("requesting…");
+    void requestFile(id, path).catch((err) => setDownloadProgress(`error: ${String(err)}`));
   });
 }
 
 async function sendFile(file: File): Promise<void> {
   // 32bit に収まる転送 id。FileResult の照合に使う。
   const id = Date.now() >>> 0;
-  activeId = id;
-  setProgress("0%");
+  activeUploadId = id;
+  setUploadProgress("0%");
 
   await sendFileOffer(id, file.name, file.size);
 
   if (file.size === 0) {
     // 空ファイルは last=true の空チャンクで完了させる。
     await sendFileChunk(id, 0, [], true);
-    setProgress("sent, waiting…");
+    setUploadProgress("sent, waiting…");
     return;
   }
 
@@ -63,18 +85,28 @@ async function sendFile(file: File): Promise<void> {
     // invoke 引数は JSON 化されるため number[] で渡す。
     await sendFileChunk(id, offset, Array.from(bytes), last);
     offset += bytes.length;
-    setProgress(`${Math.floor((offset / file.size) * 100)}%`);
+    setUploadProgress(`${Math.floor((offset / file.size) * 100)}%`);
   }
-  setProgress("sent, waiting…");
+  setUploadProgress("sent, waiting…");
 }
 
-/// host からの FileResult を反映する。
+/// host からの FileResult を反映する (アップロード / ダウンロード両方)。
 export function handleFileResult(id: number, ok: boolean, message: string): void {
-  if (activeId !== null && id !== activeId) return;
-  setProgress(ok ? `done: ${message}` : `failed: ${message}`);
-  activeId = null;
+  if (id === activeDownloadId) {
+    setDownloadProgress(ok ? `saved: ${message}` : `failed: ${message}`);
+    activeDownloadId = null;
+    return;
+  }
+  if (activeUploadId === null || id === activeUploadId) {
+    setUploadProgress(ok ? `done: ${message}` : `failed: ${message}`);
+    activeUploadId = null;
+  }
 }
 
-function setProgress(s: string): void {
-  if (progressEl) progressEl.textContent = s;
+function setUploadProgress(s: string): void {
+  if (uploadProgressEl) uploadProgressEl.textContent = s;
+}
+
+function setDownloadProgress(s: string): void {
+  if (downloadProgressEl) downloadProgressEl.textContent = s;
 }

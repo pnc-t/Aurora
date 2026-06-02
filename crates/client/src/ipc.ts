@@ -59,3 +59,7 @@ export async function sendFileChunk(
 ): Promise<void> {
   await invoke("send_file_chunk", { id, offset, data, last });
 }
+
+export async function requestFile(id: number, path: string): Promise<void> {
+  await invoke("request_file", { id, path });
+}
