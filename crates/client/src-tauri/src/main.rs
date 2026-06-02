@@ -26,6 +26,7 @@ fn main() {
             net::disconnect,
             net::send_input,
             net::request_keyframe,
+            net::select_display,
             net::send_file_offer,
             net::send_file_chunk,
         ])

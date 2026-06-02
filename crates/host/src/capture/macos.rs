@@ -24,7 +24,23 @@ use objc2_screen_capture_kit::{
     SCStreamOutput, SCStreamOutputType,
 };
 
-use super::{Frame, ScreenCapturer};
+use super::{DisplayInfo, Frame, ScreenCapturer};
+
+/// 接続済みディスプレイを列挙する。MVP では SCShareableContent のプライマリ 1 枚のみ返す
+/// (id は 0 固定、原点は 0,0)。マルチディスプレイの動的切替は未対応。
+pub fn enumerate_displays() -> anyhow::Result<Vec<DisplayInfo>> {
+    let display = primary_display()?;
+    // SAFETY: display は有効。width/height はピクセル寸法を返す。
+    let (w, h) = unsafe { (display.width(), display.height()) };
+    Ok(vec![DisplayInfo {
+        id: 0,
+        name: "primary".to_string(),
+        width: w as u32,
+        height: h as u32,
+        x: 0,
+        y: 0,
+    }])
+}
 
 /// kCVPixelFormatType_32BGRA ('BGRA')。
 const PIXEL_FORMAT_32BGRA: u32 = 0x4247_5241;
@@ -126,6 +142,11 @@ fn sample_to_frame(sample: &CMSampleBuffer) -> Option<Frame> {
 }
 
 impl ScreenCaptureKitCapturer {
+    /// macOS は MVP では primary 固定。出力インデックスは無視する。
+    pub fn new_for_output(_output_index: u32) -> Result<Self> {
+        Self::new_primary()
+    }
+
     pub fn new_primary() -> Result<Self> {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);
 

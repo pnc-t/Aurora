@@ -26,8 +26,8 @@ pub struct UinputInjector {
 }
 
 impl UinputInjector {
-    pub fn new(display_width: u32, display_height: u32) -> Self {
-        match Self::try_new(display_width, display_height) {
+    pub fn new(geom: super::DisplayGeom) -> Self {
+        match Self::try_new(geom.width, geom.height) {
             Ok(injector) => injector,
             Err(e) => {
                 // PlatformInjector::new はインフォリブルな契約 (Windows 実装に合わせる)。
@@ -88,6 +88,13 @@ impl UinputInjector {
 }
 
 impl super::InputInjector for UinputInjector {
+    fn set_display(&mut self, geom: super::DisplayGeom) {
+        // uinput の絶対軸レンジは生成時に固定のため寸法変更は完全には反映できない。
+        // Linux は単一ディスプレイ前提 (enumerate が 1 枚) なので clamp 値のみ更新する。
+        self.width = (geom.width.max(1)) as i32;
+        self.height = (geom.height.max(1)) as i32;
+    }
+
     fn inject(&mut self, ev: &ProtoInput) -> Result<()> {
         match *ev {
             ProtoInput::MouseMove { x, y } => {
