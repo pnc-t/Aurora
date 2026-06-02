@@ -13,6 +13,7 @@ mod capture;
 mod encode;
 mod input;
 mod net;
+mod projfs;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};

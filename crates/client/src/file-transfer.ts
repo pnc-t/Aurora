@@ -4,7 +4,7 @@
 //   受信ファイルはクライアント側の ddd-downloads/ に自動保存される。
 // 完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
 
-import { requestFile, sendFileChunk, sendFileOffer } from "./ipc";
+import { requestFile, sendFileChunk, sendFileOffer, setShareRoot } from "./ipc";
 
 // TCP フレーム上限 (64KB) と bincode オーバーヘッドに収まるサイズ。
 const CHUNK = 32 * 1024;
@@ -25,6 +25,9 @@ export function mountFileTransfer(form: HTMLElement): void {
     <input id="download-path" type="text" placeholder="host file path" style="width:160px" />
     <button type="button" id="download-file-btn">download</button>
     <span id="download-progress" style="font-family:monospace;min-width:80px"></span>
+    <input id="share-root" type="text" placeholder="share folder (ProjFS)" style="width:180px" />
+    <button type="button" id="share-root-btn">share</button>
+    <span id="share-root-status" style="font-family:monospace;min-width:80px"></span>
   `;
   form.appendChild(wrap);
 
@@ -34,6 +37,24 @@ export function mountFileTransfer(form: HTMLElement): void {
   const sendBtn = wrap.querySelector<HTMLButtonElement>("#send-file-btn");
   const pathInput = wrap.querySelector<HTMLInputElement>("#download-path");
   const dlBtn = wrap.querySelector<HTMLButtonElement>("#download-file-btn");
+  const shareInput = wrap.querySelector<HTMLInputElement>("#share-root");
+  const shareBtn = wrap.querySelector<HTMLButtonElement>("#share-root-btn");
+  const shareStatus = wrap.querySelector<HTMLElement>("#share-root-status");
+
+  shareBtn?.addEventListener("click", () => {
+    const path = shareInput?.value?.trim();
+    if (!path) {
+      if (shareStatus) shareStatus.textContent = "no path";
+      return;
+    }
+    void setShareRoot(path)
+      .then(() => {
+        if (shareStatus) shareStatus.textContent = "shared";
+      })
+      .catch((err) => {
+        if (shareStatus) shareStatus.textContent = `error: ${String(err)}`;
+      });
+  });
 
   sendBtn?.addEventListener("click", () => {
     const file = input?.files?.[0];

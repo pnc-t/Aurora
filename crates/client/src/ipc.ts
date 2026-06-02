@@ -63,3 +63,8 @@ export async function sendFileChunk(
 export async function requestFile(id: number, path: string): Promise<void> {
   await invoke("request_file", { id, path });
 }
+
+/// ホストの Explorer に投影する共有フォルダ (ProjFS ドライブリダイレクト) を設定する。
+export async function setShareRoot(path: string): Promise<void> {
+  await invoke("set_share_root", { path });
+}

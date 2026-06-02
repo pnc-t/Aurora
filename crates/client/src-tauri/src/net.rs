@@ -5,6 +5,7 @@
 //! 単一セッションのみ保持し、`SessionState` (managed state) に置く。
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,13 +15,13 @@ use ddd_common::framing::{
     AudioPacket, HEADER_LEN, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
 use ddd_common::noise::{HandshakeState, TransportSession, psk_from_password};
-use ddd_common::proto::{ControlMsg, Display, InputEvent};
+use ddd_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -109,6 +110,36 @@ pub struct SessionState {
     pub inner: Mutex<Option<SessionHandle>>,
 }
 
+/// ホストの ProjFS から見えるクライアント共有ルート。`set_share_root` で設定する。
+/// 未設定時はホームディレクトリを既定とする。spawn したリーダタスクと共有するため Arc。
+#[derive(Clone)]
+pub struct ShareRoot(pub Arc<Mutex<PathBuf>>);
+
+impl Default for ShareRoot {
+    fn default() -> Self {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        ShareRoot(Arc::new(Mutex::new(home)))
+    }
+}
+
+/// ホストへ投影する共有フォルダを設定する。
+#[tauri::command]
+pub async fn set_share_root(
+    path: String,
+    state: tauri::State<'_, ShareRoot>,
+) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    *state.0.lock().await = p;
+    tracing::info!(path = %path, "share root set");
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn connect_to_host(
     host: String,
@@ -116,6 +147,7 @@ pub async fn connect_to_host(
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
+    share_root: tauri::State<'_, ShareRoot>,
 ) -> Result<(), String> {
     // 既存セッションがあれば閉じる
     {
@@ -217,6 +249,9 @@ pub async fn connect_to_host(
     let sess_r = session.clone();
     let clip_apply_for_reader = clip_apply_tx.clone();
     let stats_for_reader = stats.clone();
+    // FS RPC 応答は制御チャネル経由で writer ループへ流す (host の同期コールバックを起こす)。
+    let fs_reply_tx = ctrl_tx.clone();
+    let share_root_for_reader = share_root.0.clone();
     let reader_task = tokio::spawn(async move {
         let res = tcp_reader_loop(
             read_half,
@@ -225,6 +260,8 @@ pub async fn connect_to_host(
             clip_apply_for_reader,
             stats_for_reader,
             session_start,
+            fs_reply_tx,
+            share_root_for_reader,
         )
         .await;
         let reason = match res {
@@ -472,6 +509,7 @@ async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> 
     Ok((file, path.display().to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tcp_reader_loop(
     mut read_half: OwnedReadHalf,
     session: Arc<Mutex<TransportSession>>,
@@ -479,6 +517,8 @@ async fn tcp_reader_loop(
     clip_apply_tx: mpsc::UnboundedSender<String>,
     stats: Arc<StatsCollector>,
     session_start: Instant,
+    fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
+    share_root: Arc<Mutex<PathBuf>>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
@@ -582,9 +622,258 @@ async fn tcp_reader_loop(
                 }
                 _ => tracing::warn!(id, "download chunk without matching offer, ignored"),
             },
+            // --- ProjFS ドライブリダイレクト: 自分のファイルをホストへ配信 ---
+            ControlMsg::FsList {
+                req_id,
+                path,
+                offset,
+            } => {
+                let root = share_root.lock().await.clone();
+                let reply = fs_list(&root, &path, offset).await;
+                let _ = fs_reply_tx.send(reply.into_msg(req_id));
+            }
+            ControlMsg::FsRead {
+                req_id,
+                path,
+                offset,
+                length,
+            } => {
+                let root = share_root.lock().await.clone();
+                let (data, error) = fs_read(&root, &path, offset, length).await;
+                let _ = fs_reply_tx.send(ControlMsg::FsReadReply {
+                    req_id,
+                    data,
+                    error,
+                });
+            }
+            // --- 書き戻し (ホスト Explorer → クライアント、一方向) ---
+            ControlMsg::FsCreate { path, is_dir } => {
+                let root = share_root.lock().await.clone();
+                if let Err(e) = fs_create(&root, &path, is_dir).await {
+                    tracing::warn!(path = %path, error = %e, "FsCreate failed");
+                }
+            }
+            ControlMsg::FsWrite { path, offset, data } => {
+                let root = share_root.lock().await.clone();
+                if let Err(e) = fs_write(&root, &path, offset, &data).await {
+                    tracing::warn!(path = %path, error = %e, "FsWrite failed");
+                }
+            }
+            ControlMsg::FsDelete { path } => {
+                let root = share_root.lock().await.clone();
+                if let Err(e) = fs_delete(&root, &path).await {
+                    tracing::warn!(path = %path, error = %e, "FsDelete failed");
+                }
+            }
+            ControlMsg::FsRename { from, to } => {
+                let root = share_root.lock().await.clone();
+                if let Err(e) = fs_rename(&root, &from, &to).await {
+                    tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
+                }
+            }
             other => tracing::debug!(?other, "ignored control msg"),
         }
     }
+}
+
+/// 1 ページの一覧結果。
+struct ListPage {
+    entries: Vec<FsEntry>,
+    done: bool,
+    error: Option<String>,
+}
+
+impl ListPage {
+    fn err(msg: String) -> Self {
+        Self {
+            entries: Vec::new(),
+            done: true,
+            error: Some(msg),
+        }
+    }
+    fn into_msg(self, req_id: u64) -> ControlMsg {
+        ControlMsg::FsListReply {
+            req_id,
+            entries: self.entries,
+            done: self.done,
+            error: self.error,
+        }
+    }
+}
+
+/// 制御フレーム 64KB 上限に収めるための 1 ページあたりエントリ数上限。
+const LIST_PAGE: usize = 128;
+/// FsRead の上限 (host も 32KB ずつ要求するが念のためクランプ)。
+const MAX_READ: u32 = 64 * 1024;
+
+/// 共有ルート相対パス (`/` 区切り) を実パスへ解決する。`..` によるルート外脱出を禁止。
+async fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut p = root.to_path_buf();
+    for comp in rel.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            return Err("path traversal rejected".into());
+        }
+        p.push(comp);
+    }
+    let canon_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| format!("canonicalize root: {e}"))?;
+    let canon = tokio::fs::canonicalize(&p)
+        .await
+        .map_err(|e| format!("canonicalize: {e}"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err("path escapes share root".into());
+    }
+    Ok(canon)
+}
+
+/// 共有ルート相対 `rel` のディレクトリを `offset` から最大 `LIST_PAGE` 件列挙する。
+async fn fs_list(root: &Path, rel: &str, offset: u32) -> ListPage {
+    let dir = match resolve_in_root(root, rel).await {
+        Ok(p) => p,
+        Err(e) => return ListPage::err(e),
+    };
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) => return ListPage::err(format!("read_dir: {e}")),
+    };
+    let mut all: Vec<FsEntry> = Vec::new();
+    loop {
+        match rd.next_entry().await {
+            Ok(Some(ent)) => {
+                let name = ent.file_name().to_string_lossy().to_string();
+                let (is_dir, size) = match ent.metadata().await {
+                    Ok(m) => (m.is_dir(), m.len()),
+                    Err(_) => continue, // メタ取得不能なエントリはスキップ
+                };
+                all.push(FsEntry { name, is_dir, size });
+            }
+            Ok(None) => break,
+            Err(e) => return ListPage::err(format!("read entry: {e}")),
+        }
+    }
+    // ページ境界の安定のため名前で整列 (host 側でも ProjFS 規約で再整列する)。
+    all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let total = all.len();
+    let start = offset as usize;
+    let entries: Vec<FsEntry> = all.into_iter().skip(start).take(LIST_PAGE).collect();
+    let done = start + entries.len() >= total;
+    ListPage {
+        entries,
+        done,
+        error: None,
+    }
+}
+
+/// 共有ルート相対 `rel` のファイルを `offset` から最大 `length` バイト読む。
+/// 戻り (data, error)。空 data かつ error=None は EOF。
+async fn fs_read(root: &Path, rel: &str, offset: u64, length: u32) -> (Vec<u8>, Option<String>) {
+    let path = match resolve_in_root(root, rel).await {
+        Ok(p) => p,
+        Err(e) => return (Vec::new(), Some(e)),
+    };
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => return (Vec::new(), Some(format!("open: {e}"))),
+    };
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        return (Vec::new(), Some(format!("seek: {e}")));
+    }
+    let want = length.min(MAX_READ) as usize;
+    let mut buf = vec![0u8; want];
+    let mut filled = 0;
+    // 要求長を満たすか EOF まで読む (短い read を埋める)。
+    while filled < want {
+        match file.read(&mut buf[filled..]).await {
+            Ok(0) => break, // EOF
+            Ok(n) => filled += n,
+            Err(e) => return (Vec::new(), Some(format!("read: {e}"))),
+        }
+    }
+    buf.truncate(filled);
+    (buf, None)
+}
+
+/// 書き込み系操作のパス解決。対象が未存在でも使えるよう canonicalize はせず、
+/// `..` / 絶対成分を弾いて root 配下に閉じ込める (レキシカルなトラバーサル防止)。
+fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut p = root.to_path_buf();
+    for comp in rel.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." || comp.contains('\\') || comp.contains(':') {
+            return Err(format!("unsafe path component: {comp}"));
+        }
+        p.push(comp);
+    }
+    Ok(p)
+}
+
+/// ファイル / ディレクトリを作成する (ファイルは 0 バイトに truncate)。
+async fn fs_create(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> {
+    let p = safe_join(root, rel)?;
+    if is_dir {
+        tokio::fs::create_dir_all(&p)
+            .await
+            .map_err(|e| format!("create_dir: {e}"))
+    } else {
+        if let Some(parent) = p.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        tokio::fs::File::create(&p)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("create_file: {e}"))
+    }
+}
+
+/// ファイルの `offset` 以降にバイトを書き込む (なければ作成、truncate はしない)。
+async fn fs_write(root: &Path, rel: &str, offset: u64, data: &[u8]) -> Result<(), String> {
+    let p = safe_join(root, rel)?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&p)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| format!("seek: {e}"))?;
+    file.write_all(data)
+        .await
+        .map_err(|e| format!("write: {e}"))
+}
+
+/// ファイル / ディレクトリを削除する。
+async fn fs_delete(root: &Path, rel: &str) -> Result<(), String> {
+    let p = safe_join(root, rel)?;
+    match tokio::fs::metadata(&p).await {
+        Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(&p)
+            .await
+            .map_err(|e| format!("remove_dir: {e}")),
+        Ok(_) => tokio::fs::remove_file(&p)
+            .await
+            .map_err(|e| format!("remove_file: {e}")),
+        Err(_) => Ok(()), // 既に無いなら成功扱い
+    }
+}
+
+/// `from` を `to` にリネーム / 移動する。
+async fn fs_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    let src = safe_join(root, from)?;
+    let dst = safe_join(root, to)?;
+    if let Some(parent) = dst.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    tokio::fs::rename(&src, &dst)
+        .await
+        .map_err(|e| format!("rename: {e}"))
 }
 
 /// 受信したパケットからフレームを再構成し、Channel<InvokeResponseBody> でフロントへ。
