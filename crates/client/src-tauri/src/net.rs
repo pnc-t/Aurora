@@ -362,6 +362,21 @@ pub async fn select_display(id: u32, state: tauri::State<'_, SessionState>) -> R
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
+/// ホスト上のファイルのダウンロードを要求する。受信は reader ループが
+/// `ddd-downloads/` に保存し、完了を FileResult イベントで通知する。
+#[tauri::command]
+pub async fn request_file(
+    id: u32,
+    path: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.as_ref().ok_or("not connected")?;
+    s.ctrl_tx
+        .send(ControlMsg::FileRequest { id, path })
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
 /// ファイル転送開始の告知。チャンク列の前に 1 回だけ呼ぶ。
 #[tauri::command]
 pub async fn send_file_offer(
@@ -434,6 +449,29 @@ async fn tcp_writer_loop(
     Ok(())
 }
 
+/// ダウンロード受信状態 (ホスト → クライアント)。1 セッション 1 転送のみ。
+struct DownloadState {
+    id: u32,
+    file: tokio::fs::File,
+    written: u64,
+    path: String,
+}
+
+/// `ddd-downloads/` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
+async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> {
+    use std::path::Path;
+    let dir = Path::new("ddd-downloads");
+    tokio::fs::create_dir_all(dir).await?;
+    let safe = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download.bin");
+    let path = dir.join(safe);
+    let file = tokio::fs::File::create(&path).await?;
+    Ok((file, path.display().to_string()))
+}
+
 async fn tcp_reader_loop(
     mut read_half: OwnedReadHalf,
     session: Arc<Mutex<TransportSession>>,
@@ -445,6 +483,7 @@ async fn tcp_reader_loop(
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
     let mut plain = Vec::new();
+    let mut download: Option<DownloadState> = None;
     loop {
         read_tcp_frame(&mut read_half, &mut buf).await?;
         plain.clear();
@@ -474,6 +513,75 @@ async fn tcp_reader_loop(
             ControlMsg::FileResult { id, ok, message } => {
                 let _ = event_channel.send(ClientEvent::FileResult { id, ok, message });
             }
+            // --- ダウンロード受信 (ホスト → クライアント) ---
+            ControlMsg::FileOffer { id, name, size } => match open_download(&name).await {
+                Ok((file, path)) => {
+                    tracing::info!(id, name = %name, size, path = %path, "download start");
+                    download = Some(DownloadState {
+                        id,
+                        file,
+                        written: 0,
+                        path,
+                    });
+                }
+                Err(e) => {
+                    let _ = event_channel.send(ClientEvent::FileResult {
+                        id,
+                        ok: false,
+                        message: format!("open failed: {e}"),
+                    });
+                }
+            },
+            ControlMsg::FileChunk {
+                id,
+                offset,
+                data,
+                last,
+            } => match download.as_mut() {
+                Some(d) if d.id == id => {
+                    if offset != d.written {
+                        tracing::warn!(
+                            id,
+                            expected = d.written,
+                            got = offset,
+                            "download offset mismatch"
+                        );
+                    }
+                    if let Err(e) = d.file.write_all(&data).await {
+                        let message = format!("write failed: {e}");
+                        let _ = event_channel.send(ClientEvent::FileResult {
+                            id,
+                            ok: false,
+                            message,
+                        });
+                        download = None;
+                    } else {
+                        d.written += data.len() as u64;
+                        if last {
+                            let (written, path) = (d.written, d.path.clone());
+                            let res = d.file.flush().await;
+                            download = None;
+                            let ev = match res {
+                                Ok(()) => {
+                                    tracing::info!(id, written, path = %path, "download complete");
+                                    ClientEvent::FileResult {
+                                        id,
+                                        ok: true,
+                                        message: path,
+                                    }
+                                }
+                                Err(e) => ClientEvent::FileResult {
+                                    id,
+                                    ok: false,
+                                    message: format!("flush failed: {e}"),
+                                },
+                            };
+                            let _ = event_channel.send(ev);
+                        }
+                    }
+                }
+                _ => tracing::warn!(id, "download chunk without matching offer, ignored"),
+            },
             other => tracing::debug!(?other, "ignored control msg"),
         }
     }

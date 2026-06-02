@@ -29,6 +29,7 @@ fn main() {
             net::select_display,
             net::send_file_offer,
             net::send_file_chunk,
+            net::request_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
