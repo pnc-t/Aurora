@@ -14,7 +14,6 @@ use windows::Win32::Foundation::{
     BOOLEAN, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary, S_OK,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
     PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
@@ -27,6 +26,7 @@ use windows::Win32::Storage::ProjectedFileSystem::{
     PrjFillDirEntryBuffer, PrjFreeAlignedBuffer, PrjMarkDirectoryAsPlaceholder,
     PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData, PrjWritePlaceholderInfo,
 };
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::core::{GUID, HRESULT, PCWSTR};
 
 use super::FsBridge;
@@ -138,9 +138,7 @@ fn projfs_available() -> bool {
 
 pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
     if !projfs_available() {
-        anyhow::bail!(
-            "projectedfslib.dll をロードできません (Windows 機能 Client-ProjFS が無効)"
-        );
+        anyhow::bail!("projectedfslib.dll をロードできません (Windows 機能 Client-ProjFS が無効)");
     }
 
     std::fs::create_dir_all(root).with_context(|| format!("create projfs root {root:?}"))?;

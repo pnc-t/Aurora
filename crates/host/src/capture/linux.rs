@@ -15,7 +15,7 @@
 //!   バージョン差があり、ここでは pipewire 0.8 / ashpd 0.9 を前提にしている。
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use pipewire as pw;
@@ -220,7 +220,6 @@ fn run_capture(
                     height,
                     stride,
                     bgra,
-                    captured_at: Instant::now(),
                 };
                 // バックプレッシャ時は捨てる (次フレームで回復)。
                 let _ = user_data.tx.try_send(frame);

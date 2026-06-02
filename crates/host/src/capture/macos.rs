@@ -10,7 +10,7 @@
 //!   の細部はバージョン差があるため、本番検証は実機 (macOS) で行うこと。
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use block2::RcBlock;
@@ -131,7 +131,6 @@ fn sample_to_frame(sample: &CMSampleBuffer) -> Option<Frame> {
             height: height as u32,
             stride: stride as u32,
             bgra,
-            captured_at: Instant::now(),
         })
     })();
     // SAFETY: lock と対。

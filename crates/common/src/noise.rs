@@ -119,7 +119,12 @@ pub struct TransportSession {
 
 impl TransportSession {
     /// `nonce` で暗号化し、暗号文を `out` の末尾に追記する。戻り値は書き込んだバイト数。
-    pub fn encrypt(&self, nonce: u64, plain: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
+    pub fn encrypt(
+        &self,
+        nonce: u64,
+        plain: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<usize, NoiseError> {
         let start = out.len();
         out.resize(start + plain.len() + 16, 0);
         let n = self.inner.write_message(nonce, plain, &mut out[start..])?;
@@ -128,7 +133,12 @@ impl TransportSession {
     }
 
     /// `nonce` で復号する。暗号化時と同じ nonce でなければ失敗する。
-    pub fn decrypt(&self, nonce: u64, cipher: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
+    pub fn decrypt(
+        &self,
+        nonce: u64,
+        cipher: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<usize, NoiseError> {
         let start = out.len();
         out.resize(start + cipher.len(), 0);
         let n = self.inner.read_message(nonce, cipher, &mut out[start..])?;
@@ -185,7 +195,11 @@ mod tests {
 
         // nonce が違えば復号は失敗する。
         let mut bad = Vec::new();
-        assert!(ini_t.decrypt(NONCE_DOMAIN_VIDEO | 8, &ct2, &mut bad).is_err());
+        assert!(
+            ini_t
+                .decrypt(NONCE_DOMAIN_VIDEO | 8, &ct2, &mut bad)
+                .is_err()
+        );
     }
 
     #[test]
