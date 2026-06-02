@@ -4,6 +4,10 @@ import { handleVideoChunk, initDecoder, resetDecoder } from "./decoder";
 import { attachInput, detachInput } from "./input";
 import { mountConnectionUi, setHostInfo, setStatus } from "./connection-ui";
 import { handleFileResult, mountFileTransfer } from "./file-transfer";
+import { installWebviewGuard } from "./webview-guard";
+
+// ブラウザ既定挙動 (右クリック / リロード / devtools / ズーム等) を抑止。
+installWebviewGuard();
 
 const toolbar = document.getElementById("toolbar") as HTMLElement;
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
