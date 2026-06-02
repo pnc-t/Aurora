@@ -13,6 +13,7 @@ mod capture;
 mod encode;
 mod input;
 mod net;
+mod perf;
 mod projfs;
 
 use audio::EncodedAudio;
@@ -25,6 +26,8 @@ use net::{EncoderCommand, InputCmd, ServerConfig};
 struct Args {
     dump_bmp: bool,
     dump_h264: Option<usize>,
+    /// エンコード遅延・ソースビットレートを 1 秒窓で info ログに出す。
+    perf: bool,
 }
 
 fn parse_args() -> Args {
@@ -33,6 +36,7 @@ fn parse_args() -> Args {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dump-bmp" => args.dump_bmp = true,
+            "--perf" => args.perf = true,
             "--dump-h264" => {
                 let n: usize = it
                     .next()
@@ -62,7 +66,7 @@ fn main() -> Result<()> {
         return dump_h264(n);
     }
 
-    run_server()
+    run_server(args.perf)
 }
 
 fn dump_one_bmp() -> Result<()> {
@@ -107,7 +111,7 @@ fn dump_h264(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_server() -> Result<()> {
+fn run_server(perf: bool) -> Result<()> {
     let password: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(10)
@@ -192,7 +196,7 @@ fn run_server() -> Result<()> {
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
-            if let Err(e) = encode_loop(frame_rx, nal_tx, enc_cmd_rx) {
+            if let Err(e) = encode_loop(frame_rx, nal_tx, enc_cmd_rx, perf) {
                 tracing::error!(error = %e, "encode loop ended");
             }
         })?;
@@ -289,8 +293,12 @@ fn encode_loop(
     mut frame_rx: mpsc::Receiver<Frame>,
     nal_tx: mpsc::Sender<EncodedNal>,
     mut cmd_rx: mpsc::Receiver<EncoderCommand>,
+    perf: bool,
 ) -> Result<()> {
     let mut enc = PlatformEncoder::new()?;
+    let mut meter = perf.then(perf::EncodeMeter::new);
+    // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
+    let mut nals: Vec<EncodedNal> = Vec::new();
     loop {
         // ノンブロックでコマンドを吸う
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -305,11 +313,22 @@ fn encode_loop(
         }
         match frame_rx.blocking_recv() {
             Some(frame) => {
+                let t0 = std::time::Instant::now();
                 if let Err(e) = enc.push_frame(&frame) {
                     tracing::warn!(error = %e, "push_frame failed");
                     continue;
                 }
+                nals.clear();
                 while let Some(nal) = enc.poll_nal()? {
+                    nals.push(nal);
+                }
+                if let Some(m) = meter.as_mut() {
+                    let encode_us = t0.elapsed().as_micros() as u32;
+                    let nal_bytes: usize = nals.iter().map(|n| n.data.len()).sum();
+                    m.record(encode_us, nal_bytes);
+                    m.maybe_flush();
+                }
+                for nal in nals.drain(..) {
                     if nal_tx.blocking_send(nal).is_err() {
                         return Ok(());
                     }
