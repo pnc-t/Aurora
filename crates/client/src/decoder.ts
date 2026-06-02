@@ -91,7 +91,9 @@ function codecStringFromSps(sps: Uint8Array): string | null {
   const profile = sps[1].toString(16).padStart(2, "0");
   const constraints = sps[2].toString(16).padStart(2, "0");
   const level = sps[3].toString(16).padStart(2, "0");
-  return `avc1.${profile}${constraints}${level}`.toUpperCase();
+  // fourCC "avc1" は小文字必須 (Chromium の codec パーサは大小区別する)。
+  // 16 進部分は大小どちらも可だが慣例の小文字に揃える。
+  return `avc1.${profile}${constraints}${level}`.toLowerCase();
 }
 
 /** バイナリチャンク 1 個を受け取って decoder に渡す。 */

@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use bincode::Options;
-use ddd_common::noise::{HandshakeState, psk_from_password};
+use ddd_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, psk_from_password};
 use ddd_common::proto::ControlMsg;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -53,12 +53,13 @@ fn main() -> Result<()> {
     hs.write_msg(&[], &mut out)?;
     write_frame(&mut stream, &out)?;
 
-    let mut session = hs.into_transport()?;
+    let session = hs.into_transport()?;
     println!("handshake complete");
 
     let ct = read_frame(&mut stream)?;
     let mut plain = Vec::new();
-    session.decrypt(&ct, &mut plain)?;
+    // HostInfo は CTRL ドメインの nonce 0。
+    session.decrypt(NONCE_DOMAIN_CTRL, &ct, &mut plain)?;
     let msg: ControlMsg = bincode::DefaultOptions::new()
         .with_limit(64 * 1024)
         .deserialize(&plain)

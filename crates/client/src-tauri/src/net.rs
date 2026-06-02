@@ -14,7 +14,9 @@ use ddd_common::clipboard::{self, ClipboardHandle};
 use ddd_common::framing::{
     AudioPacket, HEADER_LEN, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
-use ddd_common::noise::{HandshakeState, TransportSession, psk_from_password};
+use ddd_common::noise::{
+    HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password,
+};
 use ddd_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -188,13 +190,14 @@ pub async fn connect_to_host(
     let session = Arc::new(Mutex::new(hs.into_transport().map_err(err)?));
     tracing::info!("noise handshake complete");
 
-    // 最初の制御メッセージ (HostInfo) を受け取る
+    // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
+    // 以降の TCP 受信は reader ループが nonce 1 から続ける。
     read_tcp_frame(&mut tcp, &mut buf).await.map_err(err)?;
     let mut plain = Vec::new();
     session
         .lock()
         .await
-        .decrypt(&buf, &mut plain)
+        .decrypt(NONCE_DOMAIN_CTRL, &buf, &mut plain)
         .map_err(err)?;
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let host_info: ControlMsg = opts.deserialize(&plain).map_err(err)?;
@@ -211,12 +214,9 @@ pub async fn connect_to_host(
         return Err(format!("expected HostInfo, got {host_info:?}"));
     }
 
-    // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "DDDHELLO"
-    let udp = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("UDP bind: {e}"))?,
-    );
+    // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "DDDHELLO"。
+    // 高 fps 時のバースト受信での取りこぼし (= 映像ノイズ) を抑えるため受信バッファを拡大する。
+    let udp = Arc::new(make_udp_socket().map_err(|e| format!("UDP socket: {e}"))?);
     udp.connect(udp_addr)
         .await
         .map_err(|e| format!("UDP connect: {e}"))?;
@@ -283,8 +283,12 @@ pub async fn connect_to_host(
 
     let sess_u = session.clone();
     let stats_for_udp = stats.clone();
+    // ロス検出時にキーフレームを要求して映像を即時回復させるための送信口。
+    let keyframe_tx = ctrl_tx.clone();
     let udp_task = tokio::spawn(async move {
-        if let Err(e) = udp_reader_loop(udp, sess_u, video_channel, audio_tx, stats_for_udp).await {
+        if let Err(e) =
+            udp_reader_loop(udp, sess_u, video_channel, audio_tx, stats_for_udp, keyframe_tx).await
+        {
             tracing::warn!(error = %e, "UDP reader ended");
         }
     });
@@ -471,6 +475,9 @@ async fn tcp_writer_loop(
     mut file_rx: mpsc::Receiver<ControlMsg>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
+    // クライアント → ホストの TCP 制御は CTRL ドメインの連番 nonce。ホスト側 rx と
+    // TCP の順序保証により歩調が合う。
+    let mut tcp_tx_nonce: u64 = 0;
     loop {
         // 制御チャネルとファイルチャネルの両方を待つ。どちらかが閉じたら終了。
         let msg = tokio::select! {
@@ -479,8 +486,10 @@ async fn tcp_writer_loop(
         };
         let Some(msg) = msg else { break };
         let plain = opts.serialize(&msg)?;
+        let nonce = NONCE_DOMAIN_CTRL | tcp_tx_nonce;
+        tcp_tx_nonce += 1;
         let mut cipher = Vec::new();
-        session.lock().await.encrypt(&plain, &mut cipher)?;
+        session.lock().await.encrypt(nonce, &plain, &mut cipher)?;
         write_tcp_frame(&mut write_half, &cipher).await?;
     }
     Ok(())
@@ -524,10 +533,14 @@ async fn tcp_reader_loop(
     let mut buf = Vec::new();
     let mut plain = Vec::new();
     let mut download: Option<DownloadState> = None;
+    // HostInfo (nonce 0) は connect_to_host で消費済みなので 1 から続ける。
+    let mut tcp_rx_nonce: u64 = 1;
     loop {
         read_tcp_frame(&mut read_half, &mut buf).await?;
         plain.clear();
-        session.lock().await.decrypt(&buf, &mut plain)?;
+        let nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
+        tcp_rx_nonce += 1;
+        session.lock().await.decrypt(nonce, &buf, &mut plain)?;
         let msg: ControlMsg = opts.deserialize(&plain)?;
         match msg {
             ControlMsg::Pong { ts_us } => {
@@ -887,6 +900,7 @@ async fn udp_reader_loop(
     video_channel: Channel<InvokeResponseBody>,
     audio_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     stats: Arc<StatsCollector>,
+    keyframe_tx: mpsc::UnboundedSender<ControlMsg>,
 ) -> anyhow::Result<()> {
     let mut recv_buf = vec![0u8; 2048];
     let mut plain = Vec::new();
@@ -897,16 +911,23 @@ async fn udp_reader_loop(
     let mut cur_payload: Vec<u8> = Vec::new();
     let mut last_seq: Option<u32> = None;
     let mut dropping = false;
+    // キーフレーム要求のスロットル。ロスが連続しても要求が殺到しないようにする。
+    let mut last_keyframe_req = Instant::now() - Duration::from_secs(1);
 
     loop {
         let n = udp.recv(&mut recv_buf).await?;
-        // 受信スループット (映像 + 音声、暗号文サイズ) を計測。
+        // 受信スループット (映像 + 音声、データグラム全体) を計測。
         stats.add_bytes(n as u64);
+        // 先頭 8B は平文の nonce (BE)。これで復号する。
+        if n < 8 {
+            continue;
+        }
+        let nonce = u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
         plain.clear();
         if session
             .lock()
             .await
-            .decrypt(&recv_buf[..n], &mut plain)
+            .decrypt(nonce, &recv_buf[8..n], &mut plain)
             .is_err()
         {
             // 復号失敗パケットは捨てる
@@ -949,6 +970,12 @@ async fn udp_reader_loop(
                 cur_payload.clear();
                 cur_frame_id = None;
                 dropping = true;
+                // 参照フレームが壊れたままにならないよう、キーフレームを要求して回復する。
+                // 連続ロスでの殺到を避けるため最短 200ms 間隔にスロットル。
+                if last_keyframe_req.elapsed() >= Duration::from_millis(200) {
+                    last_keyframe_req = Instant::now();
+                    let _ = keyframe_tx.send(ControlMsg::RequestKeyframe);
+                }
             }
         }
         last_seq = Some(pkt.seq);
@@ -987,6 +1014,22 @@ async fn udp_reader_loop(
             cur_frame_id = None;
         }
     }
+}
+
+/// 受信バッファを拡大した UDP ソケットを 0.0.0.0:任意ポート で開く。
+///
+/// 既定の受信バッファ (数百 KB) は 1440p/60fps のバースト時に溢れてパケットロス
+/// (映像ノイズの主因) を招くため、4MB に広げてバーストを吸収する。
+fn make_udp_socket() -> anyhow::Result<UdpSocket> {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+    // 失敗しても致命的ではない (既定値で続行)。
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    sock.set_nonblocking(true)?;
+    let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    sock.bind(&addr.into())?;
+    let std_udp: std::net::UdpSocket = sock.into();
+    Ok(UdpSocket::from_std(std_udp)?)
 }
 
 // -------- TCP framing util (host net.rs と同形) --------
