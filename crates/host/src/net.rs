@@ -18,6 +18,7 @@ use crate::audio::EncodedAudio;
 use crate::capture::DisplayInfo;
 use crate::encode::EncodedNal;
 use crate::input::DisplayGeom;
+use crate::projfs::{self, FsBridge, FsReply};
 
 use crate::encode::{DEFAULT_BITRATE_BPS, MAX_BITRATE_BPS, MIN_BITRATE_BPS};
 
@@ -299,6 +300,18 @@ async fn handle_client(
     // 送信タスクがここに積み、ループが TCP へ書く (stream への書き込みは単一箇所に集約)。
     let (out_tx, mut out_rx) = mpsc::channel::<ControlMsg>(64);
 
+    // ProjFS ドライブリダイレクト。コールバック (同期) → ここへ FsList/FsRead 要求が流れる。
+    // 開始失敗 (Client-ProjFS 無効など) はファイル投影を諦めてリモデス本体は継続する。
+    let (fs_req_tx, mut fs_req_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let fs_bridge = Arc::new(FsBridge::new(fs_req_tx));
+    let _virt = match projfs::start(fs_bridge.clone(), std::path::Path::new("ddd-remote")) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "ProjFS drive redirection disabled");
+            None
+        }
+    };
+
     loop {
         tokio::select! {
             // 制御メッセージ受信
@@ -406,6 +419,13 @@ async fn handle_client(
                             stream_file_to_client(id, &path, out_tx).await;
                         });
                     }
+                    // ProjFS コールバックへの応答。相関 ID で待機中のコールバックを起こす。
+                    ControlMsg::FsListReply { req_id, entries, done, error } => {
+                        fs_bridge.complete(req_id, FsReply::List { entries, done, error });
+                    }
+                    ControlMsg::FsReadReply { req_id, data, error } => {
+                        fs_bridge.complete(req_id, FsReply::Read { data, error });
+                    }
                     other => {
                         tracing::debug!(?other, "received control msg (ignored in MVP)");
                     }
@@ -413,6 +433,10 @@ async fn handle_client(
             }
             // ダウンロード送信タスクからのメッセージ (FileOffer/FileChunk/FileResult)
             Some(msg) = out_rx.recv() => {
+                send_control_msg(&mut stream, &session, &msg).await?;
+            }
+            // ProjFS コールバックからの FS RPC 要求 (FsList/FsRead) を TCP へ送る
+            Some(msg) = fs_req_rx.recv() => {
                 send_control_msg(&mut stream, &session, &msg).await?;
             }
             // ローカルクリップボード変化 → 制御チャネルで送信

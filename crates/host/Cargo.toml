@@ -42,6 +42,8 @@ features = [
     "Win32_System_Threading",
     "Win32_System_Com",
     "Win32_Media_MediaFoundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_ProjectedFileSystem",
 ]
 
 # --- Linux / macOS 共通: H.264 エンコードは ffmpeg-next 経由 ---

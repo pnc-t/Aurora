@@ -9,7 +9,7 @@ mod audio;
 mod net;
 mod stats;
 
-use net::SessionState;
+use net::{SessionState, ShareRoot};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -21,6 +21,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(SessionState::default())
+        .manage(ShareRoot::default())
         .invoke_handler(tauri::generate_handler![
             net::connect_to_host,
             net::disconnect,
@@ -30,6 +31,7 @@ fn main() {
             net::send_file_offer,
             net::send_file_chunk,
             net::request_file,
+            net::set_share_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
