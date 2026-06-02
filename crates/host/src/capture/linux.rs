@@ -25,10 +25,24 @@ use pw::spa::param::video::VideoInfoRaw;
 use pw::spa::pod::Pod;
 use pw::spa::utils::Direction;
 
-use super::{Frame, ScreenCapturer};
+use super::{DisplayInfo, Frame, ScreenCapturer};
 
 pub struct PipewireCapturer {
     rx: Receiver<Frame>,
+}
+
+/// Linux ではポータル/PipeWire 交渉前に解像度・配置を確定できないため、単一の primary を
+/// 仮値で返す。実解像度は capture_loop が最初のフレームで上書きする。マルチディスプレイの
+/// 動的切替はポータルのソース選択 UI に委ねる前提で未対応 (id は 0 固定)。
+pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
+    Ok(vec![DisplayInfo {
+        id: 0,
+        name: "primary".to_string(),
+        width: 1920,
+        height: 1080,
+        x: 0,
+        y: 0,
+    }])
 }
 
 /// PipeWire コールバック間で共有する状態。
@@ -38,6 +52,11 @@ struct UserData {
 }
 
 impl PipewireCapturer {
+    /// Linux はポータルがソースを選ぶため出力インデックスは無視し primary を開く。
+    pub fn new_for_output(_output_index: u32) -> Result<Self> {
+        Self::new_primary()
+    }
+
     pub fn new_primary() -> Result<Self> {
         // フレーム送出用。詰まったら捨てる (try_send) ためのバウンデッドチャネル。
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);

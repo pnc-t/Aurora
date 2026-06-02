@@ -24,14 +24,14 @@ pub struct CgEventInjector {
 }
 
 impl CgEventInjector {
-    pub fn new(display_width: u32, display_height: u32) -> Self {
+    pub fn new(geom: super::DisplayGeom) -> Self {
         // HIDSystemState: 物理デバイス相当のイベント源。修飾キーの状態も追跡される。
         let source =
             CGEventSource::new(CGEventSourceStateID::HIDSystemState).expect("create CGEventSource");
         Self {
             source,
-            width: display_width.max(1) as f64,
-            height: display_height.max(1) as f64,
+            width: (geom.width.max(1)) as f64,
+            height: (geom.height.max(1)) as f64,
             last_x: 0.0,
             last_y: 0.0,
             left_down: false,
@@ -48,6 +48,12 @@ impl CgEventInjector {
 }
 
 impl super::InputInjector for CgEventInjector {
+    fn set_display(&mut self, geom: super::DisplayGeom) {
+        // macOS は MVP では primary 固定 (原点 0,0)。寸法のみ更新する。
+        self.width = (geom.width.max(1)) as f64;
+        self.height = (geom.height.max(1)) as f64;
+    }
+
     fn inject(&mut self, ev: &InputEvent) -> Result<()> {
         match *ev {
             InputEvent::MouseMove { x, y } => {

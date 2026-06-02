@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
-use super::{Frame, ScreenCapturer};
+use super::{DisplayInfo, Frame, ScreenCapturer};
 
 pub struct DxgiCapturer {
     _device: ID3D11Device,
@@ -29,36 +29,84 @@ pub struct DxgiCapturer {
     height: u32,
 }
 
+/// D3D11 デバイス + コンテキストを 1 つ作る。各キャプチャ・列挙で共通。
+fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+    // SAFETY: D3D11CreateDevice は OUT パラメータの ID3D11Device 等を初期化する。out-only。
+    unsafe {
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        let feature_levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1];
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            None,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+        .context("D3D11CreateDevice failed")?;
+        Ok((
+            device.ok_or_else(|| anyhow!("D3D11 device null"))?,
+            context.ok_or_else(|| anyhow!("D3D11 context null"))?,
+        ))
+    }
+}
+
+/// 接続済みの全ディスプレイ (DXGI 出力) を列挙する。`id` は EnumOutputs のインデックス
+/// で、これが `new_for_output` / `SelectDisplay` の指定値になる。
+pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
+    let (device, _context) = create_device()?;
+    let dxgi_device: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
+    let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
+
+    let mut displays = Vec::new();
+    let mut i = 0u32;
+    loop {
+        // SAFETY: EnumOutputs は範囲外で DXGI_ERROR_NOT_FOUND を返す。
+        let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(i) } {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        // SAFETY: output live。GetDesc は DXGI_OUTPUT_DESC を値で返す。
+        let desc = unsafe { output.GetDesc() }.context("IDXGIOutput::GetDesc")?;
+        let r = desc.DesktopCoordinates;
+        let name = String::from_utf16_lossy(&desc.DeviceName)
+            .trim_end_matches('\0')
+            .to_string();
+        displays.push(DisplayInfo {
+            id: i,
+            name,
+            width: (r.right - r.left).max(0) as u32,
+            height: (r.bottom - r.top).max(0) as u32,
+            x: r.left,
+            y: r.top,
+        });
+        i += 1;
+    }
+
+    if displays.is_empty() {
+        return Err(anyhow!("no DXGI outputs found"));
+    }
+    Ok(displays)
+}
+
 impl DxgiCapturer {
     pub fn new_primary() -> Result<Self> {
-        // SAFETY: D3D11CreateDevice は OUT パラメータの ID3D11Device 等を初期化する。out-only。
-        let (device, context) = unsafe {
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            let feature_levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1];
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                None,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&feature_levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-            .context("D3D11CreateDevice failed")?;
-            (
-                device.ok_or_else(|| anyhow!("D3D11 device null"))?,
-                context.ok_or_else(|| anyhow!("D3D11 context null"))?,
-            )
-        };
+        Self::new_for_output(0)
+    }
+
+    /// 指定インデックスの DXGI 出力をキャプチャ対象にする。
+    pub fn new_for_output(output_index: u32) -> Result<Self> {
+        let (device, context) = create_device()?;
 
         // SAFETY: 取得した device は live。cast は同 COM オブジェクトの別 IID。
         let dxgi_device: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
         let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
-        let output: IDXGIOutput =
-            unsafe { adapter.EnumOutputs(0) }.context("EnumOutputs(0) -- no primary display?")?;
+        let output: IDXGIOutput = unsafe { adapter.EnumOutputs(output_index) }
+            .with_context(|| format!("EnumOutputs({output_index}) -- no such display?"))?;
         let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
         let duplication: IDXGIOutputDuplication =
             unsafe { output1.DuplicateOutput(&device) }.context("DuplicateOutput")?;

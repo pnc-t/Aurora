@@ -15,7 +15,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::audio::EncodedAudio;
+use crate::capture::DisplayInfo;
 use crate::encode::EncodedNal;
+use crate::input::DisplayGeom;
 
 use crate::encode::{DEFAULT_BITRATE_BPS, MAX_BITRATE_BPS, MIN_BITRATE_BPS};
 
@@ -24,6 +26,13 @@ pub enum EncoderCommand {
     RequestKeyframe,
     /// 適応制御による平均ビットレート変更 (bps)。
     SetBitrate(u32),
+}
+
+/// 制御ループ → input スレッドへの通知。入力イベントとディスプレイ切替を 1 本にまとめる。
+pub enum InputCmd {
+    Event(InputEvent),
+    /// キャプチャ対象ディスプレイ切替に伴う座標系更新。
+    SetDisplay(DisplayGeom),
 }
 
 /// クライアント Stats を元にしたビットレート適応制御 (AIMD)。
@@ -101,16 +110,18 @@ pub struct ServerConfig {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
     pub psk: [u8; 32],
-    pub display: Display,
+    pub displays: Vec<DisplayInfo>,
     pub audio: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     cfg: ServerConfig,
     mut nal_rx: mpsc::Receiver<EncodedNal>,
     mut audio_rx: mpsc::Receiver<EncodedAudio>,
     enc_tx: mpsc::Sender<EncoderCommand>,
-    input_tx: mpsc::Sender<InputEvent>,
+    input_tx: mpsc::Sender<InputCmd>,
+    cap_select_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     mut clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
@@ -128,11 +139,12 @@ pub async fn run_server(
         let (stream, peer) = tcp.accept().await?;
         tracing::info!(peer = %peer, "TCP client connected");
         let psk = cfg.psk;
-        let display = cfg.display.clone();
+        let displays = cfg.displays.clone();
         let audio = cfg.audio;
         let udp = udp.clone();
         let enc_tx2 = enc_tx.clone();
         let input_tx2 = input_tx.clone();
+        let cap_select_tx2 = cap_select_tx.clone();
         let clip_apply_tx2 = clip_apply_tx.clone();
         // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
         // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
@@ -143,11 +155,12 @@ pub async fn run_server(
             stream,
             peer,
             psk,
-            display,
+            displays,
             audio,
             udp,
             enc_tx2,
             input_tx2,
+            cap_select_tx2,
             clip_apply_tx2,
             nal_rx_ref,
             audio_rx_ref,
@@ -165,11 +178,12 @@ async fn handle_client(
     mut stream: TcpStream,
     peer: SocketAddr,
     psk: [u8; 32],
-    display: Display,
+    displays: Vec<DisplayInfo>,
     audio: bool,
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
-    input_tx: mpsc::Sender<InputEvent>,
+    input_tx: mpsc::Sender<InputCmd>,
+    cap_select_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
     audio_rx: &mut mpsc::Receiver<EncodedAudio>,
@@ -194,9 +208,9 @@ async fn handle_client(
     let session = Arc::new(Mutex::new(hs.into_transport()?));
     tracing::info!(peer = %peer, "noise handshake complete");
 
-    // HostInfo を即時送信
+    // HostInfo を即時送信 (全ディスプレイを提示)
     let host_info = ControlMsg::HostInfo {
-        displays: vec![display.clone()],
+        displays: displays.iter().map(Display::from).collect(),
         audio,
     };
     send_control_msg(&mut stream, &session, &host_info).await?;
@@ -234,8 +248,28 @@ async fn handle_client(
                         }
                     }
                     ControlMsg::Input(ev) => {
-                        if input_tx.send(ev).await.is_err() {
+                        if input_tx.send(InputCmd::Event(ev)).await.is_err() {
                             tracing::warn!("input channel closed");
+                        }
+                    }
+                    ControlMsg::SelectDisplay { id } => {
+                        match displays.iter().find(|d| d.id == id) {
+                            Some(d) => {
+                                tracing::info!(id, name = %d.name, "select display");
+                                // capture スレッドへ切替指示。
+                                let _ = cap_select_tx.send(id);
+                                // input スレッドの座標系を新ディスプレイへ更新。
+                                let geom = DisplayGeom {
+                                    x: d.x,
+                                    y: d.y,
+                                    width: d.width,
+                                    height: d.height,
+                                };
+                                let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
+                                // 新キャプチャの最初の出力を keyframe にしてクライアント復帰を促す。
+                                let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                            }
+                            None => tracing::warn!(id, "SelectDisplay for unknown display id"),
                         }
                     }
                     ControlMsg::Clipboard { text } => {

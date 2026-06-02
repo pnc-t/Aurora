@@ -352,6 +352,16 @@ pub async fn request_keyframe(state: tauri::State<'_, SessionState>) -> Result<(
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
+/// キャプチャ対象ディスプレイの切替を要求する。
+#[tauri::command]
+pub async fn select_display(id: u32, state: tauri::State<'_, SessionState>) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.as_ref().ok_or("not connected")?;
+    s.ctrl_tx
+        .send(ControlMsg::SelectDisplay { id })
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
 /// ファイル転送開始の告知。チャンク列の前に 1 回だけ呼ぶ。
 #[tauri::command]
 pub async fn send_file_offer(

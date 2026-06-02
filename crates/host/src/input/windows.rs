@@ -7,21 +7,45 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::InputInjector;
+use super::{DisplayGeom, InputInjector};
 
 pub struct WinInjector {
-    width: i32,
-    height: i32,
+    /// キャプチャ対象ディスプレイのデスクトップ配置 (原点 + 寸法)。
+    geom: DisplayGeom,
+    /// 仮想デスクトップ境界 (左上原点 + 幅高)。MOUSEEVENTF_VIRTUALDESK の正規化基準。
+    vx: i32,
+    vy: i32,
+    vw: i32,
+    vh: i32,
 }
 
 impl WinInjector {
-    pub fn new(display_width: u32, display_height: u32) -> Self {
-        Self {
-            width: display_width.max(1) as i32,
-            height: display_height.max(1) as i32,
+    pub fn new(geom: DisplayGeom) -> Self {
+        let mut s = Self {
+            geom,
+            vx: 0,
+            vy: 0,
+            vw: 1,
+            vh: 1,
+        };
+        s.refresh_virtual();
+        s
+    }
+
+    /// 仮想デスクトップの境界を取得し直す。ディスプレイ構成変更時に呼ぶ。
+    fn refresh_virtual(&mut self) {
+        // SAFETY: GetSystemMetrics は副作用なしの値取得。
+        unsafe {
+            self.vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            self.vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            self.vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+            self.vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
         }
     }
 
@@ -50,20 +74,28 @@ fn is_extended_vk(vk: u32) -> bool {
 }
 
 impl InputInjector for WinInjector {
+    fn set_display(&mut self, geom: DisplayGeom) {
+        self.geom = geom;
+        self.refresh_virtual();
+    }
+
     fn inject(&mut self, ev: &InputEvent) -> Result<()> {
         match *ev {
             InputEvent::MouseMove { x, y } => {
-                // MOUSEEVENTF_ABSOLUTE はプライマリモニタ全域を 0..65535 に正規化する。
-                // ホストが primary ディスプレイ全体をキャプチャしている前提でスケール。
-                let max_x = (self.width as i64 - 1).max(1);
-                let max_y = (self.height as i64 - 1).max(1);
-                let cx = (x.clamp(0, self.width - 1) as i64 * 65535 / max_x) as i32;
-                let cy = (y.clamp(0, self.height - 1) as i64 * 65535 / max_y) as i32;
+                // クライアントは選択ディスプレイ内の座標 (0..width, 0..height) を送る。
+                // まずデスクトップ仮想座標へ平行移動し、仮想デスクトップ全域を 0..65535 に
+                // 正規化して MOUSEEVENTF_VIRTUALDESK で注入する (非プライマリでも正しく届く)。
+                let w = self.geom.width.max(1) as i32;
+                let h = self.geom.height.max(1) as i32;
+                let abs_x = self.geom.x + x.clamp(0, w - 1);
+                let abs_y = self.geom.y + y.clamp(0, h - 1);
+                let cx = ((abs_x - self.vx) as i64 * 65535 / (self.vw as i64 - 1).max(1)) as i32;
+                let cy = ((abs_y - self.vy) as i64 * 65535 / (self.vh as i64 - 1).max(1)) as i32;
                 let mi = MOUSEINPUT {
                     dx: cx,
                     dy: cy,
                     mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time: 0,
                     dwExtraInfo: 0,
                 };

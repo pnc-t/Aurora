@@ -43,6 +43,10 @@ export async function requestKeyframe(): Promise<void> {
   await invoke("request_keyframe");
 }
 
+export async function selectDisplay(id: number): Promise<void> {
+  await invoke("select_display", { id });
+}
+
 export async function sendFileOffer(id: number, name: string, size: number): Promise<void> {
   await invoke("send_file_offer", { id, name, size });
 }

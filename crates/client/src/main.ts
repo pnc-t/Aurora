@@ -1,5 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
-import { connectToHost, disconnect, type ClientEvent } from "./ipc";
+import { connectToHost, disconnect, selectDisplay, type ClientEvent } from "./ipc";
 import { handleVideoChunk, initDecoder, resetDecoder } from "./decoder";
 import { attachInput, detachInput } from "./input";
 import { mountConnectionUi, setHostInfo, setStatus } from "./connection-ui";
@@ -28,6 +28,14 @@ mountConnectionUi({
     void disconnect();
     detachInput();
     setStatus("disconnected");
+  },
+  onSelectDisplay: (d) => {
+    // 解像度/SPS が変わるためデコーダを作り直し、入力スケールを新ディスプレイへ更新。
+    void selectDisplay(d.id);
+    resetDecoder();
+    attachInput(canvas, { width: d.width, height: d.height });
+    canvas.focus();
+    setStatus(`switching to ${d.name} ${d.width}x${d.height}…`);
   },
 });
 
