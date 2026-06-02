@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{
-    BOOLEAN, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, S_OK,
+    BOOLEAN, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary, S_OK,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
     PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
@@ -115,7 +116,33 @@ fn name_compare(a: &str, b: &str) -> std::cmp::Ordering {
     n.cmp(&0)
 }
 
+/// `projectedfslib.dll` をロードできるか確認する。
+///
+/// このDLLは Windows のオプション機能 "Projected File System" (Client-ProjFS) が
+/// 有効なときだけ存在する。`build.rs` で遅延ロードにしているため、ここで事前に
+/// プローブしておかないと、無効環境では最初の `Prj*` 呼び出しが SEH 例外で abort
+/// する。存在すれば `Err` でなく net 側の graceful フォールバックに委ねる。
+fn projfs_available() -> bool {
+    let name = wide("projectedfslib.dll");
+    // SAFETY: name は null 終端の有効な PCWSTR。成功時の HMODULE は直後に FreeLibrary する。
+    unsafe {
+        match LoadLibraryW(PCWSTR(name.as_ptr())) {
+            Ok(h) if !h.is_invalid() => {
+                let _ = FreeLibrary(h);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
+    if !projfs_available() {
+        anyhow::bail!(
+            "projectedfslib.dll をロードできません (Windows 機能 Client-ProjFS が無効)"
+        );
+    }
+
     std::fs::create_dir_all(root).with_context(|| format!("create projfs root {root:?}"))?;
 
     // 仮想化インスタンス GUID をルート直下に永続化し、再起動でも再利用する。
