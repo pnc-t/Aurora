@@ -1,6 +1,6 @@
 //! 画面キャプチャ抽象 (Port)。OS別の Adapter は cfg で差し替える。
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Frame {
@@ -9,8 +9,6 @@ pub struct Frame {
     /// BGRA8 行間隔 (バイト)。`width * 4` と一致するとは限らない。
     pub stride: u32,
     pub bgra: Vec<u8>,
-    #[allow(dead_code)] // 取得時刻。遅延計測用に保持 (現状未使用)
-    pub captured_at: Instant,
 }
 
 pub trait ScreenCapturer: Send {

@@ -1,6 +1,6 @@
 //! DXGI Desktop Duplication ベースのプライマリディスプレイキャプチャ。
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Graphics::Direct3D::{
@@ -330,7 +330,6 @@ impl ScreenCapturer for DxgiCapturer {
             height,
             stride: dst_stride as u32,
             bgra,
-            captured_at: Instant::now(),
         }))
     }
 }
