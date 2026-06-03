@@ -1,6 +1,8 @@
 //! 映像エンコーダ抽象 (Port)。
 
 use crate::capture::Frame;
+#[cfg(target_os = "windows")]
+use crate::capture::SharedDevice;
 
 #[derive(Debug, Clone)]
 pub struct EncodedNal {
@@ -27,7 +29,59 @@ pub const MAX_BITRATE_BPS: u32 = 15_000_000;
 #[cfg(target_os = "windows")]
 mod mf;
 #[cfg(target_os = "windows")]
-pub use mf::MfH264Encoder as PlatformEncoder;
+mod mf_hw;
+
+/// Windows のプラットフォームエンコーダ。HW (NVENC/AMF/QSV) を優先し、初期化に失敗
+/// したら SW (Microsoft H.264 MFT) へフォールバックする。どちらも GPU NV12 `Frame` を消費。
+#[cfg(target_os = "windows")]
+pub enum PlatformEncoder {
+    Hw(mf_hw::MfHwH264Encoder),
+    Sw(mf::MfH264Encoder),
+}
+
+#[cfg(target_os = "windows")]
+impl PlatformEncoder {
+    pub fn new(device: SharedDevice) -> anyhow::Result<Self> {
+        match mf_hw::MfHwH264Encoder::new(device.clone()) {
+            Ok(e) => {
+                tracing::info!("video encoder: hardware H.264 MFT (zero-copy NV12)");
+                Ok(Self::Hw(e))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "HW H.264 encoder unavailable; falling back to software MFT (NV12 read-back)");
+                Ok(Self::Sw(mf::MfH264Encoder::new(device)?))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl VideoEncoder for PlatformEncoder {
+    fn push_frame(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        match self {
+            Self::Hw(e) => e.push_frame(frame),
+            Self::Sw(e) => e.push_frame(frame),
+        }
+    }
+    fn poll_nal(&mut self) -> anyhow::Result<Option<EncodedNal>> {
+        match self {
+            Self::Hw(e) => e.poll_nal(),
+            Self::Sw(e) => e.poll_nal(),
+        }
+    }
+    fn request_keyframe(&mut self) {
+        match self {
+            Self::Hw(e) => e.request_keyframe(),
+            Self::Sw(e) => e.request_keyframe(),
+        }
+    }
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> anyhow::Result<()> {
+        match self {
+            Self::Hw(e) => e.set_bitrate(bitrate_bps),
+            Self::Sw(e) => e.set_bitrate(bitrate_bps),
+        }
+    }
+}
 
 // Linux / macOS は ffmpeg-next 経由の H.264 エンコーダを共有する
 // (Linux: nvenc/libx264, macOS: videotoolbox)。

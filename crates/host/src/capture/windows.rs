@@ -1,4 +1,8 @@
-//! DXGI Desktop Duplication ベースのプライマリディスプレイキャプチャ。
+//! DXGI Desktop Duplication ベースのディスプレイキャプチャ (ゼロコピー版)。
+//!
+//! acquire → CopyResource(shader-readable) → GPU 色変換 → NV12 テクスチャ、で完結する。
+//! CPU での LUT トーンマップと staging リードバックは廃し、色変換は `convert::Converter`
+//! (D3D11 シェーダ) が GPU 上で行う。デバイスは `DeviceBundle` を capture・encode で共有。
 
 use std::time::Duration;
 
@@ -9,11 +13,10 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-    DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_NV12, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIDevice, IDXGIOutput,
@@ -24,26 +27,21 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::core::Interface;
 
-use super::{DisplayInfo, Frame, ScreenCapturer};
+use super::convert::Converter;
+use super::{DisplayInfo, Frame, ScreenCapturer, SendTexture, SharedDevice};
 
 pub struct DxgiCapturer {
-    _device: ID3D11Device,
-    context: ID3D11DeviceContext,
+    /// 共有デバイスの保持 (寿命確保)。実 COM 参照は duplication / converter が持つ。
+    _device: SharedDevice,
     duplication: IDXGIOutputDuplication,
-    staging: Option<ID3D11Texture2D>,
-    staging_format: DXGI_FORMAT,
-    /// HDR(scRGB FP16) → SDR sRGB8 変換テーブル。このディスプレイの SDR white level で正規化済み。
-    scrgb_lut: Box<[u8; 65536]>,
-    width: u32,
-    height: u32,
+    converter: Converter,
 }
 
-/// D3D11 デバイス + コンテキストを 1 つ作る。各キャプチャ・列挙で共通。
-fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-    // SAFETY: D3D11CreateDevice は OUT パラメータの ID3D11Device 等を初期化する。out-only。
+/// 列挙専用の使い捨て D3D11 デバイスを作る (起動時 1 回)。共有デバイスとは別。
+fn create_enum_device() -> Result<ID3D11Device> {
+    // SAFETY: D3D11CreateDevice は OUT パラメータを初期化する。out-only。
     unsafe {
         let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
         let feature_levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1];
         D3D11CreateDevice(
             None,
@@ -54,20 +52,16 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
             D3D11_SDK_VERSION,
             Some(&mut device),
             None,
-            Some(&mut context),
+            None,
         )
-        .context("D3D11CreateDevice failed")?;
-        Ok((
-            device.ok_or_else(|| anyhow!("D3D11 device null"))?,
-            context.ok_or_else(|| anyhow!("D3D11 context null"))?,
-        ))
+        .context("D3D11CreateDevice (enum)")?;
+        device.ok_or_else(|| anyhow!("D3D11 device null"))
     }
 }
 
-/// 接続済みの全ディスプレイ (DXGI 出力) を列挙する。`id` は EnumOutputs のインデックス
-/// で、これが `new_for_output` / `SelectDisplay` の指定値になる。
+/// 接続済みの全ディスプレイ (DXGI 出力) を列挙する。`id` は EnumOutputs のインデックス。
 pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
-    let (device, _context) = create_device()?;
+    let device = create_enum_device()?;
     let dxgi_device: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
     let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
 
@@ -103,16 +97,16 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
 }
 
 impl DxgiCapturer {
-    pub fn new_primary() -> Result<Self> {
-        Self::new_for_output(0)
+    pub fn new_primary(device: SharedDevice) -> Result<Self> {
+        Self::new_for_output(device, 0)
     }
 
-    /// 指定インデックスの DXGI 出力をキャプチャ対象にする。
-    pub fn new_for_output(output_index: u32) -> Result<Self> {
-        let (device, context) = create_device()?;
+    /// 指定インデックスの DXGI 出力をキャプチャ対象にする。共有デバイスを受け取る。
+    pub fn new_for_output(device: SharedDevice, output_index: u32) -> Result<Self> {
+        let d3d = &device.device;
 
-        // SAFETY: 取得した device は live。cast は同 COM オブジェクトの別 IID。
-        let dxgi_device: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
+        // SAFETY: device は live。cast は同 COM オブジェクトの別 IID。
+        let dxgi_device: IDXGIDevice = d3d.cast().context("cast IDXGIDevice")?;
         let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
         let output: IDXGIOutput = unsafe { adapter.EnumOutputs(output_index) }
             .with_context(|| format!("EnumOutputs({output_index}) -- no such display?"))?;
@@ -126,10 +120,9 @@ impl DxgiCapturer {
         let (hdr_active, scale) = hdr_info(&gdi_name);
         tracing::info!(display = %gdi_name, hdr_active, sdr_white_scale = scale, "capture color");
 
-        // HDR 有効時のみ FP16(scRGB) 取得 + トーンマップする。HDR デスクトップは MPO により
-        // 通常の DuplicateOutput だと FP16/BGRA8 が混在するため、DuplicateOutput1 で取得
-        // フォーマットを scRGB に固定して混在を消す。SDR ディスプレイは従来の BGRA8 素通し
-        // (DuplicateOutput) のままにする (変換不要で実績がある経路)。
+        // HDR 有効時のみ FP16(scRGB) 取得する。HDR デスクトップは MPO により通常の
+        // DuplicateOutput だと FP16/BGRA8 が混在するため、DuplicateOutput1 で scRGB に固定する。
+        // SDR は従来の BGRA8 素通し (DuplicateOutput)。色変換は GPU シェーダで行う。
         let duplication: IDXGIOutputDuplication = if hdr_active {
             // DuplicateOutput1 は DPI-aware プロセスでないと E_ACCESSDENIED になる。
             // SAFETY: プロセス全体の設定。既に設定済みなら失敗するだけで無害。
@@ -138,92 +131,32 @@ impl DxgiCapturer {
             }
             match output.cast::<IDXGIOutput5>() {
                 Ok(output5) => match unsafe {
-                    output5.DuplicateOutput1(&device, 0, &[DXGI_FORMAT_R16G16B16A16_FLOAT])
+                    output5.DuplicateOutput1(d3d, 0, &[DXGI_FORMAT_R16G16B16A16_FLOAT])
                 } {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::warn!(error = %e, "DuplicateOutput1(FP16) failed, falling back");
                         let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
-                        unsafe { output1.DuplicateOutput(&device) }.context("DuplicateOutput")?
+                        unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
                     }
                 },
                 Err(_) => {
                     let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
-                    unsafe { output1.DuplicateOutput(&device) }.context("DuplicateOutput")?
+                    unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
                 }
             }
         } else {
             let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
-            unsafe { output1.DuplicateOutput(&device) }.context("DuplicateOutput")?
+            unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
         };
 
-        // SAFETY: duplication live。GetDesc は値返し。
-        let desc = unsafe { duplication.GetDesc() };
-        let width = desc.ModeDesc.Width;
-        let height = desc.ModeDesc.Height;
+        let converter = Converter::new(&device, hdr_active, scale)?;
 
         Ok(Self {
             _device: device,
-            context,
             duplication,
-            staging: None,
-            staging_format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            scrgb_lut: build_scrgb_lut(scale),
-            width,
-            height,
+            converter,
         })
-    }
-
-    /// ソーステクスチャと同じフォーマット・サイズの staging を用意する。
-    /// `CopyResource` はフォーマット一致が前提なので、HDR (FP16) ソースには FP16 staging を作る。
-    fn ensure_staging(
-        &mut self,
-        width: u32,
-        height: u32,
-        format: DXGI_FORMAT,
-    ) -> Result<&ID3D11Texture2D> {
-        let need_new = match &self.staging {
-            Some(_) => {
-                self.width != width || self.height != height || self.staging_format != format
-            }
-            None => true,
-        };
-        if need_new {
-            tracing::info!(
-                format = format.0,
-                width,
-                height,
-                "capture source format (10=R16G16B16A16F scRGB/HDR, 87=B8G8R8A8 SDR)"
-            );
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: format,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: Default::default(),
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: Default::default(),
-            };
-            // SAFETY: device は live、desc は全フィールド初期化済み、out param は null 可。
-            let tex: ID3D11Texture2D = unsafe {
-                let mut tex: Option<ID3D11Texture2D> = None;
-                self._device
-                    .CreateTexture2D(&desc, None, Some(&mut tex))
-                    .context("CreateTexture2D(staging)")?;
-                tex.ok_or_else(|| anyhow!("staging texture null"))?
-            };
-            self.staging = Some(tex);
-            self.staging_format = format;
-            self.width = width;
-            self.height = height;
-        }
-        Ok(self.staging.as_ref().unwrap())
     }
 }
 
@@ -249,145 +182,25 @@ impl ScreenCapturer for DxgiCapturer {
             resource.ok_or_else(|| anyhow!("AcquireNextFrame returned null resource"))?;
         let src_tex: ID3D11Texture2D = resource.cast().context("cast ID3D11Texture2D")?;
 
-        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { src_tex.GetDesc(&mut src_desc) };
+        // GPU で NV12 へ変換 (HDR トーンマップ込み)。CPU リードバックなし。
+        let convert_result = self.converter.convert(&src_tex);
 
-        let width = src_desc.Width;
-        let height = src_desc.Height;
-        let src_format = src_desc.Format;
-
-        let staging = self.ensure_staging(width, height, src_format)?.clone();
-
-        // SAFETY: 同 device・同フォーマット・同サイズの 2 texture 間で CopyResource。
-        unsafe { self.context.CopyResource(&staging, &src_tex) };
-
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // SAFETY: staging は D3D11_USAGE_STAGING + CPU_ACCESS_READ。Map は安全に呼べる。
-        unsafe {
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .context("Map(staging)")?;
-        }
-
-        let src_pitch = mapped.RowPitch as usize;
-        // 出力は常に行間隔ぴったりの BGRA8。HDR(FP16) ソースは scRGB→sRGB トーンマップする。
-        let dst_stride = width as usize * 4;
-        let mut bgra = vec![0u8; dst_stride * height as usize];
-
-        let convert_result: Result<()> = match src_format {
-            DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => {
-                // SAFETY: mapped.pData は各行 src_pitch バイト読める。BGRA8 をそのままコピー。
-                unsafe {
-                    let base = mapped.pData as *const u8;
-                    for y in 0..height as usize {
-                        std::ptr::copy_nonoverlapping(
-                            base.add(y * src_pitch),
-                            bgra.as_mut_ptr().add(y * dst_stride),
-                            dst_stride,
-                        );
-                    }
-                }
-                Ok(())
-            }
-            DXGI_FORMAT_R16G16B16A16_FLOAT => {
-                let lut = &self.scrgb_lut;
-                // SAFETY: mapped.pData は各行 src_pitch バイト読める。RGBA 各 16bit half。
-                unsafe {
-                    let base = mapped.pData as *const u8;
-                    for y in 0..height as usize {
-                        let row = base.add(y * src_pitch) as *const u16;
-                        let dst_row = y * dst_stride;
-                        for x in 0..width as usize {
-                            let r = lut[*row.add(x * 4) as usize];
-                            let g = lut[*row.add(x * 4 + 1) as usize];
-                            let b = lut[*row.add(x * 4 + 2) as usize];
-                            let o = dst_row + x * 4;
-                            bgra[o] = b;
-                            bgra[o + 1] = g;
-                            bgra[o + 2] = r;
-                            bgra[o + 3] = 255;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            other => Err(anyhow!(
-                "unsupported capture format {:?} (0x{:x})",
-                other,
-                other.0
-            )),
-        };
-
-        // SAFETY: Map と対になる Unmap。変換成否に関わらず必ず解放する。
-        unsafe { self.context.Unmap(&staging, 0) };
-        // SAFETY: AcquireNextFrame と対になる。
+        // SAFETY: AcquireNextFrame と対になる。変換成否に関わらず解放する。
         let _ = unsafe { self.duplication.ReleaseFrame() };
 
-        convert_result?;
+        let nv12 = convert_result?;
+
+        // NV12 テクスチャの寸法を読む (= キャプチャ解像度)。
+        let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: nv12 live。GetDesc は OUT を埋める。
+        unsafe { nv12.GetDesc(&mut desc) };
 
         Ok(Some(Frame {
-            width,
-            height,
-            stride: dst_stride as u32,
-            bgra,
+            width: desc.Width,
+            height: desc.Height,
+            texture: SendTexture(nv12),
         }))
     }
-}
-
-/// IEEE 754 half (16bit) を f32 へ変換する (ビット演算)。
-fn half_to_f32(h: u16) -> f32 {
-    let h = h as u32;
-    let sign = (h & 0x8000) << 16;
-    let exp = (h & 0x7c00) >> 10;
-    let mant = h & 0x03ff;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign // ±0
-        } else {
-            // 非正規化数を正規化する
-            let mut e: i32 = -1;
-            let mut m = mant;
-            loop {
-                e += 1;
-                m <<= 1;
-                if m & 0x0400 != 0 {
-                    break;
-                }
-            }
-            let mant = (m & 0x03ff) << 13;
-            let exp = ((127 - 15 - e) as u32) << 23;
-            sign | exp | mant
-        }
-    } else if exp == 0x1f {
-        // Inf / NaN
-        sign | 0x7f80_0000 | (mant << 13)
-    } else {
-        // 正規化数 (half バイアス 15 → f32 バイアス 127)
-        sign | ((exp + 112) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
-
-/// リニア値 (sRGB プライマリ) を sRGB OETF で符号化する。
-fn srgb_encode(l: f32) -> f32 {
-    if l <= 0.003_130_8 {
-        12.92 * l
-    } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-/// scRGB half 値 → SDR sRGB 8bit の変換テーブルを `scale` (SDR white level / 80nit) 込みで作る。
-/// scRGB はリニア光で (1,1,1)=80nit。HDR デスクトップは SDR 白を `scale*80`nit で合成するため、
-/// `scrgb/scale` で正規化 → [0,1] ハードクランプ (HDR ハイライトはクリップ) → sRGB 符号化する。
-fn build_scrgb_lut(scale: f32) -> Box<[u8; 65536]> {
-    let inv = 1.0 / scale.max(f32::MIN_POSITIVE);
-    let mut t = Box::new([0u8; 65536]);
-    for (i, slot) in t.iter_mut().enumerate() {
-        let lin = (half_to_f32(i as u16) * inv).clamp(0.0, 1.0);
-        *slot = (srgb_encode(lin) * 255.0 + 0.5) as u8;
-    }
-    t
 }
 
 /// 指定 GDI デバイス名 (`\\.\DISPLAYn`) の (HDR 有効か, scRGB 正規化係数) を返す。
@@ -474,4 +287,76 @@ fn hdr_info(gdi_device_name: &str) -> (bool, f32) {
         }
         default
     }
+}
+
+/// デバッグ用 (`--dump-bmp`): NV12 `Frame` を BGRA8 (行詰め) に読み戻す。
+/// staging へ `CopyResource` → `Map` し、BT.601 limited 逆変換で BGRA を組む。
+pub fn debug_frame_to_bgra(device: &SharedDevice, frame: &Frame) -> Result<Vec<u8>> {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: frame.width,
+        Height: frame.height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    // SAFETY: device live、desc 全フィールド初期化済み。
+    let staging = unsafe {
+        let mut tex = None;
+        device
+            .device
+            .CreateTexture2D(&desc, None, Some(&mut tex))
+            .context("CreateTexture2D(debug NV12 staging)")?;
+        tex.ok_or_else(|| anyhow!("debug staging null"))?
+    };
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // SAFETY: 同サイズ・同フォーマット間コピー後、STAGING を Map する。
+    unsafe {
+        device.context.CopyResource(&staging, &frame.texture.0);
+        device
+            .context
+            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .context("Map(debug NV12)")?;
+    }
+
+    let pitch = mapped.RowPitch as usize;
+    let mut bgra = vec![0u8; w * h * 4];
+    // SAFETY: pData は luma(h 行) + chroma(h/2 行) を各 pitch バイトで保持する。
+    unsafe {
+        let base = mapped.pData as *const u8;
+        let chroma = base.add(pitch * h);
+        for j in 0..h {
+            for i in 0..w {
+                let y = *base.add(j * pitch + i) as i32;
+                let cbase = (j / 2) * pitch + (i / 2) * 2;
+                let u = *chroma.add(cbase) as i32;
+                let v = *chroma.add(cbase + 1) as i32;
+                // BT.601 limited 逆変換 (8bit 固定小数)。
+                let c = y - 16;
+                let d = u - 128;
+                let e = v - 128;
+                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255);
+                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255);
+                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255);
+                let o = (j * w + i) * 4;
+                bgra[o] = b as u8;
+                bgra[o + 1] = g as u8;
+                bgra[o + 2] = r as u8;
+                bgra[o + 3] = 255;
+            }
+        }
+        device.context.Unmap(&staging, 0);
+    }
+    Ok(bgra)
 }

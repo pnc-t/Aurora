@@ -1,28 +1,32 @@
-//! Media Foundation 同期 SW H.264 エンコーダ。
+//! Media Foundation 同期 SW H.264 エンコーダ (HW 初期化失敗時のフォールバック)。
 //!
-//! MVP 方針:
+//! 方針:
 //! - 同期 (SW) MFT を使い、HW MFT のメッセージシーケンスを避ける
 //! - 入力 NV12 / 出力 H.264 (Annex-B start code 付き、MF のデフォルト)
 //! - 解像度は最初のフレームに追従し、変化したら MFT を作り直す
 //! - 60fps / Baseline。ビットレートは初期 8Mbps、`ICodecAPI` で実行時可変
-//! - BGRA→NV12 変換は CPU。GPU 化は将来課題
+//! - 入力は GPU 上の NV12 テクスチャ。staging へ `CopyResource` → `Map` で 1 度だけ
+//!   リードバックして SW MFT に渡す (AMD 以外 / VM / ドライバ不備でも必ず動く保険経路)
 
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, anyhow};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, ID3D11DeviceContext, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, ICodecAPI, IMFMediaBuffer, IMFMediaType, IMFTransform,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
     MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFSTARTUP_LITE, MFStartup, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Base,
 };
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::GUID;
 use windows::core::Interface;
 
@@ -30,20 +34,21 @@ use windows::core::Interface;
 /// windows-rs 0.58 では未エクスポートのため手定義。
 const CLSID_CMSH264_ENCODER_MFT: GUID = GUID::from_u128(0x6ca50344_051a_4ded_9779_a43305165e35);
 
-/// MF_VERSION = (MF_SDK_VERSION << 16) | MF_API_VERSION = (2 << 16) | 0x0070
-const MF_VERSION_CONST: u32 = (2u32 << 16) | 0x0070;
-
 use crate::capture::Frame;
+use crate::capture::SharedDevice;
+use crate::capture::device::DeviceBundle;
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
-const FPS: u32 = 60;
-const FRAME_DURATION_100NS: i64 = (10_000_000i64) / FPS as i64;
+pub(crate) const FPS: u32 = 60;
+pub(crate) const FRAME_DURATION_100NS: i64 = (10_000_000i64) / FPS as i64;
 
 /// VARIANT 型タグ VT_UI4 (unsigned long)。`windows::Win32::System::Variant` の
 /// 追加 feature を避けるため数値を直接定義する。
 const VT_UI4: u16 = 19;
 
 pub struct MfH264Encoder {
+    /// 共有デバイス (NV12 テクスチャの staging リードバックに使う)。
+    device: SharedDevice,
     /// 実 MFT は最初のフレーム解像度が分かってから構築する。
     inner: Option<Inner>,
     /// 目標平均ビットレート (bps)。inner 構築時・set_bitrate 時に反映。
@@ -63,16 +68,17 @@ struct Inner {
     sample_time_100ns: i64,
     out_queue: VecDeque<EncodedNal>,
     nv12_buf: Vec<u8>,
+    /// NV12 リードバック用 staging テクスチャと共有コンテキスト。
+    context: ID3D11DeviceContext,
+    readback: ID3D11Texture2D,
 }
 
 impl MfH264Encoder {
-    pub fn new() -> Result<Self> {
-        // SAFETY: COM の多重初期化は許可。同スレッドで以前 STA だと失敗するが MTA 期待。
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION_CONST, MFSTARTUP_LITE).context("MFStartup")?;
-        }
+    pub fn new(device: SharedDevice) -> Result<Self> {
+        // COM/MF はこのスレッドで初期化済み前提だが冪等に保証する。
+        crate::capture::device::init_thread_com()?;
         Ok(Self {
+            device,
             inner: None,
             bitrate: DEFAULT_BITRATE_BPS,
             frame_id: 0,
@@ -87,8 +93,13 @@ impl MfH264Encoder {
             None => true,
         };
         if need_new {
-            tracing::info!(width, height, bitrate = self.bitrate, "building H.264 MFT");
-            self.inner = Some(Inner::new(width, height, self.bitrate)?);
+            tracing::info!(
+                width,
+                height,
+                bitrate = self.bitrate,
+                "building SW H.264 MFT"
+            );
+            self.inner = Some(Inner::new(&self.device, width, height, self.bitrate)?);
             // 新しい MFT の最初の出力は keyframe にする。
             self.force_keyframe = true;
         }
@@ -97,7 +108,7 @@ impl MfH264Encoder {
 }
 
 impl Inner {
-    fn new(width: u32, height: u32, bitrate: u32) -> Result<Self> {
+    fn new(device: &DeviceBundle, width: u32, height: u32, bitrate: u32) -> Result<Self> {
         // SAFETY: CoCreateInstance は OUT param を初期化。CLSID は MS H.264 encoder。
         let transform: IMFTransform = unsafe {
             CoCreateInstance(&CLSID_CMSH264_ENCODER_MFT, None, CLSCTX_INPROC_SERVER)
@@ -134,6 +145,34 @@ impl Inner {
                 .context("START_OF_STREAM")?;
         }
 
+        // NV12 リードバック用 staging テクスチャ (CPU READ)。
+        let readback = {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            // SAFETY: device live、desc 全フィールド初期化済み。
+            unsafe {
+                let mut tex = None;
+                device
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut tex))
+                    .context("CreateTexture2D(NV12 readback staging)")?;
+                tex.ok_or_else(|| anyhow!("readback staging null"))?
+            }
+        };
+
         Ok(Self {
             transform,
             codec_api,
@@ -142,7 +181,48 @@ impl Inner {
             sample_time_100ns: 0,
             out_queue: VecDeque::new(),
             nv12_buf: vec![0u8; (width * height * 3 / 2) as usize],
+            context: device.context.clone(),
+            readback,
         })
+    }
+
+    /// GPU NV12 テクスチャを staging へコピーし `Map` で `nv12_buf` (連続 NV12) へ読み戻す。
+    fn readback_nv12(&mut self, src: &ID3D11Texture2D) -> Result<()> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        // SAFETY: 同 device・同フォーマット・同サイズ間の GPU 内コピー。
+        unsafe { self.context.CopyResource(&self.readback, src) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: readback は STAGING + CPU_ACCESS_READ。Map は安全に呼べる。
+        unsafe {
+            self.context
+                .Map(&self.readback, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Map(NV12 readback)")?;
+        }
+        let pitch = mapped.RowPitch as usize;
+        let (y_dst, uv_dst) = self.nv12_buf.split_at_mut(w * h);
+        // SAFETY: pData は各行 pitch バイト読める。NV12 は luma(h 行) の後に chroma(h/2 行)。
+        unsafe {
+            let base = mapped.pData as *const u8;
+            for j in 0..h {
+                std::ptr::copy_nonoverlapping(
+                    base.add(j * pitch),
+                    y_dst.as_mut_ptr().add(j * w),
+                    w,
+                );
+            }
+            let chroma = base.add(pitch * h);
+            for j in 0..h / 2 {
+                std::ptr::copy_nonoverlapping(
+                    chroma.add(j * pitch),
+                    uv_dst.as_mut_ptr().add(j * w),
+                    w,
+                );
+            }
+            self.context.Unmap(&self.readback, 0);
+        }
+        Ok(())
     }
 
     fn drain_outputs(&mut self, current_frame_id: u16) -> Result<()> {
@@ -228,8 +308,8 @@ impl VideoEncoder for MfH264Encoder {
         let force_keyframe = self.force_keyframe;
         self.force_keyframe = false;
         let inner = self.inner.as_mut().unwrap();
-        let (w, h) = (inner.width, inner.height);
-        bgra_to_nv12(&frame.bgra, frame.stride, w, h, &mut inner.nv12_buf);
+        // GPU NV12 テクスチャを CPU へ読み戻す (フォールバック経路のリードバック)。
+        inner.readback_nv12(&frame.texture.0)?;
 
         // IMFSample 生成
         let nv12_size = inner.nv12_buf.len() as u32;
@@ -304,7 +384,7 @@ impl VideoEncoder for MfH264Encoder {
 
 /// VT_UI4 の VARIANT を組み立てる。windows-core 0.58 は VARIANT 内部を非公開にしており
 /// 整数からの構築 API が無いため、メモリレイアウトを手動で再現して transmute する。
-fn variant_u32(value: u32) -> windows::core::VARIANT {
+pub(crate) fn variant_u32(value: u32) -> windows::core::VARIANT {
     // 64bit Windows の VARIANT レイアウト: vt(u16) + 予約 3*u16 + 16B 共用体。
     // VT_UI4 は共用体先頭 (offset 8) の ulVal(u32) に値を置く。
     #[repr(C)]
@@ -348,7 +428,7 @@ impl Drop for Inner {
 // IMFTransform は MTA で COM 初期化されており、別スレッドへの move は安全。
 unsafe impl Send for MfH264Encoder {}
 
-fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Result<IMFMediaType> {
+pub(crate) fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Result<IMFMediaType> {
     // SAFETY: all API are OUT/SETTER.
     unsafe {
         let t = MFCreateMediaType().context("MFCreateMediaType (out)")?;
@@ -362,13 +442,13 @@ fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Result<IMFMed
         t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
         // 色 VUI (matrix / nominal range) はあえて設定しない。MS H.264 エンコーダの
         // 挙動とデコーダ (WebCodecs) の解釈が噛み合わず、付けると色/明るさが破綻する。
-        // VUI 無指定のとき WebCodecs は BT.601 limited と解釈するので、bgra_to_nv12 も
-        // それに揃えてある (= ほぼ無損失なラウンドトリップ)。
+        // VUI 無指定のとき WebCodecs は BT.601 limited と解釈するので、GPU 色変換
+        // (convert.rs) も同係数の BT.601 limited に揃えてある (ほぼ無損失なラウンドトリップ)。
         Ok(t)
     }
 }
 
-fn make_nv12_input_type(width: u32, height: u32) -> Result<IMFMediaType> {
+pub(crate) fn make_nv12_input_type(width: u32, height: u32) -> Result<IMFMediaType> {
     unsafe {
         let t = MFCreateMediaType().context("MFCreateMediaType (in)")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -381,69 +461,12 @@ fn make_nv12_input_type(width: u32, height: u32) -> Result<IMFMediaType> {
     }
 }
 
-fn pack_u64(hi: u32, lo: u32) -> u64 {
+pub(crate) fn pack_u64(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// BGRA8 (DXGI) → NV12 (BT.601 Limited)。
-///
-/// クライアントの WebCodecs デコーダは VUI 無指定のストリームを BT.601 limited として
-/// 解釈する (実測)。RGB→YUV→RGB はエンコードとデコードで同じ matrix/range を使えば
-/// ほぼ無損失で戻るため、ここを 601 limited に揃え、出力には余計な色 VUI を付けない
-/// (付けるとデコーダの解釈とズレて色/明るさが破綻する)。係数は 8bit 固定小数 (<<8):
-///   Y  =  0.257R + 0.504G + 0.098B + 16    -> 66,129,25
-///   Cb = -0.148R - 0.291G + 0.439B + 128   -> -38,-74,112
-///   Cr =  0.439R - 0.368G - 0.071B + 128   -> 112,-94,-18
-fn bgra_to_nv12(bgra: &[u8], src_stride: u32, w: u32, h: u32, out: &mut [u8]) {
-    let w = w as usize;
-    let h = h as usize;
-    let src_stride = src_stride as usize;
-    let y_plane_size = w * h;
-    let (y_plane, uv_plane) = out.split_at_mut(y_plane_size);
-
-    for j in 0..h {
-        let src_row = &bgra[j * src_stride..j * src_stride + w * 4];
-        for i in 0..w {
-            let b = src_row[i * 4] as i32;
-            let g = src_row[i * 4 + 1] as i32;
-            let r = src_row[i * 4 + 2] as i32;
-            // BT.601 limited
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[j * w + i] = y.clamp(0, 255) as u8;
-        }
-    }
-    // UV: 2x2 ダウンサンプリング
-    for j in (0..h).step_by(2) {
-        for i in (0..w).step_by(2) {
-            let mut sb = 0i32;
-            let mut sg = 0i32;
-            let mut sr = 0i32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let row = &bgra[(j + dy) * src_stride..];
-                    let p = (i + dx) * 4;
-                    sb += row[p] as i32;
-                    sg += row[p + 1] as i32;
-                    sr += row[p + 2] as i32;
-                }
-            }
-            let b = sb / 4;
-            let g = sg / 4;
-            let r = sr / 4;
-            // BT.601 limited
-            let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-            let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-            let uv_row = j / 2;
-            let uv_col = (i / 2) * 2;
-            let idx = uv_row * w + uv_col;
-            uv_plane[idx] = u.clamp(0, 255) as u8;
-            uv_plane[idx + 1] = v.clamp(0, 255) as u8;
-        }
-    }
-}
-
 /// Annex-B NAL 列を走査して IDR (nal_unit_type=5) を含むか判定。
-fn is_keyframe_annexb(buf: &[u8]) -> bool {
+pub(crate) fn is_keyframe_annexb(buf: &[u8]) -> bool {
     let mut i = 0;
     while i + 4 < buf.len() {
         let start3 = buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1;
