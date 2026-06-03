@@ -9,10 +9,15 @@ const state: {
   canvas: HTMLCanvasElement | null;
   display: DisplaySize | null;
   enabled: boolean;
+  // 押下中の VK / マウスボタン。フォーカス喪失時に解放して残留を防ぐ。
+  pressedKeys: Set<number>;
+  pressedButtons: Set<"Left" | "Right" | "Middle">;
 } = {
   canvas: null,
   display: null,
   enabled: false,
+  pressedKeys: new Set(),
+  pressedButtons: new Set(),
 };
 
 export function attachInput(canvas: HTMLCanvasElement, display: DisplaySize): void {
@@ -28,6 +33,8 @@ export function attachInput(canvas: HTMLCanvasElement, display: DisplaySize): vo
   canvas.addEventListener("contextmenu", preventDefault);
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
+  // フォーカス喪失 (Alt+Tab 等) で keyup が来ず修飾キーが残留するのを防ぐ。
+  window.addEventListener("blur", releaseAllInput);
 }
 
 export function detachInput(): void {
@@ -41,9 +48,23 @@ export function detachInput(): void {
   }
   window.removeEventListener("keydown", onKeyDown);
   window.removeEventListener("keyup", onKeyUp);
+  window.removeEventListener("blur", releaseAllInput);
+  releaseAllInput();
   state.canvas = null;
   state.display = null;
   state.enabled = false;
+}
+
+/** 押下中の全キー / マウスボタンに up を送って残留を解消する。 */
+export function releaseAllInput(): void {
+  for (const vk of state.pressedKeys) {
+    dispatch({ Key: { vk, down: false } });
+  }
+  state.pressedKeys.clear();
+  for (const button of state.pressedButtons) {
+    dispatch({ MouseButton: { button, down: false } });
+  }
+  state.pressedButtons.clear();
 }
 
 function preventDefault(e: Event): void {
@@ -88,6 +109,7 @@ function onMouseDown(e: MouseEvent): void {
   const b = mouseButton(e.button);
   if (!b) return;
   e.preventDefault();
+  state.pressedButtons.add(b);
   dispatch({ MouseButton: { button: b, down: true } });
 }
 
@@ -95,6 +117,7 @@ function onMouseUp(e: MouseEvent): void {
   const b = mouseButton(e.button);
   if (!b) return;
   e.preventDefault();
+  state.pressedButtons.delete(b);
   dispatch({ MouseButton: { button: b, down: false } });
 }
 
@@ -113,6 +136,7 @@ function onKeyDown(e: KeyboardEvent): void {
   const vk = vkFromKeyboardEvent(e);
   if (vk == null) return;
   e.preventDefault();
+  state.pressedKeys.add(vk);
   dispatch({ Key: { vk, down: true } });
 }
 
@@ -120,6 +144,7 @@ function onKeyUp(e: KeyboardEvent): void {
   const vk = vkFromKeyboardEvent(e);
   if (vk == null) return;
   e.preventDefault();
+  state.pressedKeys.delete(vk);
   dispatch({ Key: { vk, down: false } });
 }
 

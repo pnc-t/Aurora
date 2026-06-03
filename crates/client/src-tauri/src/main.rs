@@ -6,6 +6,7 @@
 )]
 
 mod audio;
+mod config;
 mod net;
 mod stats;
 
@@ -32,6 +33,8 @@ fn main() {
             net::send_file_chunk,
             net::request_file,
             net::set_share_root,
+            config::load_recent_hosts,
+            config::save_recent_host,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
