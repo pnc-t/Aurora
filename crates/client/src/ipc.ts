@@ -68,3 +68,13 @@ export async function requestFile(id: number, path: string): Promise<void> {
 export async function setShareRoot(path: string): Promise<void> {
   await invoke("set_share_root", { path });
 }
+
+/// 接続先 host の履歴を読み込む (最新が先頭)。
+export async function loadRecentHosts(): Promise<string[]> {
+  return await invoke<string[]>("load_recent_hosts");
+}
+
+/// 接続成功した host を履歴へ保存する。
+export async function saveRecentHost(host: string): Promise<void> {
+  await invoke("save_recent_host", { host });
+}

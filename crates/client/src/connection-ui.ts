@@ -1,83 +1,89 @@
-// 接続フォーム + ステータス表示 + ディスプレイ選択。
-// 接続成功時に onSubmit コールバックを呼ぶ。HostInfo 受信で表示一覧を
-// ドロップダウンに反映し、選択変更を onSelectDisplay で通知する。
+// 未接続時の中央接続カード (AnyDesk 風)。
+// host(履歴 datalist 補完) + password + connect。接続中はカードを隠し canvas を全画面に。
+// ディスプレイ切替・disconnect は接続中ツールバー (toolbar.ts) 側へ移譲した。
 
-import type { DisplayDto } from "./ipc";
+import { loadRecentHosts } from "./ipc";
 
-type DisconnectCallback = () => void;
 type FormCallback = (host: string, password: string) => Promise<void>;
-type SelectDisplayCallback = (display: DisplayDto) => void;
 
-let statusEl: HTMLElement | null = null;
-let formEl: HTMLFormElement | null = null;
-let displaySelectEl: HTMLSelectElement | null = null;
-let onSelectDisplayCb: SelectDisplayCallback | null = null;
-// HostInfo で受け取った表示一覧 (選択時の寸法参照に使う)。
-let currentDisplays: DisplayDto[] = [];
+export type ConnectionUiHandle = {
+  show: () => void;
+  hide: () => void;
+  setStatus: (text: string, isError?: boolean) => void;
+  setConnecting: (connecting: boolean) => void;
+  refreshHosts: () => Promise<void>;
+};
 
-export function mountConnectionUi(opts: {
-  root: HTMLElement;
-  onSubmit: FormCallback;
-  onDisconnect: DisconnectCallback;
-  onSelectDisplay: SelectDisplayCallback;
-}): void {
+export function mountConnectionUi(opts: { root: HTMLElement; onSubmit: FormCallback }): ConnectionUiHandle {
   opts.root.innerHTML = `
-    <form id="conn-form" style="display:flex;gap:8px;align-items:center;padding:8px;background:#222">
-      <label>host <input id="host" type="text" placeholder="100.x.x.x or hostname" value="127.0.0.1" required style="width:200px"></label>
-      <label>password <input id="password" type="password" required style="width:200px"></label>
-      <button type="submit">connect</button>
-      <button type="button" id="disconnect-btn">disconnect</button>
-      <label id="display-label" style="display:none">display
-        <select id="display-select"></select>
+    <form id="connect-card" autocomplete="off">
+      <h1>DDD Remote Desktop</h1>
+      <label>host (Tailscale IP / hostname)
+        <input id="host" type="text" list="recent-hosts" placeholder="100.x.x.x or hostname" required />
+        <datalist id="recent-hosts"></datalist>
       </label>
-      <span id="status" style="margin-left:auto;font-family:monospace">idle</span>
+      <label>password
+        <input id="password" type="password" required />
+      </label>
+      <button type="submit" id="connect-btn">connect</button>
+      <div id="connect-status"></div>
     </form>
   `;
-  formEl = opts.root.querySelector<HTMLFormElement>("#conn-form");
-  statusEl = opts.root.querySelector<HTMLElement>("#status");
-  displaySelectEl = opts.root.querySelector<HTMLSelectElement>("#display-select");
-  onSelectDisplayCb = opts.onSelectDisplay;
-  const disconnectBtn = opts.root.querySelector<HTMLButtonElement>("#disconnect-btn");
 
-  formEl?.addEventListener("submit", (e) => {
+  const form = opts.root.querySelector<HTMLFormElement>("#connect-card");
+  const hostInput = opts.root.querySelector<HTMLInputElement>("#host");
+  const passwordInput = opts.root.querySelector<HTMLInputElement>("#password");
+  const connectBtn = opts.root.querySelector<HTMLButtonElement>("#connect-btn");
+  const statusEl = opts.root.querySelector<HTMLElement>("#connect-status");
+  const datalist = opts.root.querySelector<HTMLDataListElement>("#recent-hosts");
+
+  const handle: ConnectionUiHandle = {
+    show(): void {
+      opts.root.classList.remove("hidden");
+      // 再表示時はパスワードを消し、host にフォーカス。
+      if (passwordInput) passwordInput.value = "";
+      hostInput?.focus();
+    },
+    hide(): void {
+      opts.root.classList.add("hidden");
+    },
+    setStatus(text: string, isError = false): void {
+      if (!statusEl) return;
+      statusEl.textContent = text;
+      statusEl.classList.toggle("error", isError);
+    },
+    setConnecting(connecting: boolean): void {
+      if (connectBtn) {
+        connectBtn.disabled = connecting;
+        connectBtn.textContent = connecting ? "connecting…" : "connect";
+      }
+    },
+    async refreshHosts(): Promise<void> {
+      if (!datalist) return;
+      try {
+        const hosts = await loadRecentHosts();
+        datalist.innerHTML = hosts.map((h) => `<option value="${h}"></option>`).join("");
+        // 直近の host を既定で入れておく (未入力時のみ)。
+        if (hostInput && !hostInput.value && hosts.length > 0) hostInput.value = hosts[0];
+      } catch {
+        // 履歴は補助機能なので失敗しても接続自体は妨げない。
+      }
+    },
+  };
+
+  form?.addEventListener("submit", (e) => {
     e.preventDefault();
-    const host = (opts.root.querySelector<HTMLInputElement>("#host"))?.value ?? "";
-    const password = (opts.root.querySelector<HTMLInputElement>("#password"))?.value ?? "";
-    setStatus(`connecting to ${host}...`);
+    const host = hostInput?.value.trim() ?? "";
+    const password = passwordInput?.value ?? "";
+    if (!host || !password) return;
+    handle.setStatus(`connecting to ${host}…`);
+    handle.setConnecting(true);
     void opts.onSubmit(host, password).catch((err) => {
-      setStatus(`error: ${String(err)}`);
+      handle.setStatus(`error: ${String(err)}`, true);
+      handle.setConnecting(false);
     });
   });
-  disconnectBtn?.addEventListener("click", () => {
-    opts.onDisconnect();
-  });
 
-  displaySelectEl?.addEventListener("change", () => {
-    const id = Number(displaySelectEl?.value);
-    const d = currentDisplays.find((x) => x.id === id);
-    if (d && onSelectDisplayCb) onSelectDisplayCb(d);
-  });
-}
-
-export function setStatus(s: string): void {
-  if (statusEl) statusEl.textContent = s;
-}
-
-export function setHostInfo(displays: DisplayDto[]): void {
-  currentDisplays = displays;
-  if (displays.length === 0) {
-    setStatus("connected (no displays?)");
-    return;
-  }
-  const d = displays[0];
-  setStatus(`connected · ${d.name} ${d.width}x${d.height}`);
-
-  // ドロップダウンを更新。表示が 1 枚だけなら隠す。
-  const label = document.getElementById("display-label");
-  if (displaySelectEl && label) {
-    displaySelectEl.innerHTML = displays
-      .map((x) => `<option value="${x.id}">${x.name} (${x.width}x${x.height})</option>`)
-      .join("");
-    label.style.display = displays.length > 1 ? "inline" : "none";
-  }
+  void handle.refreshHosts();
+  return handle;
 }

@@ -4,7 +4,10 @@
 // リモートデスクトップでは、接続中のキー入力は input.ts がホストへ転送するため、
 // ここでは preventDefault のみ行い stopPropagation はしない (転送を妨げない)。
 
-export function installWebviewGuard(): void {
+/** ローカル UI 操作ホットキーの種別。 */
+export type LocalHotkey = "toggle-stats" | "toggle-bar";
+
+export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): void {
   // 右クリックメニュー無効化。
   window.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -17,14 +20,34 @@ export function installWebviewGuard(): void {
     { passive: false, capture: true },
   );
 
-  // ブラウザ既定のキーショートカットを抑止する (capture 段階)。
+  // ブラウザ既定のショートカット抑止 + ローカルホットキー処理 (capture 段階)。
   window.addEventListener(
     "keydown",
     (e) => {
+      // Ctrl+Alt+Shift+<key> はローカル UI 操作に予約。ホストへ転送しない
+      // (stopImmediatePropagation で input.ts の window ハンドラより手前で握る)。
+      const hotkey = localHotkey(e);
+      if (hotkey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        onHotkey?.(hotkey);
+        return;
+      }
       if (shouldBlock(e)) e.preventDefault();
     },
     { capture: true },
   );
+}
+
+/** Ctrl+Alt+Shift+<key> のローカルホットキーを判定する。 */
+function localHotkey(e: KeyboardEvent): LocalHotkey | null {
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod || !e.altKey || !e.shiftKey) return null;
+  switch (e.code) {
+    case "KeyS": return "toggle-stats";
+    case "KeyB": return "toggle-bar";
+    default: return null;
+  }
 }
 
 /** ローカルで握りつぶすべきブラウザショートカットか判定する。 */

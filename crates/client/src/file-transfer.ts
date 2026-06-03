@@ -15,31 +15,37 @@ let downloadProgressEl: HTMLElement | null = null;
 let activeUploadId: number | null = null;
 let activeDownloadId: number | null = null;
 
-export function mountFileTransfer(form: HTMLElement): void {
-  const wrap = document.createElement("span");
-  wrap.style.cssText = "display:flex;gap:6px;align-items:center;margin-left:12px";
-  wrap.innerHTML = `
-    <input id="file-input" type="file" style="max-width:160px;color:#eee" />
-    <button type="button" id="send-file-btn">send</button>
-    <span id="file-progress" style="font-family:monospace;min-width:80px"></span>
-    <input id="download-path" type="text" placeholder="host file path" style="width:160px" />
-    <button type="button" id="download-file-btn">download</button>
-    <span id="download-progress" style="font-family:monospace;min-width:80px"></span>
-    <input id="share-root" type="text" placeholder="share folder (ProjFS)" style="width:180px" />
-    <button type="button" id="share-root-btn">share</button>
-    <span id="share-root-status" style="font-family:monospace;min-width:80px"></span>
+export function mountFileTransfer(panel: HTMLElement): void {
+  panel.innerHTML = `
+    <div class="section-title">upload to host</div>
+    <div class="row">
+      <input id="file-input" type="file" />
+      <button type="button" id="send-file-btn">send</button>
+      <span id="file-progress" class="progress"></span>
+    </div>
+    <div class="section-title">download from host</div>
+    <div class="row">
+      <input id="download-path" type="text" placeholder="host file path" />
+      <button type="button" id="download-file-btn">get</button>
+      <span id="download-progress" class="progress"></span>
+    </div>
+    <div class="section-title">share folder (ProjFS)</div>
+    <div class="row">
+      <input id="share-root" type="text" placeholder="share folder path" />
+      <button type="button" id="share-root-btn">share</button>
+      <span id="share-root-status" class="progress"></span>
+    </div>
   `;
-  form.appendChild(wrap);
 
-  uploadProgressEl = wrap.querySelector<HTMLElement>("#file-progress");
-  downloadProgressEl = wrap.querySelector<HTMLElement>("#download-progress");
-  const input = wrap.querySelector<HTMLInputElement>("#file-input");
-  const sendBtn = wrap.querySelector<HTMLButtonElement>("#send-file-btn");
-  const pathInput = wrap.querySelector<HTMLInputElement>("#download-path");
-  const dlBtn = wrap.querySelector<HTMLButtonElement>("#download-file-btn");
-  const shareInput = wrap.querySelector<HTMLInputElement>("#share-root");
-  const shareBtn = wrap.querySelector<HTMLButtonElement>("#share-root-btn");
-  const shareStatus = wrap.querySelector<HTMLElement>("#share-root-status");
+  uploadProgressEl = panel.querySelector<HTMLElement>("#file-progress");
+  downloadProgressEl = panel.querySelector<HTMLElement>("#download-progress");
+  const input = panel.querySelector<HTMLInputElement>("#file-input");
+  const sendBtn = panel.querySelector<HTMLButtonElement>("#send-file-btn");
+  const pathInput = panel.querySelector<HTMLInputElement>("#download-path");
+  const dlBtn = panel.querySelector<HTMLButtonElement>("#download-file-btn");
+  const shareInput = panel.querySelector<HTMLInputElement>("#share-root");
+  const shareBtn = panel.querySelector<HTMLButtonElement>("#share-root-btn");
+  const shareStatus = panel.querySelector<HTMLElement>("#share-root-status");
 
   shareBtn?.addEventListener("click", () => {
     const path = shareInput?.value?.trim();
