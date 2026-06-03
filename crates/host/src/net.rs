@@ -324,7 +324,7 @@ async fn handle_client(
     loop {
         tokio::select! {
             // 制御メッセージ受信
-            res = read_tcp_frame_into(&mut stream, &mut buf) => {
+            res = read_tcp_frame(&mut stream, &mut buf) => {
                 res?;
                 let mut plain = Vec::new();
                 let rx_nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
@@ -542,10 +542,6 @@ async fn send_control_msg(
     session.encrypt(nonce, &plain, &mut cipher)?;
     write_tcp_frame(stream, &cipher).await?;
     Ok(())
-}
-
-async fn read_tcp_frame_into(stream: &mut TcpStream, out: &mut Vec<u8>) -> Result<()> {
-    read_tcp_frame(stream, out).await
 }
 
 async fn read_tcp_frame(stream: &mut TcpStream, out: &mut Vec<u8>) -> Result<()> {

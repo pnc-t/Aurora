@@ -12,7 +12,7 @@ use std::time::Duration;
 use bincode::Options;
 use ddd_common::clipboard::{self, ClipboardHandle};
 use ddd_common::framing::{
-    AudioPacket, HEADER_LEN, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
 use ddd_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password};
 use ddd_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
@@ -1024,7 +1024,6 @@ async fn udp_reader_loop(
             continue;
         }
         cur_payload.extend_from_slice(pkt.payload);
-        let _ = HEADER_LEN; // (一応参照)
 
         if pkt.flags.contains(VideoPacketFlags::FRAME_END) {
             let mut out = Vec::with_capacity(3 + cur_payload.len());
