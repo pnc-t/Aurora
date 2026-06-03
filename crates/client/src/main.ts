@@ -8,13 +8,14 @@ import {
   type DisplayDto,
 } from "./ipc";
 import { handleVideoChunk, initDecoder, resetDecoder } from "./decoder";
-import { attachInput, detachInput } from "./input";
+import { attachInput, detachInput, isCaptured, setCaptureMode } from "./input";
 import { mountConnectionUi } from "./connection-ui";
 import { mountToolbar } from "./toolbar";
 import { initToast, showToast } from "./toast";
 import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./stats-overlay";
 import { handleFileResult, mountFileTransfer } from "./file-transfer";
 import { installWebviewGuard } from "./webview-guard";
+import { exitFullscreen, isFullscreen, toggleFullscreen } from "./fullscreen";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const overlay = document.getElementById("connect-overlay") as HTMLElement;
@@ -28,15 +29,32 @@ initDecoder(canvas);
 initToast(toastContainer);
 initStatsOverlay(statsHud);
 
-// ローカル UI ホットキー (Ctrl+Alt+Shift+S/B)。ブラウザ既定挙動も抑止する。
+// ローカル UI ホットキー (Ctrl+Alt+Shift+S/B/F/M, F11)。ブラウザ既定挙動も抑止する。
 installWebviewGuard((hotkey) => {
   if (hotkey === "toggle-stats") {
     toggleStats();
     toolbar.setStatsToggled((statsHud.classList.contains("visible")));
   } else if (hotkey === "toggle-bar") {
     toolbar.toggleBar();
+  } else if (hotkey === "toggle-fullscreen") {
+    void doToggleFullscreen();
+  } else if (hotkey === "toggle-capture") {
+    // 実状態は onCaptureChange で確定し、トースト/トグル表示を更新する。
+    setCaptureMode(!isCaptured());
   }
 });
+
+async function doToggleFullscreen(): Promise<void> {
+  const on = await toggleFullscreen();
+  toolbar.setFullscreenToggled(on);
+  showToast(on ? "fullscreen on" : "fullscreen off");
+}
+
+// input.ts のポインタロック状態変化をツールバー表示とトーストへ反映する。
+function onCaptureChange(captured: boolean): void {
+  toolbar.setCaptureToggled(captured);
+  showToast(captured ? "mouse captured (Esc to release)" : "mouse released");
+}
 
 let fileVisible = false;
 function setFilePanel(visible: boolean): void {
@@ -56,6 +74,8 @@ const toolbar = mountToolbar({
     toolbar.setStatsToggled(statsHud.classList.contains("visible"));
   },
   onToggleFilePanel: () => setFilePanel(!fileVisible),
+  onToggleFullscreen: () => void doToggleFullscreen(),
+  onToggleCapture: () => setCaptureMode(!isCaptured()),
 });
 
 // ファイル転送ポップオーバー。
@@ -86,7 +106,7 @@ function switchDisplay(d: DisplayDto): void {
   // 解像度/SPS が変わるためデコーダを作り直し、入力スケールを新ディスプレイへ更新。
   void selectDisplay(d.id);
   resetDecoder();
-  attachInput(canvas, { width: d.width, height: d.height });
+  attachInput(canvas, { width: d.width, height: d.height }, { onCaptureChange });
   canvas.focus();
   toolbar.setConnLabel(`${lastHost} · ${d.name} ${d.width}x${d.height}`);
   showToast(`switching to ${d.name} ${d.width}x${d.height}`);
@@ -95,9 +115,12 @@ function switchDisplay(d: DisplayDto): void {
 /** 切断処理 (ユーザー操作・ホスト切断の両方から呼ぶ)。 */
 function doDisconnect(reason: string): void {
   void disconnect();
-  detachInput();
+  detachInput(); // ポインタロックも解除される
   toolbar.setConnected(false);
+  toolbar.setCaptureToggled(false);
   setFilePanel(false);
+  // フルスクリーンを解除して接続カードを操作できるようにする。
+  void exitFullscreen().then(() => toolbar.setFullscreenToggled(isFullscreen()));
   clearStats();
   connectionUi.setConnecting(false);
   connectionUi.setStatus("");
@@ -121,7 +144,7 @@ function handleClientEvent(ev: ClientEvent): void {
       const d = ev.displays[0];
       if (d) {
         toolbar.setConnLabel(`${lastHost} · ${d.name} ${d.width}x${d.height}`);
-        attachInput(canvas, { width: d.width, height: d.height });
+        attachInput(canvas, { width: d.width, height: d.height }, { onCaptureChange });
         canvas.focus();
       } else {
         toolbar.setConnLabel(`${lastHost} · (no displays?)`);

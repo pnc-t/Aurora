@@ -5,6 +5,8 @@ import { sendInput, type InputEvent } from "./ipc";
 
 type DisplaySize = { width: number; height: number };
 
+type CaptureCallback = (captured: boolean) => void;
+
 const state: {
   canvas: HTMLCanvasElement | null;
   display: DisplaySize | null;
@@ -12,19 +14,32 @@ const state: {
   // 押下中の VK / マウスボタン。フォーカス喪失時に解放して残留を防ぐ。
   pressedKeys: Set<number>;
   pressedButtons: Set<"Left" | "Right" | "Middle">;
+  // ポインタロック (相対マウス) が有効か。pointerlockchange で更新する。
+  captured: boolean;
+  onCaptureChange: CaptureCallback | null;
 } = {
   canvas: null,
   display: null,
   enabled: false,
   pressedKeys: new Set(),
   pressedButtons: new Set(),
+  captured: false,
+  onCaptureChange: null,
 };
 
-export function attachInput(canvas: HTMLCanvasElement, display: DisplaySize): void {
+export function attachInput(
+  canvas: HTMLCanvasElement,
+  display: DisplaySize,
+  opts?: { onCaptureChange?: CaptureCallback },
+): void {
   detachInput();
   state.canvas = canvas;
   state.display = display;
   state.enabled = true;
+  state.onCaptureChange = opts?.onCaptureChange ?? null;
+
+  document.addEventListener("pointerlockchange", onPointerLockChange);
+  document.addEventListener("pointerlockerror", onPointerLockError);
 
   canvas.addEventListener("mousemove", onMouseMove);
   canvas.addEventListener("mousedown", onMouseDown);
@@ -49,10 +64,49 @@ export function detachInput(): void {
   window.removeEventListener("keydown", onKeyDown);
   window.removeEventListener("keyup", onKeyUp);
   window.removeEventListener("blur", releaseAllInput);
+  document.removeEventListener("pointerlockchange", onPointerLockChange);
+  document.removeEventListener("pointerlockerror", onPointerLockError);
   releaseAllInput();
+  // キャプチャ中なら解除する。
+  if (document.pointerLockElement) document.exitPointerLock();
+  state.captured = false;
   state.canvas = null;
   state.display = null;
   state.enabled = false;
+  state.onCaptureChange = null;
+}
+
+/** ポインタロック(相対マウス)モードの ON/OFF。実状態は pointerlockchange で確定する。 */
+export function setCaptureMode(on: boolean): void {
+  const canvas = state.canvas;
+  if (!canvas) return;
+  if (on) {
+    // ユーザージェスチャ起点でないと拒否されることがある (ホットキー/クリック由来で呼ぶ)。
+    void canvas.requestPointerLock();
+  } else if (document.pointerLockElement) {
+    document.exitPointerLock();
+  }
+}
+
+export function isCaptured(): boolean {
+  return state.captured;
+}
+
+function onPointerLockChange(): void {
+  state.captured = document.pointerLockElement === state.canvas;
+  // ロック解除時 (Esc 含む) に押下中マウスボタンが残らないよう解放。
+  if (!state.captured) {
+    for (const button of state.pressedButtons) {
+      dispatch({ MouseButton: { button, down: false } });
+    }
+    state.pressedButtons.clear();
+  }
+  state.onCaptureChange?.(state.captured);
+}
+
+function onPointerLockError(): void {
+  state.captured = false;
+  state.onCaptureChange?.(false);
 }
 
 /** 押下中の全キー / マウスボタンに up を送って残留を解消する。 */
@@ -100,6 +154,14 @@ function dispatch(ev: InputEvent): void {
 }
 
 function onMouseMove(e: MouseEvent): void {
+  if (state.captured) {
+    // ポインタロック中は相対移動 (movementX/Y) を送る。
+    const dx = e.movementX;
+    const dy = e.movementY;
+    if (dx === 0 && dy === 0) return;
+    dispatch({ MouseMoveRelative: { dx, dy } });
+    return;
+  }
   const p = toDisplayCoords(e);
   if (!p) return;
   dispatch({ MouseMove: p });

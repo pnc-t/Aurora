@@ -104,6 +104,22 @@ impl InputInjector for WinInjector {
                     Anonymous: INPUT_0 { mi },
                 })
             }
+            InputEvent::MouseMoveRelative { dx, dy } => {
+                // ポインタロック中の相対移動。ABSOLUTE を付けず MOUSEEVENTF_MOVE のみ。
+                // 注: Windows のポインタ加速がかかり 1:1 にはならない (MVP では許容)。
+                let mi = MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                self.send_one(INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 { mi },
+                })
+            }
             InputEvent::MouseButton { button, down } => {
                 let flag: MOUSE_EVENT_FLAGS = match (button, down) {
                     (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
