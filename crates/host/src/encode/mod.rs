@@ -42,6 +42,10 @@ pub enum PlatformEncoder {
 #[cfg(target_os = "windows")]
 impl PlatformEncoder {
     pub fn new(device: SharedDevice) -> anyhow::Result<Self> {
+        if std::env::var_os("DDD_FORCE_SW_ENCODER").is_some() {
+            tracing::warn!("DDD_FORCE_SW_ENCODER set: forcing software H.264 MFT");
+            return Ok(Self::Sw(mf::MfH264Encoder::new(device)?));
+        }
         match mf_hw::MfHwH264Encoder::new(device.clone()) {
             Ok(e) => {
                 tracing::info!("video encoder: hardware H.264 MFT (zero-copy NV12)");
