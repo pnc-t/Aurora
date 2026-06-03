@@ -370,9 +370,9 @@ pub async fn connect_to_host(
 pub async fn disconnect(state: tauri::State<'_, SessionState>) -> Result<(), String> {
     let mut guard = state.inner.lock().await;
     if let Some(s) = guard.take() {
-        for t in s.tasks {
-            t.abort();
-        }
+        // task abort だけでなくクリップボードスレッドにも shutdown を伝える
+        // (connect_to_host のセッション置換経路と同じ後始末に統一)。
+        s.shutdown();
     }
     Ok(())
 }
