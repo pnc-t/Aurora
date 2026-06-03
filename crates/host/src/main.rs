@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use ddd_common::noise::psk_from_password;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -22,12 +22,29 @@ use encode::{EncodedNal, PlatformEncoder, VideoEncoder};
 use input::{DisplayGeom, InputInjector, PlatformInjector};
 use net::{EncoderCommand, InputCmd, ServerConfig};
 
-#[derive(Debug, Default)]
+/// 既定の送出フレームレート上限 (PLAN.md の 60fps 目標)。
+const DEFAULT_FPS_CAP: u32 = 60;
+
+#[derive(Debug)]
 struct Args {
     dump_bmp: bool,
     dump_h264: Option<usize>,
     /// エンコード遅延・ソースビットレートを 1 秒窓で info ログに出す。
     perf: bool,
+    /// 送出フレームレート上限 (fps)。0 で無制限。高リフレッシュレートモニタで
+    /// クライアントのデコードを溢れさせ遅延が累積するのを防ぐ。
+    fps_cap: u32,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            dump_bmp: false,
+            dump_h264: None,
+            perf: false,
+            fps_cap: DEFAULT_FPS_CAP,
+        }
+    }
 }
 
 fn parse_args() -> Args {
@@ -43,6 +60,12 @@ fn parse_args() -> Args {
                     .and_then(|s| s.parse().ok())
                     .expect("--dump-h264 requires N");
                 args.dump_h264 = Some(n);
+            }
+            "--fps" => {
+                args.fps_cap = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--fps requires N (0 = uncapped)");
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -66,7 +89,7 @@ fn main() -> Result<()> {
         return dump_h264(n);
     }
 
-    run_server(args.perf)
+    run_server(args.perf, args.fps_cap)
 }
 
 fn dump_one_bmp() -> Result<()> {
@@ -114,7 +137,7 @@ fn dump_h264(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_server(perf: bool) -> Result<()> {
+fn run_server(perf: bool, fps_cap: u32) -> Result<()> {
     let password: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(10)
@@ -175,11 +198,23 @@ fn run_server(perf: bool) -> Result<()> {
 
     // capture スレッド: 選択ディスプレイをキャプチャし、(再)構築直後の実解像度を res_tx で通知。
     let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
+    if fps_cap == 0 {
+        tracing::info!("frame rate cap: uncapped");
+    } else {
+        tracing::info!(fps = fps_cap, "frame rate cap");
+    }
     let cap_device = device.clone();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(cap_device, frame_tx, res_tx, cap_select_rx, initial_id) {
+            if let Err(e) = capture_loop(
+                cap_device,
+                frame_tx,
+                res_tx,
+                cap_select_rx,
+                initial_id,
+                fps_cap,
+            ) {
                 tracing::error!(error = %e, "capture loop ended");
             }
         })?;
@@ -247,10 +282,25 @@ fn capture_loop(
     res_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
     select_rx: std::sync::mpsc::Receiver<u32>,
     initial_id: u32,
+    fps_cap: u32,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
     #[cfg(target_os = "windows")]
     capture::device::init_thread_com()?;
+
+    // 送出ペーシング: 高リフレッシュレートモニタだと next_frame が毎リフレッシュ
+    // (例 144Hz) でフレームを返し、全部 encode/送信するとクライアントのデコードが
+    // 追いつかずバックログが累積して遅延が増える。前回送出から min_interval 経過した
+    // フレームだけを encode 側へ流す (0 = 無制限)。
+    let min_interval = if fps_cap == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(1.0 / fps_cap as f64)
+    };
+    // 初回フレームは即送出できるよう過去側に倒しておく。
+    let mut last_sent = Instant::now()
+        .checked_sub(min_interval)
+        .unwrap_or_else(Instant::now);
 
     let mut cur_id = initial_id;
     let mut cap = PlatformCapturer::new_for_output(device.clone(), cur_id)?;
@@ -278,8 +328,14 @@ fn capture_loop(
                 let _ = res_tx.try_send((f.width, f.height));
                 reported = true;
             }
-            // try_send: バックプレッシャ。詰まったら捨てる。更新なしのときは None
-            let _ = tx.try_send(f);
+            // fps 上限ペーシング: 間隔未満のフレームは捨てる (最新フレームを送るため
+            // ここで間引く)。0 (無制限) のときは常に送る。
+            let now = Instant::now();
+            if min_interval.is_zero() || now.duration_since(last_sent) >= min_interval {
+                last_sent = now;
+                // try_send: バックプレッシャ。詰まったら捨てる。更新なしのときは None
+                let _ = tx.try_send(f);
+            }
         }
     }
 }
