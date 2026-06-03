@@ -11,7 +11,6 @@ type State = {
   configured: boolean;
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D | null;
-  pendingFrames: number;
 };
 
 const state: State = {
@@ -19,7 +18,6 @@ const state: State = {
   configured: false,
   canvas: null as unknown as HTMLCanvasElement,
   ctx: null,
-  pendingFrames: 0,
 };
 
 export function initDecoder(canvas: HTMLCanvasElement): void {
@@ -41,11 +39,9 @@ export function resetDecoder(): void {
     },
   });
   state.configured = false;
-  state.pendingFrames = 0;
 }
 
 function onFrame(frame: VideoFrame): void {
-  state.pendingFrames = Math.max(0, state.pendingFrames - 1);
   const canvas = state.canvas;
   const ctx = state.ctx;
   if (!canvas || !ctx) {
@@ -146,7 +142,6 @@ export function handleVideoChunk(buf: ArrayBuffer): void {
       timestamp: performance.now() * 1000,
       data: annexB,
     });
-    state.pendingFrames += 1;
     state.decoder.decode(chunk);
   } catch (e) {
     console.error("decode failed", e);
