@@ -507,10 +507,18 @@ async fn encrypt_udp(
     Ok(dgram)
 }
 
+/// クライアントの UDP "DDDHELLO" を待ち、対向アドレスを確定する。
+///
+/// hello は単発 UDP のためロスしうる。クライアントは映像受信が始まるまで再送するので、
+/// ここでは各受信に上限を設けるだけにし、長時間 hello が来なければ Err を返して
+/// セッションを諦める (無限ブロックで accept ループまで止めない安全弁)。
 async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
+    use std::time::Duration;
     let mut buf = [0u8; 64];
     loop {
-        let (n, src) = udp.recv_from(&mut buf).await?;
+        let (n, src) = tokio::time::timeout(Duration::from_secs(30), udp.recv_from(&mut buf))
+            .await
+            .context("timed out waiting for UDP hello")??;
         if &buf[..n] == b"DDDHELLO" {
             return Ok(src);
         }
