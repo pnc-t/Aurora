@@ -1,10 +1,20 @@
 //! UDP映像フレーミング。1パケット = ヘッダ(7B) + payload。
+//!
+//! 実際に送出される UDP データグラムは、この framed バイト列に net 層で
+//! `[平文 nonce 8B] + [ストリームタグ 1B] + framed + [Poly1305 タグ 16B]` が
+//! 付く。`MAX_PAYLOAD` はこれらを `MAX_MTU` から差し引いて算出し、暗号化後の
+//! データグラムが MTU (Tailscale 1280 を想定した安全側 1200) を超えないようにする。
 
 use thiserror::Error;
 
 pub const HEADER_LEN: usize = 7;
 pub const MAX_MTU: usize = 1200;
-pub const MAX_PAYLOAD: usize = MAX_MTU - HEADER_LEN;
+/// net 層が 1 データグラムに足す固定オーバーヘッド: 先頭平文 nonce 8B +
+/// ストリームタグ 1B + AEAD (Poly1305) タグ 16B。
+pub const DATAGRAM_OVERHEAD: usize = 8 + 1 + 16;
+/// 1 パケットの最大 payload。最大ストリームヘッダ (映像 `HEADER_LEN`) と
+/// `DATAGRAM_OVERHEAD` を MTU から引く (音声ヘッダ 4B はこれより小さく安全側)。
+pub const MAX_PAYLOAD: usize = MAX_MTU - DATAGRAM_OVERHEAD - HEADER_LEN;
 
 /// UDP メディア多重化のストリーム種別タグ。暗号化前 plaintext の先頭 1B に付ける。
 /// 映像と音声は同一 UDP ソケット・同一 Noise セッションに相乗りする。
