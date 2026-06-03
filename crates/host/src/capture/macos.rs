@@ -142,11 +142,12 @@ fn sample_to_frame(sample: &CMSampleBuffer) -> Option<Frame> {
 
 impl ScreenCaptureKitCapturer {
     /// macOS は MVP では primary 固定。出力インデックスは無視する。
-    pub fn new_for_output(_output_index: u32) -> Result<Self> {
-        Self::new_primary()
+    /// `_device` は Windows 専用の共有 D3D11 デバイス (macOS では `()`)。
+    pub fn new_for_output(_device: super::SharedDevice, _output_index: u32) -> Result<Self> {
+        Self::new_primary(_device)
     }
 
-    pub fn new_primary() -> Result<Self> {
+    pub fn new_primary(_device: super::SharedDevice) -> Result<Self> {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);
 
         let display = primary_display()?;

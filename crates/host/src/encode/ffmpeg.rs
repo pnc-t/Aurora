@@ -53,7 +53,8 @@ struct Inner {
 }
 
 impl FfmpegH264Encoder {
-    pub fn new() -> Result<Self> {
+    /// `_device` は Windows 専用の共有 D3D11 デバイス (mac/linux では `()`)。
+    pub fn new(_device: crate::capture::SharedDevice) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
         Ok(Self {
             inner: None,

@@ -53,11 +53,12 @@ struct UserData {
 
 impl PipewireCapturer {
     /// Linux はポータルがソースを選ぶため出力インデックスは無視し primary を開く。
-    pub fn new_for_output(_output_index: u32) -> Result<Self> {
-        Self::new_primary()
+    /// `_device` は Windows 専用の共有 D3D11 デバイス (Linux では `()`)。
+    pub fn new_for_output(_device: super::SharedDevice, _output_index: u32) -> Result<Self> {
+        Self::new_primary(_device)
     }
 
-    pub fn new_primary() -> Result<Self> {
+    pub fn new_primary(_device: super::SharedDevice) -> Result<Self> {
         // フレーム送出用。詰まったら捨てる (try_send) ためのバウンデッドチャネル。
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);
         // セットアップ (ポータル交渉 + Stream 接続) の成否を同期的に受け取る。

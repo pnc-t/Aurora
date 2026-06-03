@@ -70,11 +70,13 @@ fn main() -> Result<()> {
 }
 
 fn dump_one_bmp() -> Result<()> {
-    let mut cap = PlatformCapturer::new_primary()?;
+    let device = capture::create_shared_device()?;
+    let mut cap = PlatformCapturer::new_primary(device.clone())?;
     // 最初は更新がない場合があるので数回試す
     for _ in 0..30 {
         if let Some(frame) = cap.next_frame(Duration::from_millis(200))? {
-            write_bmp("capture.bmp", &frame)?;
+            let bgra = frame_to_bgra(&device, &frame)?;
+            write_bmp("capture.bmp", frame.width, frame.height, &bgra)?;
             tracing::info!(w = frame.width, h = frame.height, "captured -> capture.bmp");
             return Ok(());
         }
@@ -83,8 +85,9 @@ fn dump_one_bmp() -> Result<()> {
 }
 
 fn dump_h264(n: usize) -> Result<()> {
-    let mut cap = PlatformCapturer::new_primary()?;
-    let mut enc = PlatformEncoder::new()?;
+    let device = capture::create_shared_device()?;
+    let mut cap = PlatformCapturer::new_primary(device.clone())?;
+    let mut enc = PlatformEncoder::new(device)?;
     let mut out = std::fs::File::create("out.h264").context("create out.h264")?;
     use std::io::Write;
 
@@ -144,6 +147,10 @@ fn run_server(perf: bool) -> Result<()> {
     // 初期キャプチャ対象 (先頭 = primary)。
     let initial_id = displays[0].id;
 
+    // capture・convert・encode で共有する D3D11 デバイスを 1 つだけ生成する
+    // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
+    let device = capture::create_shared_device()?;
+
     let (frame_tx, frame_rx) = mpsc::channel::<Frame>(2);
     let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
     let (enc_cmd_tx, enc_cmd_rx) = mpsc::channel::<EncoderCommand>(8);
@@ -168,10 +175,11 @@ fn run_server(perf: bool) -> Result<()> {
 
     // capture スレッド: 選択ディスプレイをキャプチャし、(再)構築直後の実解像度を res_tx で通知。
     let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
+    let cap_device = device.clone();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(frame_tx, res_tx, cap_select_rx, initial_id) {
+            if let Err(e) = capture_loop(cap_device, frame_tx, res_tx, cap_select_rx, initial_id) {
                 tracing::error!(error = %e, "capture loop ended");
             }
         })?;
@@ -196,7 +204,7 @@ fn run_server(perf: bool) -> Result<()> {
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
-            if let Err(e) = encode_loop(frame_rx, nal_tx, enc_cmd_rx, perf) {
+            if let Err(e) = encode_loop(device, frame_rx, nal_tx, enc_cmd_rx, perf) {
                 tracing::error!(error = %e, "encode loop ended");
             }
         })?;
@@ -234,19 +242,24 @@ fn run_server(perf: bool) -> Result<()> {
 }
 
 fn capture_loop(
+    device: capture::SharedDevice,
     tx: mpsc::Sender<Frame>,
     res_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
     select_rx: std::sync::mpsc::Receiver<u32>,
     initial_id: u32,
 ) -> Result<()> {
+    // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
+    #[cfg(target_os = "windows")]
+    capture::device::init_thread_com()?;
+
     let mut cur_id = initial_id;
-    let mut cap = PlatformCapturer::new_for_output(cur_id)?;
+    let mut cap = PlatformCapturer::new_for_output(device.clone(), cur_id)?;
     let mut reported = false;
     loop {
         // ディスプレイ切替要求を吸う。新規 capturer 構築に失敗したら現状維持。
         while let Ok(id) = select_rx.try_recv() {
             if id != cur_id {
-                match PlatformCapturer::new_for_output(id) {
+                match PlatformCapturer::new_for_output(device.clone(), id) {
                     Ok(c) => {
                         cap = c;
                         cur_id = id;
@@ -290,12 +303,13 @@ fn input_loop(mut rx: mpsc::Receiver<InputCmd>, initial_geom: DisplayGeom) -> Re
 }
 
 fn encode_loop(
+    device: capture::SharedDevice,
     mut frame_rx: mpsc::Receiver<Frame>,
     nal_tx: mpsc::Sender<EncodedNal>,
     mut cmd_rx: mpsc::Receiver<EncoderCommand>,
     perf: bool,
 ) -> Result<()> {
-    let mut enc = PlatformEncoder::new()?;
+    let mut enc = PlatformEncoder::new(device)?;
     let mut meter = perf.then(perf::EncodeMeter::new);
     // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
     let mut nals: Vec<EncodedNal> = Vec::new();
@@ -339,11 +353,22 @@ fn encode_loop(
     }
 }
 
-/// 24bit BMP (BGR, ボトムアップ) を保存。
-fn write_bmp(path: &str, frame: &Frame) -> Result<()> {
+/// デバッグ用: `Frame` を行詰め BGRA8 に変換する。Windows は NV12 テクスチャを読み戻し、
+/// 他 OS は保持済みの BGRA をそのまま返す。
+#[cfg(target_os = "windows")]
+fn frame_to_bgra(device: &capture::SharedDevice, frame: &Frame) -> Result<Vec<u8>> {
+    capture::debug_frame_to_bgra(device, frame)
+}
+#[cfg(not(target_os = "windows"))]
+fn frame_to_bgra(_device: &capture::SharedDevice, frame: &Frame) -> Result<Vec<u8>> {
+    Ok(frame.bgra.clone())
+}
+
+/// 24bit BMP (BGR, ボトムアップ) を保存。`bgra` は `width*4` 行詰めの BGRA8。
+fn write_bmp(path: &str, width: u32, height: u32, bgra: &[u8]) -> Result<()> {
     use std::io::Write;
-    let w = frame.width as i32;
-    let h = frame.height as i32;
+    let w = width as i32;
+    let h = height as i32;
     let row_bytes = ((w * 3 + 3) / 4) * 4;
     let pixel_bytes = (row_bytes * h) as u32;
     let file_size: u32 = 14 + 40 + pixel_bytes;
@@ -367,10 +392,10 @@ fn write_bmp(path: &str, frame: &Frame) -> Result<()> {
     f.write_all(&0u32.to_le_bytes())?;
     f.write_all(&0u32.to_le_bytes())?;
     // ピクセル (ボトムアップ)
-    let stride = frame.stride as usize;
+    let stride = w as usize * 4;
     let pad = vec![0u8; (row_bytes as usize) - (w as usize * 3)];
     for y in (0..h as usize).rev() {
-        let row = &frame.bgra[y * stride..y * stride + w as usize * 4];
+        let row = &bgra[y * stride..y * stride + w as usize * 4];
         let mut bgr = Vec::with_capacity(w as usize * 3);
         for px in row.chunks_exact(4) {
             bgr.push(px[0]);
