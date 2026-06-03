@@ -11,6 +11,8 @@ type ToolbarOpts = {
   onSelectDisplay: (display: DisplayDto) => void;
   onToggleStats: () => void;
   onToggleFilePanel: () => void;
+  onToggleFullscreen: () => void;
+  onToggleCapture: () => void;
 };
 
 export type ToolbarHandle = {
@@ -18,6 +20,8 @@ export type ToolbarHandle = {
   setDisplays: (displays: DisplayDto[], selectedId?: number) => void;
   setStatsToggled: (on: boolean) => void;
   setFileToggled: (on: boolean) => void;
+  setFullscreenToggled: (on: boolean) => void;
+  setCaptureToggled: (on: boolean) => void;
   toggleBar: () => void;
   setConnected: (connected: boolean) => void;
 };
@@ -28,6 +32,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     <span id="display-wrap">display
       <select id="display-select"></select>
     </span>
+    <button type="button" id="tb-capture" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">capture</button>
+    <button type="button" id="tb-fullscreen" title="フルスクリーン (Ctrl+Alt+Shift+F / F11)">fullscreen</button>
     <button type="button" id="tb-files">files</button>
     <button type="button" id="tb-stats" title="Ctrl+Alt+Shift+S">stats</button>
     <span class="spacer"></span>
@@ -40,6 +46,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const displaySelect = opts.topbar.querySelector<HTMLSelectElement>("#display-select");
   const filesBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-files");
   const statsBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-stats");
+  const captureBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-capture");
+  const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const connLabel = opts.topbar.querySelector<HTMLElement>("#conn-label");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
 
@@ -78,6 +86,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   disconnectBtn?.addEventListener("click", () => opts.onDisconnect());
   filesBtn?.addEventListener("click", () => opts.onToggleFilePanel());
   statsBtn?.addEventListener("click", () => opts.onToggleStats());
+  captureBtn?.addEventListener("click", () => opts.onToggleCapture());
+  fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
   pinBtn?.addEventListener("click", () => {
     pinned = !pinned;
     pinBtn.classList.toggle("toggled", pinned);
@@ -109,6 +119,12 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     },
     setFileToggled(on: boolean): void {
       filesBtn?.classList.toggle("toggled", on);
+    },
+    setFullscreenToggled(on: boolean): void {
+      fullscreenBtn?.classList.toggle("toggled", on);
+    },
+    setCaptureToggled(on: boolean): void {
+      captureBtn?.classList.toggle("toggled", on);
     },
     toggleBar(): void {
       if (!connected) return;

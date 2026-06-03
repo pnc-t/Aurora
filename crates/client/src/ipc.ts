@@ -20,7 +20,8 @@ export type InputEvent =
   | { MouseMove: { x: number; y: number } }
   | { MouseButton: { button: "Left" | "Right" | "Middle"; down: boolean } }
   | { MouseWheel: { delta: number; horizontal: boolean } }
-  | { Key: { vk: number; down: boolean } };
+  | { Key: { vk: number; down: boolean } }
+  | { MouseMoveRelative: { dx: number; dy: number } };
 
 export async function connectToHost(
   host: string,

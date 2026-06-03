@@ -67,6 +67,19 @@ impl super::InputInjector for CgEventInjector {
                 };
                 self.post_mouse(ty, CGMouseButton::Left)
             }
+            InputEvent::MouseMoveRelative { dx, dy } => {
+                // ポインタロック中の相対移動。CGEvent は絶対座標モデルのため、保持中の
+                // last_x/last_y に加算してクランプし MouseMoved(押下中は Dragged) を post。
+                // (真の無限キャプチャにはならない best-effort。mac は未検証扱い)
+                self.last_x = (self.last_x + dx as f64).clamp(0.0, self.width - 1.0);
+                self.last_y = (self.last_y + dy as f64).clamp(0.0, self.height - 1.0);
+                let ty = if self.left_down {
+                    CGEventType::LeftMouseDragged
+                } else {
+                    CGEventType::MouseMoved
+                };
+                self.post_mouse(ty, CGMouseButton::Left)
+            }
             InputEvent::MouseButton { button, down } => {
                 let (ty, cg_btn) = match (button, down) {
                     (MouseButton::Left, true) => {

@@ -19,10 +19,28 @@ pub enum MouseButton {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    MouseMove { x: i32, y: i32 },
-    MouseButton { button: MouseButton, down: bool },
-    MouseWheel { delta: i32, horizontal: bool },
-    Key { vk: u32, down: bool },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+    },
+    MouseWheel {
+        delta: i32,
+        horizontal: bool,
+    },
+    Key {
+        vk: u32,
+        down: bool,
+    },
+    /// ポインタロック(キャプチャ)モードの相対移動量。クライアントの Pointer Lock API
+    /// が返す `movementX/Y` をそのまま運ぶ。bincode タグ互換のため必ず末尾に置く。
+    MouseMoveRelative {
+        dx: i32,
+        dy: i32,
+    },
 }
 
 /// ディレクトリ列挙の 1 エントリ (ProjFS ドライブリダイレクト用)。

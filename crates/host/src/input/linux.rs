@@ -51,10 +51,12 @@ impl UinputInjector {
         keys.insert(Key(BTN_RIGHT));
         keys.insert(Key(BTN_MIDDLE));
 
-        // 相対軸: ホイール (縦/横)。
+        // 相対軸: ホイール (縦/横) + 相対移動 (ポインタロック用)。
         let mut rel = AttributeSet::<RelativeAxisType>::new();
         rel.insert(RelativeAxisType::REL_WHEEL);
         rel.insert(RelativeAxisType::REL_HWHEEL);
+        rel.insert(RelativeAxisType::REL_X);
+        rel.insert(RelativeAxisType::REL_Y);
 
         let abs_x = UinputAbsSetup::new(
             AbsoluteAxisType::ABS_X,
@@ -106,6 +108,15 @@ impl super::InputInjector for UinputInjector {
                         InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, cy),
                     ])
                     .context("emit mouse move")
+            }
+            ProtoInput::MouseMoveRelative { dx, dy } => {
+                // ポインタロック中の相対移動を REL_X/REL_Y で注入。
+                self.device
+                    .emit(&[
+                        InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_X.0, dx),
+                        InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_Y.0, dy),
+                    ])
+                    .context("emit relative move")
             }
             ProtoInput::MouseButton { button, down } => {
                 let code = match button {
