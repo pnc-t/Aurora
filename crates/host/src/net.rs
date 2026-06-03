@@ -14,7 +14,7 @@ use ddd_common::noise::{
 use ddd_common::proto::{ControlMsg, Display, InputEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use crate::audio::EncodedAudio;
 use crate::capture::DisplayInfo;
@@ -280,7 +280,9 @@ async fn handle_client(
     read_tcp_frame(&mut stream, &mut buf).await?;
     hs.read_msg(&buf, &mut tmp)?;
 
-    let session = Arc::new(Mutex::new(hs.into_transport()?));
+    // session は単一 handle_client タスク内でのみ使う。snow の StatelessTransportState は
+    // encrypt/decrypt とも &self なので Arc<Mutex> は不要 (映像 UDP のパケット毎ロックを排除)。
+    let session = hs.into_transport()?;
     tracing::info!(peer = %peer, "noise handshake complete");
 
     // TCP 制御チャネルの nonce カウンタ (CTRL ドメイン)。送受で別カウンタを持ち、
@@ -327,7 +329,7 @@ async fn handle_client(
                 let mut plain = Vec::new();
                 let rx_nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
                 tcp_rx_nonce += 1;
-                session.lock().await.decrypt(rx_nonce, &buf, &mut plain)?;
+                session.decrypt(rx_nonce, &buf, &mut plain)?;
                 let msg: ControlMsg = bincode_opts.deserialize(&plain)
                     .context("decode ControlMsg")?;
                 match msg {
@@ -468,7 +470,7 @@ async fn handle_client(
                     let mut framed = Vec::with_capacity(chunk.len() + 7);
                     pkt.encode(&mut framed).context("encode VideoPacket")?;
                     let nonce = NONCE_DOMAIN_VIDEO | seq as u64;
-                    let dgram = encrypt_udp(&session, nonce, STREAM_VIDEO, &framed).await?;
+                    let dgram = encrypt_udp(&session, nonce, STREAM_VIDEO, &framed)?;
                     udp.send_to(&dgram, peer_udp).await.context("UDP send")?;
                     seq = seq.wrapping_add(1);
                     first = false;
@@ -480,7 +482,7 @@ async fn handle_client(
                 let mut framed = Vec::with_capacity(au.data.len() + 4);
                 pkt.encode(&mut framed).context("encode AudioPacket")?;
                 let nonce = NONCE_DOMAIN_AUDIO | au.seq as u64;
-                let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed).await?;
+                let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed)?;
                 udp.send_to(&dgram, peer_udp).await.context("UDP send audio")?;
             }
         }
@@ -492,8 +494,8 @@ async fn handle_client(
 /// plaintext は `[stream tag(1B)] + framed` を `nonce` で暗号化し、受信側が復号前に
 /// nonce を知れるよう **暗号文の前に nonce を 8B (BE) 平文で付与**する。
 /// 出力: `[nonce(8B BE)] + [ciphertext]`。
-async fn encrypt_udp(
-    session: &Arc<Mutex<TransportSession>>,
+fn encrypt_udp(
+    session: &TransportSession,
     nonce: u64,
     stream: u8,
     framed: &[u8],
@@ -503,7 +505,7 @@ async fn encrypt_udp(
     plain.extend_from_slice(framed);
     let mut dgram = Vec::with_capacity(8 + plain.len() + 16);
     dgram.extend_from_slice(&nonce.to_be_bytes());
-    session.lock().await.encrypt(nonce, &plain, &mut dgram)?;
+    session.encrypt(nonce, &plain, &mut dgram)?;
     Ok(dgram)
 }
 
@@ -528,7 +530,7 @@ async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
 
 async fn send_control_msg(
     stream: &mut TcpStream,
-    session: &Arc<Mutex<TransportSession>>,
+    session: &TransportSession,
     msg: &ControlMsg,
     tcp_tx_nonce: &mut u64,
 ) -> Result<()> {
@@ -537,7 +539,7 @@ async fn send_control_msg(
     let nonce = NONCE_DOMAIN_CTRL | *tcp_tx_nonce;
     *tcp_tx_nonce += 1;
     let mut cipher = Vec::new();
-    session.lock().await.encrypt(nonce, &plain, &mut cipher)?;
+    session.encrypt(nonce, &plain, &mut cipher)?;
     write_tcp_frame(stream, &cipher).await?;
     Ok(())
 }

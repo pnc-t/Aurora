@@ -185,7 +185,10 @@ pub async fn connect_to_host(
     hs.write_msg(&[], &mut out_msg).map_err(err)?;
     write_tcp_frame(&mut tcp, &out_msg).await.map_err(err)?;
 
-    let session = Arc::new(Mutex::new(hs.into_transport().map_err(err)?));
+    // snow の StatelessTransportState は encrypt/decrypt とも &self なので、
+    // 複数タスク (writer/reader/udp) 間の共有は Arc だけで足り Mutex は不要。
+    // 映像 UDP のパケット毎 decrypt が TCP 制御とロック競合しなくなる。
+    let session = Arc::new(hs.into_transport().map_err(err)?);
     tracing::info!("noise handshake complete");
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
@@ -193,8 +196,6 @@ pub async fn connect_to_host(
     read_tcp_frame(&mut tcp, &mut buf).await.map_err(err)?;
     let mut plain = Vec::new();
     session
-        .lock()
-        .await
         .decrypt(NONCE_DOMAIN_CTRL, &buf, &mut plain)
         .map_err(err)?;
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
@@ -475,7 +476,7 @@ async fn send_file_msg(
 
 async fn tcp_writer_loop(
     mut write_half: OwnedWriteHalf,
-    session: Arc<Mutex<TransportSession>>,
+    session: Arc<TransportSession>,
     mut ctrl_rx: mpsc::UnboundedReceiver<ControlMsg>,
     mut file_rx: mpsc::Receiver<ControlMsg>,
 ) -> anyhow::Result<()> {
@@ -494,7 +495,7 @@ async fn tcp_writer_loop(
         let nonce = NONCE_DOMAIN_CTRL | tcp_tx_nonce;
         tcp_tx_nonce += 1;
         let mut cipher = Vec::new();
-        session.lock().await.encrypt(nonce, &plain, &mut cipher)?;
+        session.encrypt(nonce, &plain, &mut cipher)?;
         write_tcp_frame(&mut write_half, &cipher).await?;
     }
     Ok(())
@@ -526,7 +527,7 @@ async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> 
 #[allow(clippy::too_many_arguments)]
 async fn tcp_reader_loop(
     mut read_half: OwnedReadHalf,
-    session: Arc<Mutex<TransportSession>>,
+    session: Arc<TransportSession>,
     event_channel: Channel<ClientEvent>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     stats: Arc<StatsCollector>,
@@ -545,7 +546,7 @@ async fn tcp_reader_loop(
         plain.clear();
         let nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
         tcp_rx_nonce += 1;
-        session.lock().await.decrypt(nonce, &buf, &mut plain)?;
+        session.decrypt(nonce, &buf, &mut plain)?;
         let msg: ControlMsg = opts.deserialize(&plain)?;
         match msg {
             ControlMsg::Pong { ts_us } => {
@@ -901,7 +902,7 @@ async fn fs_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
 ///   [3..]  Annex-B H.264 NALU
 async fn udp_reader_loop(
     udp: Arc<UdpSocket>,
-    session: Arc<Mutex<TransportSession>>,
+    session: Arc<TransportSession>,
     video_channel: Channel<InvokeResponseBody>,
     audio_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     stats: Arc<StatsCollector>,
@@ -950,8 +951,6 @@ async fn udp_reader_loop(
         let nonce = u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
         plain.clear();
         if session
-            .lock()
-            .await
             .decrypt(nonce, &recv_buf[8..n], &mut plain)
             .is_err()
         {
