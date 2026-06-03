@@ -11,9 +11,7 @@ use std::time::Duration;
 
 use bincode::Options;
 use ddd_common::clipboard::{self, ClipboardHandle};
-use ddd_common::framing::{
-    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
-};
+use ddd_common::framing::{AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags};
 use ddd_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password};
 use ddd_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use serde::Serialize;
@@ -950,10 +948,7 @@ async fn udp_reader_loop(
         }
         let nonce = u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
         plain.clear();
-        if session
-            .decrypt(nonce, &recv_buf[8..n], &mut plain)
-            .is_err()
-        {
+        if session.decrypt(nonce, &recv_buf[8..n], &mut plain).is_err() {
             // 復号失敗パケットは捨てる
             continue;
         }
