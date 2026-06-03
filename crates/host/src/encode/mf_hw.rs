@@ -66,6 +66,14 @@ struct Inner {
 impl MfHwH264Encoder {
     pub fn new(device: SharedDevice) -> Result<Self> {
         crate::capture::device::init_thread_com()?;
+        // 起動時に HW H.264 エンコーダの存在を確認する。無ければ Err を返し、呼び出し側
+        // (PlatformEncoder::new) が SW MFT へフォールバックできるようにする。ここで確認
+        // しないと、HW なし環境で push_frame が毎フレーム失敗し続けてフォールバックが
+        // 発動しない (実 MFT は解像度確定後に Inner::new で改めて構築する)。列挙のみで
+        // インスタンス化はしない (エンコーダセッションを二重に確保しないため)。
+        if !hw_h264_encoder_present()? {
+            return Err(anyhow!("no hardware H.264 encoder MFT found"));
+        }
         Ok(Self {
             device,
             inner: None,
@@ -372,6 +380,31 @@ impl Drop for Inner {
 // SAFETY: MfHwH264Encoder は encode スレッドでのみ使用される。COM は MTA、共有デバイスは
 // multithread-protected。別スレッドへの move は安全 (MfH264Encoder と同じ流儀)。
 unsafe impl Send for MfHwH264Encoder {}
+
+/// HW H.264 エンコーダ MFT が 1 つ以上存在するか (インスタンス化せず列挙のみ)。
+fn hw_h264_encoder_present() -> Result<bool> {
+    let out_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
+    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    // SAFETY: MFTEnumEx は activate 配列 (CoTaskMem) と件数を OUT で返す。
+    unsafe {
+        mft_enum_ex_call(flags, &out_info, &mut activates, &mut count)?;
+        if !activates.is_null() {
+            // 列挙された IMFActivate を解放してから配列メモリを返す。
+            let slice = std::slice::from_raw_parts_mut(activates, count as usize);
+            for slot in slice.iter_mut() {
+                let _ = slot.take(); // drop = Release
+            }
+            CoTaskMemFree(Some(activates as *const _ as *const std::ffi::c_void));
+        }
+    }
+    Ok(count > 0)
+}
 
 /// HW H.264 エンコーダ MFT を `MFTEnumEx` で 1 つ選び、(transform, friendly name) を返す。
 fn enum_hw_encoder() -> Result<(IMFTransform, String)> {
