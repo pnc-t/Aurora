@@ -34,8 +34,8 @@ use windows::core::{Interface, PWSTR};
 use crate::capture::Frame;
 use crate::capture::SharedDevice;
 use crate::encode::mf::{
-    FRAME_DURATION_100NS, is_keyframe_annexb, make_h264_output_type, make_nv12_input_type,
-    variant_u32,
+    FRAME_DURATION_100NS, configure_rate_control, is_keyframe_annexb, make_h264_output_type,
+    make_nv12_input_type, variant_u32,
 };
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
@@ -50,6 +50,8 @@ pub struct MfHwH264Encoder {
     device: SharedDevice,
     inner: Option<Inner>,
     bitrate: u32,
+    /// ピーク (最大) ビットレート上限 (bps)。PeakConstrainedVBR の上限。
+    max_bitrate: u32,
     frame_id: u16,
     force_keyframe: bool,
 }
@@ -72,7 +74,7 @@ struct Inner {
 }
 
 impl MfHwH264Encoder {
-    pub fn new(device: SharedDevice) -> Result<Self> {
+    pub fn new(device: SharedDevice, max_bitrate: u32) -> Result<Self> {
         crate::capture::device::init_thread_com()?;
         // 起動時に HW H.264 エンコーダの存在を確認する。無ければ Err を返し、呼び出し側
         // (PlatformEncoder::new) が SW MFT へフォールバックできるようにする。ここで確認
@@ -85,7 +87,8 @@ impl MfHwH264Encoder {
         Ok(Self {
             device,
             inner: None,
-            bitrate: DEFAULT_BITRATE_BPS,
+            bitrate: DEFAULT_BITRATE_BPS.min(max_bitrate),
+            max_bitrate,
             frame_id: 0,
             force_keyframe: true,
         })
@@ -103,7 +106,13 @@ impl MfHwH264Encoder {
                 bitrate = self.bitrate,
                 "building HW H.264 MFT"
             );
-            self.inner = Some(Inner::new(&self.device, width, height, self.bitrate)?);
+            self.inner = Some(Inner::new(
+                &self.device,
+                width,
+                height,
+                self.bitrate,
+                self.max_bitrate,
+            )?);
             self.force_keyframe = true;
         }
         Ok(())
@@ -111,7 +120,13 @@ impl MfHwH264Encoder {
 }
 
 impl Inner {
-    fn new(device: &SharedDevice, width: u32, height: u32, bitrate: u32) -> Result<Self> {
+    fn new(
+        device: &SharedDevice,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        max_bitrate: u32,
+    ) -> Result<Self> {
         let (transform, friendly) = enum_hw_encoder()?;
         tracing::info!(encoder = %friendly, "selected HW H.264 MFT");
 
@@ -151,14 +166,14 @@ impl Inner {
                 .context("SetInputType(NV12)")?;
         }
 
-        // ICodecAPI は任意。低遅延モード + ビットレートを設定する。
+        // ICodecAPI は任意。低遅延モード + レート制御 (PeakConstrainedVBR + 平均/ピーク) を設定。
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
-            // SAFETY: api live。VARIANT は VT_BOOL / VT_UI4 で有効。
+            // SAFETY: api live。VARIANT は VT_BOOL で有効。
             unsafe {
                 let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
-                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
             }
+            configure_rate_control(api, bitrate, max_bitrate);
         }
 
         let event_gen: IMFMediaEventGenerator = transform

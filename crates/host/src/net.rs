@@ -22,7 +22,7 @@ use crate::encode::EncodedNal;
 use crate::input::DisplayGeom;
 use crate::projfs::{self, FsBridge, FsReply};
 
-use crate::encode::{DEFAULT_BITRATE_BPS, MAX_BITRATE_BPS, MIN_BITRATE_BPS};
+use crate::encode::{DEFAULT_BITRATE_BPS, MIN_BITRATE_BPS};
 
 /// 制御ループ → encode スレッドへの通知。
 pub enum EncoderCommand {
@@ -43,15 +43,18 @@ pub enum InputCmd {
 /// - 損失率が高い → 乗算的に下げる (Multiplicative Decrease)
 /// - 損失が少なく RTT も良好 → 加算的に上げる (Additive Increase)
 ///
-/// 制御は `MIN_BITRATE_BPS`..=`MAX_BITRATE_BPS` にクランプする。
+/// 制御は `MIN_BITRATE_BPS`..=`max_bps` にクランプする (上限は `--max-bitrate` で可変)。
 struct BitrateController {
     current_bps: u32,
+    /// 適応制御の上限 (bps)。`--max-bitrate` 由来。エンコーダのピーク上限と揃える。
+    max_bps: u32,
 }
 
 impl BitrateController {
-    fn new() -> Self {
+    fn new(max_bps: u32) -> Self {
         Self {
-            current_bps: DEFAULT_BITRATE_BPS,
+            current_bps: DEFAULT_BITRATE_BPS.min(max_bps),
+            max_bps,
         }
     }
 
@@ -69,7 +72,7 @@ impl BitrateController {
         } else {
             self.current_bps
         }
-        .clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS);
+        .clamp(MIN_BITRATE_BPS, self.max_bps);
 
         if next != self.current_bps {
             self.current_bps = next;
@@ -187,6 +190,8 @@ pub struct ServerConfig {
     pub psk: [u8; 32],
     pub displays: Vec<DisplayInfo>,
     pub audio: bool,
+    /// 適応制御 / エンコーダのビットレート上限 (bps)。`--max-bitrate` 由来。
+    pub max_bitrate_bps: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,6 +221,7 @@ pub async fn run_server(
         let psk = cfg.psk;
         let displays = cfg.displays.clone();
         let audio = cfg.audio;
+        let max_bitrate_bps = cfg.max_bitrate_bps;
         let udp = udp.clone();
         let enc_tx2 = enc_tx.clone();
         let input_tx2 = input_tx.clone();
@@ -240,6 +246,7 @@ pub async fn run_server(
             nal_rx_ref,
             audio_rx_ref,
             clip_change_rx_ref,
+            max_bitrate_bps,
         )
         .await
         {
@@ -248,6 +255,7 @@ pub async fn run_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut stream: TcpStream,
@@ -263,6 +271,7 @@ async fn handle_client(
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
     audio_rx: &mut mpsc::Receiver<EncodedAudio>,
     clip_change_rx: &mut mpsc::UnboundedReceiver<String>,
+    max_bitrate_bps: u32,
 ) -> Result<()> {
     // Noise XX-PSK レスポンダ
     let mut hs = HandshakeState::new_responder(&psk)?;
@@ -304,7 +313,7 @@ async fn handle_client(
     let mut seq: u32 = 0;
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
-    let mut bitrate = BitrateController::new();
+    let mut bitrate = BitrateController::new(max_bitrate_bps);
     // ダウンロード (ホスト → クライアント) のチャンクを select ループへ流す出口。
     // 送信タスクがここに積み、ループが TCP へ書く (stream への書き込みは単一箇所に集約)。
     let (out_tx, mut out_rx) = mpsc::channel::<ControlMsg>(64);
