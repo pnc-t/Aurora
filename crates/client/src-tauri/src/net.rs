@@ -910,6 +910,13 @@ async fn udp_reader_loop(
     let mut recv_buf = vec![0u8; 2048];
     let mut plain = Vec::new();
 
+    // ホストの UDP hello は単発でロスしうる。最初のデータグラムを受信するまで
+    // 250ms ごとに hello を再送し、ホストの peer_udp 登録を確実にする (登録前は
+    // ホストが映像を送れず、こちらも何も受け取れないため再送がないと無音になる)。
+    let mut established = false;
+    let mut hello_interval = tokio::time::interval(Duration::from_millis(250));
+    hello_interval.tick().await; // 初回の即時 tick を捨てる
+
     // 映像フレーム組立状態 (STREAM_VIDEO のみで使う)
     let mut cur_frame_id: Option<u16> = None;
     let mut cur_keyframe = false;
@@ -920,7 +927,20 @@ async fn udp_reader_loop(
     let mut last_keyframe_req = Instant::now() - Duration::from_secs(1);
 
     loop {
-        let n = udp.recv(&mut recv_buf).await?;
+        let n = if established {
+            udp.recv(&mut recv_buf).await?
+        } else {
+            tokio::select! {
+                r = udp.recv(&mut recv_buf) => {
+                    established = true;
+                    r?
+                }
+                _ = hello_interval.tick() => {
+                    let _ = udp.send(b"DDDHELLO").await;
+                    continue;
+                }
+            }
+        };
         // 受信スループット (映像 + 音声、データグラム全体) を計測。
         stats.add_bytes(n as u64);
         // 先頭 8B は平文の nonce (BE)。これで復号する。
