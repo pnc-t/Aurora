@@ -19,13 +19,14 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
     IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFTransform,
     MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput, METransformNeedInput,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
+    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video,
+    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{Interface, PWSTR};
@@ -40,6 +41,10 @@ use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
 /// VARIANT 型タグ VT_BOOL。
 const VT_BOOL: u16 = 11;
+
+/// `IMFMediaEventGenerator::GetEvent` のノンブロッキング取得フラグ (MF_EVENT_FLAG_NO_WAIT)。
+/// キューが空なら待たずに `MF_E_NO_EVENTS_AVAILABLE` を返す。
+const MF_EVENT_FLAG_NO_WAIT: u32 = 0x0000_0001;
 
 pub struct MfHwH264Encoder {
     device: SharedDevice,
@@ -61,6 +66,9 @@ struct Inner {
     out_queue: VecDeque<EncodedNal>,
     /// ProcessInput 済みで未だ出力されていないフレーム ID (出力順マッピング用 FIFO)。
     in_flight: VecDeque<u16>,
+    /// 受信済みで未消化の `METransformNeedInput` 数 (= MFT の空き入力スロット)。
+    /// submit 呼び出しをまたいで保持し、トークンを 1 個も捨てないことでストールを防ぐ。
+    pending_need_input: u32,
 }
 
 impl MfHwH264Encoder {
@@ -177,6 +185,7 @@ impl Inner {
             sample_time_100ns: 0,
             out_queue: VecDeque::new(),
             in_flight: VecDeque::new(),
+            pending_need_input: 0,
         })
     }
 
@@ -211,32 +220,59 @@ impl Inner {
         };
         self.sample_time_100ns += FRAME_DURATION_100NS;
 
-        let mut pending = Some(sample);
-        let mut pending_fid = fid;
-        // イベントポンプ: 入力を投入し、エンコーダが次の入力を要求したら抜ける。
+        // このフレームの入力を 1 つだけ投入する。NeedInput トークン (空き入力スロット通知) は
+        // submit をまたいで `pending_need_input` に貯め、**1 個も捨てない**。以前は投入後に
+        // 次の NeedInput を受けて return しており、1 フレームにつき 2 個消費 (1 個破棄) して
+        // いたため、MFT が起動時に先出しするスロット数ぶんを使い切ると GetEvent が永久ブロック
+        // していた (数フレームでストール)。
         loop {
+            if self.pending_need_input > 0 {
+                self.pending_need_input -= 1;
+                // SAFETY: MFT は sample を ref する。
+                unsafe { self.transform.ProcessInput(0, &sample, 0) }.context("ProcessInput")?;
+                self.in_flight.push_back(fid);
+                break;
+            }
+            // 空きスロットが無ければブロッキングで待つ。待つ間に来た出力はドレインする。
             // SAFETY: event_gen live。dwflags=0 でブロッキング取得。
             let event = unsafe {
                 self.event_gen
                     .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))
             }
             .context("GetEvent")?;
-            let et = unsafe { event.GetType() }.context("event GetType")?;
-
-            if et == METransformNeedInput.0 as u32 {
-                match pending.take() {
-                    Some(s) => {
-                        // SAFETY: MFT は sample を ref する。
-                        unsafe { self.transform.ProcessInput(0, &s, 0) }.context("ProcessInput")?;
-                        self.in_flight.push_back(pending_fid);
-                        pending_fid = pending_fid.wrapping_add(1); // 使われないが安全側
-                    }
-                    None => return Ok(()), // 現フレーム消化済み・次入力要求 → 終了
-                }
-            } else if et == METransformHaveOutput.0 as u32 {
-                self.process_output()?;
-            }
+            self.dispatch_event(&event)?;
         }
+
+        // 既にキューにあるイベントをノンブロッキングで吸い出し、出力を速やかに流しつつ
+        // 後続フレーム用の NeedInput トークンを貯める。
+        loop {
+            // SAFETY: event_gen live。NO_WAIT は空なら MF_E_NO_EVENTS_AVAILABLE を返す。
+            let event = match unsafe {
+                self.event_gen
+                    .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(MF_EVENT_FLAG_NO_WAIT))
+            } {
+                Ok(ev) => ev,
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => break,
+                Err(e) => return Err(anyhow!("GetEvent(nowait): {e}")),
+            };
+            self.dispatch_event(&event)?;
+        }
+        Ok(())
+    }
+
+    /// MFT イベントを種別ごとに処理する。NeedInput はトークンとして加算 (消費は submit 側)、
+    /// HaveOutput は即ドレインする。その他は無視する。
+    fn dispatch_event(
+        &mut self,
+        event: &windows::Win32::Media::MediaFoundation::IMFMediaEvent,
+    ) -> Result<()> {
+        let et = unsafe { event.GetType() }.context("event GetType")?;
+        if et == METransformNeedInput.0 as u32 {
+            self.pending_need_input += 1;
+        } else if et == METransformHaveOutput.0 as u32 {
+            self.process_output()?;
+        }
+        Ok(())
     }
 
     fn process_output(&mut self) -> Result<()> {
