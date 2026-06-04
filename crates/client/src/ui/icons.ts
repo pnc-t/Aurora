@@ -42,7 +42,7 @@ const PATHS: Record<IconName, string> = {
 
 // assets/icons/ 配下の画像を URL として一括取り込み (ビルド時に解決)。
 // 該当ファイルが無ければ空オブジェクトになるだけでエラーにはならない。
-const imageModules = import.meta.glob("./assets/icons/*.{png,jpg,jpeg,webp,svg,gif}", {
+const imageModules = import.meta.glob("../assets/icons/*.{png,jpg,jpeg,webp,svg,gif}", {
   eager: true,
   query: "?url",
   import: "default",

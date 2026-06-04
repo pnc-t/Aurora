@@ -6,6 +6,7 @@
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { icon } from "./icons";
+import "./window-controls.css";
 
 export async function minimizeWindow(): Promise<void> {
   try {

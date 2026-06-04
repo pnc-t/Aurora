@@ -1,6 +1,8 @@
 // 統計 HUD (Parsec/Moonlight 風)。右上に半透明で fps/bitrate/rtt/loss を表示。
 // 既定はオフで、Ctrl+Alt+Shift+S のローカルホットキーで開閉する (main.ts が配線)。
 
+import "./stats-overlay.css";
+
 type Stats = {
   fps: number;
   bitrate_kbps: number;

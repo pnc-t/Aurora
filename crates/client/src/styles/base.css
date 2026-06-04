@@ -1,0 +1,38 @@
+/* 全 UI 共通の土台。
+ * テーマ変数 (:root)、リセット、最背面の映像 canvas、横断的なアイコン表示など、
+ * 特定コンポーネントに属さないものだけを置く。各コンポーネント固有のスタイルは
+ * ui/<component>.css に co-locate する。main.ts が最初に import する。 */
+
+:root {
+  --bg: #111;
+  --fg: #eee;
+  --panel: #1c1c1e;
+  --panel-border: #333;
+  --accent: #3a82f7;
+  --muted: #9a9a9e;
+  --danger: #e5484d;
+  --ok: #3fb950;
+}
+html, body {
+  margin: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font-family: system-ui, sans-serif; overflow: hidden; overscroll-behavior: none;
+}
+/* ネイティブアプリ感: テキスト選択/コールアウト/ドラッグを無効化。入力欄のみ選択可。 */
+* { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-user-drag: none; }
+input, textarea { user-select: text; -webkit-user-select: text; }
+button { font: inherit; }
+
+/* --- 全面 canvas (最背面) --- */
+#screen-wrap {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #000;
+}
+#screen { max-width: 100%; max-height: 100%; background: #000; outline: none; }
+
+/* --- アイコン共通 (icons.ts の出力。launcher / topbar 双方で使用) --- */
+/* SVG アイコン共通: ベースライン隙間を消し、サイズは font-size 継承 (currentColor) */
+.launcher svg.icon, #topbar svg.icon { display: block; }
+/* 画像アイコン (assets/icons の png/jpg 等): 1em の正方形に収める */
+.icon-img { width: 1em; height: 1em; object-fit: contain; display: block; }

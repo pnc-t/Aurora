@@ -1,0 +1,17 @@
+/* ファイル転送ポップオーバー (file-transfer.ts)。AnyDesk 風グルーピング。 */
+
+#file-panel {
+  position: fixed; top: 46px; right: 10px; z-index: 35;
+  display: none; flex-direction: column; gap: 8px;
+  padding: 12px; border-radius: 10px; width: 300px;
+  background: var(--panel); border: 1px solid var(--panel-border);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+#file-panel.visible { display: flex; }
+#file-panel .row { display: flex; gap: 6px; align-items: center; }
+#file-panel .section-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+#file-panel input[type="text"], #file-panel input[type="file"] { flex: 1; min-width: 0; }
+#file-panel input { background: #2c2c2e; color: var(--fg); border: 1px solid var(--panel-border); border-radius: 6px; padding: 4px 6px; }
+#file-panel button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+#file-panel button:disabled { opacity: 0.5; cursor: default; }
+#file-panel .progress { font-family: monospace; font-size: 11px; color: var(--muted); min-width: 64px; text-align: right; }

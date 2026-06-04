@@ -1,0 +1,12 @@
+/* 統計 HUD (stats-overlay.ts)。Parsec/Moonlight 風。右上、既定オフ。 */
+
+#stats-hud {
+  position: fixed; top: 8px; right: 8px; z-index: 25;
+  display: none;
+  padding: 6px 10px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  font-family: monospace; font-size: 12px; line-height: 1.5;
+  color: #d8d8d8; pointer-events: none;
+  white-space: pre;
+}
+#stats-hud.visible { display: block; }

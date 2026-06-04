@@ -1,0 +1,41 @@
+/* 接続中の自動格納ツールバー (toolbar.ts)。RDP/RustDesk 風。
+ * 既定は画面外に隠れ、上端ホバー or ホットキーで表示。ピンで常時表示。 */
+
+/* マウスを上端へ持っていく / Ctrl+Alt+Shift+B で表示。ピンで常時表示。 */
+#topbar-hotzone { position: fixed; top: 0; left: 0; right: 0; height: 6px; z-index: 20; }
+#topbar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 30;
+  display: flex; gap: 8px; align-items: center;
+  padding: 6px 10px;
+  background: rgba(28, 28, 30, 0.96);
+  border-bottom: 1px solid var(--panel-border);
+  transform: translateY(-100%);
+  transition: transform 0.18s ease;
+}
+#topbar.visible { transform: translateY(0); }
+#topbar button, #topbar select {
+  background: #2c2c2e; color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px;
+  padding: 4px 10px; cursor: pointer;
+}
+#topbar button:hover { background: #3a3a3c; }
+#topbar button.danger { border-color: var(--danger); color: #ff8a8d; }
+#topbar button.toggled { background: var(--accent); border-color: var(--accent); color: #fff; }
+#topbar .spacer { margin-left: auto; }
+/* ライブ映像パラメータ入力 (fps / Mbps) */
+#topbar .tb-video { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+#topbar .tb-video input {
+  width: 44px; text-align: right; background: #2c2c2e; color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 4px 6px;
+}
+#topbar .tb-video input:focus { outline: none; border-color: var(--accent); }
+/* ツールバー右端のウィンドウ操作 (フレームレス用)。通常ボタン装飾を打ち消す。 */
+#topbar .window-controls { display: flex; margin-left: 6px; }
+#topbar .winctl {
+  width: 38px; height: 28px; padding: 0; border: none; border-radius: 0;
+  background: transparent; color: var(--muted);
+}
+#topbar .winctl:hover { background: rgba(255, 255, 255, 0.1); color: var(--fg); }
+#topbar .winctl.close:hover { background: var(--danger); color: #fff; }
+#conn-label { font-family: monospace; font-size: 12px; color: var(--muted); }
+#display-wrap { display: none; align-items: center; gap: 4px; font-size: 12px; }
