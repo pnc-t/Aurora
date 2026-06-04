@@ -8,6 +8,7 @@
 mod audio;
 mod config;
 mod net;
+mod secret;
 mod stats;
 
 use net::{SessionState, ShareRoot};
@@ -40,6 +41,8 @@ fn main() {
             config::delete_recent_host,
             config::load_settings,
             config::save_settings,
+            secret::saved_password_hosts,
+            secret::delete_host_password,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -98,6 +98,11 @@
   display: inline-flex; align-items: center; justify-content: center;
 }
 .host-card .card-btn:hover { background: var(--menu-hover); color: var(--fg); }
+/* パスワード保存済みカードの鍵マーク (押すと即接続)。アクセント色で控えめに示す。 */
+.host-card .saved-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent); font-size: 14px; flex-shrink: 0; opacity: 0.85;
+}
 .host-card .chevron { display: inline-flex; align-items: center; color: var(--muted); font-size: 20px; margin-left: 2px; }
 /* 並べ替え (grip を掴んでドラッグ) */
 .host-card .grip {
