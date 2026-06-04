@@ -4,8 +4,9 @@
 //! Session 0 で隔離実行される Windows サービスではキャプチャできないため、
 //! タスクスケジューラの ONLOGON タスク (= ユーザセッションで実行) として登録する。
 //!
-//! パスワードはタスク定義へ埋め込まない (機密非保存方針)。`DDD_PASSWORD` を
-//! システム / ユーザ環境変数に設定しておけば、ログオン時タスクが継承して読む。
+//! パスワードはタスク定義へ埋め込まない (機密非保存方針)。同一ユーザーで一度
+//! `ddd-host --set-password` を実行して DPAPI 暗号ファイルに保存しておけば、
+//! 同じユーザーで走るログオン時タスクがそれを復号して読む。
 
 use anyhow::Result;
 
@@ -41,7 +42,9 @@ pub fn install(forward_args: &[String]) -> Result<()> {
     }
     println!("registered scheduled task \"{TASK_NAME}\" (runs at logon)");
     println!("command: {tr}");
-    println!("note: set DDD_PASSWORD as a (system) environment variable so the task can read it");
+    println!(
+        "note: run `ddd-host --set-password` once as this same user so the task can read the password"
+    );
     Ok(())
 }
 
