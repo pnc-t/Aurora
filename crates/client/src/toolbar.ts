@@ -3,6 +3,7 @@
 // 中身: disconnect / ディスプレイ切替 / 統計トグル / ファイル転送トグル / 接続ラベル / ピン。
 
 import type { DisplayDto } from "./ipc";
+import { mountWindowControls } from "./window-controls";
 
 type ToolbarOpts = {
   topbar: HTMLElement;
@@ -22,6 +23,7 @@ export type ToolbarHandle = {
   setFileToggled: (on: boolean) => void;
   setFullscreenToggled: (on: boolean) => void;
   setCaptureToggled: (on: boolean) => void;
+  setPinned: (on: boolean) => void;
   toggleBar: () => void;
   setConnected: (connected: boolean) => void;
 };
@@ -36,10 +38,15 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     <button type="button" id="tb-fullscreen" title="フルスクリーン (Ctrl+Alt+Shift+F / F11)">fullscreen</button>
     <button type="button" id="tb-files">files</button>
     <button type="button" id="tb-stats" title="Ctrl+Alt+Shift+S">stats</button>
-    <span class="spacer"></span>
-    <span id="conn-label">—</span>
+    <span class="spacer" data-tauri-drag-region></span>
+    <span id="conn-label" data-tauri-drag-region>—</span>
     <button type="button" id="tb-pin" title="ピン留め (常時表示)">📌</button>
+    <span id="tb-winctl" class="window-controls"></span>
   `;
+
+  // フレームレスのため接続中もウィンドウ操作 (min/max/close) をバーに持つ。
+  const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
+  if (winctl) mountWindowControls(winctl);
 
   const disconnectBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-disconnect");
   const displayWrap = opts.topbar.querySelector<HTMLElement>("#display-wrap");
@@ -125,6 +132,12 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     },
     setCaptureToggled(on: boolean): void {
       captureBtn?.classList.toggle("toggled", on);
+    },
+    setPinned(on: boolean): void {
+      pinned = on;
+      pinBtn?.classList.toggle("toggled", on);
+      if (on) show();
+      else scheduleHide();
     },
     toggleBar(): void {
       if (!connected) return;

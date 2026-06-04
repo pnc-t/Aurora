@@ -82,6 +82,10 @@ export type HostEntry = {
 export type ClientSettings = {
   default_fullscreen: boolean;
   show_stats: boolean;
+  default_capture: boolean;
+  default_port: number;
+  toolbar_pinned: boolean;
+  accent_color: string;
 };
 
 /// 接続先 host の履歴を読み込む (最新が先頭)。

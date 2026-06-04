@@ -1,0 +1,44 @@
+// フレームレスウィンドウ用の自前ウィンドウ操作 (最小化 / 最大化トグル / 閉じる)。
+// ネイティブのタイトルバーを消した (tauri.conf.json decorations:false) ため、
+// min/max/close を UI 側に持つ。ドラッグ移動は data-tauri-drag-region 属性で行う。
+// 権限: capabilities/default.json の allow-minimize / allow-toggle-maximize /
+//       allow-close / allow-start-dragging。
+
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { icon } from "./icons";
+
+export async function minimizeWindow(): Promise<void> {
+  try {
+    await getCurrentWindow().minimize();
+  } catch (e) {
+    console.warn("minimize failed", e);
+  }
+}
+
+export async function toggleMaximizeWindow(): Promise<void> {
+  try {
+    await getCurrentWindow().toggleMaximize();
+  } catch (e) {
+    console.warn("toggleMaximize failed", e);
+  }
+}
+
+export async function closeWindow(): Promise<void> {
+  try {
+    await getCurrentWindow().close();
+  } catch (e) {
+    console.warn("close failed", e);
+  }
+}
+
+/** min/max/close ボタンを container 内に生成して配線する。 */
+export function mountWindowControls(container: HTMLElement): void {
+  container.innerHTML = `
+    <button class="winctl" data-act="min" title="最小化" tabindex="-1">${icon("minimize")}</button>
+    <button class="winctl" data-act="max" title="最大化" tabindex="-1">${icon("maximize")}</button>
+    <button class="winctl close" data-act="close" title="閉じる" tabindex="-1">${icon("close")}</button>
+  `;
+  container.querySelector('[data-act="min"]')?.addEventListener("click", () => void minimizeWindow());
+  container.querySelector('[data-act="max"]')?.addEventListener("click", () => void toggleMaximizeWindow());
+  container.querySelector('[data-act="close"]')?.addEventListener("click", () => void closeWindow());
+}

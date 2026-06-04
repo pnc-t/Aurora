@@ -152,11 +152,18 @@ function handleClientEvent(ev: ClientEvent): void {
       } else {
         toolbar.setConnLabel(`${lastHost} · (no displays?)`);
       }
-      // 設定を反映: 既定フルスクリーン / 統計 HUD。
+      // 設定を反映: 統計 HUD / ツールバーピン / マウスキャプチャ / フルスクリーン。
       const settings = launcher.getSettings();
       if (settings.show_stats && !statsHud.classList.contains("visible")) {
         toggleStats();
         toolbar.setStatsToggled(true);
+      }
+      if (settings.toolbar_pinned) {
+        toolbar.setPinned(true);
+      }
+      if (settings.default_capture) {
+        // ポインタロックはユーザー操作直後でないと拒否されることがある (その場合はトーストで通知)。
+        setCaptureMode(true);
       }
       if (settings.default_fullscreen && !isFullscreen()) {
         void doToggleFullscreen();

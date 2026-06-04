@@ -14,9 +14,12 @@
       {
         "label": "main",
         "title": "DDD Remote Desktop",
-        "width": 1280,
-        "height": 800,
+        "width": 920,
+        "height": 600,
+        "minWidth": 720,
+        "minHeight": 480,
         "resizable": true,
+        "decorations": false,
         "fullscreen": false
       }
     ],

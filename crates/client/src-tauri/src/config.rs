@@ -35,8 +35,13 @@ fn default_port() -> u16 {
     DEFAULT_PORT
 }
 
-/// クライアント側の永続設定。接続後の挙動の既定値。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_accent() -> String {
+    "#3a82f7".to_string()
+}
+
+/// クライアント側の永続設定。接続後の挙動と UI の既定値。
+/// 各フィールドは `#[serde(default)]` で、項目を増やしても旧 settings.json を読める。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientSettings {
     /// 接続成立時に自動でフルスクリーンにする。
     #[serde(default)]
@@ -44,6 +49,31 @@ pub struct ClientSettings {
     /// 接続成立時に統計 HUD を表示する。
     #[serde(default)]
     pub show_stats: bool,
+    /// 接続成立時に自動でマウスキャプチャ (相対マウス) を有効化する。
+    #[serde(default)]
+    pub default_capture: bool,
+    /// ホスト追加ダイアログの port 欄の初期値。
+    #[serde(default = "default_port")]
+    pub default_port: u16,
+    /// 接続後、ツールバーを最初からピン留め表示する。
+    #[serde(default)]
+    pub toolbar_pinned: bool,
+    /// UI のアクセント色 (CSS 色)。
+    #[serde(default = "default_accent")]
+    pub accent_color: String,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self {
+            default_fullscreen: false,
+            show_stats: false,
+            default_capture: false,
+            default_port: DEFAULT_PORT,
+            toolbar_pinned: false,
+            accent_color: default_accent(),
+        }
+    }
 }
 
 fn config_path(app: &AppHandle, file: &str) -> Result<PathBuf, String> {
