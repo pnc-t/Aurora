@@ -39,6 +39,10 @@ fn default_accent() -> String {
     "#3a82f7".to_string()
 }
 
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
 /// クライアント側の永続設定。接続後の挙動と UI の既定値。
 /// 各フィールドは `#[serde(default)]` で、項目を増やしても旧 settings.json を読める。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +65,9 @@ pub struct ClientSettings {
     /// UI のアクセント色 (CSS 色)。
     #[serde(default = "default_accent")]
     pub accent_color: String,
+    /// 配色テーマ ("auto" | "dark" | "light" | "legacy")。CSS の data-theme に渡す。
+    #[serde(default = "default_theme")]
+    pub theme: String,
     /// 接続時にホストへ送る送出 fps 上限 (0 = 無制限)。
     #[serde(default = "default_fps")]
     pub fps: u32,
@@ -86,6 +93,7 @@ impl Default for ClientSettings {
             default_port: DEFAULT_PORT,
             toolbar_pinned: false,
             accent_color: default_accent(),
+            theme: default_theme(),
             fps: default_fps(),
             max_mbps: default_max_mbps(),
         }

@@ -14,6 +14,7 @@ import {
   saveSettings,
   type ClientSettings,
   type HostEntry,
+  type ThemeId,
 } from "../core/ipc";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
@@ -39,6 +40,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   default_port: DEFAULT_PORT,
   toolbar_pinned: false,
   accent_color: "#3a82f7",
+  theme: "dark",
   fps: 60,
   max_mbps: 15,
 };
@@ -59,6 +61,15 @@ function applyAccent(color: string): void {
   document.documentElement.style.setProperty("--accent", color);
 }
 
+/**
+ * 配色テーマを <html data-theme> へ反映する (styles/base.css が配色を切り替える)。
+ * どのテーマでもユーザー設定のアクセント色を効かせる (legacy のグレー調も含む)。
+ */
+function applyTheme(theme: ThemeId, accent: string): void {
+  document.documentElement.dataset.theme = theme;
+  applyAccent(accent);
+}
+
 export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallback }): LauncherHandle {
   opts.root.innerHTML = `
     <div class="launcher">
@@ -66,11 +77,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <div class="window-controls" id="win-controls"></div>
       </div>
       <aside class="sidebar">
-        <button class="nav-item active" data-page="hosts"><span class="ico">${icon("hosts")}</span> Hosts</button>
-        <button class="nav-item" data-page="settings"><span class="ico">${icon("settings")}</span> Settings</button>
+        <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
+        <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
         <div class="sidebar-spacer"></div>
-        <div class="status-card" id="status-card">
-          <span class="dot"></span><span class="txt" id="status-txt">未接続</span>
+        <div class="status-card" id="status-card" title="未接続">
+          <span class="dot"></span>
         </div>
       </aside>
       <main class="content">
@@ -126,6 +137,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             <div class="setting-group">外観・既定値</div>
             <div class="setting-row">
               <div class="s-meta">
+                <div class="s-title">テーマ</div>
+                <div class="s-desc">配色。auto は OS のダーク/ライト設定に追従。legacy はグレーのクラシック調</div>
+              </div>
+              <select id="set-theme" class="select-input">
+                <option value="auto">システム連動</option>
+                <option value="dark">ダーク</option>
+                <option value="light">ライト</option>
+                <option value="legacy">レガシー</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta">
                 <div class="s-title">アクセントカラー</div>
                 <div class="s-desc">ボタンや選択中の表示に使う色</div>
               </div>
@@ -148,7 +171,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   const $ = <T extends HTMLElement>(sel: string) => opts.root.querySelector<T>(sel);
   const statusCard = $("#status-card") as HTMLElement;
-  const statusTxt = $("#status-txt") as HTMLElement;
   const hostList = $("#host-list") as HTMLElement;
   const backdrop = $("#dialog-backdrop") as HTMLElement;
   const cardMenu = $("#card-menu") as HTMLElement;
@@ -156,6 +178,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
   const accentInput = $<HTMLInputElement>("#set-accent");
+  const themeSelect = $<HTMLSelectElement>("#set-theme");
   const portInput = $<HTMLInputElement>("#set-port");
   const fpsInput = $<HTMLInputElement>("#set-fps");
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
@@ -355,7 +378,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     card.classList.add("drag-placeholder");
 
     const onMove = (ev: PointerEvent): void => {
-      clone.style.top = `${ev.clientY - offsetY}px`;
+      // 分身がホスト一覧の領域外 (タイトルバーや画面外) へ出ないよう上下をクランプする。
+      const listRect = hostList.getBoundingClientRect();
+      const desiredTop = ev.clientY - offsetY;
+      const maxTop = Math.max(listRect.top, listRect.bottom - rect.height);
+      const top = Math.min(Math.max(desiredTop, listRect.top), maxTop);
+      clone.style.top = `${top}px`;
       // placeholder 以外のカードの中点と比較して挿入位置を決め、元カードを移動する。
       const others = Array.from(hostList.querySelectorAll<HTMLElement>(".host-card")).filter(
         (c) => c !== card,
@@ -457,6 +485,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     applyAccent(accentInput.value);
     persist();
   });
+  themeSelect?.addEventListener("change", () => {
+    const theme = themeSelect.value as ThemeId;
+    settings = { ...settings, theme };
+    applyTheme(theme, settings.accent_color);
+    persist();
+  });
   portInput?.addEventListener("change", () => {
     const port = Number(portInput.value) || DEFAULT_PORT;
     settings = { ...settings, default_port: port };
@@ -488,7 +522,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       if (connecting) handle.setConnState("connecting…", "connecting");
     },
     setConnState(text: string, kind: ConnState = "idle"): void {
-      statusTxt.textContent = text;
+      // アイコンのみのサイドバーなので状態文はドットの title (ホバー) に出す。
+      statusCard.title = text;
       statusCard.classList.remove("connecting", "connected", "error");
       if (kind !== "idle") statusCard.classList.add(kind);
     },
@@ -515,10 +550,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (statsToggle) statsToggle.checked = settings.show_stats;
     if (captureToggle) captureToggle.checked = settings.default_capture;
     if (accentInput) accentInput.value = settings.accent_color;
+    if (themeSelect) themeSelect.value = settings.theme;
     if (portInput) portInput.value = String(settings.default_port);
     if (fpsInput) fpsInput.value = String(settings.fps);
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
-    applyAccent(settings.accent_color);
+    applyTheme(settings.theme, settings.accent_color);
   })();
   void handle.refreshHosts();
 

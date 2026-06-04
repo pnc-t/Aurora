@@ -94,6 +94,9 @@ export type HostEntry = {
   port: number;
 };
 
+/// 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。
+export type ThemeId = "auto" | "dark" | "light" | "legacy";
+
 /// クライアント設定 (Rust 側 config::ClientSettings と対応)。
 export type ClientSettings = {
   default_fullscreen: boolean;
@@ -102,6 +105,7 @@ export type ClientSettings = {
   default_port: number;
   toolbar_pinned: boolean;
   accent_color: string;
+  theme: ThemeId;
   fps: number;
   max_mbps: number;
 };
