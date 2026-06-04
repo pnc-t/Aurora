@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use ddd_common::noise::psk_from_password;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -24,6 +25,10 @@ use net::{EncoderCommand, InputCmd, ServerConfig};
 
 /// 既定の送出フレームレート上限 (PLAN.md の 60fps 目標)。
 const DEFAULT_FPS_CAP: u32 = 60;
+/// 既定の待受ポート (TCP 制御 / UDP 映像で共用)。
+const DEFAULT_PORT: u16 = 7000;
+/// パスワードを供給する環境変数。設定時はランダム生成を行わずこの値を使う。
+const PASSWORD_ENV: &str = "DDD_PASSWORD";
 
 #[derive(Debug)]
 struct Args {
@@ -36,6 +41,8 @@ struct Args {
     fps_cap: u32,
     /// ビットレート上限 (bps)。適応制御の上限 + エンコーダのピーク上限。
     max_bitrate_bps: u32,
+    /// 待受ポート (TCP 制御 / UDP 映像で共用)。
+    port: u16,
 }
 
 impl Default for Args {
@@ -46,6 +53,7 @@ impl Default for Args {
             perf: false,
             fps_cap: DEFAULT_FPS_CAP,
             max_bitrate_bps: MAX_BITRATE_BPS,
+            port: DEFAULT_PORT,
         }
     }
 }
@@ -82,6 +90,13 @@ fn parse_args() -> Args {
                     (mbps * 1_000_000.0) as u32
                 };
             }
+            "--port" => {
+                args.port = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&p| p != 0)
+                    .expect("--port requires N (1..=65535)");
+            }
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -104,7 +119,7 @@ fn main() -> Result<()> {
         return dump_h264(n);
     }
 
-    run_server(args.perf, args.fps_cap, args.max_bitrate_bps)
+    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, args.port)
 }
 
 fn dump_one_bmp() -> Result<()> {
@@ -152,15 +167,27 @@ fn dump_h264(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32) -> Result<()> {
-    let password: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(10)
-        .map(char::from)
-        .collect();
+fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Result<()> {
+    // DDD_PASSWORD があればそれを使い (再起動しても固定)、無ければランダム生成する。
+    // 機密はログに出さない方針のため、env 指定時はパスワードを表示しない。
+    let (password, password_from_env) = match std::env::var(PASSWORD_ENV) {
+        Ok(p) if !p.is_empty() => (p, true),
+        _ => {
+            let generated: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(10)
+                .map(char::from)
+                .collect();
+            (generated, false)
+        }
+    };
     println!("== ddd-host ready ==");
-    println!("password: {password}");
-    println!("TCP/UDP: 0.0.0.0:7000");
+    if password_from_env {
+        println!("password: (from {PASSWORD_ENV})");
+    } else {
+        println!("password: {password}");
+    }
+    println!("TCP/UDP: 0.0.0.0:{port}");
 
     let psk = psk_from_password(&password);
 
@@ -280,8 +307,8 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let cfg = ServerConfig {
-            tcp_addr: "0.0.0.0:7000".parse().unwrap(),
-            udp_addr: "0.0.0.0:7000".parse().unwrap(),
+            tcp_addr: SocketAddr::from(([0, 0, 0, 0], port)),
+            udp_addr: SocketAddr::from(([0, 0, 0, 0], port)),
             psk,
             displays,
             audio: audio_enabled,
