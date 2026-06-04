@@ -28,7 +28,11 @@ button { font: inherit; }
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
   background: #000;
+  transition: top 0.18s ease;
 }
+/* ツールバー表示中は映像エリアをバーの高さ分下げ、バーと重ならないようにする
+ * (--topbar-h は toolbar.ts が実測値を設定。bar-open は接続中かつ非表示でない間)。 */
+body.bar-open #screen-wrap { top: var(--topbar-h, 44px); }
 #screen { max-width: 100%; max-height: 100%; background: #000; outline: none; }
 
 /* --- アイコン共通 (icons.ts の出力。launcher / topbar 双方で使用) --- */

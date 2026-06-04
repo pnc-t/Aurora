@@ -6,6 +6,7 @@ import {
   saveRecentHost,
   selectDisplay,
   setVideoParams,
+  formatDisplayName,
   type ClientEvent,
   type DisplayDto,
   type HostEntry,
@@ -19,11 +20,11 @@ import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./ui/sta
 import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
 import { installWebviewGuard } from "./core/webview-guard";
 import { exitFullscreen, isFullscreen, toggleFullscreen } from "./core/fullscreen";
+import { restoreLauncherWindow, setResizable } from "./ui/window-controls";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const overlay = document.getElementById("connect-overlay") as HTMLElement;
 const topbar = document.getElementById("topbar") as HTMLElement;
-const hotzone = document.getElementById("topbar-hotzone") as HTMLElement;
 const statsHud = document.getElementById("stats-hud") as HTMLElement;
 const filePanel = document.getElementById("file-panel") as HTMLElement;
 const toastContainer = document.getElementById("toast-container") as HTMLElement;
@@ -50,6 +51,9 @@ installWebviewGuard((hotkey) => {
 async function doToggleFullscreen(): Promise<void> {
   const on = await toggleFullscreen();
   toolbar.setFullscreenToggled(on);
+  // フルスクリーンを抜けると Tauri がウィンドウを作成時状態 (resizable:false) に戻すため、
+  // 接続中はリサイズ可を再適用する (Win11 の角丸=WS_THICKFRAME も復活する)。
+  if (connected) void setResizable(true);
   showToast(on ? "fullscreen on" : "fullscreen off");
 }
 
@@ -69,7 +73,6 @@ function setFilePanel(visible: boolean): void {
 // 接続中ツールバー。
 const toolbar = mountToolbar({
   topbar,
-  hotzone,
   onDisconnect: () => doDisconnect("disconnected"),
   onSelectDisplay: (d) => switchDisplay(d),
   onToggleStats: () => {
@@ -88,6 +91,8 @@ mountFileTransfer(filePanel);
 // 未接続のランチャー (サイドバー + ホスト一覧 / 設定)。
 let lastHost = "";
 let pendingEntry: HostEntry | null = null;
+// 接続中か (フルスクリーン切替後の resizable 再適用判定に使う)。
+let connected = false;
 const launcher = mountLauncher({
   root: overlay,
   onConnect: async (entry, password) => {
@@ -114,16 +119,20 @@ function switchDisplay(d: DisplayDto): void {
   resetDecoder();
   attachInput(canvas, { width: d.width, height: d.height }, { onCaptureChange });
   canvas.focus();
-  toolbar.setConnLabel(`${lastHost} · ${d.name} ${d.width}x${d.height}`);
-  showToast(`switching to ${d.name} ${d.width}x${d.height}`);
+  const dn = formatDisplayName(d.name);
+  toolbar.setConnLabel(`${lastHost} · ${dn} ${d.width}x${d.height}`);
+  showToast(`switching to ${dn} ${d.width}x${d.height}`);
 }
 
 /** 切断処理 (ユーザー操作・ホスト切断の両方から呼ぶ)。 */
 function doDisconnect(reason: string): void {
   void disconnect();
+  connected = false;
   detachInput(); // ポインタロックも解除される
   toolbar.setConnected(false);
   toolbar.setCaptureToggled(false);
+  // ランチャーへ戻るので、接続中に変えたサイズを固定サイズへ戻しリサイズも無効化。
+  void restoreLauncherWindow();
   setFilePanel(false);
   // フルスクリーンを解除して接続カードを操作できるようにする。
   void exitFullscreen().then(() => toolbar.setFullscreenToggled(isFullscreen()));
@@ -146,23 +155,23 @@ function handleClientEvent(ev: ClientEvent): void {
       launcher.setConnState(`connected · ${lastHost}`, "connected");
       if (pendingEntry) void saveRecentHost(pendingEntry);
       toolbar.setConnected(true);
+      connected = true;
+      // 接続中はウィンドウのリサイズを許可 (未接続のランチャーは固定サイズ)。
+      void setResizable(true);
       toolbar.setDisplays(ev.displays, ev.displays[0]?.id);
       const d = ev.displays[0];
       if (d) {
-        toolbar.setConnLabel(`${lastHost} · ${d.name} ${d.width}x${d.height}`);
+        toolbar.setConnLabel(`${lastHost} · ${formatDisplayName(d.name)} ${d.width}x${d.height}`);
         attachInput(canvas, { width: d.width, height: d.height }, { onCaptureChange });
         canvas.focus();
       } else {
         toolbar.setConnLabel(`${lastHost} · (no displays?)`);
       }
-      // 設定を反映: 統計 HUD / ツールバーピン / マウスキャプチャ / フルスクリーン。
+      // 設定を反映: 統計 HUD / マウスキャプチャ / フルスクリーン。
       const settings = launcher.getSettings();
       if (settings.show_stats && !statsHud.classList.contains("visible")) {
         toggleStats();
         toolbar.setStatsToggled(true);
-      }
-      if (settings.toolbar_pinned) {
-        toolbar.setPinned(true);
       }
       if (settings.default_capture) {
         // ポインタロックはユーザー操作直後でないと拒否されることがある (その場合はトーストで通知)。

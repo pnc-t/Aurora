@@ -22,7 +22,14 @@ export type IconName =
   | "grip"
   | "chevron"
   | "minimize"
-  | "close";
+  | "close"
+  | "power"
+  | "fullscreen"
+  | "mouse"
+  | "files"
+  | "stats"
+  | "display"
+  | "pin";
 
 // viewBox 0 0 24 24 の path/shape 部分のみ (共通の <svg> ラッパーは icon() で付与)。
 const PATHS: Record<IconName, string> = {
@@ -38,6 +45,13 @@ const PATHS: Record<IconName, string> = {
   chevron: `<path d="M9 18l6-6-6-6"/>`,
   minimize: `<path d="M5 12h14"/>`,
   close: `<path d="M18 6L6 18M6 6l12 12"/>`,
+  power: `<path d="M12 2v9"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>`,
+  fullscreen: `<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>`,
+  mouse: `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/>`,
+  files: `<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>`,
+  stats: `<path d="M3 3v18h18"/><path d="M19 9l-5 5-3-3-4 4"/>`,
+  display: `<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>`,
+  pin: `<path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z"/>`,
 };
 
 // assets/icons/ 配下の画像を URL として一括取り込み (ビルド時に解決)。

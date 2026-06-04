@@ -3,6 +3,7 @@
 #stats-hud {
   position: fixed; top: 8px; right: 8px; z-index: 25;
   display: none;
+  transition: top 0.18s ease;
   padding: 6px 10px; border-radius: 8px;
   background: rgba(0, 0, 0, 0.55);
   font-family: monospace; font-size: 12px; line-height: 1.5;
@@ -10,3 +11,5 @@
   white-space: pre;
 }
 #stats-hud.visible { display: block; }
+/* ツールバー表示中はバーの下へ下げて重なりを防ぐ (--topbar-h は toolbar.ts が設定)。 */
+body.bar-open #stats-hud { top: calc(var(--topbar-h, 44px) + 8px); }
