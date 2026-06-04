@@ -1,12 +1,12 @@
 [package]
-name = "ddd-host"
+name = "aurora-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "ddd-host"
+name = "aurora-host"
 path = "src/main.rs"
 
 [[example]]
@@ -14,7 +14,7 @@ name = "handshake_smoke"
 path = "examples/handshake_smoke.rs"
 
 [dependencies]
-ddd-common = { path = "../common" }
+aurora-common = { path = "../common" }
 tokio = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }

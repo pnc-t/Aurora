@@ -1,7 +1,7 @@
 //! 入力注入の抽象 (Port)。OS別の Adapter は cfg で差し替える。
 
 use anyhow::Result;
-use ddd_common::proto::InputEvent;
+use aurora_common::proto::InputEvent;
 
 /// 入力注入対象ディスプレイのデスクトップ上の配置 (原点 + 寸法)。
 /// マルチディスプレイ環境で非プライマリを選んだときの座標マッピングに使う。

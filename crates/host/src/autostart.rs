@@ -5,13 +5,13 @@
 //! タスクスケジューラの ONLOGON タスク (= ユーザセッションで実行) として登録する。
 //!
 //! パスワードはタスク定義へ埋め込まない (機密非保存方針)。同一ユーザーで一度
-//! `ddd-host --set-password` を実行して DPAPI 暗号ファイルに保存しておけば、
+//! `aurora-host --set-password` を実行して DPAPI 暗号ファイルに保存しておけば、
 //! 同じユーザーで走るログオン時タスクがそれを復号して読む。
 
 use anyhow::Result;
 
 /// 登録するタスク名。`--uninstall` で同名を削除する。
-const TASK_NAME: &str = "DDD Host";
+const TASK_NAME: &str = "Aurora Host";
 
 #[cfg(target_os = "windows")]
 pub fn install(forward_args: &[String]) -> Result<()> {
@@ -43,7 +43,7 @@ pub fn install(forward_args: &[String]) -> Result<()> {
     println!("registered scheduled task \"{TASK_NAME}\" (runs at logon)");
     println!("command: {tr}");
     println!(
-        "note: run `ddd-host --set-password` once as this same user so the task can read the password"
+        "note: run `aurora-host --set-password` once as this same user so the task can read the password"
     );
     Ok(())
 }

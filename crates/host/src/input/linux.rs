@@ -7,7 +7,7 @@
 //! 権限がない場合は `new` が失敗するが、入力スレッドのみが停止し映像は継続する。
 
 use anyhow::{Context, Result, anyhow};
-use ddd_common::proto::{InputEvent as ProtoInput, MouseButton};
+use aurora_common::proto::{InputEvent as ProtoInput, MouseButton};
 use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{
     AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent, Key, RelativeAxisType,

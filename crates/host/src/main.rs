@@ -1,7 +1,7 @@
-//! DDD ホスト (操作される側) のエントリポイント。
+//! Aurora ホスト (操作される側) のエントリポイント。
 
 use anyhow::{Context, Result, anyhow};
-use ddd_common::noise::psk_from_password;
+use aurora_common::noise::psk_from_password;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use std::net::SocketAddr;
@@ -123,7 +123,7 @@ fn parse_args() -> Args {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "ddd=info".into()))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into()))
         .init();
 
     let args = parse_args();
@@ -209,7 +209,7 @@ fn dump_h264(n: usize) -> Result<()> {
 fn set_password_interactive() -> Result<()> {
     use std::io::Write;
 
-    print!("Enter new DDD password: ");
+    print!("Enter new Aurora password: ");
     std::io::stdout().flush().ok();
     let pw1 = read_secret_line()?;
     print!("Confirm password: ");
@@ -270,7 +270,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     // DPAPI で保存済みのパスワードがあればそれを使う (再起動しても固定・無人起動で読める)。
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
     // 方針のため、保存済みを使う場合は値を表示しない。
-    println!("== ddd-host ready ==");
+    println!("== aurora-host ready ==");
     let password = match secret::load_password() {
         Ok(Some(p)) if !p.is_empty() => {
             println!("password: (from secure store)");
@@ -283,7 +283,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
                 .map(char::from)
                 .collect();
             println!("password: {generated}");
-            println!("(no stored password; run `ddd-host --set-password` to set a fixed one)");
+            println!("(no stored password; run `aurora-host --set-password` to set a fixed one)");
             generated
         }
         Err(e) => {
@@ -334,7 +334,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     let (audio_tx, audio_rx) = mpsc::channel::<EncodedAudio>(64);
     // 制御スレッド → capture スレッドへ「キャプチャ対象ディスプレイ id」を渡す。
     let (cap_select_tx, cap_select_rx) = std::sync::mpsc::channel::<u32>();
-    let (clip_handle, clip_change_rx) = ddd_common::clipboard::spawn();
+    let (clip_handle, clip_change_rx) = aurora_common::clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
 
     // 音声ループバック取り込み。失敗してもホストは映像のみで継続する。

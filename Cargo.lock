@@ -318,6 +318,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurora-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aurora-common",
+ "bincode",
+ "bytes",
+ "cpal",
+ "opus",
+ "serde",
+ "serde_json",
+ "snow",
+ "socket2 0.5.10",
+ "tauri",
+ "tauri-build",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.58.0",
+]
+
+[[package]]
+name = "aurora-common"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "bincode",
+ "bitflags 2.11.1",
+ "blake2s_simd",
+ "bytes",
+ "serde",
+ "snow",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aurora-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "aurora-common",
+ "bincode",
+ "block2",
+ "bytes",
+ "core-graphics 0.24.0",
+ "cpal",
+ "dispatch2",
+ "evdev",
+ "ffmpeg-next",
+ "libc",
+ "libspa",
+ "objc2",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation",
+ "objc2-screen-capture-kit",
+ "opus",
+ "pipewire",
+ "rand",
+ "serde",
+ "snow",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,79 +1135,6 @@ dependencies = [
  "libc",
  "libdbus-sys",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ddd-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "bytes",
- "cpal",
- "ddd-common",
- "opus",
- "serde",
- "serde_json",
- "snow",
- "socket2 0.5.10",
- "tauri",
- "tauri-build",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows 0.58.0",
-]
-
-[[package]]
-name = "ddd-common"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "bincode",
- "bitflags 2.11.1",
- "blake2s_simd",
- "bytes",
- "serde",
- "snow",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ddd-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ashpd",
- "bincode",
- "block2",
- "bytes",
- "core-graphics 0.24.0",
- "cpal",
- "ddd-common",
- "dispatch2",
- "evdev",
- "ffmpeg-next",
- "libc",
- "libspa",
- "objc2",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation",
- "objc2-screen-capture-kit",
- "opus",
- "pipewire",
- "rand",
- "serde",
- "snow",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "windows 0.58.0",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! DDD クライアント (Tauri) エントリポイント。
+//! Aurora クライアント (Tauri) エントリポイント。
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -17,7 +17,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ddd=info".into()),
+                .unwrap_or_else(|_| "aurora=info".into()),
         )
         .init();
 

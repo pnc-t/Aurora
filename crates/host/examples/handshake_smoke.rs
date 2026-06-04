@@ -1,18 +1,18 @@
-//! ddd-host が立ち上がっている前提で、TCP 経由で Noise XX-PSK ハンドシェイクし
+//! aurora-host が立ち上がっている前提で、TCP 経由で Noise XX-PSK ハンドシェイクし
 //! 最初の HostInfo を受信して表示する結合テスト。
 //!
 //! 使い方:
 //! ```text
 //! # term1
-//! cargo run -p ddd-host --release
+//! cargo run -p aurora-host --release
 //! # term2 (表示されたパスワードを引数に)
-//! cargo run -p ddd-host --release --example handshake_smoke -- <password>
+//! cargo run -p aurora-host --release --example handshake_smoke -- <password>
 //! ```
 
 use anyhow::{Context, Result, anyhow};
+use aurora_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, psk_from_password};
+use aurora_common::proto::ControlMsg;
 use bincode::Options;
-use ddd_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, psk_from_password};
-use ddd_common::proto::ControlMsg;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 

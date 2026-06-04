@@ -4,14 +4,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use bincode::Options;
-use ddd_common::framing::{
+use aurora_common::framing::{
     AudioPacket, MAX_PAYLOAD, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
-use ddd_common::noise::{
+use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_VIDEO, TransportSession,
 };
-use ddd_common::proto::{ControlMsg, Display, InputEvent};
+use aurora_common::proto::{ControlMsg, Display, InputEvent};
+use bincode::Options;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -321,7 +321,7 @@ async fn handle_client(
     };
     send_control_msg(&mut stream, &session, &host_info, &mut tcp_tx_nonce).await?;
 
-    // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "DDDHELLO" を送る想定。
+    // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "AURHELLO" を送る想定。
     let peer_udp = wait_udp_hello(&udp).await?;
     tracing::info!(peer_udp = %peer_udp, "UDP peer registered");
 
@@ -337,7 +337,7 @@ async fn handle_client(
     // 開始失敗 (Client-ProjFS 無効など) はファイル投影を諦めてリモデス本体は継続する。
     let (fs_req_tx, mut fs_req_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let fs_bridge = Arc::new(FsBridge::new(fs_req_tx));
-    let _virt = match projfs::start(fs_bridge.clone(), std::path::Path::new("ddd-remote")) {
+    let _virt = match projfs::start(fs_bridge.clone(), std::path::Path::new("aurora-remote")) {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(error = %e, "ProjFS drive redirection disabled");
@@ -541,7 +541,7 @@ fn encrypt_udp(
     Ok(dgram)
 }
 
-/// クライアントの UDP "DDDHELLO" を待ち、対向アドレスを確定する。
+/// クライアントの UDP "AURHELLO" を待ち、対向アドレスを確定する。
 ///
 /// hello は単発 UDP のためロスしうる。クライアントは映像受信が始まるまで再送するので、
 /// ここでは各受信に上限を設けるだけにし、長時間 hello が来なければ Err を返して
@@ -553,7 +553,7 @@ async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
         let (n, src) = tokio::time::timeout(Duration::from_secs(30), udp.recv_from(&mut buf))
             .await
             .context("timed out waiting for UDP hello")??;
-        if &buf[..n] == b"DDDHELLO" {
+        if &buf[..n] == b"AURHELLO" {
             return Ok(src);
         }
         tracing::debug!(?src, n, "unexpected UDP probe");

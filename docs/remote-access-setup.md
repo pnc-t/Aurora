@@ -14,12 +14,12 @@ host が起動していて、パスワードが事前に分かっている** 必
 
 1. **パスワードを事前共有しておく**
    host は既定では起動ごとにランダムなパスワードを生成してコンソールへ表示する。
-   無人起動ではこれを読めないので、`ddd-host --set-password` で**固定パスワード**を
+   無人起動ではこれを読めないので、`aurora-host --set-password` で**固定パスワード**を
    保存しておき、両端であらかじめ共有する（接続時に「取得」するのではなく、自分で
    決めた値を両方が知っている状態にする）。
 
    > **保存方法**: 入力したパスワードは **DPAPI**（Windows のデータ保護 API）で
-   > 暗号化して `%LOCALAPPDATA%\DDD\password.bin` に保存される。平文の環境変数や
+   > 暗号化して `%LOCALAPPDATA%\Aurora\password.bin` に保存される。平文の環境変数や
    > レジストリには残らない。復号できるのは**保存したのと同じ Windows ユーザー
    > アカウントだけ**で、他ユーザーや他 PC では復号できない。したがって
    > `--set-password` は**ログオン時タスクを走らせるのと同じユーザー**で実行すること
@@ -27,7 +27,7 @@ host が起動していて、パスワードが事前に分かっている** 必
 
 2. **host をログオン時に自動起動する**
    誰も操作しなくても host プロセスが立ち上がっている必要がある。
-   `ddd-host --install` がタスクスケジューラに「ログオン時」タスクを登録する。
+   `aurora-host --install` がタスクスケジューラに「ログオン時」タスクを登録する。
 
    > **なぜ Windows サービスではないのか**: 画面キャプチャに使う DXGI Desktop
    > Duplication は対話ユーザセッションでしか動作しない。Windows サービスは
@@ -41,9 +41,9 @@ host が起動していて、パスワードが事前に分かっている** 必
 
 ```
 [事前準備・自宅で一度]
-  ddd-host --set-password でパスワードを DPAPI 暗号保存
+  aurora-host --set-password でパスワードを DPAPI 暗号保存
         +
-  ddd-host --install で自動起動を登録
+  aurora-host --install で自動起動を登録
         +
   Tailscale を自動接続に、PC を WoL 対応に
         ↓
@@ -60,10 +60,10 @@ host が起動していて、パスワードが事前に分かっている** 必
 ### 1. host をリリースビルドする
 
 ```powershell
-cargo build -p ddd-host --release
+cargo build -p aurora-host --release
 ```
 
-成果物は `target\release\ddd-host.exe`。
+成果物は `target\release\aurora-host.exe`。
 
 ### 2. パスワードを設定する（DPAPI 暗号保存）
 
@@ -72,11 +72,11 @@ PowerShell で実行する（昇格すると別アカウント＝管理者の鍵
 セッションのタスクから復号できなくなる）:
 
 ```powershell
-.\target\release\ddd-host.exe --set-password
+.\target\release\aurora-host.exe --set-password
 ```
 
 - パスワードを 2 回（確認入力）求められる。入力はエコーされない。
-- 入力値は DPAPI で暗号化され `%LOCALAPPDATA%\DDD\password.bin` に保存される
+- 入力値は DPAPI で暗号化され `%LOCALAPPDATA%\Aurora\password.bin` に保存される
   （平文の環境変数・レジストリには残らない）。
 - このパスワードは出先の client で入力する値そのもの。秘密として扱い、リポジトリや
   ログに残さないこと。
@@ -92,14 +92,14 @@ PowerShell で実行する（昇格すると別アカウント＝管理者の鍵
 
 ```powershell
 # 例: ポート 8000 / ビットレート上限 10Mbps で自動起動させる
-.\target\release\ddd-host.exe --install --port 8000 --max-bitrate 10
+.\target\release\aurora-host.exe --install --port 8000 --max-bitrate 10
 ```
 
 登録内容を確認・解除するには:
 
 ```powershell
-schtasks /Query /TN "DDD Host"          # 確認
-.\target\release\ddd-host.exe --uninstall   # 解除
+schtasks /Query /TN "Aurora Host"          # 確認
+.\target\release\aurora-host.exe --uninstall   # 解除
 ```
 
 > パスワードはタスク定義へ埋め込まれない（手順 2 で保存した DPAPI ファイルを、同じ
@@ -215,7 +215,7 @@ ssh pi@raspberrypi '~/wake-home.sh 8000'   # 引数は host の --port
 | 症状 | 確認点 |
 |------|--------|
 | 接続できない | `tailscale status` で双方がオンラインか。`<port>` が host の `--port` と一致しているか |
-| パスワードが通らない | `--set-password` をタスクと同じユーザーで（昇格せず）実行したか。`%LOCALAPPDATA%\DDD\password.bin` があるか。client 側の入力値と一致しているか |
+| パスワードが通らない | `--set-password` をタスクと同じユーザーで（昇格せず）実行したか。`%LOCALAPPDATA%\Aurora\password.bin` があるか。client 側の入力値と一致しているか |
 | タスクは動くが映像が来ない | ログオンセッションがアクティブか（ロック画面のみでは DXGI が止まる構成あり）。GPU ドライバ |
 | `--install` が失敗する | 管理者権限で実行しているか（`/RL HIGHEST` 登録のため） |
 | WoL で起きない | Pi と自宅 PC が同一サブネットか。MAC が正しいか。高速スタートアップ無効化したか。S5 不可なら S3/S4（スリープ/休止）で運用 |

@@ -177,7 +177,7 @@ impl ScreenCaptureKitCapturer {
         };
 
         // サンプルハンドラ用シリアルキュー。
-        let queue = dispatch2::DispatchQueue::new("com.ddd.capture", None);
+        let queue = dispatch2::DispatchQueue::new("com.aurora.capture", None);
         let output_proto = ProtocolObject::from_ref(&*output);
 
         // SAFETY: stream / output 有効。Screen 出力を要求。

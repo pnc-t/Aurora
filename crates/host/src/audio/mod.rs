@@ -7,8 +7,8 @@
 //! (park し続ける)。エンコード済みフレームのみ `tokio::sync::mpsc` でネットワーク層へ渡す。
 
 use anyhow::{Result, anyhow};
+use aurora_common::framing::MAX_PAYLOAD;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ddd_common::framing::MAX_PAYLOAD;
 use tokio::sync::mpsc;
 
 /// Opus が要求するサンプリングレート。

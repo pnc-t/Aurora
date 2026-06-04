@@ -1,7 +1,7 @@
 //! host 接続パスワードのローカル保存。
 //!
 //! Windows: DPAPI (`CryptProtectData` / `CryptUnprotectData`) でユーザープロファイル鍵に
-//! 紐づけて暗号化し `%LOCALAPPDATA%\DDD\password.bin` に保存する。平文の環境変数や
+//! 紐づけて暗号化し `%LOCALAPPDATA%\Aurora\password.bin` に保存する。平文の環境変数や
 //! レジストリへ秘密を置かないための置き換え。復号できるのは保存したのと同じユーザー
 //! アカウントのみ (他ユーザー・他PCでは不可) なので、同一ユーザーで走るログオン時タスク
 //! からは無人で読めるが、それ以外からは読めない。
@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 
-/// 保存ファイル名 (`%LOCALAPPDATA%\DDD\` 配下)。
+/// 保存ファイル名 (`%LOCALAPPDATA%\Aurora\` 配下)。
 #[cfg(target_os = "windows")]
 const FILE_NAME: &str = "password.bin";
 
@@ -20,7 +20,7 @@ fn store_path() -> Result<std::path::PathBuf> {
     use anyhow::Context;
     let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
     let mut p = std::path::PathBuf::from(base);
-    p.push("DDD");
+    p.push("Aurora");
     p.push(FILE_NAME);
     Ok(p)
 }
