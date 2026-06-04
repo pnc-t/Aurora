@@ -71,12 +71,16 @@ fn parse_args() -> Args {
                     .expect("--fps requires N (0 = uncapped)");
             }
             "--max-bitrate" => {
-                // 引数は Mbps。内部 bps へ変換する。
+                // 引数は Mbps。内部 bps へ変換する。0 (以下) は無制限 (u32::MAX) を表す。
                 let mbps: f64 = it
                     .next()
                     .and_then(|s| s.parse().ok())
-                    .expect("--max-bitrate requires N (Mbps)");
-                args.max_bitrate_bps = (mbps * 1_000_000.0) as u32;
+                    .expect("--max-bitrate requires N (Mbps, 0 = unlimited)");
+                args.max_bitrate_bps = if mbps <= 0.0 {
+                    u32::MAX
+                } else {
+                    (mbps * 1_000_000.0) as u32
+                };
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -214,10 +218,14 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32) -> Result<()> {
     } else {
         tracing::info!(fps = fps_cap, "frame rate cap");
     }
-    tracing::info!(
-        max_mbps = max_bitrate_bps as f64 / 1_000_000.0,
-        "bitrate cap (PeakConstrainedVBR peak)"
-    );
+    if max_bitrate_bps == u32::MAX {
+        tracing::info!("bitrate cap: unlimited");
+    } else {
+        tracing::info!(
+            max_mbps = max_bitrate_bps as f64 / 1_000_000.0,
+            "bitrate cap (PeakConstrainedVBR peak)"
+        );
+    }
     let cap_device = device.clone();
     std::thread::Builder::new()
         .name("capture".into())

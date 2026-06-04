@@ -407,6 +407,15 @@ impl VideoEncoder for MfH264Encoder {
 /// ことがあるため各設定は best-effort (失敗は debug ログのみ) とする。
 /// SW / HW 両エンコーダから共有する。
 pub(crate) fn configure_rate_control(codec_api: &ICodecAPI, mean_bps: u32, max_bps: u32) {
+    // 無制限 (u32::MAX): レート制御モードを設定せず既定 VBR のまま、平均目標のみ与える
+    // (コミット前の挙動と等価)。上限を課さないので大きなオーバーシュートを許容する。
+    if max_bps == u32::MAX {
+        // SAFETY: codec_api 生存、VARIANT は VT_UI4。
+        unsafe {
+            let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(mean_bps));
+        }
+        return;
+    }
     // ピークは平均以上でなければならない。
     let max_bps = max_bps.max(mean_bps);
     // SAFETY: codec_api 生存、VARIANT は VT_UI4。SetValue は値をコピーする。

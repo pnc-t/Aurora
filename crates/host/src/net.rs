@@ -52,8 +52,11 @@ struct BitrateController {
 
 impl BitrateController {
     fn new(max_bps: u32) -> Self {
+        // 上限が下限 (MIN_BITRATE_BPS) を下回ると on_stats の clamp が min>max で
+        // panic するため、下限以上へ持ち上げる (無制限 = u32::MAX はそのまま)。
+        let max_bps = max_bps.max(MIN_BITRATE_BPS);
         Self {
-            current_bps: DEFAULT_BITRATE_BPS.min(max_bps),
+            current_bps: DEFAULT_BITRATE_BPS.clamp(MIN_BITRATE_BPS, max_bps),
             max_bps,
         }
     }
