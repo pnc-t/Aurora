@@ -101,24 +101,96 @@ tailscale ip -4       # 自宅 PC の 100.x.x.x を控える（client で使う�
 
 Tailscale はサービスとして常駐し、起動時に自動で tailnet へ参加する。
 
-### 5. （任意）Wake-on-LAN を有効化する
+### 5. （任意）Wake-on-LAN を Raspberry Pi 中継で構成する
 
-外出先から電源を入れたい場合のみ。スリープ運用なら WoL で復帰できる。
+外出先から自宅 PC の電源を入れたい場合のみ（常時オン運用なら不要）。
 
-- BIOS/UEFI で Wake-on-LAN を有効化
-- ネットワークアダプタのプロパティ →「電源の管理」で
-  「このデバイスでコンピューターのスタンバイ状態を解除できるようにする」と
-  「Magic Packet でのみ…」を有効化
-- 高速スタートアップを無効化すると WoL が安定する場合がある
+> **なぜ中継役が要るのか**: WoL の「マジックパケット」は LAN 内ブロードキャスト
+> (L2) で飛ぶが、Tailscale は L3 の VPN なのでブロードキャストを中継しない。
+> 加えて寝ている自宅 PC は Tailscale に乗っていない。よって自宅 LAN 上に
+> **常時起動 + Tailscale 常駐の中継役**を 1 台置き、出先からそこへ Tailscale で
+> 入ってマジックパケットを LAN へ送る。Raspberry Pi は低消費電力で最適。
+>
+> ```
+> [出先PC] --Tailscale(L3)--> [Raspberry Pi] --LANブロードキャスト--> [寝てる自宅PC]
+> ```
 
-> WoL のマジックパケット送出自体は本アプリの管轄外（Tailscale 側機能や
-> 別ツールで行う）。
+#### 5-1. 自宅 PC 側（起こされる側）の設定
+
+- **MAC アドレスを控える**: 自宅 PC で `getmac /v`（または `ipconfig /all` の物理アドレス）。
+  WoL に使うのは host が待ち受ける有線/無線 NIC のもの。
+- **BIOS/UEFI** で Wake-on-LAN（"Power On by PCI-E" 等）を有効化。
+- **NIC ドライバ**: デバイスマネージャ → ネットワークアダプタ → プロパティ
+  - 「電源の管理」→「このデバイスで…スタンバイ状態を解除」「Magic Packet でのみ…」を有効
+  - 「詳細設定」→「Wake on Magic Packet」を Enabled
+- **高速スタートアップを無効化**（完全シャットダウン S5 からの WoL が効かない主因）:
+  ```powershell
+  powercfg /h off
+  ```
+
+> S3（スリープ）/S4（休止）からの復帰が最も安定。運用は **「スリープ + WoL」** 推奨。
+
+#### 5-2. Raspberry Pi 側（中継役）の設定
+
+Pi は自宅 PC と**同じ LAN（同一サブネット）**に接続しておく（有線が確実）。
+
+```bash
+# 1. Tailscale を入れて tailnet に参加（常駐する）
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --ssh          # --ssh で tailnet 内から鍵管理なしに SSH 可能
+
+# 2. マジックパケット送出ツール
+sudo apt update && sudo apt install -y wakeonlan
+
+# 3. 動作テスト（自宅 PC をスリープさせてから）
+wakeonlan AA:BB:CC:DD:EE:FF      # ← 自宅 PC の MAC
+```
+
+控えておく値: `tailscale ip -4`（Pi の 100.x.x.x）または MagicDNS 名（例 `raspberrypi`）。
+
+#### 5-3. 出先から起こす
+
+出先 PC（Tailscale 接続済み）から、Pi へ SSH してコマンドを 1 発打つだけ:
+
+```bash
+ssh pi@raspberrypi 'wakeonlan AA:BB:CC:DD:EE:FF'
+```
+
+毎回 MAC を打ちたくなければ、Pi に下記ヘルパーを置いておくと「起こして host が
+上がるまで待つ」までやってくれる（`~/wake-home.sh`）:
+
+```bash
+#!/usr/bin/env bash
+# 自宅 PC を WoL で起こし、host のポートが開くまで待つ。
+MAC="AA:BB:CC:DD:EE:FF"      # 自宅 PC の MAC
+HOST="100.x.x.x"            # 自宅 PC の Tailscale IP
+PORT="${1:-7000}"          # host の --port（既定 7000）
+
+echo "sending magic packet to $MAC ..."
+wakeonlan "$MAC"
+echo -n "waiting for $HOST:$PORT "
+until nc -z -w1 "$HOST" "$PORT" 2>/dev/null; do
+  echo -n "."
+  sleep 2
+done
+echo " up!"
+```
+
+```bash
+chmod +x ~/wake-home.sh
+# 出先からは:
+ssh pi@raspberrypi '~/wake-home.sh 8000'   # 引数は host の --port
+```
+
+> WoL のマジックパケット送出自体は本アプリの管轄外（中継役 = Raspberry Pi の役割）。
+> 上のスクリプトはあくまで運用例。
 
 ---
 
 ## 出先からの接続
 
-1. （PC が落ちているなら）WoL で自宅 PC を起こす
+1. （PC が落ちているなら）Pi 経由で WoL を送って自宅 PC を起こす
+   （例: `ssh pi@raspberrypi '~/wake-home.sh 8000'`）
 2. 自宅 PC がログオンすると host が自動起動し、`DDD_PASSWORD` で待ち受ける
 3. 出先の PC で client を起動
 4. 接続先に `100.x.x.x:<port>`、パスワードに `DDD_PASSWORD` の値を入力して接続
@@ -133,4 +205,5 @@ Tailscale はサービスとして常駐し、起動時に自動で tailnet へ�
 | パスワードが通らない | `DDD_PASSWORD` がシステム環境変数か（`/M`）。設定後に再ログオンしたか |
 | タスクは動くが映像が来ない | ログオンセッションがアクティブか（ロック画面のみでは DXGI が止まる構成あり）。GPU ドライバ |
 | `--install` が失敗する | 管理者権限で実行しているか（`/RL HIGHEST` 登録のため） |
+| WoL で起きない | Pi と自宅 PC が同一サブネットか。MAC が正しいか。高速スタートアップ無効化したか。S5 不可なら S3/S4（スリープ/休止）で運用 |
 | 自動ログオンしたい | 無人運用で「ログオン時」を満たすには自動ログオン設定が要る（セキュリティと要相談） |
