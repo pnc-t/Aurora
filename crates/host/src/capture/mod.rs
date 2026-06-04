@@ -67,7 +67,7 @@ pub struct DisplayInfo {
     pub y: i32,
 }
 
-impl From<&DisplayInfo> for ddd_common::proto::Display {
+impl From<&DisplayInfo> for aurora_common::proto::Display {
     fn from(d: &DisplayInfo) -> Self {
         Self {
             id: d.id,

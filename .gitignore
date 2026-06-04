@@ -11,6 +11,6 @@ crates/client/src-tauri/gen
 CLAUDE.md
 PLAN.md
 # ランタイム生成ディレクトリ (ProjFS 投影 / ファイル転送の保存先)
-/ddd-remote
+/aurora-remote
 /ddd-received
-/ddd-downloads
+/aurora-downloads

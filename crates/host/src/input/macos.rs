@@ -5,12 +5,12 @@
 //! クライアント (`input.ts`) が送る VK 集合のみを対象とする。
 
 use anyhow::{Result, anyhow};
+use aurora_common::proto::{InputEvent, MouseButton};
 use core_graphics::event::{
     CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
-use ddd_common::proto::{InputEvent, MouseButton};
 
 pub struct CgEventInjector {
     source: CGEventSource,

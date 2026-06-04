@@ -1,6 +1,6 @@
 //! ProjFS の Windows 実装。
 //!
-//! `ddd-remote/` をプレースホルダ化して `PrjStartVirtualizing` を呼び、列挙 / メタ情報 /
+//! `aurora-remote/` をプレースホルダ化して `PrjStartVirtualizing` を呼び、列挙 / メタ情報 /
 //! ファイル内容のコールバックを [`FsBridge`] 経由でクライアントへ転送する (読み取り方向)。
 
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::core::{GUID, HRESULT, PCWSTR};
 
 use super::FsBridge;
-use ddd_common::proto::{ControlMsg, FsEntry};
+use aurora_common::proto::{ControlMsg, FsEntry};
 
 /// FsRead 1 回の最大バイト数 (制御フレーム 64KB 上限に収める)。
 const READ_CHUNK: u32 = 32 * 1024;

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "DDD client default capability",
+  "description": "Aurora client default capability",
   "windows": ["main"],
   "permissions": [
     "core:default",

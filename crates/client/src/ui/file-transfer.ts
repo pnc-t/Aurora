@@ -1,7 +1,7 @@
 // ファイル転送 UI。
 // - アップロード (クライアント → ホスト): ファイルを選んでチャンク送信。
 // - ダウンロード (ホスト → クライアント): ホスト上のパスを指定して取得。
-//   受信ファイルはクライアント側の ddd-downloads/ に自動保存される。
+//   受信ファイルはクライアント側の aurora-downloads/ に自動保存される。
 // 完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
 
 import { requestFile, sendFileChunk, sendFileOffer, setShareRoot } from "../core/ipc";

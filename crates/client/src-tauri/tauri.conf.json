@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2.0.0",
-  "productName": "DDD",
+  "productName": "Aurora",
   "version": "0.1.0",
-  "identifier": "com.ddd.remote",
+  "identifier": "com.aurora.remote",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "DDD Remote Desktop",
+        "title": "Aurora Remote Desktop",
         "width": 920,
         "height": 600,
         "resizable": false,

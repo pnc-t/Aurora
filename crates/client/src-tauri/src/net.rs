@@ -9,11 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aurora_common::clipboard::{self, ClipboardHandle};
+use aurora_common::framing::{
+    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+};
+use aurora_common::noise::{
+    HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password,
+};
+use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use bincode::Options;
-use ddd_common::clipboard::{self, ClipboardHandle};
-use ddd_common::framing::{AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags};
-use ddd_common::noise::{HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password};
-use ddd_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 
@@ -227,13 +231,13 @@ pub async fn connect_to_host(
         return Err(format!("expected HostInfo, got {host_info:?}"));
     }
 
-    // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "DDDHELLO"。
+    // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "AURHELLO"。
     // 高 fps 時のバースト受信での取りこぼし (= 映像ノイズ) を抑えるため受信バッファを拡大する。
     let udp = Arc::new(make_udp_socket().map_err(|e| format!("UDP socket: {e}"))?);
     udp.connect(udp_addr)
         .await
         .map_err(|e| format!("UDP connect: {e}"))?;
-    udp.send(b"DDDHELLO")
+    udp.send(b"AURHELLO")
         .await
         .map_err(|e| format!("UDP hello: {e}"))?;
 
@@ -441,7 +445,7 @@ pub async fn set_video_params(
 }
 
 /// ホスト上のファイルのダウンロードを要求する。受信は reader ループが
-/// `ddd-downloads/` に保存し、完了を FileResult イベントで通知する。
+/// `aurora-downloads/` に保存し、完了を FileResult イベントで通知する。
 #[tauri::command]
 pub async fn request_file(
     id: u32,
@@ -540,10 +544,10 @@ struct DownloadState {
     path: String,
 }
 
-/// `ddd-downloads/` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
+/// `aurora-downloads/` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
 async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> {
     use std::path::Path;
-    let dir = Path::new("ddd-downloads");
+    let dir = Path::new("aurora-downloads");
     tokio::fs::create_dir_all(dir).await?;
     let safe = Path::new(name)
         .file_name()
@@ -968,7 +972,7 @@ async fn udp_reader_loop(
                     r?
                 }
                 _ = hello_interval.tick() => {
-                    let _ = udp.send(b"DDDHELLO").await;
+                    let _ = udp.send(b"AURHELLO").await;
                     continue;
                 }
             }

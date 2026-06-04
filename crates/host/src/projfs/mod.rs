@@ -1,6 +1,6 @@
 //! ProjFS によるドライブリダイレクト (RDP 風)。
 //!
-//! クライアントの共有フォルダをホストの仮想フォルダ (`ddd-remote/`) として投影し、
+//! クライアントの共有フォルダをホストの仮想フォルダ (`aurora-remote/`) として投影し、
 //! ホストの Explorer からそのまま閲覧・コピーできるようにする (読み取り方向のみ)。
 //!
 //! ProjFS のコールバックは ProjFS 所有の同期スレッドから呼ばれるため、tokio の制御
@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ddd_common::proto::{ControlMsg, FsEntry};
+use aurora_common::proto::{ControlMsg, FsEntry};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(windows)]
