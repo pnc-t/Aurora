@@ -17,14 +17,16 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, ICodecAPI, IMFMediaBuffer, IMFMediaType, IMFTransform,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Base,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, ICodecAPI,
+    IMFMediaBuffer, IMFMediaType, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_Base,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::GUID;
@@ -53,6 +55,8 @@ pub struct MfH264Encoder {
     inner: Option<Inner>,
     /// 目標平均ビットレート (bps)。inner 構築時・set_bitrate 時に反映。
     bitrate: u32,
+    /// ピーク (最大) ビットレート上限 (bps)。PeakConstrainedVBR の上限。
+    max_bitrate: u32,
     frame_id: u16,
     /// 次フレームを強制 keyframe にするフラグ (初回 / 再構築 / 明示要求)。
     force_keyframe: bool,
@@ -74,13 +78,14 @@ struct Inner {
 }
 
 impl MfH264Encoder {
-    pub fn new(device: SharedDevice) -> Result<Self> {
+    pub fn new(device: SharedDevice, max_bitrate: u32) -> Result<Self> {
         // COM/MF はこのスレッドで初期化済み前提だが冪等に保証する。
         crate::capture::device::init_thread_com()?;
         Ok(Self {
             device,
             inner: None,
-            bitrate: DEFAULT_BITRATE_BPS,
+            bitrate: DEFAULT_BITRATE_BPS.min(max_bitrate),
+            max_bitrate,
             frame_id: 0,
             force_keyframe: true,
         })
@@ -99,7 +104,13 @@ impl MfH264Encoder {
                 bitrate = self.bitrate,
                 "building SW H.264 MFT"
             );
-            self.inner = Some(Inner::new(&self.device, width, height, self.bitrate)?);
+            self.inner = Some(Inner::new(
+                &self.device,
+                width,
+                height,
+                self.bitrate,
+                self.max_bitrate,
+            )?);
             // 新しい MFT の最初の出力は keyframe にする。
             self.force_keyframe = true;
         }
@@ -108,7 +119,13 @@ impl MfH264Encoder {
 }
 
 impl Inner {
-    fn new(device: &DeviceBundle, width: u32, height: u32, bitrate: u32) -> Result<Self> {
+    fn new(
+        device: &DeviceBundle,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        max_bitrate: u32,
+    ) -> Result<Self> {
         // SAFETY: CoCreateInstance は OUT param を初期化。CLSID は MS H.264 encoder。
         let transform: IMFTransform = unsafe {
             CoCreateInstance(&CLSID_CMSH264_ENCODER_MFT, None, CLSCTX_INPROC_SERVER)
@@ -134,6 +151,8 @@ impl Inner {
 
         // 実行時ビットレート変更用に ICodecAPI を取得 (MS H.264 encoder は対応)。
         let codec_api: ICodecAPI = transform.cast().context("QueryInterface ICodecAPI")?;
+        // レート制御を明示する (既定の緩い VBR は目標を大きく超過するため)。
+        configure_rate_control(&codec_api, bitrate, max_bitrate);
 
         // SAFETY: メッセージ送信は副作用のみ。
         unsafe {
@@ -379,6 +398,40 @@ impl VideoEncoder for MfH264Encoder {
             }
         }
         Ok(())
+    }
+}
+
+/// エンコーダのレート制御を PeakConstrainedVBR + 平均/ピーク/バッファで明示設定する。
+/// 既定の (無指定) レート制御は緩い VBR で、動きの多い場面で目標を大きく超過する
+/// (実測で 15Mbps 目標に対し ~23Mbps)。HW MFT はベンダによって一部の knob を無視する
+/// ことがあるため各設定は best-effort (失敗は debug ログのみ) とする。
+/// SW / HW 両エンコーダから共有する。
+pub(crate) fn configure_rate_control(codec_api: &ICodecAPI, mean_bps: u32, max_bps: u32) {
+    // 無制限 (u32::MAX): レート制御モードを設定せず既定 VBR のまま、平均目標のみ与える
+    // (コミット前の挙動と等価)。上限を課さないので大きなオーバーシュートを許容する。
+    if max_bps == u32::MAX {
+        // SAFETY: codec_api 生存、VARIANT は VT_UI4。
+        unsafe {
+            let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(mean_bps));
+        }
+        return;
+    }
+    // ピークは平均以上でなければならない。
+    let max_bps = max_bps.max(mean_bps);
+    // SAFETY: codec_api 生存、VARIANT は VT_UI4。SetValue は値をコピーする。
+    unsafe {
+        if let Err(e) = codec_api.SetValue(
+            &CODECAPI_AVEncCommonRateControlMode,
+            &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+        ) {
+            tracing::debug!(error = %e, "set RateControlMode (PeakConstrainedVBR) unsupported");
+        }
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(mean_bps));
+        if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(max_bps)) {
+            tracing::debug!(error = %e, "set MaxBitRate unsupported");
+        }
+        // VBV 相当のバッファ ~1 秒分でバーストを抑える。
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(max_bps));
     }
 }
 

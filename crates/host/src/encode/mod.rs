@@ -41,19 +41,19 @@ pub enum PlatformEncoder {
 
 #[cfg(target_os = "windows")]
 impl PlatformEncoder {
-    pub fn new(device: SharedDevice) -> anyhow::Result<Self> {
+    pub fn new(device: SharedDevice, max_bitrate_bps: u32) -> anyhow::Result<Self> {
         if std::env::var_os("DDD_FORCE_SW_ENCODER").is_some() {
             tracing::warn!("DDD_FORCE_SW_ENCODER set: forcing software H.264 MFT");
-            return Ok(Self::Sw(mf::MfH264Encoder::new(device)?));
+            return Ok(Self::Sw(mf::MfH264Encoder::new(device, max_bitrate_bps)?));
         }
-        match mf_hw::MfHwH264Encoder::new(device.clone()) {
+        match mf_hw::MfHwH264Encoder::new(device.clone(), max_bitrate_bps) {
             Ok(e) => {
                 tracing::info!("video encoder: hardware H.264 MFT (zero-copy NV12)");
                 Ok(Self::Hw(e))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "HW H.264 encoder unavailable; falling back to software MFT (NV12 read-back)");
-                Ok(Self::Sw(mf::MfH264Encoder::new(device)?))
+                Ok(Self::Sw(mf::MfH264Encoder::new(device, max_bitrate_bps)?))
             }
         }
     }

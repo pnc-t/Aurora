@@ -54,7 +54,8 @@ struct Inner {
 
 impl FfmpegH264Encoder {
     /// `_device` は Windows 専用の共有 D3D11 デバイス (mac/linux では `()`)。
-    pub fn new(_device: crate::capture::SharedDevice) -> Result<Self> {
+    /// `_max_bitrate_bps` のピーク上限適用は mac/linux 側では未対応 (signature 整合のみ)。
+    pub fn new(_device: crate::capture::SharedDevice, _max_bitrate_bps: u32) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
         Ok(Self {
             inner: None,

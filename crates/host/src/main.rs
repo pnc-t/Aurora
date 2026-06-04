@@ -18,7 +18,7 @@ mod projfs;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
-use encode::{EncodedNal, PlatformEncoder, VideoEncoder};
+use encode::{EncodedNal, MAX_BITRATE_BPS, PlatformEncoder, VideoEncoder};
 use input::{DisplayGeom, InputInjector, PlatformInjector};
 use net::{EncoderCommand, InputCmd, ServerConfig};
 
@@ -34,6 +34,8 @@ struct Args {
     /// 送出フレームレート上限 (fps)。0 で無制限。高リフレッシュレートモニタで
     /// クライアントのデコードを溢れさせ遅延が累積するのを防ぐ。
     fps_cap: u32,
+    /// ビットレート上限 (bps)。適応制御の上限 + エンコーダのピーク上限。
+    max_bitrate_bps: u32,
 }
 
 impl Default for Args {
@@ -43,6 +45,7 @@ impl Default for Args {
             dump_h264: None,
             perf: false,
             fps_cap: DEFAULT_FPS_CAP,
+            max_bitrate_bps: MAX_BITRATE_BPS,
         }
     }
 }
@@ -67,6 +70,18 @@ fn parse_args() -> Args {
                     .and_then(|s| s.parse().ok())
                     .expect("--fps requires N (0 = uncapped)");
             }
+            "--max-bitrate" => {
+                // 引数は Mbps。内部 bps へ変換する。0 (以下) は無制限 (u32::MAX) を表す。
+                let mbps: f64 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--max-bitrate requires N (Mbps, 0 = unlimited)");
+                args.max_bitrate_bps = if mbps <= 0.0 {
+                    u32::MAX
+                } else {
+                    (mbps * 1_000_000.0) as u32
+                };
+            }
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -89,7 +104,7 @@ fn main() -> Result<()> {
         return dump_h264(n);
     }
 
-    run_server(args.perf, args.fps_cap)
+    run_server(args.perf, args.fps_cap, args.max_bitrate_bps)
 }
 
 fn dump_one_bmp() -> Result<()> {
@@ -110,7 +125,7 @@ fn dump_one_bmp() -> Result<()> {
 fn dump_h264(n: usize) -> Result<()> {
     let device = capture::create_shared_device()?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
-    let mut enc = PlatformEncoder::new(device)?;
+    let mut enc = PlatformEncoder::new(device, MAX_BITRATE_BPS)?;
     let mut out = std::fs::File::create("out.h264").context("create out.h264")?;
     use std::io::Write;
 
@@ -137,7 +152,7 @@ fn dump_h264(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_server(perf: bool, fps_cap: u32) -> Result<()> {
+fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32) -> Result<()> {
     let password: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(10)
@@ -203,6 +218,14 @@ fn run_server(perf: bool, fps_cap: u32) -> Result<()> {
     } else {
         tracing::info!(fps = fps_cap, "frame rate cap");
     }
+    if max_bitrate_bps == u32::MAX {
+        tracing::info!("bitrate cap: unlimited");
+    } else {
+        tracing::info!(
+            max_mbps = max_bitrate_bps as f64 / 1_000_000.0,
+            "bitrate cap (PeakConstrainedVBR peak)"
+        );
+    }
     let cap_device = device.clone();
     std::thread::Builder::new()
         .name("capture".into())
@@ -239,7 +262,8 @@ fn run_server(perf: bool, fps_cap: u32) -> Result<()> {
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
-            if let Err(e) = encode_loop(device, frame_rx, nal_tx, enc_cmd_rx, perf) {
+            if let Err(e) = encode_loop(device, frame_rx, nal_tx, enc_cmd_rx, perf, max_bitrate_bps)
+            {
                 tracing::error!(error = %e, "encode loop ended");
             }
         })?;
@@ -261,6 +285,7 @@ fn run_server(perf: bool, fps_cap: u32) -> Result<()> {
             psk,
             displays,
             audio: audio_enabled,
+            max_bitrate_bps,
         };
         net::run_server(
             cfg,
@@ -364,8 +389,9 @@ fn encode_loop(
     nal_tx: mpsc::Sender<EncodedNal>,
     mut cmd_rx: mpsc::Receiver<EncoderCommand>,
     perf: bool,
+    max_bitrate_bps: u32,
 ) -> Result<()> {
-    let mut enc = PlatformEncoder::new(device)?;
+    let mut enc = PlatformEncoder::new(device, max_bitrate_bps)?;
     let mut meter = perf.then(perf::EncodeMeter::new);
     // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
     let mut nals: Vec<EncodedNal> = Vec::new();
