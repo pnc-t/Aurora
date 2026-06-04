@@ -104,34 +104,139 @@
       #file-panel button:disabled { opacity: 0.5; cursor: default; }
       #file-panel .progress { font-family: monospace; font-size: 11px; color: var(--muted); min-width: 64px; text-align: right; }
 
-      /* --- 接続オーバーレイ (中央カード、未接続時のみ) --- */
+      /* --- ランチャー (未接続時、サイドバー + ホスト一覧 / 設定) --- */
       #connect-overlay {
         position: fixed; inset: 0; z-index: 50;
-        display: flex; align-items: center; justify-content: center;
-        background: rgba(8, 8, 10, 0.82); backdrop-filter: blur(3px);
+        background: var(--bg);
       }
       #connect-overlay.hidden { display: none; }
-      #connect-card {
-        width: 340px; padding: 24px;
+      .launcher { display: flex; height: 100%; }
+
+      /* サイドバー */
+      .sidebar {
+        width: 200px; flex-shrink: 0;
+        display: flex; flex-direction: column;
+        padding: 14px 12px; gap: 6px;
+        background: #161618; border-right: 1px solid var(--panel-border);
+      }
+      .brand { display: flex; align-items: center; gap: 10px; padding: 6px 8px 14px; }
+      .brand .logo {
+        width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: linear-gradient(135deg, var(--accent), #6aa6ff); color: #fff; font-weight: 700;
+      }
+      .brand .name { font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
+      .nav-item {
+        display: flex; align-items: center; gap: 10px;
+        padding: 10px 12px; border-radius: 10px;
+        background: transparent; border: none; color: var(--muted);
+        font-size: 14px; text-align: left; cursor: pointer; width: 100%;
+      }
+      .nav-item .ico { width: 18px; text-align: center; opacity: 0.9; }
+      .nav-item:hover { background: #1f1f22; color: var(--fg); }
+      .nav-item.active { background: #232327; color: var(--fg); font-weight: 600; }
+      .sidebar-spacer { flex: 1; }
+      .status-card {
+        display: flex; align-items: center; gap: 10px;
+        padding: 10px 12px; border-radius: 10px;
+        background: #1f1f22; border: 1px solid var(--panel-border); font-size: 13px;
+      }
+      .status-card .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+      .status-card.connecting .dot { background: #d6a83a; }
+      .status-card.connected .dot { background: var(--ok); }
+      .status-card.error .dot { background: var(--danger); }
+      .status-card .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+      /* コンテンツ領域 */
+      .content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 22px 26px; overflow: hidden; }
+      .page { display: none; flex-direction: column; min-height: 0; flex: 1; }
+      .page.active { display: flex; }
+      .page-head { display: flex; align-items: center; margin-bottom: 16px; }
+      .page-head h2 { margin: 0; font-size: 22px; font-weight: 700; }
+      .page-head .actions { margin-left: auto; display: flex; gap: 8px; }
+      .icon-btn {
+        width: 34px; height: 34px; border-radius: 8px;
+        background: #232327; border: 1px solid var(--panel-border); color: var(--fg);
+        cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center;
+      }
+      .icon-btn:hover { background: #2d2d31; }
+
+      /* ホスト一覧 */
+      .host-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 4px; }
+      .host-card {
+        display: flex; align-items: center; gap: 14px;
+        padding: 14px 16px; border-radius: 12px;
+        background: var(--panel); border: 1px solid var(--panel-border); cursor: pointer;
+      }
+      .host-card:hover { border-color: #4a4a4e; background: #202024; }
+      .host-card .avatar {
+        width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 18px; font-weight: 700; color: #fff;
+      }
+      .host-card .meta { flex: 1; min-width: 0; }
+      .host-card .meta .label { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .host-card .meta .addr { font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px; }
+      .host-card .card-btn {
+        background: transparent; border: none; color: var(--muted);
+        cursor: pointer; font-size: 15px; padding: 4px 6px; border-radius: 6px;
+      }
+      .host-card .card-btn:hover { background: #2d2d31; color: var(--fg); }
+      .host-card .chevron { color: var(--muted); font-size: 18px; margin-left: 2px; }
+      .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
+
+      /* 設定ページ */
+      .settings-body { display: flex; flex-direction: column; gap: 2px; max-width: 460px; }
+      .setting-row {
+        display: flex; align-items: center; gap: 12px;
+        padding: 14px 4px; border-bottom: 1px solid var(--panel-border);
+      }
+      .setting-row .s-meta { flex: 1; }
+      .setting-row .s-title { font-size: 14px; }
+      .setting-row .s-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+      /* トグルスイッチ */
+      .switch { position: relative; width: 42px; height: 24px; flex-shrink: 0; }
+      .switch input { opacity: 0; width: 0; height: 0; }
+      .switch .slider {
+        position: absolute; inset: 0; border-radius: 24px;
+        background: #3a3a3e; transition: background 0.15s; cursor: pointer;
+      }
+      .switch .slider::before {
+        content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+        border-radius: 50%; background: #fff; transition: transform 0.15s;
+      }
+      .switch input:checked + .slider { background: var(--accent); }
+      .switch input:checked + .slider::before { transform: translateX(18px); }
+
+      /* ダイアログ (接続 / ホスト編集) */
+      #dialog-backdrop {
+        position: absolute; inset: 0; z-index: 60;
+        display: none; align-items: center; justify-content: center;
+        background: rgba(8, 8, 10, 0.6); backdrop-filter: blur(2px);
+      }
+      #dialog-backdrop.visible { display: flex; }
+      .dialog {
+        width: 340px; padding: 22px;
         background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
         box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
-        display: flex; flex-direction: column; gap: 14px;
+        display: flex; flex-direction: column; gap: 12px;
       }
-      #connect-card h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
-      #connect-card label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
-      #connect-card input {
+      .dialog h3 { margin: 0 0 2px; font-size: 17px; font-weight: 600; }
+      .dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+      .dialog input {
         background: #2c2c2e; color: var(--fg);
-        border: 1px solid var(--panel-border); border-radius: 8px;
-        padding: 8px 10px; font-size: 14px;
+        border: 1px solid var(--panel-border); border-radius: 8px; padding: 8px 10px; font-size: 14px;
       }
-      #connect-card input:focus { outline: none; border-color: var(--accent); }
-      #connect-card button[type="submit"] {
-        margin-top: 4px; padding: 10px; border: none; border-radius: 8px;
-        background: var(--accent); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+      .dialog input:focus { outline: none; border-color: var(--accent); }
+      .dialog .dlg-status { min-height: 14px; font-size: 12px; font-family: monospace; color: var(--muted); }
+      .dialog .dlg-status.error { color: #ff8a8d; }
+      .dialog .dlg-actions { display: flex; gap: 8px; margin-top: 4px; }
+      .dialog .dlg-actions button {
+        flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
       }
-      #connect-card button[type="submit"]:disabled { opacity: 0.6; cursor: default; }
-      #connect-status { min-height: 16px; font-size: 12px; font-family: monospace; color: var(--muted); }
-      #connect-status.error { color: #ff8a8d; }
+      .dialog .btn-primary { background: var(--accent); color: #fff; }
+      .dialog .btn-primary:disabled { opacity: 0.6; cursor: default; }
+      .dialog .btn-ghost { background: #2c2c2e; color: var(--fg); border: 1px solid var(--panel-border) !important; }
     </style>
   </head>
   <body>

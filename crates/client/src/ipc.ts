@@ -25,11 +25,12 @@ export type InputEvent =
 
 export async function connectToHost(
   host: string,
+  port: number,
   password: string,
   eventChannel: Channel<ClientEvent>,
   videoChannel: Channel<ArrayBuffer>,
 ): Promise<void> {
-  await invoke("connect_to_host", { host, password, eventChannel, videoChannel });
+  await invoke("connect_to_host", { host, port, password, eventChannel, videoChannel });
 }
 
 export async function disconnect(): Promise<void> {
@@ -70,12 +71,40 @@ export async function setShareRoot(path: string): Promise<void> {
   await invoke("set_share_root", { path });
 }
 
+/// 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。
+export type HostEntry = {
+  label: string;
+  host: string;
+  port: number;
+};
+
+/// クライアント設定 (Rust 側 config::ClientSettings と対応)。
+export type ClientSettings = {
+  default_fullscreen: boolean;
+  show_stats: boolean;
+};
+
 /// 接続先 host の履歴を読み込む (最新が先頭)。
-export async function loadRecentHosts(): Promise<string[]> {
-  return await invoke<string[]>("load_recent_hosts");
+export async function loadRecentHosts(): Promise<HostEntry[]> {
+  return await invoke<HostEntry[]>("load_recent_hosts");
 }
 
-/// 接続成功した host を履歴へ保存する。
-export async function saveRecentHost(host: string): Promise<void> {
-  await invoke("save_recent_host", { host });
+/// 接続成功した host を履歴へ保存する (host で重複排除・更新)。
+export async function saveRecentHost(entry: HostEntry): Promise<void> {
+  await invoke("save_recent_host", { entry });
+}
+
+/// 指定 host を履歴から削除する。
+export async function deleteRecentHost(host: string): Promise<void> {
+  await invoke("delete_recent_host", { host });
+}
+
+/// クライアント設定を読み込む。
+export async function loadSettings(): Promise<ClientSettings> {
+  return await invoke<ClientSettings>("load_settings");
+}
+
+/// クライアント設定を保存する。
+export async function saveSettings(settings: ClientSettings): Promise<void> {
+  await invoke("save_settings", { settings });
 }
