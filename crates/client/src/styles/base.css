@@ -1,22 +1,145 @@
 /* 全 UI 共通の土台。
  * テーマ変数 (:root)、リセット、最背面の映像 canvas、横断的なアイコン表示など、
  * 特定コンポーネントに属さないものだけを置く。各コンポーネント固有のスタイルは
- * ui/<component>.css に co-locate する。main.ts が最初に import する。 */
+ * ui/<component>.css に co-locate する。main.ts が最初に import する。
+ *
+ * テーマ: <html data-theme="..."> で切り替える (launcher.ts が設定値から付与)。
+ *   未指定 / "dark" = 既定 (:root の値)、"light" / "legacy" (グレーのクラシック調) は上書き、
+ *   "auto" は OS の prefers-color-scheme に追従 (下部の media query)。
+ * 各コンポーネント CSS は生の色を持たず、必ずここで定義した変数を参照すること。 */
 
 :root {
-  --bg: #111;
-  --fg: #eee;
-  --panel: #1c1c1e;
-  --panel-border: #333;
-  --accent: #3a82f7;
-  --muted: #9a9a9e;
-  --danger: #e5484d;
-  --ok: #3fb950;
+  /* 基本 */
+  --bg: #111;             /* ウィンドウ背景 */
+  --fg: #eee;             /* 主要テキスト */
+  --muted: #9a9a9e;       /* 補助テキスト */
+  --panel: #1c1c1e;       /* カード / ダイアログ / パネル面 */
+  --panel-border: #333;   /* 枠線 */
+  --accent: #3a82f7;      /* アクセント (ユーザー設定で上書き可) */
+  --accent-fg: #fff;      /* アクセント面上のテキスト */
+  --danger: #e5484d;      /* 危険操作 / エラー枠 */
+  --danger-fg: #ff8a8d;   /* 危険テキスト (淡い赤) */
+  --ok: #3fb950;          /* 正常 */
+  /* 面の階層 (暗→明) */
+  --sidebar: #161618;       /* サイドバー背景 */
+  --raised: #232327;        /* 一段浮いた面: nav 選択中 / icon ボタン / カード hover */
+  --raised-faint: #1f1f22;  /* 控えめに浮いた面: nav hover / ステータスカード */
+  --control: #2c2c2e;       /* 入力欄 / ボタン / メニュー面 */
+  --control-hover: #3a3a3c; /* ボタン hover */
+  --menu-hover: #2d2d31;    /* メニュー項目 / 小ボタン hover */
+  /* 細部 */
+  --track: #3a3a3e;            /* スクロールバー */
+  --track-hover: #56565c;     /* スクロールバー hover */
+  --toggle-off: #3a3a3e;      /* トグル off 時のトラック (off と分かる地味色) */
+  --card-hover-border: #4a4a4e;
+  --grip: #6a6a70;            /* ドラッグつまみ */
+  --toolbar-bg: rgba(28, 28, 30, 0.96);
+  --toast-bg: rgba(40, 40, 44, 0.96);
+  --backdrop: rgba(8, 8, 10, 0.6);       /* ダイアログ背後 */
+  --winctl-hover: rgba(255, 255, 255, 0.1);
+  --shadow: rgba(0, 0, 0, 0.5);
+  /* 文字 */
+  --font: system-ui, sans-serif;
 }
+
+/* --- ライト --- */
+:root[data-theme="light"] {
+  --bg: #f5f5f7;
+  --fg: #1c1c1e;
+  --muted: #6b6b70;
+  --panel: #ffffff;
+  --panel-border: #d8d8dc;
+  --accent: #3a82f7;
+  --accent-fg: #fff;
+  --danger: #e5484d;
+  --danger-fg: #c0282c;
+  --ok: #2f9e44;
+  --sidebar: #ececf0;
+  --raised: #e2e2e8;
+  --raised-faint: #ededf1;
+  --control: #ffffff;
+  --control-hover: #e8e8ec;
+  --menu-hover: #ededf1;
+  --track: #c4c4cc;
+  --track-hover: #a0a0a8;
+  --toggle-off: #c4c4cc;
+  --card-hover-border: #c0c0c8;
+  --grip: #b0b0b8;
+  --toolbar-bg: rgba(245, 245, 247, 0.96);
+  --toast-bg: rgba(255, 255, 255, 0.97);
+  --backdrop: rgba(0, 0, 0, 0.25);
+  --winctl-hover: rgba(0, 0, 0, 0.06);
+  --shadow: rgba(0, 0, 0, 0.18);
+}
+
+/* --- レガシー (ニュートラルなダークグレーのクラシック調) ---
+ * 旧来のデスクトップアプリ風。やや青みのあるグレーで彩度を抑え、面の階層も
+ * グレーの濃淡だけで表現する。アクセント色は --accent を上書きしないので、
+ * ユーザー設定のアクセント色 (既定の青) が選択中ナビ/プライマリボタンに効く。 */
+:root[data-theme="legacy"] {
+  --bg: #1e1e1e;
+  --fg: #e4e4e4;
+  --muted: #9d9d9d;
+  --panel: #252526;
+  --panel-border: #3c3c3c;
+  --accent-fg: #fff;
+  --danger: #e5484d;
+  --danger-fg: #f0888b;
+  --ok: #4ec96a;
+  --sidebar: #1b1b1b;
+  --raised: #2d2d2e;
+  --raised-faint: #262627;
+  --control: #2a2a2b;
+  --control-hover: #37373a;
+  --menu-hover: #2f2f31;
+  --track: #4a4a4d;
+  --track-hover: #5e5e62;
+  --toggle-off: #4a4a4d;
+  --card-hover-border: #505053;
+  --grip: #6a6a6e;
+  --toolbar-bg: rgba(37, 37, 38, 0.96);
+  --toast-bg: rgba(45, 45, 48, 0.96);
+  --backdrop: rgba(0, 0, 0, 0.5);
+  --winctl-hover: rgba(255, 255, 255, 0.09);
+  --shadow: rgba(0, 0, 0, 0.5);
+}
+
+/* --- システム連動 (auto): OS がライトのときだけライト配色へ --- */
+@media (prefers-color-scheme: light) {
+  :root[data-theme="auto"] {
+    --bg: #f5f5f7;
+    --fg: #1c1c1e;
+    --muted: #6b6b70;
+    --panel: #ffffff;
+    --panel-border: #d8d8dc;
+    --accent: #3a82f7;
+    --accent-fg: #fff;
+    --danger: #e5484d;
+    --danger-fg: #c0282c;
+    --ok: #2f9e44;
+    --sidebar: #ececf0;
+    --raised: #e2e2e8;
+    --raised-faint: #ededf1;
+    --control: #ffffff;
+    --control-hover: #e8e8ec;
+    --menu-hover: #ededf1;
+    --track: #c4c4cc;
+    --track-hover: #a0a0a8;
+    --toggle-off: #c4c4cc;
+    --card-hover-border: #c0c0c8;
+    --grip: #b0b0b8;
+    --toolbar-bg: rgba(245, 245, 247, 0.96);
+    --toast-bg: rgba(255, 255, 255, 0.97);
+    --backdrop: rgba(0, 0, 0, 0.25);
+    --winctl-hover: rgba(0, 0, 0, 0.06);
+    --shadow: rgba(0, 0, 0, 0.18);
+  }
+}
+
 html, body {
   margin: 0; height: 100%;
   background: var(--bg); color: var(--fg);
-  font-family: system-ui, sans-serif; overflow: hidden; overscroll-behavior: none;
+  font-family: var(--font); overflow: hidden; overscroll-behavior: none;
 }
 /* ネイティブアプリ感: テキスト選択/コールアウト/ドラッグを無効化。入力欄のみ選択可。 */
 * { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-user-drag: none; }

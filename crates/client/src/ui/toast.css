@@ -7,7 +7,7 @@
 }
 .toast {
   padding: 8px 14px; border-radius: 8px; max-width: 360px;
-  background: rgba(40, 40, 44, 0.96); color: var(--fg);
+  background: var(--toast-bg); color: var(--fg);
   border: 1px solid var(--panel-border); font-size: 13px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;

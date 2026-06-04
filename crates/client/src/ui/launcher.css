@@ -14,33 +14,32 @@
   position: absolute; top: 0; left: 0; right: 0; height: 34px; z-index: 55;
 }
 
-/* サイドバー (ブランドは非表示。上端はタイトルバー分あける) */
+/* サイドバー: アイコンのみの細いレール (ブランド非表示。上端はタイトルバー分あける)。
+ * 各項目の名称はボタンの title 属性 (ホバー) で表示する。 */
 .sidebar {
-  width: 200px; flex-shrink: 0;
-  display: flex; flex-direction: column;
-  padding: 42px 12px 14px; gap: 6px;
-  background: #161618; border-right: 1px solid var(--panel-border);
+  width: 60px; flex-shrink: 0;
+  display: flex; flex-direction: column; align-items: center;
+  padding: 42px 8px 14px; gap: 6px;
+  background: var(--sidebar); border-right: 1px solid var(--panel-border);
 }
 .nav-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px; border-radius: 10px;
-  background: transparent; border: none; color: var(--muted);
-  font-size: 14px; text-align: left; cursor: pointer; width: 100%;
+  display: flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; padding: 0; border-radius: 10px;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
 }
-.nav-item .ico { display: inline-flex; align-items: center; font-size: 18px; opacity: 0.9; }
-.nav-item:hover { background: #1f1f22; color: var(--fg); }
-.nav-item.active { background: #232327; color: var(--fg); font-weight: 600; }
+.nav-item .ico { display: inline-flex; align-items: center; font-size: 19px; opacity: 0.9; }
+.nav-item:hover { background: var(--raised-faint); color: var(--fg); }
+.nav-item.active { background: var(--raised); color: var(--fg); }
 .sidebar-spacer { flex: 1; }
 .status-card {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px; border-radius: 10px;
-  background: #1f1f22; border: 1px solid var(--panel-border); font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; border-radius: 10px;
+  background: var(--raised-faint); border: 1px solid var(--panel-border);
 }
 .status-card .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
 .status-card.connecting .dot { background: #d6a83a; }
 .status-card.connected .dot { background: var(--ok); }
 .status-card.error .dot { background: var(--danger); }
-.status-card .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* コンテンツ領域 */
 .content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 26px 22px; overflow: hidden; }
@@ -51,15 +50,15 @@
 .page-head .actions { margin-left: auto; display: flex; gap: 8px; }
 .icon-btn {
   width: 34px; height: 34px; border-radius: 8px;
-  background: #232327; border: 1px solid var(--panel-border); color: var(--fg);
+  background: var(--raised); border: 1px solid var(--panel-border); color: var(--fg);
   cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center;
 }
-.icon-btn:hover { background: #2d2d31; }
+.icon-btn:hover { background: var(--menu-hover); }
 
 /* スリムなスクロールバー (ダークテーマ用、OS 標準の太いバーを置換) */
 .host-list, .settings-body, .content {
   scrollbar-width: thin;                       /* Firefox 系 */
-  scrollbar-color: #3a3a3e transparent;
+  scrollbar-color: var(--track) transparent;
 }
 .host-list::-webkit-scrollbar,
 .settings-body::-webkit-scrollbar,
@@ -70,10 +69,10 @@
 .host-list::-webkit-scrollbar-thumb,
 .settings-body::-webkit-scrollbar-thumb,
 .content::-webkit-scrollbar-thumb {
-  background: #3a3a3e; border-radius: 4px; border: 2px solid transparent; background-clip: padding-box;
+  background: var(--track); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box;
 }
 .host-list:hover::-webkit-scrollbar-thumb,
-.settings-body:hover::-webkit-scrollbar-thumb { background: #56565c; background-clip: padding-box; }
+.settings-body:hover::-webkit-scrollbar-thumb { background: var(--track-hover); background-clip: padding-box; }
 .host-list::-webkit-scrollbar-thumb:hover,
 .settings-body::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
 
@@ -84,7 +83,7 @@
   padding: 14px 16px; border-radius: 12px;
   background: var(--panel); border: 1px solid var(--panel-border); cursor: pointer;
 }
-.host-card:hover { border-color: #4a4a4e; background: #202024; }
+.host-card:hover { border-color: var(--card-hover-border); background: var(--raised-faint); }
 .host-card .avatar {
   width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
@@ -98,11 +97,11 @@
   cursor: pointer; font-size: 16px; padding: 6px; border-radius: 6px;
   display: inline-flex; align-items: center; justify-content: center;
 }
-.host-card .card-btn:hover { background: #2d2d31; color: var(--fg); }
+.host-card .card-btn:hover { background: var(--menu-hover); color: var(--fg); }
 .host-card .chevron { display: inline-flex; align-items: center; color: var(--muted); font-size: 20px; margin-left: 2px; }
 /* 並べ替え (grip を掴んでドラッグ) */
 .host-card .grip {
-  display: inline-flex; align-items: center; color: #6a6a70;
+  display: inline-flex; align-items: center; color: var(--grip);
   font-size: 18px; cursor: grab; padding: 2px; margin-right: 2px; flex-shrink: 0;
   touch-action: none;
 }
@@ -128,14 +127,20 @@
 .setting-group:first-child { margin-top: 4px; }
 .color-input {
   width: 42px; height: 28px; padding: 0; border: 1px solid var(--panel-border);
-  border-radius: 6px; background: #2c2c2e; cursor: pointer; flex-shrink: 0;
+  border-radius: 6px; background: var(--control); cursor: pointer; flex-shrink: 0;
 }
 .num-input {
   width: 80px; flex-shrink: 0; text-align: right;
-  background: #2c2c2e; color: var(--fg);
+  background: var(--control); color: var(--fg);
   border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px;
 }
 .num-input:focus { outline: none; border-color: var(--accent); }
+/* テーマ選択などのプルダウン */
+.select-input {
+  flex-shrink: 0; background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px; cursor: pointer;
+}
+.select-input:focus { outline: none; border-color: var(--accent); }
 /* number 入力の上下スピナーを消す (port などは text+inputmode を使うが念のため) */
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
@@ -152,7 +157,7 @@ input[type="number"] { -moz-appearance: textfield; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .switch .slider {
   position: absolute; inset: 0; border-radius: 24px;
-  background: #3a3a3e; transition: background 0.15s; cursor: pointer;
+  background: var(--toggle-off); transition: background 0.15s; cursor: pointer;
 }
 .switch .slider::before {
   content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
@@ -165,7 +170,7 @@ input[type="number"] { -moz-appearance: textfield; }
 #dialog-backdrop {
   position: absolute; inset: 0; z-index: 60;
   display: none; align-items: center; justify-content: center;
-  background: rgba(8, 8, 10, 0.6); backdrop-filter: blur(2px);
+  background: var(--backdrop); backdrop-filter: blur(2px);
 }
 #dialog-backdrop.visible { display: flex; }
 .dialog {
@@ -177,19 +182,19 @@ input[type="number"] { -moz-appearance: textfield; }
 .dialog h3 { margin: 0 0 2px; font-size: 17px; font-weight: 600; }
 .dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .dialog input {
-  background: #2c2c2e; color: var(--fg);
+  background: var(--control); color: var(--fg);
   border: 1px solid var(--panel-border); border-radius: 8px; padding: 8px 10px; font-size: 14px;
 }
 .dialog input:focus { outline: none; border-color: var(--accent); }
 .dialog .dlg-status { min-height: 14px; font-size: 12px; font-family: monospace; color: var(--muted); }
-.dialog .dlg-status.error { color: #ff8a8d; }
+.dialog .dlg-status.error { color: var(--danger-fg); }
 .dialog .dlg-actions { display: flex; gap: 8px; margin-top: 4px; }
 .dialog .dlg-actions button {
   flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
 }
-.dialog .btn-primary { background: var(--accent); color: #fff; }
+.dialog .btn-primary { background: var(--accent); color: var(--accent-fg); }
 .dialog .btn-primary:disabled { opacity: 0.6; cursor: default; }
-.dialog .btn-ghost { background: #2c2c2e; color: var(--fg); border: 1px solid var(--panel-border) !important; }
+.dialog .btn-ghost { background: var(--control); color: var(--fg); border: 1px solid var(--panel-border) !important; }
 .dialog .btn-danger { background: var(--danger); color: #fff; }
 
 /* カードの ⋯ メニュー (編集 / 削除) */
@@ -205,6 +210,6 @@ input[type="number"] { -moz-appearance: textfield; }
   padding: 8px 10px; border: none; background: transparent; color: var(--fg);
   font-size: 14px; text-align: left; cursor: pointer; border-radius: 6px;
 }
-.card-menu .menu-item:hover { background: #2d2d31; }
-.card-menu .menu-item.danger { color: #ff8a8d; }
+.card-menu .menu-item:hover { background: var(--menu-hover); }
+.card-menu .menu-item.danger { color: var(--danger-fg); }
 .card-menu .menu-item.danger:hover { background: var(--danger); color: #fff; }
