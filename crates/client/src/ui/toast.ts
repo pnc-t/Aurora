@@ -2,6 +2,8 @@
 // 恒久ステータス (接続ラベル) や統計 HUD とは分離し、重要な一時メッセージ
 // (エラー / ディスプレイ切替 / ファイル結果 / 切断) が即上書きされないようにする。
 
+import "./toast.css";
+
 type ToastLevel = "info" | "success" | "error";
 
 let container: HTMLElement | null = null;

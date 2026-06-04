@@ -4,7 +4,8 @@
 //   受信ファイルはクライアント側の ddd-downloads/ に自動保存される。
 // 完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
 
-import { requestFile, sendFileChunk, sendFileOffer, setShareRoot } from "./ipc";
+import { requestFile, sendFileChunk, sendFileOffer, setShareRoot } from "../core/ipc";
+import "./file-transfer.css";
 
 // TCP フレーム上限 (64KB) と bincode オーバーヘッドに収まるサイズ。
 const CHUNK = 32 * 1024;

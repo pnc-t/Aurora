@@ -1,4 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
+import "./styles/base.css";
 import {
   connectToHost,
   disconnect,
@@ -8,16 +9,16 @@ import {
   type ClientEvent,
   type DisplayDto,
   type HostEntry,
-} from "./ipc";
-import { handleVideoChunk, initDecoder, resetDecoder } from "./decoder";
-import { attachInput, detachInput, isCaptured, setCaptureMode } from "./input";
-import { mountLauncher } from "./launcher";
-import { mountToolbar } from "./toolbar";
-import { initToast, showToast } from "./toast";
-import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./stats-overlay";
-import { handleFileResult, mountFileTransfer } from "./file-transfer";
-import { installWebviewGuard } from "./webview-guard";
-import { exitFullscreen, isFullscreen, toggleFullscreen } from "./fullscreen";
+} from "./core/ipc";
+import { handleVideoChunk, initDecoder, resetDecoder } from "./core/decoder";
+import { attachInput, detachInput, isCaptured, setCaptureMode } from "./core/input";
+import { mountLauncher } from "./ui/launcher";
+import { mountToolbar } from "./ui/toolbar";
+import { initToast, showToast } from "./ui/toast";
+import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./ui/stats-overlay";
+import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
+import { installWebviewGuard } from "./core/webview-guard";
+import { exitFullscreen, isFullscreen, toggleFullscreen } from "./core/fullscreen";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const overlay = document.getElementById("connect-overlay") as HTMLElement;

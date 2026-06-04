@@ -2,8 +2,9 @@
 // 既定は画面外に隠れ、上端ホバーゾーン or ホットキーで表示。ピンで常時表示。
 // 中身: disconnect / ディスプレイ切替 / 統計トグル / ファイル転送トグル / 接続ラベル / ピン。
 
-import type { DisplayDto } from "./ipc";
+import type { DisplayDto } from "../core/ipc";
 import { mountWindowControls } from "./window-controls";
+import "./toolbar.css";
 
 type ToolbarOpts = {
   topbar: HTMLElement;

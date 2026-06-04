@@ -14,9 +14,10 @@ import {
   saveSettings,
   type ClientSettings,
   type HostEntry,
-} from "./ipc";
+} from "../core/ipc";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
+import "./launcher.css";
 
 type ConnectCallback = (entry: HostEntry, password: string) => Promise<void>;
 type ConnState = "idle" | "connecting" | "connected" | "error";
