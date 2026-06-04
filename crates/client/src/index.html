@@ -55,6 +55,14 @@
       #topbar button.danger { border-color: var(--danger); color: #ff8a8d; }
       #topbar button.toggled { background: var(--accent); border-color: var(--accent); color: #fff; }
       #topbar .spacer { margin-left: auto; }
+      /* ツールバー右端のウィンドウ操作 (フレームレス用)。通常ボタン装飾を打ち消す。 */
+      #topbar .window-controls { display: flex; margin-left: 6px; }
+      #topbar .winctl {
+        width: 38px; height: 28px; padding: 0; border: none; border-radius: 0;
+        background: transparent; color: var(--muted);
+      }
+      #topbar .winctl:hover { background: rgba(255, 255, 255, 0.1); color: var(--fg); }
+      #topbar .winctl.close:hover { background: var(--danger); color: #fff; }
       #conn-label { font-family: monospace; font-size: 12px; color: var(--muted); }
       #display-wrap { display: none; align-items: center; gap: 4px; font-size: 12px; }
 
@@ -110,29 +118,38 @@
         background: var(--bg);
       }
       #connect-overlay.hidden { display: none; }
-      .launcher { display: flex; height: 100%; }
+      .launcher { display: flex; height: 100%; position: relative; }
 
-      /* サイドバー */
+      /* 自前タイトルバー (フレームレス): 上端のドラッグ領域 + 右上のウィンドウ操作 */
+      .titlebar {
+        position: absolute; top: 0; left: 0; right: 0; height: 34px; z-index: 55;
+      }
+      .window-controls { position: absolute; top: 0; right: 0; display: flex; height: 34px; }
+      .winctl {
+        width: 44px; height: 34px; border: none; background: transparent; color: var(--muted);
+        cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center;
+      }
+      .winctl:hover { background: rgba(255, 255, 255, 0.08); color: var(--fg); }
+      .winctl.close:hover { background: var(--danger); color: #fff; }
+
+      /* サイドバー (ブランドは非表示。上端はタイトルバー分あける) */
       .sidebar {
         width: 200px; flex-shrink: 0;
         display: flex; flex-direction: column;
-        padding: 14px 12px; gap: 6px;
+        padding: 42px 12px 14px; gap: 6px;
         background: #161618; border-right: 1px solid var(--panel-border);
       }
-      .brand { display: flex; align-items: center; gap: 10px; padding: 6px 8px 14px; }
-      .brand .logo {
-        width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
-        display: flex; align-items: center; justify-content: center;
-        background: linear-gradient(135deg, var(--accent), #6aa6ff); color: #fff; font-weight: 700;
-      }
-      .brand .name { font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
       .nav-item {
         display: flex; align-items: center; gap: 10px;
         padding: 10px 12px; border-radius: 10px;
         background: transparent; border: none; color: var(--muted);
         font-size: 14px; text-align: left; cursor: pointer; width: 100%;
       }
-      .nav-item .ico { width: 18px; text-align: center; opacity: 0.9; }
+      .nav-item .ico { display: inline-flex; align-items: center; font-size: 18px; opacity: 0.9; }
+      /* SVG アイコン共通: ベースライン隙間を消し、サイズは font-size 継承 (currentColor) */
+      .launcher svg.icon, #topbar svg.icon { display: block; }
+      /* 画像アイコン (assets/icons の png/jpg 等): 1em の正方形に収める */
+      .icon-img { width: 1em; height: 1em; object-fit: contain; display: block; }
       .nav-item:hover { background: #1f1f22; color: var(--fg); }
       .nav-item.active { background: #232327; color: var(--fg); font-weight: 600; }
       .sidebar-spacer { flex: 1; }
@@ -148,7 +165,7 @@
       .status-card .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
       /* コンテンツ領域 */
-      .content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 22px 26px; overflow: hidden; }
+      .content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 26px 22px; overflow: hidden; }
       .page { display: none; flex-direction: column; min-height: 0; flex: 1; }
       .page.active { display: flex; }
       .page-head { display: flex; align-items: center; margin-bottom: 16px; }
@@ -179,14 +196,34 @@
       .host-card .meta .addr { font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px; }
       .host-card .card-btn {
         background: transparent; border: none; color: var(--muted);
-        cursor: pointer; font-size: 15px; padding: 4px 6px; border-radius: 6px;
+        cursor: pointer; font-size: 16px; padding: 6px; border-radius: 6px;
+        display: inline-flex; align-items: center; justify-content: center;
       }
       .host-card .card-btn:hover { background: #2d2d31; color: var(--fg); }
-      .host-card .chevron { color: var(--muted); font-size: 18px; margin-left: 2px; }
+      .host-card .chevron { display: inline-flex; align-items: center; color: var(--muted); font-size: 20px; margin-left: 2px; }
       .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
 
       /* 設定ページ */
-      .settings-body { display: flex; flex-direction: column; gap: 2px; max-width: 460px; }
+      .settings-body { display: flex; flex-direction: column; gap: 2px; max-width: 480px; }
+      .setting-group {
+        font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+        margin: 16px 4px 4px; font-weight: 600;
+      }
+      .setting-group:first-child { margin-top: 0; }
+      .color-input {
+        width: 42px; height: 28px; padding: 0; border: 1px solid var(--panel-border);
+        border-radius: 6px; background: #2c2c2e; cursor: pointer; flex-shrink: 0;
+      }
+      .num-input {
+        width: 80px; flex-shrink: 0; text-align: right;
+        background: #2c2c2e; color: var(--fg);
+        border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px;
+      }
+      .num-input:focus { outline: none; border-color: var(--accent); }
+      /* number 入力の上下スピナーを消す (port などは text+inputmode を使うが念のため) */
+      input[type="number"]::-webkit-inner-spin-button,
+      input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+      input[type="number"] { -moz-appearance: textfield; }
       .setting-row {
         display: flex; align-items: center; gap: 12px;
         padding: 14px 4px; border-bottom: 1px solid var(--panel-border);
