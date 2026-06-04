@@ -6,10 +6,11 @@ import {
   selectDisplay,
   type ClientEvent,
   type DisplayDto,
+  type HostEntry,
 } from "./ipc";
 import { handleVideoChunk, initDecoder, resetDecoder } from "./decoder";
 import { attachInput, detachInput, isCaptured, setCaptureMode } from "./input";
-import { mountConnectionUi } from "./connection-ui";
+import { mountLauncher } from "./launcher";
 import { mountToolbar } from "./toolbar";
 import { initToast, showToast } from "./toast";
 import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./stats-overlay";
@@ -81,12 +82,14 @@ const toolbar = mountToolbar({
 // ファイル転送ポップオーバー。
 mountFileTransfer(filePanel);
 
-// 未接続の中央カード。
+// 未接続のランチャー (サイドバー + ホスト一覧 / 設定)。
 let lastHost = "";
-const connectionUi = mountConnectionUi({
+let pendingEntry: HostEntry | null = null;
+const launcher = mountLauncher({
   root: overlay,
-  onSubmit: async (host, password) => {
-    lastHost = host;
+  onConnect: async (entry, password) => {
+    lastHost = entry.host;
+    pendingEntry = entry;
     resetDecoder();
     const eventChannel = new Channel<ClientEvent>();
     const videoChannel = new Channel<ArrayBuffer>();
@@ -96,11 +99,11 @@ const connectionUi = mountConnectionUi({
       const buf = data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
       handleVideoChunk(buf);
     };
-    await connectToHost(host, password, eventChannel, videoChannel);
+    await connectToHost(entry.host, entry.port, password, eventChannel, videoChannel);
   },
 });
 
-connectionUi.show();
+launcher.show();
 
 function switchDisplay(d: DisplayDto): void {
   // 解像度/SPS が変わるためデコーダを作り直し、入力スケールを新ディスプレイへ更新。
@@ -122,23 +125,23 @@ function doDisconnect(reason: string): void {
   // フルスクリーンを解除して接続カードを操作できるようにする。
   void exitFullscreen().then(() => toolbar.setFullscreenToggled(isFullscreen()));
   clearStats();
-  connectionUi.setConnecting(false);
-  connectionUi.setStatus("");
-  connectionUi.show();
-  void connectionUi.refreshHosts();
-  showToast(reason, reason.startsWith("disconnected:") ? "error" : "info");
+  const errored = reason.startsWith("disconnected:");
+  launcher.setConnState(errored ? reason : "未接続", errored ? "error" : "idle");
+  launcher.show();
+  void launcher.refreshHosts();
+  showToast(reason, errored ? "error" : "info");
 }
 
 function handleClientEvent(ev: ClientEvent): void {
   switch (ev.kind) {
     case "connected":
-      connectionUi.setStatus("handshake complete…");
+      launcher.setConnState("handshake complete…", "connecting");
       break;
     case "host_info": {
-      // 接続成立。カードを隠して全画面化、ツールバー有効化。
-      connectionUi.setConnecting(false);
-      connectionUi.hide();
-      void saveRecentHost(lastHost);
+      // 接続成立。ランチャーを隠してツールバー有効化。
+      launcher.hide();
+      launcher.setConnState(`connected · ${lastHost}`, "connected");
+      if (pendingEntry) void saveRecentHost(pendingEntry);
       toolbar.setConnected(true);
       toolbar.setDisplays(ev.displays, ev.displays[0]?.id);
       const d = ev.displays[0];
@@ -148,6 +151,15 @@ function handleClientEvent(ev: ClientEvent): void {
         canvas.focus();
       } else {
         toolbar.setConnLabel(`${lastHost} · (no displays?)`);
+      }
+      // 設定を反映: 既定フルスクリーン / 統計 HUD。
+      const settings = launcher.getSettings();
+      if (settings.show_stats && !statsHud.classList.contains("visible")) {
+        toggleStats();
+        toolbar.setStatsToggled(true);
+      }
+      if (settings.default_fullscreen && !isFullscreen()) {
+        void doToggleFullscreen();
       }
       showToast("connected", "success");
       break;

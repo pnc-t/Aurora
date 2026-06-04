@@ -141,6 +141,7 @@ pub async fn set_share_root(
 #[tauri::command]
 pub async fn connect_to_host(
     host: String,
+    port: u16,
     password: String,
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
@@ -155,7 +156,7 @@ pub async fn connect_to_host(
         }
     }
 
-    let tcp_addr: SocketAddr = format!("{host}:7000")
+    let tcp_addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| format!("invalid host: {e}"))?;
     let udp_addr = tcp_addr;

@@ -35,6 +35,9 @@ fn main() {
             net::set_share_root,
             config::load_recent_hosts,
             config::save_recent_host,
+            config::delete_recent_host,
+            config::load_settings,
+            config::save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
