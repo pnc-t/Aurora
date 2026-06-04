@@ -5,8 +5,13 @@
 //       allow-close / allow-start-dragging。
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { icon } from "./icons";
 import "./window-controls.css";
+
+// 未接続ランチャーの固定サイズ (tauri.conf.json の初期値と一致させる)。
+const LAUNCHER_WIDTH = 920;
+const LAUNCHER_HEIGHT = 600;
 
 export async function minimizeWindow(): Promise<void> {
   try {
@@ -21,6 +26,34 @@ export async function closeWindow(): Promise<void> {
     await getCurrentWindow().close();
   } catch (e) {
     console.warn("close failed", e);
+  }
+}
+
+/**
+ * ウィンドウのリサイズ可否を切り替える。
+ * ランチャー (未接続) は固定サイズ、接続中は四辺リサイズを許可する用途。
+ * 権限: capabilities/default.json の core:window:allow-set-resizable。
+ */
+export async function setResizable(on: boolean): Promise<void> {
+  try {
+    await getCurrentWindow().setResizable(on);
+  } catch (e) {
+    console.warn("setResizable failed", e);
+  }
+}
+
+/**
+ * ランチャー (未接続) のウィンドウ状態へ戻す。
+ * 接続中にユーザーがリサイズしたサイズが切断後も残らないよう、固定サイズに戻し
+ * リサイズも無効化する。権限: core:window:allow-set-size / allow-set-resizable。
+ */
+export async function restoreLauncherWindow(): Promise<void> {
+  try {
+    const w = getCurrentWindow();
+    await w.setResizable(false);
+    await w.setSize(new LogicalSize(LAUNCHER_WIDTH, LAUNCHER_HEIGHT));
+  } catch (e) {
+    console.warn("restoreLauncherWindow failed", e);
   }
 }
 

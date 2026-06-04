@@ -1,14 +1,15 @@
-// 接続中の自動格納ツールバー (RDP/RustDesk 風)。
-// 既定は画面外に隠れ、上端ホバーゾーン or ホットキーで表示。ピンで常時表示。
-// 中身: disconnect / ディスプレイ切替 / 統計トグル / ファイル転送トグル / 接続ラベル / ピン。
+// 接続中の操作ツールバー。
+// 既定で常時表示 (上端に固定オーバーレイ)。Ctrl+Alt+Shift+B で一時的に隠せる。
+// 構成: [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替] | [fps/Mbps] … [接続ラベル(ドラッグ移動)] [min/close]
+// 各操作はアイコン + ツールチップ。空き領域と接続ラベルは data-tauri-drag-region でウィンドウ移動に使う。
 
-import type { DisplayDto } from "../core/ipc";
+import { formatDisplayName, type DisplayDto } from "../core/ipc";
 import { mountWindowControls } from "./window-controls";
+import { icon } from "./icons";
 import "./toolbar.css";
 
 type ToolbarOpts = {
   topbar: HTMLElement;
-  hotzone: HTMLElement;
   onDisconnect: () => void;
   onSelectDisplay: (display: DisplayDto) => void;
   onToggleStats: () => void;
@@ -25,7 +26,6 @@ export type ToolbarHandle = {
   setFileToggled: (on: boolean) => void;
   setFullscreenToggled: (on: boolean) => void;
   setCaptureToggled: (on: boolean) => void;
-  setPinned: (on: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
   setConnected: (connected: boolean) => void;
@@ -33,25 +33,32 @@ export type ToolbarHandle = {
 
 export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   opts.topbar.innerHTML = `
-    <button type="button" id="tb-disconnect" class="danger">disconnect</button>
-    <span id="display-wrap">display
+    <div class="tb-group">
+      <button type="button" id="tb-disconnect" class="tb-btn danger" title="切断">${icon("power")}</button>
+    </div>
+    <span class="tb-sep"></span>
+    <div class="tb-group">
+      <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (F11 / Ctrl+Alt+Shift+F)">${icon("fullscreen")}</button>
+      <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
+      <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
+      <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
+    </div>
+    <span id="display-wrap" class="tb-group" title="表示するディスプレイ">
+      <span class="tb-ico">${icon("display")}</span>
       <select id="display-select"></select>
     </span>
-    <button type="button" id="tb-capture" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">capture</button>
-    <button type="button" id="tb-fullscreen" title="フルスクリーン (Ctrl+Alt+Shift+F / F11)">fullscreen</button>
-    <button type="button" id="tb-files">files</button>
-    <button type="button" id="tb-stats" title="Ctrl+Alt+Shift+S">stats</button>
-    <span class="tb-video">
-      <input type="text" inputmode="numeric" id="tb-fps" title="送出 fps 上限 (0=無制限)" />fps
-      <input type="text" inputmode="numeric" id="tb-mbps" title="ビットレート上限" />Mbps
+    <span class="tb-sep"></span>
+    <span class="tb-video" title="送出 fps 上限 (0=無制限) / ビットレート上限">
+      <input type="text" inputmode="numeric" id="tb-fps" />fps
+      <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
     </span>
-    <span class="spacer" data-tauri-drag-region></span>
-    <span id="conn-label" data-tauri-drag-region>—</span>
-    <button type="button" id="tb-pin" title="ピン留め (常時表示)">📌</button>
+    <span class="spacer" data-tauri-drag-region title="ドラッグでウィンドウ移動"></span>
+    <span id="conn-label" data-tauri-drag-region title="ドラッグでウィンドウ移動">—</span>
+    <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
     <span id="tb-winctl" class="window-controls"></span>
   `;
 
-  // フレームレスのため接続中もウィンドウ操作 (min/max/close) をバーに持つ。
+  // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。
   const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
   if (winctl) mountWindowControls(winctl);
 
@@ -78,48 +85,55 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   mbpsInput?.addEventListener("change", emitVideoParams);
 
   let displays: DisplayDto[] = [];
-  let pinned = false;
   let connected = false;
-  let hideTimer: number | null = null;
+  // ピン留め (常時表示)。既定は false = 自動格納し、上端ホバーで一時表示する。
+  let pinned = false;
+  // 上端ホバーで一時表示中か (ピン留め時は無関係)。
+  let revealed = false;
 
-  function show(): void {
-    if (hideTimer !== null) {
-      window.clearTimeout(hideTimer);
-      hideTimer = null;
-    }
-    opts.topbar.classList.add("visible");
-  }
-  function scheduleHide(): void {
-    if (pinned || !connected) return;
-    if (hideTimer !== null) window.clearTimeout(hideTimer);
-    hideTimer = window.setTimeout(() => opts.topbar.classList.remove("visible"), 400);
-  }
-  function hideNow(): void {
-    if (hideTimer !== null) {
-      window.clearTimeout(hideTimer);
-      hideTimer = null;
-    }
-    opts.topbar.classList.remove("visible");
+  function barHeight(): number {
+    // transform で隠していてもレイアウト高は取れる。未確定時は概算。
+    return opts.topbar.offsetHeight || 48;
   }
 
-  // 上端ホバーで表示、バーから離れたら格納 (ピン時は維持)。
-  opts.hotzone.addEventListener("mouseenter", () => {
-    if (connected) show();
+  function applyVisibility(): void {
+    const visible = connected && (pinned || revealed);
+    opts.topbar.classList.toggle("visible", visible);
+    if (visible) {
+      // 実測したバー高を CSS 変数へ (映像エリア/統計 HUD をこの分だけ下げる)。
+      document.documentElement.style.setProperty("--topbar-h", `${opts.topbar.offsetHeight}px`);
+    }
+    pinBtn?.classList.toggle("toggled", pinned);
+    // bar-open: バー表示中は常に映像エリア/統計 HUD を確保し、キャプチャに重ならないようにする
+    // (ピン留め・上端ホバー表示のどちらでも同じ挙動)。
+    document.body.classList.toggle("bar-open", visible);
+  }
+
+  function setPinned(on: boolean): void {
+    pinned = on;
+    if (pinned) revealed = false;
+    applyVisibility();
+  }
+
+  // 上端付近にマウスがある間だけ表示する (Y 座標で判定)。
+  // mouseleave ではなく座標判定にすることで、バーを掴んでウィンドウをドラッグ移動する
+  // 間 (カーソルは上端に留まる) もバーが消えない。ネイティブドラッグ中は mousemove が
+  // 来なくても revealed は維持される。
+  window.addEventListener("mousemove", (e) => {
+    if (!connected || pinned) return;
+    const want = e.clientY <= barHeight() + 6;
+    if (want !== revealed) {
+      revealed = want;
+      applyVisibility();
+    }
   });
-  opts.topbar.addEventListener("mouseenter", show);
-  opts.topbar.addEventListener("mouseleave", scheduleHide);
 
   disconnectBtn?.addEventListener("click", () => opts.onDisconnect());
   filesBtn?.addEventListener("click", () => opts.onToggleFilePanel());
   statsBtn?.addEventListener("click", () => opts.onToggleStats());
   captureBtn?.addEventListener("click", () => opts.onToggleCapture());
   fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
-  pinBtn?.addEventListener("click", () => {
-    pinned = !pinned;
-    pinBtn.classList.toggle("toggled", pinned);
-    if (pinned) show();
-    else scheduleHide();
-  });
+  pinBtn?.addEventListener("click", () => setPinned(!pinned));
   displaySelect?.addEventListener("change", () => {
     const id = Number(displaySelect.value);
     const d = displays.find((x) => x.id === id);
@@ -134,7 +148,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       displays = list;
       if (!displaySelect || !displayWrap) return;
       displaySelect.innerHTML = list
-        .map((x) => `<option value="${x.id}">${x.name} (${x.width}x${x.height})</option>`)
+        .map((x) => `<option value="${x.id}">${formatDisplayName(x.name)} (${x.width}x${x.height})</option>`)
         .join("");
       if (selectedId !== undefined) displaySelect.value = String(selectedId);
       // ディスプレイが複数あるときだけ切替 UI を出す。
@@ -152,32 +166,21 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     setCaptureToggled(on: boolean): void {
       captureBtn?.classList.toggle("toggled", on);
     },
-    setPinned(on: boolean): void {
-      pinned = on;
-      pinBtn?.classList.toggle("toggled", on);
-      if (on) show();
-      else scheduleHide();
-    },
     setVideoParams(fps: number, mbps: number): void {
       if (fpsInput) fpsInput.value = String(fps);
       if (mbpsInput) mbpsInput.value = String(mbps);
     },
+    /** Ctrl+Alt+Shift+B: ピン留めのトグル (常時表示 ⇔ 自動格納)。 */
     toggleBar(): void {
       if (!connected) return;
-      if (opts.topbar.classList.contains("visible")) hideNow();
-      else show();
+      setPinned(!pinned);
     },
     setConnected(isConnected: boolean): void {
       connected = isConnected;
-      if (isConnected) {
-        // 接続直後は一度バーを見せて操作場所を知らせる。
-        show();
-        scheduleHide();
-      } else {
-        pinned = false;
-        pinBtn?.classList.remove("toggled");
-        hideNow();
-      }
+      // 既定はピン留め (常時表示・映像とは重ならない)。ピンを外すと自動格納 (RDP の接続バー風)。
+      pinned = isConnected;
+      revealed = false;
+      applyVisibility();
     },
   };
 }

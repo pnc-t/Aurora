@@ -8,6 +8,17 @@ export type DisplayDto = {
   name: string;
 };
 
+/**
+ * ホストの生デバイス名 (Windows DXGI の `\\.\DISPLAY1` 等) を表示用に整形する。
+ * 先頭の `\\.\` / `\\?\` を除き、`DISPLAY1` は `Display 1` に直す。
+ * (バックスラッシュは日本語フォントで ¥ に化けるため UI には出さない)
+ */
+export function formatDisplayName(raw: string): string {
+  const stripped = raw.replace(/^\\\\[.?]\\/, "");
+  const m = /^DISPLAY(\d+)$/i.exec(stripped);
+  return m ? `Display ${m[1]}` : stripped;
+}
+
 export type ClientEvent =
   | { kind: "connected" }
   | { kind: "host_info"; displays: DisplayDto[]; audio: boolean }

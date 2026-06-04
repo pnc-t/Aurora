@@ -123,13 +123,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <label class="switch"><input type="checkbox" id="set-capture" /><span class="slider"></span></label>
             </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">ツールバーを最初から表示</div>
-                <div class="s-desc">接続後、上部の操作バーをピン留めして常時表示</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-pinned" /><span class="slider"></span></label>
-            </div>
             <div class="setting-group">外観・既定値</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -162,7 +155,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
-  const pinnedToggle = $<HTMLInputElement>("#set-pinned");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const portInput = $<HTMLInputElement>("#set-port");
   const fpsInput = $<HTMLInputElement>("#set-fps");
@@ -460,10 +452,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, default_capture: captureToggle.checked };
     persist();
   });
-  pinnedToggle?.addEventListener("change", () => {
-    settings = { ...settings, toolbar_pinned: pinnedToggle.checked };
-    persist();
-  });
   accentInput?.addEventListener("input", () => {
     settings = { ...settings, accent_color: accentInput.value };
     applyAccent(accentInput.value);
@@ -526,7 +514,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (fullscreenToggle) fullscreenToggle.checked = settings.default_fullscreen;
     if (statsToggle) statsToggle.checked = settings.show_stats;
     if (captureToggle) captureToggle.checked = settings.default_capture;
-    if (pinnedToggle) pinnedToggle.checked = settings.toolbar_pinned;
     if (accentInput) accentInput.value = settings.accent_color;
     if (portInput) portInput.value = String(settings.default_port);
     if (fpsInput) fpsInput.value = String(settings.fps);
