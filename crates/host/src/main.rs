@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 mod audio;
+mod autostart;
 mod capture;
 mod encode;
 mod input;
@@ -43,6 +44,10 @@ struct Args {
     max_bitrate_bps: u32,
     /// 待受ポート (TCP 制御 / UDP 映像で共用)。
     port: u16,
+    /// ログオン時自動起動タスクを登録して終了する。
+    install: bool,
+    /// 自動起動タスクを解除して終了する。
+    uninstall: bool,
 }
 
 impl Default for Args {
@@ -54,6 +59,8 @@ impl Default for Args {
             fps_cap: DEFAULT_FPS_CAP,
             max_bitrate_bps: MAX_BITRATE_BPS,
             port: DEFAULT_PORT,
+            install: false,
+            uninstall: false,
         }
     }
 }
@@ -97,6 +104,8 @@ fn parse_args() -> Args {
                     .filter(|&p| p != 0)
                     .expect("--port requires N (1..=65535)");
             }
+            "--install" => args.install = true,
+            "--uninstall" => args.uninstall = true,
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -111,6 +120,18 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+
+    if args.install {
+        // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
+        let forward: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|a| a != "--install" && a != "--uninstall")
+            .collect();
+        return autostart::install(&forward);
+    }
+    if args.uninstall {
+        return autostart::uninstall();
+    }
 
     if args.dump_bmp {
         return dump_one_bmp();
