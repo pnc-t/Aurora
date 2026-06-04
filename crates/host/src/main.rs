@@ -17,6 +17,7 @@ mod input;
 mod net;
 mod perf;
 mod projfs;
+mod secret;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
@@ -28,8 +29,6 @@ use net::{EncoderCommand, InputCmd, ServerConfig};
 const DEFAULT_FPS_CAP: u32 = 60;
 /// 既定の待受ポート (TCP 制御 / UDP 映像で共用)。
 const DEFAULT_PORT: u16 = 7000;
-/// パスワードを供給する環境変数。設定時はランダム生成を行わずこの値を使う。
-const PASSWORD_ENV: &str = "DDD_PASSWORD";
 
 #[derive(Debug)]
 struct Args {
@@ -48,6 +47,10 @@ struct Args {
     install: bool,
     /// 自動起動タスクを解除して終了する。
     uninstall: bool,
+    /// 接続パスワードを対話入力し DPAPI で暗号化保存して終了する。
+    set_password: bool,
+    /// 保存済みパスワードを削除して終了する。
+    clear_password: bool,
 }
 
 impl Default for Args {
@@ -61,6 +64,8 @@ impl Default for Args {
             port: DEFAULT_PORT,
             install: false,
             uninstall: false,
+            set_password: false,
+            clear_password: false,
         }
     }
 }
@@ -106,6 +111,8 @@ fn parse_args() -> Args {
             }
             "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
+            "--set-password" => args.set_password = true,
+            "--clear-password" => args.clear_password = true,
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -131,6 +138,14 @@ fn main() -> Result<()> {
     }
     if args.uninstall {
         return autostart::uninstall();
+    }
+    if args.set_password {
+        return set_password_interactive();
+    }
+    if args.clear_password {
+        secret::clear_password()?;
+        println!("stored password cleared");
+        return Ok(());
     }
 
     if args.dump_bmp {
@@ -188,26 +203,101 @@ fn dump_h264(n: usize) -> Result<()> {
     Ok(())
 }
 
+/// 接続パスワードを対話入力 (確認のため 2 回) し、DPAPI で暗号化保存する。
+/// 保存はこのコマンドを実行したユーザーの鍵で行われるため、ログオン時タスクと
+/// **同じユーザー**で実行すること (昇格は不要)。
+fn set_password_interactive() -> Result<()> {
+    use std::io::Write;
+
+    print!("Enter new DDD password: ");
+    std::io::stdout().flush().ok();
+    let pw1 = read_secret_line()?;
+    print!("Confirm password: ");
+    std::io::stdout().flush().ok();
+    let pw2 = read_secret_line()?;
+
+    if pw1 != pw2 {
+        return Err(anyhow!("passwords do not match"));
+    }
+    if pw1.is_empty() {
+        return Err(anyhow!("password must not be empty"));
+    }
+    secret::save_password(&pw1)?;
+    println!("password saved to secure store (DPAPI, current user)");
+    Ok(())
+}
+
+/// 標準入力から 1 行をエコーなしで読み取る (パスワード入力用)。
+#[cfg(target_os = "windows")]
+fn read_secret_line() -> Result<String> {
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+        SetConsoleMode,
+    };
+
+    // SAFETY: 標準入力ハンドルを取得し、エコーフラグだけを一時的に外す。コンソール以外
+    // (パイプ等) では GetConsoleMode が失敗するので、その場合は素通しで読み取る。
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.context("GetStdHandle")?;
+    let mut orig = CONSOLE_MODE(0);
+    let have_mode = unsafe { GetConsoleMode(handle, &mut orig) }.is_ok();
+    if have_mode {
+        // SAFETY: 直前に取得したハンドル/モードに対しエコーのみ無効化する。
+        let _ = unsafe { SetConsoleMode(handle, orig & !ENABLE_ECHO_INPUT) };
+    }
+
+    let mut line = String::new();
+    let res = std::io::stdin().read_line(&mut line);
+
+    if have_mode {
+        // SAFETY: 元のモードへ確実に復帰させる。
+        let _ = unsafe { SetConsoleMode(handle, orig) };
+    }
+    println!(); // エコーされない改行を補う
+    res.context("read password from stdin")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_secret_line() -> Result<String> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read password from stdin")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Result<()> {
-    // DDD_PASSWORD があればそれを使い (再起動しても固定)、無ければランダム生成する。
-    // 機密はログに出さない方針のため、env 指定時はパスワードを表示しない。
-    let (password, password_from_env) = match std::env::var(PASSWORD_ENV) {
-        Ok(p) if !p.is_empty() => (p, true),
-        _ => {
+    // DPAPI で保存済みのパスワードがあればそれを使う (再起動しても固定・無人起動で読める)。
+    // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
+    // 方針のため、保存済みを使う場合は値を表示しない。
+    println!("== ddd-host ready ==");
+    let password = match secret::load_password() {
+        Ok(Some(p)) if !p.is_empty() => {
+            println!("password: (from secure store)");
+            p
+        }
+        Ok(_) => {
             let generated: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
                 .take(10)
                 .map(char::from)
                 .collect();
-            (generated, false)
+            println!("password: {generated}");
+            println!("(no stored password; run `ddd-host --set-password` to set a fixed one)");
+            generated
+        }
+        Err(e) => {
+            // 保存はされているが復号できない (別ユーザー等)。ランダム生成で継続する。
+            tracing::warn!(error = %e, "could not load stored password; using a random one");
+            let generated: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(10)
+                .map(char::from)
+                .collect();
+            println!("password: {generated}");
+            generated
         }
     };
-    println!("== ddd-host ready ==");
-    if password_from_env {
-        println!("password: (from {PASSWORD_ENV})");
-    } else {
-        println!("password: {password}");
-    }
     println!("TCP/UDP: 0.0.0.0:{port}");
 
     let psk = psk_from_password(&password);
