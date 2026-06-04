@@ -4,6 +4,7 @@ import {
   disconnect,
   saveRecentHost,
   selectDisplay,
+  setVideoParams,
   type ClientEvent,
   type DisplayDto,
   type HostEntry,
@@ -77,6 +78,7 @@ const toolbar = mountToolbar({
   onToggleFilePanel: () => setFilePanel(!fileVisible),
   onToggleFullscreen: () => void doToggleFullscreen(),
   onToggleCapture: () => setCaptureMode(!isCaptured()),
+  onSetVideoParams: (fps, mbps) => void setVideoParams(fps, mbps * 1_000_000),
 });
 
 // ファイル転送ポップオーバー。
@@ -168,6 +170,9 @@ function handleClientEvent(ev: ClientEvent): void {
       if (settings.default_fullscreen && !isFullscreen()) {
         void doToggleFullscreen();
       }
+      // 映像パラメータを設定値でホストへ適用し、ツールバー表示も同期。
+      toolbar.setVideoParams(settings.fps, settings.max_mbps);
+      void setVideoParams(settings.fps, settings.max_mbps * 1_000_000);
       showToast("connected", "success");
       break;
     }

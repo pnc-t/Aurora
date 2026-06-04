@@ -15,14 +15,6 @@ export async function minimizeWindow(): Promise<void> {
   }
 }
 
-export async function toggleMaximizeWindow(): Promise<void> {
-  try {
-    await getCurrentWindow().toggleMaximize();
-  } catch (e) {
-    console.warn("toggleMaximize failed", e);
-  }
-}
-
 export async function closeWindow(): Promise<void> {
   try {
     await getCurrentWindow().close();
@@ -31,14 +23,16 @@ export async function closeWindow(): Promise<void> {
   }
 }
 
-/** min/max/close ボタンを container 内に生成して配線する。 */
+/**
+ * 最小化 / 閉じる ボタンを container 内に生成して配線する。
+ * ウィンドウは固定サイズのため最大化は持たない (リモート接続中のフルスクリーンは
+ * ツールバーの専用ボタンで行う)。
+ */
 export function mountWindowControls(container: HTMLElement): void {
   container.innerHTML = `
     <button class="winctl" data-act="min" title="最小化" tabindex="-1">${icon("minimize")}</button>
-    <button class="winctl" data-act="max" title="最大化" tabindex="-1">${icon("maximize")}</button>
     <button class="winctl close" data-act="close" title="閉じる" tabindex="-1">${icon("close")}</button>
   `;
   container.querySelector('[data-act="min"]')?.addEventListener("click", () => void minimizeWindow());
-  container.querySelector('[data-act="max"]')?.addEventListener("click", () => void toggleMaximizeWindow());
   container.querySelector('[data-act="close"]')?.addEventListener("click", () => void closeWindow());
 }

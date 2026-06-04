@@ -61,6 +61,20 @@ pub struct ClientSettings {
     /// UI のアクセント色 (CSS 色)。
     #[serde(default = "default_accent")]
     pub accent_color: String,
+    /// 接続時にホストへ送る送出 fps 上限 (0 = 無制限)。
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    /// 接続時にホストへ送るビットレート上限 (Mbps)。
+    #[serde(default = "default_max_mbps")]
+    pub max_mbps: u32,
+}
+
+fn default_fps() -> u32 {
+    60
+}
+
+fn default_max_mbps() -> u32 {
+    15
 }
 
 impl Default for ClientSettings {
@@ -72,6 +86,8 @@ impl Default for ClientSettings {
             default_port: DEFAULT_PORT,
             toolbar_pinned: false,
             accent_color: default_accent(),
+            fps: default_fps(),
+            max_mbps: default_max_mbps(),
         }
     }
 }
@@ -112,8 +128,8 @@ pub fn load_recent_hosts(app: AppHandle) -> Result<Vec<HostEntry>, String> {
         .collect())
 }
 
-/// 接続先を履歴の先頭へ重複排除して追加し、最大件数で切り詰めて保存する。
-/// 重複判定は host (大文字小文字無視) で行うため、同一 host の再保存は更新になる。
+/// 接続先を保存する。手動並べ替えを尊重するため、既存 host (大文字小文字無視) は
+/// **位置を保ったまま**内容を更新し、新規 host のみ先頭へ追加する。最大件数で切り詰める。
 #[tauri::command]
 pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> {
     let host = entry.host.trim().to_string();
@@ -127,8 +143,21 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
     };
 
     let mut hosts = load_recent_hosts(app.clone())?;
-    hosts.retain(|h| !h.host.eq_ignore_ascii_case(&entry.host));
-    hosts.insert(0, entry);
+    match hosts
+        .iter()
+        .position(|h| h.host.eq_ignore_ascii_case(&entry.host))
+    {
+        Some(i) => hosts[i] = entry, // 既存は位置維持で更新
+        None => hosts.insert(0, entry),
+    }
+    hosts.truncate(MAX_RECENT);
+    write_hosts(&app, &hosts)
+}
+
+/// 履歴の並び順を丸ごと置き換える (ドラッグ並べ替え後にフロントから呼ぶ)。
+#[tauri::command]
+pub fn set_recent_hosts(app: AppHandle, hosts: Vec<HostEntry>) -> Result<(), String> {
+    let mut hosts = hosts;
     hosts.truncate(MAX_RECENT);
     write_hosts(&app, &hosts)
 }

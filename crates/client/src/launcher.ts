@@ -10,6 +10,7 @@ import {
   loadRecentHosts,
   loadSettings,
   saveRecentHost,
+  setRecentHosts,
   saveSettings,
   type ClientSettings,
   type HostEntry,
@@ -37,6 +38,8 @@ const DEFAULT_SETTINGS: ClientSettings = {
   default_port: DEFAULT_PORT,
   toolbar_pinned: false,
   accent_color: "#3a82f7",
+  fps: 60,
+  max_mbps: 15,
 };
 
 /** ラベル/host から決定的に淡い色を作りアバター背景に使う。 */
@@ -75,7 +78,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             <h2>Hosts</h2>
             <div class="actions">
               <button class="icon-btn" id="add-host" title="ホストを追加">${icon("add")}</button>
-              <button class="icon-btn" id="refresh-hosts" title="再読み込み">${icon("refresh")}</button>
             </div>
           </div>
           <div class="host-list" id="host-list"></div>
@@ -83,6 +85,21 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <section class="page" id="page-settings">
           <div class="page-head"><h2>Settings</h2></div>
           <div class="settings-body">
+            <div class="setting-group">映像 (接続時にホストへ適用)</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">送出 fps 上限</div>
+                <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
+              </div>
+              <input type="text" inputmode="numeric" id="set-fps" class="num-input" />
+            </div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">ビットレート上限 (Mbps)</div>
+                <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
+              </div>
+              <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
+            </div>
             <div class="setting-group">接続</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -130,6 +147,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           </div>
         </section>
       </main>
+      <div id="card-menu" class="card-menu"></div>
       <div id="dialog-backdrop"></div>
     </div>
   `;
@@ -139,12 +157,15 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const statusTxt = $("#status-txt") as HTMLElement;
   const hostList = $("#host-list") as HTMLElement;
   const backdrop = $("#dialog-backdrop") as HTMLElement;
+  const cardMenu = $("#card-menu") as HTMLElement;
   const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
   const pinnedToggle = $<HTMLInputElement>("#set-pinned");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const portInput = $<HTMLInputElement>("#set-port");
+  const fpsInput = $<HTMLInputElement>("#set-fps");
+  const mbpsInput = $<HTMLInputElement>("#set-mbps");
 
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
@@ -173,6 +194,56 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   }
   backdrop.addEventListener("click", (e) => {
     if (e.target === backdrop) closeDialog();
+  });
+
+  /** 削除などの確認ダイアログ。OK で onConfirm を実行する。 */
+  function openConfirmDialog(message: string, onConfirm: () => Promise<void>): void {
+    backdrop.innerHTML = `
+      <div class="dialog">
+        <h3>削除の確認</h3>
+        <div class="s-desc">${message}</div>
+        <div class="dlg-actions">
+          <button type="button" class="btn-ghost" id="c-cancel">cancel</button>
+          <button type="button" class="btn-danger" id="c-ok">削除</button>
+        </div>
+      </div>
+    `;
+    backdrop.classList.add("visible");
+    backdrop.querySelector("#c-cancel")?.addEventListener("click", closeDialog);
+    backdrop.querySelector("#c-ok")?.addEventListener("click", () => {
+      void onConfirm().finally(closeDialog);
+    });
+  }
+
+  // --- カードの ⋯ メニュー ---
+  function closeCardMenu(): void {
+    cardMenu.classList.remove("visible");
+    cardMenu.innerHTML = "";
+  }
+  /** ⋯ ボタン (anchor) の下に削除メニューを開く (編集は直接ボタンへ移した)。 */
+  function openCardMenu(anchor: HTMLElement, entry: HostEntry): void {
+    cardMenu.innerHTML = `
+      <button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>
+    `;
+    cardMenu.classList.add("visible");
+    // 表示してから幅を測り、ボタン右端に揃えて配置する。
+    const r = anchor.getBoundingClientRect();
+    cardMenu.style.top = `${r.bottom + 4}px`;
+    cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      const name = entry.label || entry.host;
+      openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
+        await deleteRecentHost(entry.host);
+        await handle.refreshHosts();
+      });
+    });
+  }
+  // メニュー外クリック / スクロール / Esc で閉じる。
+  document.addEventListener("click", () => closeCardMenu());
+  hostList.addEventListener("scroll", () => closeCardMenu());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeCardMenu();
   });
 
   /** ホスト追加/編集ダイアログ (label/host/port を保存。接続はしない)。entry=null で新規。 */
@@ -256,7 +327,71 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   }
 
   // --- ホスト一覧の描画 ---
+  // 現在表示中の並び (ドラッグ並べ替えの基準)。
+  let currentHosts: HostEntry[] = [];
+
+  /** from の要素を to の位置へ移動し、保存して再描画する。 */
+  function reorder(from: number, to: number): void {
+    if (from === to || from < 0 || to < 0) return;
+    const arr = [...currentHosts];
+    const [moved] = arr.splice(from, 1);
+    arr.splice(to, 0, moved);
+    currentHosts = arr;
+    renderHosts(arr);
+    void setRecentHosts(arr).catch(() => {});
+  }
+
+  /**
+   * カード追従ドラッグ並べ替え。掴んだカードの分身 (clone) がカーソルに追従し、
+   * 元カードは空きスロット (placeholder) として他カードの間を移動する。
+   * HTML5 DnD は WebView2 で不安定なため pointer イベントで自前実装する。
+   */
+  function startDrag(from: number, downEvent: PointerEvent, card: HTMLElement): void {
+    const rect = card.getBoundingClientRect();
+    const offsetY = downEvent.clientY - rect.top;
+    let targetPos = from;
+
+    // カーソル追従用の分身。
+    const clone = card.cloneNode(true) as HTMLElement;
+    clone.classList.add("drag-clone");
+    clone.style.width = `${rect.width}px`;
+    clone.style.left = `${rect.left}px`;
+    clone.style.top = `${rect.top}px`;
+    opts.root.appendChild(clone);
+    // 元カードは空きスロットにする。
+    card.classList.add("drag-placeholder");
+
+    const onMove = (ev: PointerEvent): void => {
+      clone.style.top = `${ev.clientY - offsetY}px`;
+      // placeholder 以外のカードの中点と比較して挿入位置を決め、元カードを移動する。
+      const others = Array.from(hostList.querySelectorAll<HTMLElement>(".host-card")).filter(
+        (c) => c !== card,
+      );
+      let pos = others.length;
+      for (let i = 0; i < others.length; i++) {
+        const r = others[i].getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) {
+          pos = i;
+          break;
+        }
+      }
+      targetPos = pos;
+      if (pos >= others.length) hostList.appendChild(card);
+      else hostList.insertBefore(card, others[pos]);
+    };
+    const onUp = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      clone.remove();
+      card.classList.remove("drag-placeholder");
+      reorder(from, targetPos);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   function renderHosts(hosts: HostEntry[]): void {
+    currentHosts = hosts;
     if (hosts.length === 0) {
       hostList.innerHTML = `<div class="empty-hint">保存済みのホストはありません。<br>右上の ＋ から追加してください。</div>`;
       return;
@@ -267,13 +402,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         const initial = escapeHtml((name[0] ?? "?").toUpperCase());
         return `
           <div class="host-card" data-idx="${i}">
+            <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
             <div class="avatar" style="background:${avatarColor(name)}">${initial}</div>
             <div class="meta">
               <div class="label">${escapeHtml(name)}</div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
             </div>
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
-            <button class="card-btn" data-act="del" title="削除">${icon("delete")}</button>
+            <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
             <span class="chevron">${icon("chevron")}</span>
           </div>`;
       })
@@ -283,21 +419,33 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       const idx = Number(card.dataset.idx);
       card.addEventListener("click", (e) => {
         // SVG 内クリックでも拾えるよう data-act を持つ最近接要素から判定する。
-        const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
-        if (act === "edit") {
+        const actEl = (e.target as HTMLElement).closest<HTMLElement>("[data-act]");
+        const act = actEl?.dataset.act;
+        if (act === "grip") {
+          e.stopPropagation(); // 掴むだけのクリックでは接続しない
+        } else if (act === "edit") {
+          e.stopPropagation();
           openHostDialog(hosts[idx]);
-        } else if (act === "del") {
-          void deleteRecentHost(hosts[idx].host).then(() => handle.refreshHosts());
+        } else if (act === "menu") {
+          e.stopPropagation();
+          openCardMenu(actEl as HTMLElement, hosts[idx]);
         } else {
           openConnectDialog(hosts[idx]);
         }
+      });
+
+      // grip を掴んでドラッグ並べ替え (カードがカーソルに追従、他カードが隙間を空ける)。
+      card.querySelector<HTMLElement>(".grip")?.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        closeCardMenu();
+        startDrag(idx, e, card);
       });
     });
   }
 
   // --- アクション配線 ---
   $("#add-host")?.addEventListener("click", () => openHostDialog(null));
-  $("#refresh-hosts")?.addEventListener("click", () => void handle.refreshHosts());
 
   fullscreenToggle?.addEventListener("change", () => {
     settings = { ...settings, default_fullscreen: fullscreenToggle.checked };
@@ -324,6 +472,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     const port = Number(portInput.value) || DEFAULT_PORT;
     settings = { ...settings, default_port: port };
     portInput.value = String(port);
+    persist();
+  });
+  fpsInput?.addEventListener("change", () => {
+    const fps = Math.max(0, Math.floor(Number(fpsInput.value) || 0));
+    settings = { ...settings, fps };
+    fpsInput.value = String(fps);
+    persist();
+  });
+  mbpsInput?.addEventListener("change", () => {
+    const mbps = Math.max(1, Math.floor(Number(mbpsInput.value) || 1));
+    settings = { ...settings, max_mbps: mbps };
+    mbpsInput.value = String(mbps);
     persist();
   });
 
@@ -368,6 +528,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (pinnedToggle) pinnedToggle.checked = settings.toolbar_pinned;
     if (accentInput) accentInput.value = settings.accent_color;
     if (portInput) portInput.value = String(settings.default_port);
+    if (fpsInput) fpsInput.value = String(settings.fps);
+    if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     applyAccent(settings.accent_color);
   })();
   void handle.refreshHosts();

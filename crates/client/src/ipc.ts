@@ -49,6 +49,11 @@ export async function selectDisplay(id: number): Promise<void> {
   await invoke("select_display", { id });
 }
 
+/// 映像パラメータ (fps 上限 / ビットレート上限 bps) を実行時にホストへ送る。
+export async function setVideoParams(fps: number, maxBitrateBps: number): Promise<void> {
+  await invoke("set_video_params", { fps, maxBitrateBps });
+}
+
 export async function sendFileOffer(id: number, name: string, size: number): Promise<void> {
   await invoke("send_file_offer", { id, name, size });
 }
@@ -86,6 +91,8 @@ export type ClientSettings = {
   default_port: number;
   toolbar_pinned: boolean;
   accent_color: string;
+  fps: number;
+  max_mbps: number;
 };
 
 /// 接続先 host の履歴を読み込む (最新が先頭)。
@@ -101,6 +108,11 @@ export async function saveRecentHost(entry: HostEntry): Promise<void> {
 /// 指定 host を履歴から削除する。
 export async function deleteRecentHost(host: string): Promise<void> {
   await invoke("delete_recent_host", { host });
+}
+
+/// 履歴の並び順を丸ごと置き換える (ドラッグ並べ替え後)。
+export async function setRecentHosts(hosts: HostEntry[]): Promise<void> {
+  await invoke("set_recent_hosts", { hosts });
 }
 
 /// クライアント設定を読み込む。
