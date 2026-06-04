@@ -274,6 +274,8 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
             "bitrate cap (PeakConstrainedVBR peak)"
         );
     }
+    // 実行時 fps 変更 (クライアントの SetVideoParams) を capture スレッドへ届けるチャネル。
+    let (fps_tx, fps_rx) = std::sync::mpsc::channel::<u32>();
     let cap_device = device.clone();
     std::thread::Builder::new()
         .name("capture".into())
@@ -285,6 +287,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
                 cap_select_rx,
                 initial_id,
                 fps_cap,
+                fps_rx,
             ) {
                 tracing::error!(error = %e, "capture loop ended");
             }
@@ -342,6 +345,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
             enc_cmd_tx,
             input_tx,
             cap_select_tx,
+            fps_tx,
             clip_apply_tx,
             clip_change_rx,
         )
@@ -356,6 +360,7 @@ fn capture_loop(
     select_rx: std::sync::mpsc::Receiver<u32>,
     initial_id: u32,
     fps_cap: u32,
+    fps_rx: std::sync::mpsc::Receiver<u32>,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
     #[cfg(target_os = "windows")]
@@ -365,11 +370,14 @@ fn capture_loop(
     // (例 144Hz) でフレームを返し、全部 encode/送信するとクライアントのデコードが
     // 追いつかずバックログが累積して遅延が増える。前回送出から min_interval 経過した
     // フレームだけを encode 側へ流す (0 = 無制限)。
-    let min_interval = if fps_cap == 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_secs_f64(1.0 / fps_cap as f64)
+    let fps_to_interval = |fps: u32| {
+        if fps == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(1.0 / fps as f64)
+        }
     };
+    let mut min_interval = fps_to_interval(fps_cap);
     // 初回フレームは即送出できるよう過去側に倒しておく。
     let mut last_sent = Instant::now()
         .checked_sub(min_interval)
@@ -379,6 +387,11 @@ fn capture_loop(
     let mut cap = PlatformCapturer::new_for_output(device.clone(), cur_id)?;
     let mut reported = false;
     loop {
+        // 実行時の fps 上限変更 (クライアント SetVideoParams) を反映する。
+        while let Ok(fps) = fps_rx.try_recv() {
+            min_interval = fps_to_interval(fps);
+            tracing::info!(fps, "fps cap updated");
+        }
         // ディスプレイ切替要求を吸う。新規 capturer 構築に失敗したら現状維持。
         while let Ok(id) = select_rx.try_recv() {
             if id != cur_id {

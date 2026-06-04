@@ -408,6 +408,23 @@ pub async fn select_display(id: u32, state: tauri::State<'_, SessionState>) -> R
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
+/// 映像パラメータ (fps 上限 / ビットレート上限) を実行時にホストへ送る。
+#[tauri::command]
+pub async fn set_video_params(
+    fps: u32,
+    max_bitrate_bps: u32,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.as_ref().ok_or("not connected")?;
+    s.ctrl_tx
+        .send(ControlMsg::SetVideoParams {
+            fps,
+            max_bitrate_bps,
+        })
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
 /// ホスト上のファイルのダウンロードを要求する。受信は reader ループが
 /// `ddd-downloads/` に保存し、完了を FileResult イベントで通知する。
 #[tauri::command]

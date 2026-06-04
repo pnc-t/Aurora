@@ -21,12 +21,13 @@
 | `hosts` | サイドバー: Hosts |
 | `settings` | サイドバー: Settings |
 | `add` | ホスト追加 (＋) |
-| `refresh` | 再読み込み |
 | `edit` | カードの編集 |
-| `delete` | カードの削除 |
+| `delete` | カードのメニュー: 削除 |
+| `more` | カードのメニュー (⋯) |
+| `up` | 並べ替え: 上へ |
+| `down` | 並べ替え: 下へ |
 | `chevron` | カード右端の矢印 |
 | `minimize` | ウィンドウ最小化 |
-| `maximize` | ウィンドウ最大化 |
 | `close` | ウィンドウ閉じる |
 
 ## 注意

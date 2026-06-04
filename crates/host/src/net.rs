@@ -61,6 +61,14 @@ impl BitrateController {
         }
     }
 
+    /// クライアントからビットレート上限を明示変更する。上限を新しい値にし、現在値は
+    /// その上限から開始する (即反映)。以後 `on_stats` が loss/RTT で下げる。新しい現在値を返す。
+    fn set_max(&mut self, max_bps: u32) -> u32 {
+        self.max_bps = max_bps.max(MIN_BITRATE_BPS);
+        self.current_bps = self.max_bps;
+        self.current_bps
+    }
+
     /// 新しい Stats を反映し、ビットレートを変更すべきなら新しい値 (bps) を返す。
     fn on_stats(&mut self, loss_permille: u16, rtt_us: u32) -> Option<u32> {
         const LOSS_HIGH: u16 = 50; // 5% 超で輻輳とみなす
@@ -205,6 +213,7 @@ pub async fn run_server(
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputCmd>,
     cap_select_tx: std::sync::mpsc::Sender<u32>,
+    fps_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     mut clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
@@ -229,6 +238,7 @@ pub async fn run_server(
         let enc_tx2 = enc_tx.clone();
         let input_tx2 = input_tx.clone();
         let cap_select_tx2 = cap_select_tx.clone();
+        let fps_tx2 = fps_tx.clone();
         let clip_apply_tx2 = clip_apply_tx.clone();
         // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
         // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
@@ -245,6 +255,7 @@ pub async fn run_server(
             enc_tx2,
             input_tx2,
             cap_select_tx2,
+            fps_tx2,
             clip_apply_tx2,
             nal_rx_ref,
             audio_rx_ref,
@@ -270,6 +281,7 @@ async fn handle_client(
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputCmd>,
     cap_select_tx: std::sync::mpsc::Sender<u32>,
+    fps_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
     audio_rx: &mut mpsc::Receiver<EncodedAudio>,
@@ -350,6 +362,14 @@ async fn handle_client(
                     }
                     ControlMsg::RequestKeyframe => {
                         let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                    }
+                    ControlMsg::SetVideoParams { fps, max_bitrate_bps } => {
+                        tracing::info!(fps, max_bitrate_bps, "client set video params");
+                        // fps 上限を capture スレッドへ。
+                        let _ = fps_tx.send(fps);
+                        // ビットレート上限を更新し、新しい現在値を即エンコーダへ反映。
+                        let new_bps = bitrate.set_max(max_bitrate_bps);
+                        let _ = enc_tx.send(EncoderCommand::SetBitrate(new_bps)).await;
                     }
                     ControlMsg::Stats { bitrate_kbps, fps, rtt_us, loss_permille } => {
                         tracing::debug!(bitrate_kbps, fps, rtt_us, loss_permille, "client stats");

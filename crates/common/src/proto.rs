@@ -147,4 +147,11 @@ pub enum ControlMsg {
         rtt_us: u32,
         loss_permille: u16,
     },
+    /// クライアントからの映像パラメータ変更 (実行時)。末尾に追加し既存タグを保持する。
+    SetVideoParams {
+        /// 送出フレームレート上限 (fps)。0 = 無制限。
+        fps: u32,
+        /// ビットレート上限 (bps)。適応制御の上限 + エンコーダの目標。
+        max_bitrate_bps: u32,
+    },
 }

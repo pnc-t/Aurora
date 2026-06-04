@@ -14,6 +14,7 @@ type ToolbarOpts = {
   onToggleFilePanel: () => void;
   onToggleFullscreen: () => void;
   onToggleCapture: () => void;
+  onSetVideoParams: (fps: number, mbps: number) => void;
 };
 
 export type ToolbarHandle = {
@@ -24,6 +25,7 @@ export type ToolbarHandle = {
   setFullscreenToggled: (on: boolean) => void;
   setCaptureToggled: (on: boolean) => void;
   setPinned: (on: boolean) => void;
+  setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
   setConnected: (connected: boolean) => void;
 };
@@ -38,6 +40,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     <button type="button" id="tb-fullscreen" title="フルスクリーン (Ctrl+Alt+Shift+F / F11)">fullscreen</button>
     <button type="button" id="tb-files">files</button>
     <button type="button" id="tb-stats" title="Ctrl+Alt+Shift+S">stats</button>
+    <span class="tb-video">
+      <input type="text" inputmode="numeric" id="tb-fps" title="送出 fps 上限 (0=無制限)" />fps
+      <input type="text" inputmode="numeric" id="tb-mbps" title="ビットレート上限" />Mbps
+    </span>
     <span class="spacer" data-tauri-drag-region></span>
     <span id="conn-label" data-tauri-drag-region>—</span>
     <button type="button" id="tb-pin" title="ピン留め (常時表示)">📌</button>
@@ -57,6 +63,18 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const connLabel = opts.topbar.querySelector<HTMLElement>("#conn-label");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
+  const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
+  const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
+
+  function emitVideoParams(): void {
+    const fps = Math.max(0, Math.floor(Number(fpsInput?.value) || 0));
+    const mbps = Math.max(1, Math.floor(Number(mbpsInput?.value) || 1));
+    if (fpsInput) fpsInput.value = String(fps);
+    if (mbpsInput) mbpsInput.value = String(mbps);
+    opts.onSetVideoParams(fps, mbps);
+  }
+  fpsInput?.addEventListener("change", emitVideoParams);
+  mbpsInput?.addEventListener("change", emitVideoParams);
 
   let displays: DisplayDto[] = [];
   let pinned = false;
@@ -138,6 +156,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       pinBtn?.classList.toggle("toggled", on);
       if (on) show();
       else scheduleHide();
+    },
+    setVideoParams(fps: number, mbps: number): void {
+      if (fpsInput) fpsInput.value = String(fps);
+      if (mbpsInput) mbpsInput.value = String(mbps);
     },
     toggleBar(): void {
       if (!connected) return;
