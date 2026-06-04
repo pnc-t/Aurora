@@ -34,14 +34,26 @@ export type InputEvent =
   | { Key: { vk: number; down: boolean } }
   | { MouseMoveRelative: { dx: number; dy: number } };
 
+/// password に null を渡すと、Rust 側が保存済みパスワード (DPAPI) を復号して使う
+/// (平文をフロントに載せない)。手入力時は文字列を渡し、接続成功時に Rust が保存する。
 export async function connectToHost(
   host: string,
   port: number,
-  password: string,
+  password: string | null,
   eventChannel: Channel<ClientEvent>,
   videoChannel: Channel<ArrayBuffer>,
 ): Promise<void> {
   await invoke("connect_to_host", { host, port, password, eventChannel, videoChannel });
+}
+
+/// パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。
+export async function savedPasswordHosts(): Promise<string[]> {
+  return await invoke<string[]>("saved_password_hosts");
+}
+
+/// 指定 host の保存済みパスワードを削除する (「忘れる」)。
+export async function deleteHostPassword(host: string): Promise<void> {
+  await invoke("delete_host_password", { host });
 }
 
 export async function disconnect(): Promise<void> {

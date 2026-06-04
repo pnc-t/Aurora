@@ -1,15 +1,20 @@
 // 未接続時のランチャー画面。
 // 左サイドバー (ブランド + Hosts/Settings ナビ + 接続ステータス) と、
 // 右に「保存ホストのカード一覧」/「設定」ページを切り替えて表示する。
-// ＋追加はパスワード無しで即一覧へ保存。カード押下でパスワード入力 → 接続。
+// ＋追加はパスワード無しで即一覧へ保存。カード押下で接続。
 //
-// パスワードは保存しない方針 (config.rs)。カードには { label, host, port } のみ保持する。
+// パスワードは接続成功時に DPAPI で暗号化保存される (Rust 側 secret.rs)。保存済みの
+// host は鍵マーク付きで、カード押下時にダイアログを出さず即接続する (平文はフロントに
+// 載せず Rust が復号して使う)。未保存の host は従来どおりパスワード入力ダイアログ。
+// recent_hosts.json (config.rs) には引き続き { label, host, port } のみ保持する。
 
 import {
   deleteRecentHost,
+  deleteHostPassword,
   loadRecentHosts,
   loadSettings,
   saveRecentHost,
+  savedPasswordHosts,
   setRecentHosts,
   saveSettings,
   type ClientSettings,
@@ -20,7 +25,8 @@ import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
 import "./launcher.css";
 
-type ConnectCallback = (entry: HostEntry, password: string) => Promise<void>;
+// password に null を渡すと Rust 側が保存済みパスワード (DPAPI) を使って接続する。
+type ConnectCallback = (entry: HostEntry, password: string | null) => Promise<void>;
 type ConnState = "idle" | "connecting" | "connected" | "error";
 
 export type LauncherHandle = {
@@ -174,6 +180,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const hostList = $("#host-list") as HTMLElement;
   const backdrop = $("#dialog-backdrop") as HTMLElement;
   const cardMenu = $("#card-menu") as HTMLElement;
+  // パスワード保存済みの host(小文字) 集合。refreshHosts で更新し、カードの
+  // 鍵マーク表示・即接続・「忘れる」メニューの出し分けに使う。
+  let savedSet = new Set<string>();
+  const hasSaved = (host: string): boolean => savedSet.has(host.trim().toLowerCase());
   const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
@@ -236,9 +246,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     cardMenu.classList.remove("visible");
     cardMenu.innerHTML = "";
   }
-  /** ⋯ ボタン (anchor) の下に削除メニューを開く (編集は直接ボタンへ移した)。 */
+  /** ⋯ ボタン (anchor) の下にメニューを開く (編集は直接ボタンへ移した)。
+   *  パスワード保存済みなら「忘れる」項目も出す。 */
   function openCardMenu(anchor: HTMLElement, entry: HostEntry): void {
+    const forgetItem = hasSaved(entry.host)
+      ? `<button class="menu-item" data-m="forget">${icon("key")} パスワードを忘れる</button>`
+      : "";
     cardMenu.innerHTML = `
+      ${forgetItem}
       <button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>
     `;
     cardMenu.classList.add("visible");
@@ -246,10 +261,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     const r = anchor.getBoundingClientRect();
     cardMenu.style.top = `${r.bottom + 4}px`;
     cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector('[data-m="forget"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      void (async () => {
+        await deleteHostPassword(entry.host);
+        await handle.refreshHosts();
+      })().catch(() => {});
+    });
     cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
       closeCardMenu();
       const name = entry.label || entry.host;
       openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
+        // 一覧から消すときは保存済みパスワードも一緒に消す (孤立を防ぐ)。
+        await deleteHostPassword(entry.host);
         await deleteRecentHost(entry.host);
         await handle.refreshHosts();
       });
@@ -421,6 +445,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       .map((h, i) => {
         const name = h.label || h.host;
         const initial = escapeHtml((name[0] ?? "?").toUpperCase());
+        const saved = hasSaved(h.host)
+          ? `<span class="saved-badge" title="パスワード保存済み (押すと即接続)">${icon("key")}</span>`
+          : "";
         return `
           <div class="host-card" data-idx="${i}">
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
@@ -429,6 +456,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               <div class="label">${escapeHtml(name)}</div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
             </div>
+            ${saved}
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
             <span class="chevron">${icon("chevron")}</span>
@@ -450,6 +478,15 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         } else if (act === "menu") {
           e.stopPropagation();
           openCardMenu(actEl as HTMLElement, hosts[idx]);
+        } else if (hasSaved(hosts[idx].host)) {
+          // パスワード保存済み: ダイアログを出さず即接続 (平文はフロントに載らない)。
+          // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
+          const entry = hosts[idx];
+          handle.setConnecting(true);
+          void opts.onConnect(entry, null).catch(() => {
+            handle.setConnState("", "idle");
+            openConnectDialog(entry);
+          });
         } else {
           openConnectDialog(hosts[idx]);
         }
@@ -529,6 +566,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     },
     async refreshHosts(): Promise<void> {
       try {
+        // 鍵マーク/即接続の判定用に、保存済みパスワードの host 集合も更新する。
+        try {
+          savedSet = new Set(await savedPasswordHosts());
+        } catch {
+          savedSet = new Set();
+        }
         renderHosts(await loadRecentHosts());
       } catch {
         // 履歴は補助機能。失敗しても致命的ではない。

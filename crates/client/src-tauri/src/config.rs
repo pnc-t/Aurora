@@ -3,7 +3,8 @@
 //! 接続先 host (ラベル / Tailscale IP・hostname / ポート) の履歴と、クライアント
 //! 設定 (既定フルスクリーン等) をアプリ設定ディレクトリの JSON に保存する。
 //! WebView の localStorage は平文・キャッシュ消去で揮発・任意 JS から読める、
-//! という理由で使わない。**パスワードは保存しない** (接続時に毎回入力)。
+//! という理由で使わない。**この JSON にはパスワードを入れない**。パスワードは
+//! 別途 `secret.rs` が DPAPI で暗号化して `passwords.bin` に保存する。
 
 use std::fs;
 use std::path::PathBuf;

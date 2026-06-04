@@ -139,15 +139,24 @@ pub async fn set_share_root(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri コマンドの引数 (state/channel) 注入で増える
 pub async fn connect_to_host(
+    app: tauri::AppHandle,
     host: String,
     port: u16,
-    password: String,
+    password: Option<String>,
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
     share_root: tauri::State<'_, ShareRoot>,
 ) -> Result<(), String> {
+    // password 未指定 (保存済み接続) なら DPAPI ストアから復号して使う。平文は
+    // フロント (WebView) へ渡さず Rust 内で解決する。
+    let password = match password {
+        Some(p) => p,
+        None => crate::secret::get(&app, &host)
+            .ok_or_else(|| "保存済みパスワードがありません".to_string())?,
+    };
     // 既存セッションがあれば閉じる
     {
         let mut guard = state.inner.lock().await;
@@ -189,6 +198,12 @@ pub async fn connect_to_host(
     // 映像 UDP のパケット毎 decrypt が TCP 制御とロック競合しなくなる。
     let session = Arc::new(hs.into_transport().map_err(err)?);
     tracing::info!("noise handshake complete");
+
+    // ハンドシェイク成功 = PSK (パスワード) 一致。常に保存する (DPAPI 暗号化)。
+    // 失敗してもログのみで接続は続行する (保存は補助機能)。
+    if let Err(e) = crate::secret::put(&app, &host, &password) {
+        tracing::warn!(error = %e, "failed to save host password");
+    }
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
     // 以降の TCP 受信は reader ループが nonce 1 から続ける。

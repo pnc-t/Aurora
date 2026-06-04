@@ -29,7 +29,8 @@ export type IconName =
   | "files"
   | "stats"
   | "display"
-  | "pin";
+  | "pin"
+  | "key";
 
 // viewBox 0 0 24 24 の path/shape 部分のみ (共通の <svg> ラッパーは icon() で付与)。
 const PATHS: Record<IconName, string> = {
@@ -52,6 +53,7 @@ const PATHS: Record<IconName, string> = {
   stats: `<path d="M3 3v18h18"/><path d="M19 9l-5 5-3-3-4 4"/>`,
   display: `<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>`,
   pin: `<path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z"/>`,
+  key: `<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2M16 7l3 3"/>`,
 };
 
 // assets/icons/ 配下の画像を URL として一括取り込み (ビルド時に解決)。

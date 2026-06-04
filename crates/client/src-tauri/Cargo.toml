@@ -29,6 +29,13 @@ cpal = "0.15"
 opus = "0.3"
 socket2 = "0.5"
 
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+]
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
