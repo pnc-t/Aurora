@@ -198,7 +198,9 @@ async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<Control
 pub struct ServerConfig {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
-    pub psk: [u8; 32],
+    /// 接続 PSK。tray UI からのパスワード変更で書き換えられるため共有可変で持つ。
+    /// 各接続は受理時にスナップショットを取り、その値でハンドシェイクする。
+    pub psk: std::sync::Arc<std::sync::Mutex<[u8; 32]>>,
     pub displays: Vec<DisplayInfo>,
     pub audio: bool,
     /// 適応制御 / エンコーダのビットレート上限 (bps)。`--max-bitrate` 由来。
@@ -230,7 +232,8 @@ pub async fn run_server(
     loop {
         let (stream, peer) = tcp.accept().await?;
         tracing::info!(peer = %peer, "TCP client connected");
-        let psk = cfg.psk;
+        // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
+        let psk = *cfg.psk.lock().expect("psk mutex poisoned");
         let displays = cfg.displays.clone();
         let audio = cfg.audio;
         let max_bitrate_bps = cfg.max_bitrate_bps;

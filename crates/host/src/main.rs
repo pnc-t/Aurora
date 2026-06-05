@@ -1,10 +1,17 @@
 //! Aurora ホスト (操作される側) のエントリポイント。
+//!
+//! リリースビルドの Windows では GUI サブシステムにしてコンソール窓を出さず、システム
+//! トレイ常駐で動かす (出先 PC での無人/バックグラウンド運用が主用途)。CLI サブコマンド
+//! (`--set-password` 等) を端末から実行したときだけ親コンソールへ接続して入出力する。
+//! デバッグビルドはログ確認のためコンソールサブシステムのまま。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use anyhow::{Context, Result, anyhow};
 use aurora_common::noise::psk_from_password;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -18,6 +25,7 @@ mod net;
 mod perf;
 mod projfs;
 mod secret;
+mod tray;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
@@ -122,11 +130,26 @@ fn parse_args() -> Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into()))
-        .init();
-
     let args = parse_args();
+
+    // CLI サブコマンドは端末への入出力が要る。既定のサーバ起動はバックグラウンド
+    // (トレイ常駐) で、リリースでは GUI サブシステムのためコンソールが無い。
+    let needs_console = args.install
+        || args.uninstall
+        || args.set_password
+        || args.clear_password
+        || args.dump_bmp
+        || args.dump_h264.is_some();
+
+    // CLI のときだけ親プロセスのコンソールへ接続する (サーバ起動では開かない)。
+    #[cfg(windows)]
+    if needs_console {
+        attach_console(args.set_password);
+    }
+
+    // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
+    // (CLI / デバッグ) は従来どおりコンソールへ出す。
+    init_tracing(!needs_console && !cfg!(debug_assertions));
 
     if args.install {
         // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
@@ -156,6 +179,66 @@ fn main() -> Result<()> {
     }
 
     run_server(args.perf, args.fps_cap, args.max_bitrate_bps, args.port)
+}
+
+/// `tracing` を初期化する。`to_file` が真なら `%LOCALAPPDATA%\Aurora\host.log` へ書き、
+/// 開けない場合や偽のときはコンソール (stdout) へ出す。
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn init_tracing(to_file: bool) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into());
+    #[cfg(windows)]
+    if to_file {
+        if let Some(file) = open_log_file() {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+            return;
+        }
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// ログ出力先ファイルを追記モードで開く。一定サイズを超えていたら作り直す (簡易
+/// ローテーション)。ディレクトリや環境変数が無ければ `None`。
+#[cfg(windows)]
+fn open_log_file() -> Option<std::fs::File> {
+    /// これを超えたら次回起動時に作り直す (約 5MiB)。
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let mut dir = std::path::PathBuf::from(base);
+    dir.push("Aurora");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("host.log");
+
+    let too_big = std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if too_big {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    opts.open(&path).ok()
+}
+
+/// CLI サブコマンドのためにコンソールを用意する。端末から起動された場合は親プロセスの
+/// コンソールへ接続して入出力する。`alloc_if_none` が真で親コンソールが無い場合 (例:
+/// ダブルクリック起動) は新規コンソールを割り当てる (`--set-password` の対話入力用)。
+/// デバッグビルドは既にコンソールサブシステムなので `AttachConsole` は失敗するが無害。
+#[cfg(windows)]
+fn attach_console(alloc_if_none: bool) {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
+    // SAFETY: コンソールへの接続/割り当てのみ。失敗は無視する (接続済み・親無し等)。
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() && alloc_if_none {
+            let _ = AllocConsole();
+        }
+    }
 }
 
 fn dump_one_bmp() -> Result<()> {
@@ -271,9 +354,12 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
     // 方針のため、保存済みを使う場合は値を表示しない。
     println!("== aurora-host ready ==");
+    // 保存パスワードの有無を覚えておく。無ければトレイ起動直後に設定ダイアログを促す。
+    let mut have_stored = false;
     let password = match secret::load_password() {
         Ok(Some(p)) if !p.is_empty() => {
             println!("password: (from secure store)");
+            have_stored = true;
             p
         }
         Ok(_) => {
@@ -283,7 +369,9 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
                 .map(char::from)
                 .collect();
             println!("password: {generated}");
-            println!("(no stored password; run `aurora-host --set-password` to set a fixed one)");
+            println!(
+                "(no stored password; set one from the tray icon or `aurora-host --set-password`)"
+            );
             generated
         }
         Err(e) => {
@@ -300,7 +388,12 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     };
     println!("TCP/UDP: 0.0.0.0:{port}");
 
-    let psk = psk_from_password(&password);
+    // PSK は tray (UI スレッド) と net (接続受理) で共有する。tray でパスワードを変更すると
+    // ここを書き換え、net が次の接続受理時に読むことで再起動なしに反映される。
+    let psk = Arc::new(Mutex::new(psk_from_password(&password)));
+    // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
+    // 設定ダイアログを自動表示する。
+    tray::spawn(psk.clone(), !have_stored);
 
     // 接続済みディスプレイを列挙する。失敗時は 1080p 単一ディスプレイで継続。
     let mut displays = match capture::enumerate_displays() {
