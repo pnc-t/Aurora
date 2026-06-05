@@ -43,8 +43,12 @@ pub fn install(forward_args: &[String]) -> Result<()> {
     println!("registered scheduled task \"{TASK_NAME}\" (runs at logon)");
     println!("command: {tr}");
     println!(
-        "note: run `aurora-host --set-password` once as this same user so the task can read the password"
+        "note: set the connection password from the tray icon (right-click -> change password),"
     );
+    println!(
+        "      or run `aurora-host --set-password` once as this same user. Without one, a random"
+    );
+    println!("      password is generated each start until you set a fixed one.");
     Ok(())
 }
 

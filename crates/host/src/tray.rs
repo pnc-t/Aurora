@@ -1,0 +1,448 @@
+//! システムトレイ常駐 UI。アイコンの右クリックメニューから接続パスワードの設定・変更を
+//! 行う。変更は DPAPI に保存し、共有 PSK ([`SharedPsk`]) を更新して **次の接続から** 反映する
+//! (既存セッションは現行 PSK のまま継続)。
+//!
+//! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
+
+use std::sync::{Arc, Mutex};
+
+/// host 全体で共有する接続 PSK。net 層が接続受理時に読み、tray がパスワード変更時に書く。
+pub type SharedPsk = Arc<Mutex<[u8; 32]>>;
+
+/// トレイ常駐 UI を別スレッドで起動する。`prompt_now` が真なら起動直後に変更ダイアログを
+/// 自動表示する (保存パスワードが無い初回向け)。
+#[cfg(target_os = "windows")]
+pub fn spawn(psk: SharedPsk, prompt_now: bool) {
+    let _ = std::thread::Builder::new()
+        .name("tray".into())
+        .spawn(move || {
+            if let Err(e) = imp::run(psk, prompt_now) {
+                tracing::warn!(error = %e, "tray UI disabled");
+            }
+        });
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn spawn(_psk: SharedPsk, _prompt_now: bool) {}
+
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::SharedPsk;
+    use aurora_common::noise::psk_from_password;
+    use std::ffi::c_void;
+    use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush,
+    };
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+    use windows::Win32::UI::Shell::{
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::{PCWSTR, w};
+
+    /// トレイアイコンからの通知を受けるカスタムメッセージ。
+    const WM_TRAY: u32 = WM_APP + 1;
+    /// メニュー項目 ID。
+    const ID_CHANGE: usize = 1001;
+    const ID_EXIT: usize = 1002;
+    /// 変更ダイアログ内コントロール ID。
+    const ID_EDIT: i32 = 101;
+    const ID_EDIT2: i32 = 102;
+
+    /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn run(psk: SharedPsk, prompt_now: bool) -> windows::core::Result<()> {
+        unsafe {
+            let hmod = GetModuleHandleW(None)?;
+            let hinstance = HINSTANCE(hmod.0);
+            let class_name = w!("AuroraTrayWnd");
+
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinstance,
+                lpszClassName: class_name,
+                hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW)?,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            // PSK 共有ハンドルをウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
+            let boxed: *mut SharedPsk = Box::into_raw(Box::new(psk));
+
+            // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class_name,
+                w!("Aurora Host"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                HWND::default(),
+                HMENU::default(),
+                hinstance,
+                Some(boxed as *const c_void),
+            )?;
+
+            // トレイアイコン登録。標準のアプリアイコンを使う。
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+                uCallbackMessage: WM_TRAY,
+                hIcon: LoadIconW(HINSTANCE::default(), IDI_APPLICATION)?,
+                ..Default::default()
+            };
+            let tip = to_wide("Aurora Host");
+            nid.szTip[..tip.len()].copy_from_slice(&tip);
+            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+
+            // 初回 (保存パスワード無し) は起動直後に変更ダイアログを出す。
+            if prompt_now {
+                let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_CHANGE), LPARAM(0));
+            }
+
+            // メッセージループ。
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            // ループを抜けるのは「終了」メニューでウィンドウを破棄したときだけ
+            // (初期化失敗時はループ前に return する)。アイコンを消して host 全体を終了する。
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+            drop(Box::from_raw(boxed));
+        }
+        tracing::info!("tray exit requested; shutting down host");
+        std::process::exit(0);
+    }
+
+    /// 隠しウィンドウのウィンドウプロシージャ。
+    extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe {
+            match msg {
+                WM_CREATE => {
+                    // CreateWindowEx の lpCreateParams (=Box<SharedPsk> ポインタ) を保存。
+                    let cs = lparam.0 as *const CREATESTRUCTW;
+                    if !cs.is_null() {
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*cs).lpCreateParams as isize);
+                    }
+                    LRESULT(0)
+                }
+                WM_TRAY => {
+                    // 右クリック (とアイコンの WM_CONTEXTMENU) でメニュー表示。
+                    let ev = (lparam.0 as u32) & 0xffff;
+                    if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU || ev == WM_LBUTTONUP {
+                        show_menu(hwnd);
+                    }
+                    LRESULT(0)
+                }
+                WM_COMMAND => {
+                    match wparam.0 & 0xffff {
+                        ID_CHANGE => change_password(hwnd),
+                        ID_EXIT => {
+                            // host プロセス全体を終了する。
+                            let _ = DestroyWindow(hwnd);
+                        }
+                        _ => {}
+                    }
+                    LRESULT(0)
+                }
+                WM_DESTROY => {
+                    PostQuitMessage(0);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+    }
+
+    /// 隠しウィンドウに紐づけた共有 PSK を取り出す。
+    unsafe fn shared_psk(hwnd: HWND) -> Option<SharedPsk> {
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SharedPsk;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { (*ptr).clone() })
+        }
+    }
+
+    /// トレイの右クリックメニューを表示する。
+    unsafe fn show_menu(hwnd: HWND) {
+        unsafe {
+            let menu = match CreatePopupMenu() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("終了"));
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            // メニューが正しく閉じるよう自ウィンドウを前面化する (Win32 の定石)。
+            let _ = SetForegroundWindow(hwnd);
+            let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+            let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = DestroyMenu(menu);
+        }
+    }
+
+    /// パスワード変更ダイアログを表示し、入力されたら DPAPI 保存 + 共有 PSK を更新する。
+    fn change_password(hwnd: HWND) {
+        let Some(psk) = (unsafe { shared_psk(hwnd) }) else {
+            return;
+        };
+        if let Some(pw) = prompt_password(hwnd) {
+            if let Err(e) = crate::secret::save_password(&pw) {
+                message_box(hwnd, &format!("保存に失敗しました: {e}"), "Aurora Host");
+                return;
+            }
+            if let Ok(mut g) = psk.lock() {
+                *g = psk_from_password(&pw);
+            }
+            message_box(
+                hwnd,
+                "パスワードを変更しました (次の接続から有効)。",
+                "Aurora Host",
+            );
+        }
+    }
+
+    /// 簡易メッセージボックス。
+    fn message_box(owner: HWND, text: &str, caption: &str) {
+        let t = to_wide(text);
+        let c = to_wide(caption);
+        unsafe {
+            MessageBoxW(
+                owner,
+                PCWSTR(t.as_ptr()),
+                PCWSTR(c.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+
+    // --- パスワード入力ダイアログ (プログラム生成、リソース不要) ---
+
+    /// ダイアログの入力結果。WndProc から書き戻すため `GWLP_USERDATA` に置く。
+    struct DlgResult {
+        value: Option<String>,
+    }
+
+    fn prompt_password(owner: HWND) -> Option<String> {
+        unsafe {
+            let hmod = GetModuleHandleW(None).ok()?;
+            let hinstance = HINSTANCE(hmod.0);
+            let class_name = w!("AuroraPwDlg");
+
+            // 専用クラスを (毎回) 登録する。RegisterClassW は二重登録でも害がない。
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(dlg_proc),
+                hInstance: hinstance,
+                lpszClassName: class_name,
+                hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).ok()?,
+                hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            let mut result = Box::new(DlgResult { value: None });
+            let result_ptr: *mut DlgResult = result.as_mut();
+
+            let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+            let (w, h) = (340, 200);
+            let dlg = match CreateWindowExW(
+                WS_EX_DLGMODALFRAME,
+                class_name,
+                w!("接続パスワードの設定"),
+                style,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                w,
+                h,
+                owner,
+                HMENU::default(),
+                hinstance,
+                Some(result_ptr as *const c_void),
+            ) {
+                Ok(h) => h,
+                Err(_) => return None,
+            };
+
+            let font = GetStockObject(DEFAULT_GUI_FONT);
+            let mk_label = |y: i32, text: PCWSTR| {
+                let h = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    text,
+                    WS_CHILD | WS_VISIBLE,
+                    16,
+                    y,
+                    300,
+                    18,
+                    dlg,
+                    HMENU::default(),
+                    hinstance,
+                    None,
+                )
+                .ok();
+                if let Some(h) = h {
+                    SendMessageW(h, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                }
+            };
+            let mk_edit = |y: i32, id: i32| -> Option<HWND> {
+                let edit = CreateWindowExW(
+                    WS_EX_CLIENTEDGE,
+                    w!("EDIT"),
+                    w!(""),
+                    WS_CHILD
+                        | WS_VISIBLE
+                        | WS_TABSTOP
+                        | WINDOW_STYLE((ES_PASSWORD | ES_AUTOHSCROLL) as u32),
+                    16,
+                    y,
+                    300,
+                    24,
+                    dlg,
+                    HMENU(id as *mut c_void),
+                    hinstance,
+                    None,
+                )
+                .ok()?;
+                SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                Some(edit)
+            };
+
+            mk_label(12, w!("新しいパスワード:"));
+            let _ = mk_edit(32, ID_EDIT);
+            mk_label(66, w!("確認のため再入力:"));
+            let _ = mk_edit(86, ID_EDIT2);
+
+            // OK / キャンセルボタン。
+            let mk_button = |x: i32, id: usize, text: PCWSTR, default: bool| {
+                let extra = if default { BS_DEFPUSHBUTTON as u32 } else { 0 };
+                let b = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    text,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(extra),
+                    x,
+                    128,
+                    96,
+                    28,
+                    dlg,
+                    HMENU(id as *mut c_void),
+                    hinstance,
+                    None,
+                )
+                .ok();
+                if let Some(b) = b {
+                    SendMessageW(b, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                }
+            };
+            mk_button(120, IDOK.0 as usize, w!("OK"), true);
+            mk_button(224, IDCANCEL.0 as usize, w!("キャンセル"), false);
+
+            // モーダル化: オーナーを無効化し、破棄まで自前のメッセージループを回す。
+            let _ = EnableWindow(owner, BOOL::from(false));
+            let _ = SetForegroundWindow(dlg);
+            if let Ok(first) = GetDlgItem(dlg, ID_EDIT) {
+                let _ = SetFocus(first);
+            }
+
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+                if !IsWindow(dlg).as_bool() {
+                    break;
+                }
+                if !IsDialogMessageW(dlg, &msg).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            let _ = EnableWindow(owner, BOOL::from(true));
+            let _ = SetForegroundWindow(owner);
+
+            result.value.take()
+        }
+    }
+
+    /// ダイアログのウィンドウプロシージャ。
+    extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe {
+            match msg {
+                WM_CREATE => {
+                    let cs = lparam.0 as *const CREATESTRUCTW;
+                    if !cs.is_null() {
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*cs).lpCreateParams as isize);
+                    }
+                    LRESULT(0)
+                }
+                WM_COMMAND => {
+                    let id = (wparam.0 & 0xffff) as i32;
+                    if id == IDOK.0 {
+                        on_ok(hwnd);
+                    } else if id == IDCANCEL.0 {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+    }
+
+    /// OK 押下: 2 つの入力欄を検証し、一致すれば結果へ格納してダイアログを閉じる。
+    unsafe fn on_ok(hwnd: HWND) {
+        unsafe {
+            let pw1 = match GetDlgItem(hwnd, ID_EDIT) {
+                Ok(h) => get_text(h),
+                Err(_) => return,
+            };
+            let pw2 = match GetDlgItem(hwnd, ID_EDIT2) {
+                Ok(h) => get_text(h),
+                Err(_) => return,
+            };
+            if pw1.is_empty() {
+                message_box(hwnd, "パスワードを入力してください。", "Aurora Host");
+                return;
+            }
+            if pw1 != pw2 {
+                message_box(hwnd, "確認用パスワードが一致しません。", "Aurora Host");
+                return;
+            }
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgResult;
+            if !ptr.is_null() {
+                (*ptr).value = Some(pw1);
+            }
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    /// EDIT コントロールの現在テキストを取得する。
+    unsafe fn get_text(edit: HWND) -> String {
+        unsafe {
+            let len = GetWindowTextLengthW(edit);
+            if len <= 0 {
+                return String::new();
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let n = GetWindowTextW(edit, &mut buf);
+            String::from_utf16_lossy(&buf[..n as usize])
+        }
+    }
+}
