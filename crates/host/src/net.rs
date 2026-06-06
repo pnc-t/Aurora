@@ -232,6 +232,10 @@ pub async fn run_server(
     loop {
         let (stream, peer) = tcp.accept().await?;
         tracing::info!(peer = %peer, "TCP client connected");
+        // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
+        // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
+        // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
+        let _active = crate::conn::ActiveGuard::new();
         // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
         let psk = *cfg.psk.lock().expect("psk mutex poisoned");
         let displays = cfg.displays.clone();
@@ -296,15 +300,26 @@ async fn handle_client(
     let mut buf = Vec::new();
     let mut tmp = Vec::new();
 
+    // ハンドシェイクの各 I/O にタイムアウトを設ける。これが無いと、認証前のクライアントが
+    // TCP 接続だけして何も送らないとここで永久にブロックし、単一クライアントモデルでは
+    // accept ループが進まず正規ユーザーまで締め出される (認証前 DoS)。
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     // <- e
-    read_tcp_frame(&mut stream, &mut buf).await?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
+        .await
+        .context("handshake timed out (e)")??;
     hs.read_msg(&buf, &mut tmp)?;
     // -> e, ee, s, es
     let mut out_msg = Vec::new();
     hs.write_msg(&[], &mut out_msg)?;
-    write_tcp_frame(&mut stream, &out_msg).await?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, write_tcp_frame(&mut stream, &out_msg))
+        .await
+        .context("handshake timed out (e,ee,s,es)")??;
     // <- s, se, psk
-    read_tcp_frame(&mut stream, &mut buf).await?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
+        .await
+        .context("handshake timed out (s,se,psk)")??;
     hs.read_msg(&buf, &mut tmp)?;
 
     // session は単一 handle_client タスク内でのみ使う。snow の StatelessTransportState は
