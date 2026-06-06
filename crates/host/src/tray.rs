@@ -4,32 +4,37 @@
 //!
 //! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// host 全体で共有する接続 PSK。net 層が接続受理時に読み、tray がパスワード変更時に書く。
 pub type SharedPsk = Arc<Mutex<[u8; 32]>>;
 
+/// 実パスワードが設定済みかを共有するフラグ。設定済みなら変更時に現在パスワードを要求する。
+pub type SharedHasPassword = Arc<AtomicBool>;
+
 /// トレイ常駐 UI を別スレッドで起動する。`prompt_now` が真なら起動直後に変更ダイアログを
 /// 自動表示する (保存パスワードが無い初回向け)。
 #[cfg(target_os = "windows")]
-pub fn spawn(psk: SharedPsk, prompt_now: bool) {
+pub fn spawn(psk: SharedPsk, has_password: SharedHasPassword, prompt_now: bool) {
     let _ = std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            if let Err(e) = imp::run(psk, prompt_now) {
+            if let Err(e) = imp::run(psk, has_password, prompt_now) {
                 tracing::warn!(error = %e, "tray UI disabled");
             }
         });
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn spawn(_psk: SharedPsk, _prompt_now: bool) {}
+pub fn spawn(_psk: SharedPsk, _has_password: SharedHasPassword, _prompt_now: bool) {}
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::SharedPsk;
+    use super::{SharedHasPassword, SharedPsk};
     use aurora_common::noise::psk_from_password;
     use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
     use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush,
@@ -48,15 +53,27 @@ mod imp {
     const ID_CHANGE: usize = 1001;
     const ID_EXIT: usize = 1002;
     /// 変更ダイアログ内コントロール ID。
+    const ID_EDIT_CUR: i32 = 100;
     const ID_EDIT: i32 = 101;
     const ID_EDIT2: i32 = 102;
+
+    /// 隠しウィンドウに紐づける共有状態。パスワード変更で PSK を書き換え、設定済みフラグを
+    /// 立てる。`GWLP_USERDATA` にこの Box のポインタを格納する。
+    struct WndState {
+        psk: SharedPsk,
+        has_password: SharedHasPassword,
+    }
 
     /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub fn run(psk: SharedPsk, prompt_now: bool) -> windows::core::Result<()> {
+    pub fn run(
+        psk: SharedPsk,
+        has_password: SharedHasPassword,
+        prompt_now: bool,
+    ) -> windows::core::Result<()> {
         unsafe {
             let hmod = GetModuleHandleW(None)?;
             let hinstance = HINSTANCE(hmod.0);
@@ -71,8 +88,8 @@ mod imp {
             };
             RegisterClassW(&wc);
 
-            // PSK 共有ハンドルをウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
-            let boxed: *mut SharedPsk = Box::into_raw(Box::new(psk));
+            // 共有状態をウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
+            let boxed: *mut WndState = Box::into_raw(Box::new(WndState { psk, has_password }));
 
             // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
             let hwnd = CreateWindowExW(
@@ -130,7 +147,7 @@ mod imp {
         unsafe {
             match msg {
                 WM_CREATE => {
-                    // CreateWindowEx の lpCreateParams (=Box<SharedPsk> ポインタ) を保存。
+                    // CreateWindowEx の lpCreateParams (=Box<WndState> ポインタ) を保存。
                     let cs = lparam.0 as *const CREATESTRUCTW;
                     if !cs.is_null() {
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*cs).lpCreateParams as isize);
@@ -165,13 +182,14 @@ mod imp {
         }
     }
 
-    /// 隠しウィンドウに紐づけた共有 PSK を取り出す。
-    unsafe fn shared_psk(hwnd: HWND) -> Option<SharedPsk> {
-        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SharedPsk;
+    /// 隠しウィンドウに紐づけた共有状態 (PSK + 設定済みフラグ) への参照を取り出す。
+    unsafe fn wnd_state(hwnd: HWND) -> Option<&'static WndState> {
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WndState;
         if ptr.is_null() {
             None
         } else {
-            Some(unsafe { (*ptr).clone() })
+            // SAFETY: ポインタは run の Box::into_raw 由来で、ウィンドウ生存中は有効。
+            Some(unsafe { &*ptr })
         }
     }
 
@@ -198,17 +216,34 @@ mod imp {
 
     /// パスワード変更ダイアログを表示し、入力されたら DPAPI 保存 + 共有 PSK を更新する。
     fn change_password(hwnd: HWND) {
-        let Some(psk) = (unsafe { shared_psk(hwnd) }) else {
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
-        if let Some(pw) = prompt_password(hwnd) {
+        // 接続中はリモート操作者による締め出し/乗っ取りを防ぐため変更を拒否する。
+        if crate::conn::is_active() {
+            message_box(
+                hwnd,
+                "クライアント接続中はパスワードを変更できません。\n切断してから操作してください。",
+                "Aurora Host",
+            );
+            return;
+        }
+        // 既にパスワードが設定済みなら現在のパスワードを要求して照合する。未設定 (初回/
+        // ランダム) のときは現在パスワード欄を出さない。
+        let expect_current = if state.has_password.load(Ordering::Relaxed) {
+            state.psk.lock().ok().map(|g| *g)
+        } else {
+            None
+        };
+        if let Some(pw) = prompt_password(hwnd, expect_current) {
             if let Err(e) = crate::secret::save_password(&pw) {
                 message_box(hwnd, &format!("保存に失敗しました: {e}"), "Aurora Host");
                 return;
             }
-            if let Ok(mut g) = psk.lock() {
+            if let Ok(mut g) = state.psk.lock() {
                 *g = psk_from_password(&pw);
             }
+            state.has_password.store(true, Ordering::Relaxed);
             message_box(
                 hwnd,
                 "パスワードを変更しました (次の接続から有効)。",
@@ -233,12 +268,18 @@ mod imp {
 
     // --- パスワード入力ダイアログ (プログラム生成、リソース不要) ---
 
-    /// ダイアログの入力結果。WndProc から書き戻すため `GWLP_USERDATA` に置く。
+    /// ダイアログの入力結果と検証材料。WndProc から参照/書き戻すため `GWLP_USERDATA` に置く。
     struct DlgResult {
+        /// OK が押され検証を通った新パスワード。
         value: Option<String>,
+        /// `Some` のとき「現在のパスワード」欄を検証する (期待する現行 PSK)。
+        expect_current: Option<[u8; 32]>,
     }
 
-    fn prompt_password(owner: HWND) -> Option<String> {
+    /// パスワード設定/変更ダイアログを表示する。`expect_current` が `Some` のときは「現在の
+    /// パスワード」欄を追加し、入力が現行 PSK と一致しないと OK を受け付けない。
+    fn prompt_password(owner: HWND, expect_current: Option<[u8; 32]>) -> Option<String> {
+        let require_current = expect_current.is_some();
         unsafe {
             let hmod = GetModuleHandleW(None).ok()?;
             let hinstance = HINSTANCE(hmod.0);
@@ -255,11 +296,15 @@ mod imp {
             };
             RegisterClassW(&wc);
 
-            let mut result = Box::new(DlgResult { value: None });
+            let mut result = Box::new(DlgResult {
+                value: None,
+                expect_current,
+            });
             let result_ptr: *mut DlgResult = result.as_mut();
 
             let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-            let (w, h) = (340, 200);
+            // 現在パスワード欄の有無で 1 行ぶん高さを変える。
+            let (w, h) = if require_current { (340, 254) } else { (340, 200) };
             let dlg = match CreateWindowExW(
                 WS_EX_DLGMODALFRAME,
                 class_name,
@@ -322,10 +367,18 @@ mod imp {
                 Some(edit)
             };
 
-            mk_label(12, w!("新しいパスワード:"));
-            let _ = mk_edit(32, ID_EDIT);
-            mk_label(66, w!("確認のため再入力:"));
-            let _ = mk_edit(86, ID_EDIT2);
+            // 現在パスワードを要求する場合は先頭に 1 行追加し、以降を 54px ずつ下げる。
+            let mut y = 12;
+            if require_current {
+                mk_label(y, w!("現在のパスワード:"));
+                let _ = mk_edit(y + 20, ID_EDIT_CUR);
+                y += 54;
+            }
+            mk_label(y, w!("新しいパスワード:"));
+            let _ = mk_edit(y + 20, ID_EDIT);
+            mk_label(y + 54, w!("確認のため再入力:"));
+            let _ = mk_edit(y + 74, ID_EDIT2);
+            let button_y = y + 116;
 
             // OK / キャンセルボタン。
             let mk_button = |x: i32, id: usize, text: PCWSTR, default: bool| {
@@ -336,7 +389,7 @@ mod imp {
                     text,
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(extra),
                     x,
-                    128,
+                    button_y,
                     96,
                     28,
                     dlg,
@@ -358,7 +411,9 @@ mod imp {
             // (これが無いと子コントロールはあっても親が不可視のまま何も出ない)。
             let _ = ShowWindow(dlg, SW_SHOW);
             let _ = SetForegroundWindow(dlg);
-            if let Ok(first) = GetDlgItem(dlg, ID_EDIT) {
+            // 先頭欄にフォーカス (現在パスワード欄があればそちらを優先)。
+            let first_id = if require_current { ID_EDIT_CUR } else { ID_EDIT };
+            if let Ok(first) = GetDlgItem(dlg, first_id) {
                 let _ = SetFocus(first);
             }
 
@@ -409,9 +464,29 @@ mod imp {
         }
     }
 
-    /// OK 押下: 2 つの入力欄を検証し、一致すれば結果へ格納してダイアログを閉じる。
+    /// OK 押下: (現在パスワードが要求されていれば照合し) 新旧 2 欄を検証して、問題なければ
+    /// 結果へ格納しダイアログを閉じる。検証に失敗したときはダイアログを開いたままにする。
     unsafe fn on_ok(hwnd: HWND) {
         unsafe {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgResult;
+            let expect_current = if ptr.is_null() {
+                None
+            } else {
+                (*ptr).expect_current
+            };
+
+            // 現在パスワードの照合 (要求時のみ)。一致しなければ閉じない。
+            if let Some(expected) = expect_current {
+                let cur = match GetDlgItem(hwnd, ID_EDIT_CUR) {
+                    Ok(h) => get_text(h),
+                    Err(_) => return,
+                };
+                if psk_from_password(&cur) != expected {
+                    message_box(hwnd, "現在のパスワードが違います。", "Aurora Host");
+                    return;
+                }
+            }
+
             let pw1 = match GetDlgItem(hwnd, ID_EDIT) {
                 Ok(h) => get_text(h),
                 Err(_) => return,
@@ -428,7 +503,6 @@ mod imp {
                 message_box(hwnd, "確認用パスワードが一致しません。", "Aurora Host");
                 return;
             }
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgResult;
             if !ptr.is_null() {
                 (*ptr).value = Some(pw1);
             }
