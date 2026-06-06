@@ -183,14 +183,38 @@ function onMouseUp(e: MouseEvent): void {
   dispatch({ MouseButton: { button: b, down: false } });
 }
 
+// ピクセル単位ホイール (トラックパッド/高解像度マウス) の累積量。
+// 旧実装は符号だけ送り大きさを捨てていたため、小刻みな入力が毎回フル 1 ノッチ
+// (120) になり過剰スクロールしていた。約 100px ごとに 120 を 1 つ送る。
+let wheelAccX = 0;
+let wheelAccY = 0;
+const WHEEL_PX_PER_NOTCH = 100;
+
 function onWheel(e: WheelEvent): void {
   e.preventDefault();
   const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY);
   const raw = horizontal ? e.deltaX : -e.deltaY;
-  // 120 単位の WHEEL_DELTA に正規化
-  const delta = Math.round(raw / Math.max(1, Math.abs(raw)) * 120);
-  if (delta === 0) return;
-  dispatch({ MouseWheel: { delta, horizontal } });
+  if (raw === 0) return;
+
+  if (e.deltaMode !== 0) {
+    // 行/ページ単位 (一部の物理マウス): 1 イベント = 1 ノッチ。
+    dispatch({ MouseWheel: { delta: Math.sign(raw) * 120, horizontal } });
+    return;
+  }
+  // ピクセル単位: 軸ごとに累積し、ノッチ境界を跨いだぶんだけ送る。
+  if (horizontal) {
+    wheelAccX += raw;
+    const ticks = Math.trunc(wheelAccX / WHEEL_PX_PER_NOTCH);
+    if (ticks === 0) return;
+    wheelAccX -= ticks * WHEEL_PX_PER_NOTCH;
+    dispatch({ MouseWheel: { delta: ticks * 120, horizontal: true } });
+  } else {
+    wheelAccY += raw;
+    const ticks = Math.trunc(wheelAccY / WHEEL_PX_PER_NOTCH);
+    if (ticks === 0) return;
+    wheelAccY -= ticks * WHEEL_PX_PER_NOTCH;
+    dispatch({ MouseWheel: { delta: ticks * 120, horizontal: false } });
+  }
 }
 
 function onKeyDown(e: KeyboardEvent): void {
