@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 mod audio;
 mod autostart;
 mod capture;
+mod conn;
 mod encode;
 mod input;
 mod net;
@@ -289,8 +290,31 @@ fn dump_h264(n: usize) -> Result<()> {
 /// 接続パスワードを対話入力 (確認のため 2 回) し、DPAPI で暗号化保存する。
 /// 保存はこのコマンドを実行したユーザーの鍵で行われるため、ログオン時タスクと
 /// **同じユーザー**で実行すること (昇格は不要)。
+///
+/// セキュリティ: リモートクライアントは入力注入で端末を開きこのコマンドを実行できる。
+/// (1) 稼働中サーバが接続中なら拒否する。(2) 既存パスワードがある場合は現在の
+/// パスワードを要求して照合する。これによりリモートからの締め出し/乗っ取りを防ぐ。
 fn set_password_interactive() -> Result<()> {
     use std::io::Write;
+
+    // 接続中は変更を拒否する (リモート操作者による乗っ取り防止)。
+    if conn::is_active() {
+        return Err(anyhow!(
+            "クライアント接続中はパスワードを変更できません。切断してから実行してください"
+        ));
+    }
+
+    // 既存パスワードがあるなら、まず現在のパスワードを要求して本人確認する。
+    if let Ok(Some(current)) = secret::load_password() {
+        if !current.is_empty() {
+            print!("Enter current Aurora password: ");
+            std::io::stdout().flush().ok();
+            let entered = read_secret_line()?;
+            if entered != current {
+                return Err(anyhow!("current password does not match"));
+            }
+        }
+    }
 
     print!("Enter new Aurora password: ");
     std::io::stdout().flush().ok();
@@ -391,9 +415,12 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     // PSK は tray (UI スレッド) と net (接続受理) で共有する。tray でパスワードを変更すると
     // ここを書き換え、net が次の接続受理時に読むことで再起動なしに反映される。
     let psk = Arc::new(Mutex::new(psk_from_password(&password)));
+    // 実パスワードが設定済みか (= 現在パスワードの照合を要求するか)。初回 (保存なし) は
+    // ランダム値なので「未設定」扱いで照合を求めない。tray で変更すると true になる。
+    let has_password = Arc::new(std::sync::atomic::AtomicBool::new(have_stored));
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
-    tray::spawn(psk.clone(), !have_stored);
+    tray::spawn(psk.clone(), has_password, !have_stored);
 
     // 接続済みディスプレイを列挙する。失敗時は 1080p 単一ディスプレイで継続。
     let mut displays = match capture::enumerate_displays() {
