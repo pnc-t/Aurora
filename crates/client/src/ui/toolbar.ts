@@ -4,6 +4,7 @@
 // 各操作はアイコン + ツールチップ。空き領域と接続ラベルは data-tauri-drag-region でウィンドウ移動に使う。
 
 import { formatDisplayName, type DisplayDto } from "../core/ipc";
+import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
 import "./toolbar.css";
@@ -48,7 +49,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       <select id="display-select"></select>
     </span>
     <span class="tb-sep"></span>
-    <span class="tb-video" title="送出 fps 上限 (0=無制限) / ビットレート上限">
+    <span class="tb-video" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限">
+      <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
       <input type="text" inputmode="numeric" id="tb-fps" />fps
       <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
     </span>
@@ -71,18 +73,32 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const connLabel = opts.topbar.querySelector<HTMLElement>("#conn-label");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
+  const presetSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-preset");
   const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
   const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
+
+  function syncPreset(fps: number, mbps: number): void {
+    if (presetSelect) presetSelect.value = matchPreset(fps, mbps);
+  }
 
   function emitVideoParams(): void {
     const fps = Math.max(0, Math.floor(Number(fpsInput?.value) || 0));
     const mbps = Math.max(1, Math.floor(Number(mbpsInput?.value) || 1));
     if (fpsInput) fpsInput.value = String(fps);
     if (mbpsInput) mbpsInput.value = String(mbps);
+    syncPreset(fps, mbps);
     opts.onSetVideoParams(fps, mbps);
   }
   fpsInput?.addEventListener("change", emitVideoParams);
   mbpsInput?.addEventListener("change", emitVideoParams);
+  // プリセット選択で fps/Mbps 欄を埋めて即適用 (カスタムは手動入力を維持)。
+  presetSelect?.addEventListener("change", () => {
+    const p = findPreset(presetSelect.value);
+    if (!p) return; // カスタム: 入力欄をそのまま使う
+    if (fpsInput) fpsInput.value = String(p.fps);
+    if (mbpsInput) mbpsInput.value = String(p.mbps);
+    opts.onSetVideoParams(p.fps, p.mbps);
+  });
 
   let displays: DisplayDto[] = [];
   let connected = false;
@@ -176,6 +192,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     setVideoParams(fps: number, mbps: number): void {
       if (fpsInput) fpsInput.value = String(fps);
       if (mbpsInput) mbpsInput.value = String(mbps);
+      syncPreset(fps, mbps);
     },
     /** Ctrl+Alt+Shift+B: ピン留めのトグル (常時表示 ⇔ 自動格納)。 */
     toggleBar(): void {

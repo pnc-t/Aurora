@@ -21,6 +21,7 @@ import {
   type HostEntry,
   type ThemeId,
 } from "../core/ipc";
+import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
 import "./launcher.css";
@@ -49,6 +50,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   theme: "dark",
   fps: 60,
   max_mbps: 15,
+  auto_reconnect: true,
 };
 
 /** ラベル/host から決定的に淡い色を作りアバター背景に使う。 */
@@ -109,6 +111,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             <div class="setting-group">映像 (接続時にホストへ適用)</div>
             <div class="setting-row">
               <div class="s-meta">
+                <div class="s-title">画質プリセット</div>
+                <div class="s-desc">fps とビットレートをまとめて設定。手動で変えるとカスタムになる</div>
+              </div>
+              <select id="set-preset" class="select-input">${presetOptionsHtml()}</select>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta">
                 <div class="s-title">送出 fps 上限</div>
                 <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
               </div>
@@ -122,6 +131,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
             </div>
             <div class="setting-group">接続</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">切断時に自動で再接続</div>
+                <div class="s-desc">通信断などで切れたとき、間隔を空けて自動的に接続し直す</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="set-reconnect" /><span class="slider"></span></label>
+            </div>
             <div class="setting-row">
               <div class="s-meta">
                 <div class="s-title">接続時に自動フルスクリーン</div>
@@ -190,9 +206,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
+  const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
   const portInput = $<HTMLInputElement>("#set-port");
+  const presetSelect = $<HTMLSelectElement>("#set-preset");
   const fpsInput = $<HTMLInputElement>("#set-fps");
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
 
@@ -520,6 +538,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, default_capture: captureToggle.checked };
     persist();
   });
+  reconnectToggle?.addEventListener("change", () => {
+    settings = { ...settings, auto_reconnect: reconnectToggle.checked };
+    persist();
+  });
   accentInput?.addEventListener("input", () => {
     settings = { ...settings, accent_color: accentInput.value };
     applyAccent(accentInput.value);
@@ -537,16 +559,30 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     portInput.value = String(port);
     persist();
   });
+  /** fps/mbps の現在値からプリセット選択を一致させる (手動値なら「カスタム」)。 */
+  function syncPresetSelect(): void {
+    if (presetSelect) presetSelect.value = matchPreset(settings.fps, settings.max_mbps);
+  }
+  presetSelect?.addEventListener("change", () => {
+    const p = findPreset(presetSelect.value);
+    if (!p) return; // カスタム: fps/Mbps の手動値を維持する
+    settings = { ...settings, fps: p.fps, max_mbps: p.mbps };
+    if (fpsInput) fpsInput.value = String(p.fps);
+    if (mbpsInput) mbpsInput.value = String(p.mbps);
+    persist();
+  });
   fpsInput?.addEventListener("change", () => {
     const fps = Math.max(0, Math.floor(Number(fpsInput.value) || 0));
     settings = { ...settings, fps };
     fpsInput.value = String(fps);
+    syncPresetSelect();
     persist();
   });
   mbpsInput?.addEventListener("change", () => {
     const mbps = Math.max(1, Math.floor(Number(mbpsInput.value) || 1));
     settings = { ...settings, max_mbps: mbps };
     mbpsInput.value = String(mbps);
+    syncPresetSelect();
     persist();
   });
 
@@ -595,11 +631,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (fullscreenToggle) fullscreenToggle.checked = settings.default_fullscreen;
     if (statsToggle) statsToggle.checked = settings.show_stats;
     if (captureToggle) captureToggle.checked = settings.default_capture;
+    if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
     if (accentInput) accentInput.value = settings.accent_color;
     if (themeSelect) themeSelect.value = settings.theme;
     if (portInput) portInput.value = String(settings.default_port);
     if (fpsInput) fpsInput.value = String(settings.fps);
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
+    syncPresetSelect();
     applyTheme(settings.theme, settings.accent_color);
   })();
   void handle.refreshHosts();
