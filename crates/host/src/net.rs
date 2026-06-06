@@ -103,11 +103,25 @@ struct UploadState {
     path: String,
 }
 
-/// `ddd-received/` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
+/// アップロード受信ディレクトリ (`%USERPROFILE%\Aurora\received`)。
+///
+/// トレイ常駐 + ログオン時自動起動だと CWD が `System32` 等になり得るため、CWD 相対では
+/// 保存先が予測不能になる。ユーザープロファイル配下の固定パスに絶対化して discoverable にする。
+/// `USERPROFILE` (非 Windows では `HOME`) が無ければ最後の手段としてカレントディレクトリを使う。
+fn upload_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("Aurora").join("received")
+}
+
+/// `%USERPROFILE%\Aurora\received` 配下に保存先ファイルを作る。
+/// ファイル名はパス区切りを除去して安全化する。
 async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
     use std::path::Path;
-    let dir = Path::new("ddd-received");
-    tokio::fs::create_dir_all(dir)
+    let dir = upload_dir();
+    tokio::fs::create_dir_all(&dir)
         .await
         .context("create ddd-received dir")?;
     // パス区切りを含む名前を弾き、ファイル名成分のみを採用する
@@ -277,7 +291,6 @@ pub async fn run_server(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -443,9 +456,14 @@ async fn handle_client(
                         match upload.as_mut() {
                             Some(u) if u.id == id => {
                                 if offset != u.written {
-                                    tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch");
-                                }
-                                if let Err(e) = u.file.write_all(&data).await {
+                                    // TCP は順序保証があるため offset 不一致は本来起きない。発生したら
+                                    // データ欠落/重複の可能性が高く、書き込むと破損ファイルを残すため中断する。
+                                    let message = format!("chunk offset mismatch: expected {}, got {offset}", u.written);
+                                    tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch, aborting upload");
+                                    upload = None;
+                                    let msg = ControlMsg::FileResult { id, ok: false, message };
+                                    send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                                } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
                                     upload = None;

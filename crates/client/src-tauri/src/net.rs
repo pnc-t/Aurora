@@ -14,7 +14,8 @@ use aurora_common::framing::{
     AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
 };
 use aurora_common::noise::{
-    HandshakeState, NONCE_DOMAIN_CTRL, TransportSession, psk_from_password,
+    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO,
+    TransportSession, psk_from_password,
 };
 use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use bincode::Options;
@@ -984,6 +985,13 @@ async fn udp_reader_loop(
             continue;
         }
         let nonce = u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
+        // UDP は映像/音声ドメインのみ。TCP 制御ドメイン等の暗号文 (同一鍵) を UDP へ注入
+        // されても、復号前にドメインで弾く (多重防御)。AEAD 偽造不可 + Tailscale 下層暗号と
+        // 合わせ、経路上のクロスチャネル注入をここで遮断する。
+        let domain = nonce & NONCE_DOMAIN_MASK;
+        if domain != NONCE_DOMAIN_VIDEO && domain != NONCE_DOMAIN_AUDIO {
+            continue;
+        }
         plain.clear();
         if session.decrypt(nonce, &recv_buf[8..n], &mut plain).is_err() {
             // 復号失敗パケットは捨てる

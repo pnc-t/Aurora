@@ -18,4 +18,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 arboard = { workspace = true }
 bitflags = "2.6"
-blake2s_simd = "1.0"
+argon2 = { workspace = true }
