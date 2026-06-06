@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aurora_common::proto::{ControlMsg, FsEntry};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 #[cfg(windows)]
 mod windows;
@@ -41,8 +41,10 @@ const DIR_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// ProjFS 同期コールバック ↔ tokio net ループの橋渡し。
 pub struct FsBridge {
-    /// コールバック → net ループへ要求を投入する。`send` は非同期でないので同期スレッドから安全。
-    req_tx: UnboundedSender<ControlMsg>,
+    /// コールバック → net ループへ要求を投入する **bounded** チャネル。書き戻し (FsWrite) が
+    /// 大量に積まれて TCP 制御チャネル (入力と共用) を溢れさせメモリ急増/入力遅延を招かないよう、
+    /// 満杯時は `blocking_send` で ProjFS 同期スレッドを待たせ end-to-end のバックプレッシャをかける。
+    req_tx: Sender<ControlMsg>,
     /// 相関 ID → 返信先 (同期チャネル)。net ループが [`FsBridge::complete`] で発火する。
     pending: Mutex<HashMap<u64, std::sync::mpsc::Sender<FsReply>>>,
     next_id: AtomicU64,
@@ -51,7 +53,7 @@ pub struct FsBridge {
 }
 
 impl FsBridge {
-    pub fn new(req_tx: UnboundedSender<ControlMsg>) -> Self {
+    pub fn new(req_tx: Sender<ControlMsg>) -> Self {
         Self {
             req_tx,
             pending: Mutex::new(HashMap::new()),
@@ -65,9 +67,28 @@ impl FsBridge {
     }
 
     /// 一方向メッセージ (書き戻し: FsCreate/FsWrite/FsDelete/FsRename) を net ループへ送る。
-    /// 応答は待たない (ベストエフォート)。
+    /// 応答は待たない (ベストエフォート)。bounded チャネルなので満杯時はここで待つ (ProjFS
+    /// 同期スレッド上なので blocking 安全)。構造変化 (作成/削除/リネーム) は一覧キャッシュを無効化する。
     pub fn push(&self, msg: ControlMsg) -> bool {
-        self.req_tx.send(msg).is_ok()
+        match &msg {
+            ControlMsg::FsCreate { path, .. } | ControlMsg::FsDelete { path } => {
+                self.invalidate_dir_of(path);
+            }
+            ControlMsg::FsRename { from, to } => {
+                self.invalidate_dir_of(from);
+                self.invalidate_dir_of(to);
+            }
+            _ => {}
+        }
+        self.req_tx.blocking_send(msg).is_ok()
+    }
+
+    /// `path` を含むディレクトリの一覧キャッシュを落とす (書き戻し直後の stale 表示を防ぐ)。
+    fn invalidate_dir_of(&self, path: &str) {
+        let dir = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        if let Ok(mut cache) = self.dir_cache.lock() {
+            cache.remove(dir);
+        }
     }
 
     /// net ループが返信受信時に呼ぶ。pending から相関 ID を引いて発火する。
@@ -87,7 +108,7 @@ impl FsBridge {
             .lock()
             .map_err(|_| "bridge poisoned".to_string())?
             .insert(id, tx);
-        if self.req_tx.send(make(id)).is_err() {
+        if self.req_tx.blocking_send(make(id)).is_err() {
             self.pending.lock().ok().and_then(|mut m| m.remove(&id));
             return Err("control channel closed".into());
         }

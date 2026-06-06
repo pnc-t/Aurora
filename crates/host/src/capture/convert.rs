@@ -36,6 +36,11 @@ use windows::core::s;
 use super::device::DeviceBundle;
 
 /// NV12 出力プールの枚数。async エンコーダが入力サーフェスを参照中に上書きしないため循環。
+///
+/// 前提: capture→encode は bounded(2) チャネル + try_send 間引きなので、同時に in-flight な
+/// NV12 は「キュー 2 + エンコード中 1 + 生成中 1」≈4 枚に収まる。HW MFT が入力サーフェスを
+/// これ以上 (4 枚超) 同時保持するエンコーダだと循環で参照中サーフェスを上書きし得るため、
+/// チャネル容量を増やす場合はここも合わせて見直すこと。
 const POOL_SIZE: usize = 4;
 
 /// 色変換シェーダ (HLSL)。VSMain(full-screen triangle) + PSY(luma) + PSUV(chroma)。

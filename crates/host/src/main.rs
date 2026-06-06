@@ -84,6 +84,28 @@ impl Default for Args {
     }
 }
 
+/// `--flag <value>` の値を取り出す。欠落時はパニックせずフレンドリーに終了する
+/// (CLI 引数ミスはユーザーエラーなので panic のバックトレースより明示メッセージが親切)。
+fn take_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> String {
+    it.next().unwrap_or_else(|| {
+        eprintln!("error: {flag} requires a value");
+        std::process::exit(2);
+    })
+}
+
+/// `--flag <value>` を取り出して `T` へパースする。欠落・不正値はクリーン終了する。
+fn parse_value<T, I>(it: &mut I, flag: &str, hint: &str) -> T
+where
+    T: std::str::FromStr,
+    I: Iterator<Item = String>,
+{
+    let raw = take_value(it, flag);
+    raw.parse().unwrap_or_else(|_| {
+        eprintln!("error: {flag} expects {hint} (got '{raw}')");
+        std::process::exit(2);
+    })
+}
+
 fn parse_args() -> Args {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
@@ -92,24 +114,14 @@ fn parse_args() -> Args {
             "--dump-bmp" => args.dump_bmp = true,
             "--perf" => args.perf = true,
             "--dump-h264" => {
-                let n: usize = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .expect("--dump-h264 requires N");
-                args.dump_h264 = Some(n);
+                args.dump_h264 = Some(parse_value(&mut it, "--dump-h264", "an integer N"));
             }
             "--fps" => {
-                args.fps_cap = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .expect("--fps requires N (0 = uncapped)");
+                args.fps_cap = parse_value(&mut it, "--fps", "N (0 = uncapped)");
             }
             "--max-bitrate" => {
                 // 引数は Mbps。内部 bps へ変換する。0 (以下) は無制限 (u32::MAX) を表す。
-                let mbps: f64 = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .expect("--max-bitrate requires N (Mbps, 0 = unlimited)");
+                let mbps: f64 = parse_value(&mut it, "--max-bitrate", "N in Mbps (0 = unlimited)");
                 args.max_bitrate_bps = if mbps <= 0.0 {
                     u32::MAX
                 } else {
@@ -117,21 +129,19 @@ fn parse_args() -> Args {
                 };
             }
             "--port" => {
-                args.port = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .filter(|&p| p != 0)
-                    .expect("--port requires N (1..=65535)");
+                let port: u16 = parse_value(&mut it, "--port", "N (1..=65535)");
+                if port == 0 {
+                    eprintln!("error: --port must be 1..=65535");
+                    std::process::exit(2);
+                }
+                args.port = port;
             }
             "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "--set-password" => args.set_password = true,
             "--clear-password" => args.clear_password = true,
             "--log-level" => {
-                args.log_level = Some(
-                    it.next()
-                        .expect("--log-level requires a value (e.g. debug)"),
-                );
+                args.log_level = Some(take_value(&mut it, "--log-level"));
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -428,6 +438,13 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
             println!("password: {generated}");
             println!(
                 "(no stored password; set one from the tray icon or `aurora-host --set-password`)"
+            );
+            // GUI リリースでは stdout が無く上の println は破棄される。この乱数値は表示されず
+            // 接続にも使えないため、ファイルログに「トレイで設定するまでの暫定値」である旨を残す
+            // (実運用ではトレイの初回ダイアログ prompt_now でユーザーがパスワードを設定する)。
+            tracing::warn!(
+                "no stored connection password; set one from the tray icon. A random password is \
+                 used as a placeholder until then (not shown in background/GUI mode)."
             );
             generated
         }
