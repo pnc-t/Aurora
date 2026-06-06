@@ -126,6 +126,9 @@ function switchDisplay(d: DisplayDto): void {
 
 /** 切断処理 (ユーザー操作・ホスト切断の両方から呼ぶ)。 */
 function doDisconnect(reason: string): void {
+  // サーバ起因の切断では reader/writer の両タスクが Disconnected を送るため二重に呼ばれる。
+  // 既に未接続なら何もしない (トーストやランチャー復帰の重複を防ぐ)。
+  if (!connected) return;
   void disconnect();
   connected = false;
   detachInput(); // ポインタロックも解除される

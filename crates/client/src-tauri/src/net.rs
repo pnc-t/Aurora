@@ -32,6 +32,17 @@ use tokio::time::Instant;
 
 const MAX_TCP_FRAME: usize = 64 * 1024;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// 接続確立 (TCP connect + Noise ハンドシェイク + 最初の HostInfo) の各 I/O 上限。
+/// host 側 `HANDSHAKE_TIMEOUT` と対。無応答ホストでの無限ハングを防ぐ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ハンドシェイク I/O を `CONNECT_TIMEOUT` で包む。タイムアウト/失敗を String に正規化する。
+async fn hs_io(fut: impl std::future::Future<Output = anyhow::Result<()>>) -> Result<(), String> {
+    tokio::time::timeout(CONNECT_TIMEOUT, fut)
+        .await
+        .map_err(|_| "handshake timed out".to_string())?
+        .map_err(err)
+}
 
 /// フロント (TS) に流す制御イベント。タグ付き enum。
 #[derive(Debug, Clone, Serialize)]
@@ -170,33 +181,42 @@ pub async fn connect_to_host(
         }
     }
 
-    let tcp_addr: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .map_err(|e| format!("invalid host: {e}"))?;
+    // ホスト名 (Tailscale MagicDNS 名等) も解決する。SocketAddr::parse は数値 IP しか
+    // 受け付けないため、lookup_host で名前解決し IPv4/IPv6 の最初のアドレスを採る。
+    let target = format!("{host}:{port}");
+    let tcp_addr: SocketAddr = tokio::net::lookup_host(&target)
+        .await
+        .map_err(|e| format!("resolve {host}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}"))?;
     let udp_addr = tcp_addr;
 
     tracing::info!(%tcp_addr, "connecting");
-    let mut tcp = TcpStream::connect(tcp_addr)
+    let mut tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp_addr))
         .await
+        .map_err(|_| "TCP connect timed out".to_string())?
         .map_err(|e| format!("TCP connect: {e}"))?;
     tcp.set_nodelay(true).ok();
 
     let psk = psk_from_password(&password);
 
     // --- Noise XX-PSK initiator ---
+    // ハンドシェイク I/O には全てタイムアウトを設ける。これが無いと、ポートは開いているが
+    // 応答しないホスト (別アプリがポートを掴んでいる等) に対して connect_to_host が永久に
+    // 返らず、UI が「connecting…」のままキャンセル不能になる (host 側の HANDSHAKE_TIMEOUT と対)。
     let mut hs = HandshakeState::new_initiator(&psk).map_err(err)?;
     let mut buf = Vec::new();
     let mut tmp = Vec::new();
     // -> e
     let mut out_msg = Vec::new();
     hs.write_msg(&[], &mut out_msg).map_err(err)?;
-    write_tcp_frame(&mut tcp, &out_msg).await.map_err(err)?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
     // <- e, ee, s, es
-    read_tcp_frame(&mut tcp, &mut buf).await.map_err(err)?;
+    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
     hs.read_msg(&buf, &mut tmp).map_err(err)?;
     // -> s, se, psk
     hs.write_msg(&[], &mut out_msg).map_err(err)?;
-    write_tcp_frame(&mut tcp, &out_msg).await.map_err(err)?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
 
     // snow の StatelessTransportState は encrypt/decrypt とも &self なので、
     // 複数タスク (writer/reader/udp) 間の共有は Arc だけで足り Mutex は不要。
@@ -212,7 +232,7 @@ pub async fn connect_to_host(
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
     // 以降の TCP 受信は reader ループが nonce 1 から続ける。
-    read_tcp_frame(&mut tcp, &mut buf).await.map_err(err)?;
+    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
     let mut plain = Vec::new();
     session
         .decrypt(NONCE_DOMAIN_CTRL, &buf, &mut plain)
@@ -234,7 +254,8 @@ pub async fn connect_to_host(
 
     // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "AURHELLO"。
     // 高 fps 時のバースト受信での取りこぼし (= 映像ノイズ) を抑えるため受信バッファを拡大する。
-    let udp = Arc::new(make_udp_socket().map_err(|e| format!("UDP socket: {e}"))?);
+    let udp =
+        Arc::new(make_udp_socket(udp_addr.is_ipv6()).map_err(|e| format!("UDP socket: {e}"))?);
     udp.connect(udp_addr)
         .await
         .map_err(|e| format!("UDP connect: {e}"))?;
@@ -1083,14 +1104,22 @@ async fn udp_reader_loop(
 ///
 /// 既定の受信バッファ (数百 KB) は 1440p/60fps のバースト時に溢れてパケットロス
 /// (映像ノイズの主因) を招くため、4MB に広げてバーストを吸収する。
-fn make_udp_socket() -> anyhow::Result<UdpSocket> {
+fn make_udp_socket(ipv6: bool) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Socket, Type};
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+    // 対向 (解決済みアドレス) と同じファミリでソケットを開く。IPv4 固定だと IPv6
+    // Tailscale アドレスへの connect が失敗するため、解決結果に合わせる。
+    let domain = if ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+    let sock = Socket::new(domain, Type::DGRAM, None)?;
     // 失敗しても致命的ではない (既定値で続行)。
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
     sock.set_nonblocking(true)?;
-    let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    sock.bind(&addr.into())?;
+    let bind: SocketAddr = if ipv6 {
+        "[::]:0".parse()
+    } else {
+        "0.0.0.0:0".parse()
+    }
+    .unwrap();
+    sock.bind(&bind.into())?;
     let std_udp: std::net::UdpSocket = sock.into();
     Ok(UdpSocket::from_std(std_udp)?)
 }

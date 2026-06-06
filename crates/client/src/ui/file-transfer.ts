@@ -125,7 +125,7 @@ export function handleFileResult(id: number, ok: boolean, message: string): void
     activeDownloadId = null;
     return;
   }
-  if (activeUploadId === null || id === activeUploadId) {
+  if (id === activeUploadId) {
     setUploadProgress(ok ? `done: ${message}` : `failed: ${message}`);
     activeUploadId = null;
   }

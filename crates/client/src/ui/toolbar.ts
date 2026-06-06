@@ -147,9 +147,16 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     setDisplays(list: DisplayDto[], selectedId?: number): void {
       displays = list;
       if (!displaySelect || !displayWrap) return;
-      displaySelect.innerHTML = list
-        .map((x) => `<option value="${x.id}">${formatDisplayName(x.name)} (${x.width}x${x.height})</option>`)
-        .join("");
+      // 表示名はホスト由来 (リモート) の文字列なので innerHTML に流さず、DOM + textContent
+      // で組んで XSS を防ぐ (悪意あるホストが Display.name に <img onerror> 等を仕込む経路を塞ぐ)。
+      displaySelect.replaceChildren(
+        ...list.map((x) => {
+          const opt = document.createElement("option");
+          opt.value = String(x.id);
+          opt.textContent = `${formatDisplayName(x.name)} (${x.width}x${x.height})`;
+          return opt;
+        }),
+      );
       if (selectedId !== undefined) displaySelect.value = String(selectedId);
       // ディスプレイが複数あるときだけ切替 UI を出す。
       displayWrap.style.display = list.length > 1 ? "inline-flex" : "none";
