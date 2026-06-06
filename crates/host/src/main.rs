@@ -128,7 +128,10 @@ fn parse_args() -> Args {
             "--set-password" => args.set_password = true,
             "--clear-password" => args.clear_password = true,
             "--log-level" => {
-                args.log_level = Some(it.next().expect("--log-level requires a value (e.g. debug)"));
+                args.log_level = Some(
+                    it.next()
+                        .expect("--log-level requires a value (e.g. debug)"),
+                );
             }
             other => {
                 eprintln!("unknown arg: {other}");

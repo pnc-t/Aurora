@@ -28,6 +28,11 @@ pub const NONCE_DOMAIN_VIDEO: u64 = 0;
 pub const NONCE_DOMAIN_AUDIO: u64 = 1 << 62;
 pub const NONCE_DOMAIN_CTRL: u64 = 1 << 63;
 
+/// nonce の上位 2 ビット (ドメイン選択ビット)。下位はストリーム内カウンタ/seq。
+/// `nonce & NONCE_DOMAIN_MASK` で所属ドメインを取り出せる。受信側が「想定ストリームの
+/// ドメインか」を検証し、別ドメイン (例: TCP 制御暗号文の UDP への注入) を弾くのに使う。
+pub const NONCE_DOMAIN_MASK: u64 = 0b11 << 62;
+
 #[derive(Debug, Error)]
 pub enum NoiseError {
     #[error("snow error: {0}")]
@@ -38,13 +43,28 @@ pub enum NoiseError {
     AlreadyFinished,
 }
 
+/// PSK 導出に使うアプリ固有の固定ソルト。
+///
+/// PSK は host/client が共有パスワードから **各自で独立に同じ値を計算**する必要があるため、
+/// ソルトを通信で交換できない。よって固定ソルトを使う (パスワードストレージではなく
+/// 共有鍵導出なので、毎回ユニークなソルトは要件ではない)。Argon2id のメモリ硬度により、
+/// 固定ソルトでもオフライン総当たりコストは blake2s 単発より桁違いに高い。
+const PSK_SALT: &[u8] = b"aurora-noise-psk-v1";
+
 /// 接続パスワードから PSK (32B) を導出する。
-/// MVP では blake2s。鍵強度が要るなら後で Argon2 に差し替える。
+///
+/// Argon2id (メモリ硬 KDF) + 固定アプリソルト。弱いパスワードに対するオフライン総当たり
+/// 耐性を、単一ハッシュ (旧 blake2s) より大幅に高める。host/client で同一関数を使うため
+/// 導出値は常に一致する。パラメータを変えると PSK が変わり旧クライアントと非互換になる点に注意。
 pub fn psk_from_password(password: &str) -> [u8; 32] {
-    use blake2s_simd::Params;
-    let hash = Params::new().hash_length(32).hash(password.as_bytes());
+    use argon2::{Algorithm, Argon2, Params, Version};
+    // OWASP 推奨水準 (m=19 MiB, t=2, p=1)。出力長 32B。
+    let params = Params::new(19 * 1024, 2, 1, Some(32)).expect("valid argon2 params");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
-    out.copy_from_slice(hash.as_bytes());
+    argon2
+        .hash_password_into(password.as_bytes(), PSK_SALT, &mut out)
+        .expect("argon2 derive psk");
     out
 }
 

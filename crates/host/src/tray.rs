@@ -304,7 +304,11 @@ mod imp {
 
             let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
             // 現在パスワード欄の有無で 1 行ぶん高さを変える。
-            let (w, h) = if require_current { (340, 254) } else { (340, 200) };
+            let (w, h) = if require_current {
+                (340, 254)
+            } else {
+                (340, 200)
+            };
             let dlg = match CreateWindowExW(
                 WS_EX_DLGMODALFRAME,
                 class_name,
@@ -412,7 +416,11 @@ mod imp {
             let _ = ShowWindow(dlg, SW_SHOW);
             let _ = SetForegroundWindow(dlg);
             // 先頭欄にフォーカス (現在パスワード欄があればそちらを優先)。
-            let first_id = if require_current { ID_EDIT_CUR } else { ID_EDIT };
+            let first_id = if require_current {
+                ID_EDIT_CUR
+            } else {
+                ID_EDIT
+            };
             if let Ok(first) = GetDlgItem(dlg, first_id) {
                 let _ = SetFocus(first);
             }
