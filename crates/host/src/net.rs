@@ -366,7 +366,9 @@ async fn handle_client(
 
     // ProjFS ドライブリダイレクト。コールバック (同期) → ここへ FsList/FsRead 要求が流れる。
     // 開始失敗 (Client-ProjFS 無効など) はファイル投影を諦めてリモデス本体は継続する。
-    let (fs_req_tx, mut fs_req_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    // bounded: 書き戻し (FsWrite) の殺到で制御チャネルとメモリを溢れさせないようにする
+    // (FsBridge が満杯時に blocking_send で ProjFS スレッドを待たせ、ディスク読みを止める)。
+    let (fs_req_tx, mut fs_req_rx) = mpsc::channel::<ControlMsg>(64);
     let fs_bridge = Arc::new(FsBridge::new(fs_req_tx));
     let _virt = match projfs::start(fs_bridge.clone(), std::path::Path::new("aurora-remote")) {
         Ok(v) => Some(v),

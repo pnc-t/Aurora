@@ -22,10 +22,17 @@ pub fn install(forward_args: &[String]) -> Result<()> {
     let exe = exe.to_string_lossy();
 
     // タスクが実行するコマンド行。exe を引用し、転送する起動引数 (--port 等) を後ろへ。
+    // 空白を含む引数は引用してコマンド行が壊れないようにする (値はローカル CLI 由来)。
     let mut tr = format!("\"{exe}\"");
     for a in forward_args {
         tr.push(' ');
-        tr.push_str(a);
+        if a.is_empty() || a.contains(' ') || a.contains('\t') {
+            tr.push('"');
+            tr.push_str(a);
+            tr.push('"');
+        } else {
+            tr.push_str(a);
+        }
     }
 
     // /SC ONLOGON: 現在ユーザのログオン時に起動 (対話セッションなので DXGI が動く)

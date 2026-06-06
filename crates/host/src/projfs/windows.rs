@@ -144,7 +144,7 @@ pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
     std::fs::create_dir_all(root).with_context(|| format!("create projfs root {root:?}"))?;
 
     // 仮想化インスタンス GUID をルート直下に永続化し、再起動でも再利用する。
-    let id_path = root.join(".ddd-instance");
+    let id_path = root.join(".aurora-instance");
     let instance_id = match std::fs::read(&id_path) {
         Ok(bytes) if bytes.len() == 16 => {
             GUID::from_u128(u128::from_le_bytes(bytes.try_into().unwrap()))

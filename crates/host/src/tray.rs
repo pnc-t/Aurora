@@ -92,7 +92,7 @@ mod imp {
             let boxed: *mut WndState = Box::into_raw(Box::new(WndState { psk, has_password }));
 
             // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
-            let hwnd = CreateWindowExW(
+            let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 class_name,
                 w!("Aurora Host"),
@@ -105,7 +105,15 @@ mod imp {
                 HMENU::default(),
                 hinstance,
                 Some(boxed as *const c_void),
-            )?;
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    // WM_CREATE が来ず GWLP_USERDATA に保存されないため、ここで Box を回収する。
+                    // SAFETY: boxed は直前の Box::into_raw 由来で、まだどこにも所有が移っていない。
+                    drop(Box::from_raw(boxed));
+                    return Err(e);
+                }
+            };
 
             // トレイアイコン登録。標準のアプリアイコンを使う。
             let mut nid = NOTIFYICONDATAW {
