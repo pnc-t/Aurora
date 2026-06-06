@@ -60,6 +60,10 @@ struct Args {
     set_password: bool,
     /// 保存済みパスワードを削除して終了する。
     clear_password: bool,
+    /// ログレベル指定。トレイ常駐 (コンソールなし) や自動起動では RUST_LOG を渡せないため、
+    /// 引数でファイルログのレベルを上げられるようにする。`debug` 等の素のレベル、または
+    /// `aurora=debug,snow=warn` のような完全なディレクティブを受け付ける。
+    log_level: Option<String>,
 }
 
 impl Default for Args {
@@ -75,6 +79,7 @@ impl Default for Args {
             uninstall: false,
             set_password: false,
             clear_password: false,
+            log_level: None,
         }
     }
 }
@@ -122,6 +127,9 @@ fn parse_args() -> Args {
             "--uninstall" => args.uninstall = true,
             "--set-password" => args.set_password = true,
             "--clear-password" => args.clear_password = true,
+            "--log-level" => {
+                args.log_level = Some(it.next().expect("--log-level requires a value (e.g. debug)"));
+            }
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -150,7 +158,10 @@ fn main() -> Result<()> {
 
     // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
     // (CLI / デバッグ) は従来どおりコンソールへ出す。
-    init_tracing(!needs_console && !cfg!(debug_assertions));
+    init_tracing(
+        !needs_console && !cfg!(debug_assertions),
+        args.log_level.as_deref(),
+    );
 
     if args.install {
         // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
@@ -182,11 +193,30 @@ fn main() -> Result<()> {
     run_server(args.perf, args.fps_cap, args.max_bitrate_bps, args.port)
 }
 
+/// ログフィルタを構築する。`--log-level` 引数が最優先。素のレベル (`debug`) は `aurora=`
+/// を補い、`=` を含むなら完全なディレクティブとして扱う。無効・未指定なら `RUST_LOG`、
+/// それも無ければ既定の `aurora=info`。
+fn build_log_filter(level: Option<&str>) -> EnvFilter {
+    if let Some(l) = level {
+        let directive = if l.contains('=') {
+            l.to_string()
+        } else {
+            format!("aurora={l}")
+        };
+        if let Ok(f) = EnvFilter::try_new(&directive) {
+            return f;
+        }
+        eprintln!("invalid --log-level '{l}', falling back to RUST_LOG/default");
+    }
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into())
+}
+
 /// `tracing` を初期化する。`to_file` が真なら `%LOCALAPPDATA%\Aurora\host.log` へ書き、
-/// 開けない場合や偽のときはコンソール (stdout) へ出す。
+/// 開けない場合や偽のときはコンソール (stdout) へ出す。フィルタの優先順位は
+/// `--log-level` 引数 > `RUST_LOG` 環境変数 > 既定 (`aurora=info`)。
 #[cfg_attr(not(windows), allow(unused_variables))]
-fn init_tracing(to_file: bool) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into());
+fn init_tracing(to_file: bool, level: Option<&str>) {
+    let filter = build_log_filter(level);
     #[cfg(windows)]
     if to_file {
         if let Some(file) = open_log_file() {
