@@ -354,6 +354,9 @@ mod imp {
 
             // モーダル化: オーナーを無効化し、破棄まで自前のメッセージループを回す。
             let _ = EnableWindow(owner, BOOL::from(false));
+            // ダイアログ自体は WS_VISIBLE 無しで生成しているので明示的に表示する
+            // (これが無いと子コントロールはあっても親が不可視のまま何も出ない)。
+            let _ = ShowWindow(dlg, SW_SHOW);
             let _ = SetForegroundWindow(dlg);
             if let Ok(first) = GetDlgItem(dlg, ID_EDIT) {
                 let _ = SetFocus(first);
