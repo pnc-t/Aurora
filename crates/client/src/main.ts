@@ -73,7 +73,7 @@ function setFilePanel(visible: boolean): void {
 // 接続中ツールバー。
 const toolbar = mountToolbar({
   topbar,
-  onDisconnect: () => doDisconnect("disconnected"),
+  onDisconnect: () => doDisconnect("disconnected", true),
   onSelectDisplay: (d) => switchDisplay(d),
   onToggleStats: () => {
     toggleStats();
@@ -93,21 +93,29 @@ let lastHost = "";
 let pendingEntry: HostEntry | null = null;
 // 接続中か (フルスクリーン切替後の resizable 再適用判定に使う)。
 let connected = false;
+
+/** セッションを開く下回り。チャネルを張って connect_to_host を呼ぶ (再接続も共用)。 */
+async function openSession(entry: HostEntry, password: string | null): Promise<void> {
+  lastHost = entry.host;
+  pendingEntry = entry;
+  resetDecoder();
+  const eventChannel = new Channel<ClientEvent>();
+  const videoChannel = new Channel<ArrayBuffer>();
+  eventChannel.onmessage = handleClientEvent;
+  videoChannel.onmessage = (data) => {
+    // Tauri は ArrayBuffer / number[] のどちらかで来る場合がある。
+    const buf = data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
+    handleVideoChunk(buf);
+  };
+  await connectToHost(entry.host, entry.port, password, eventChannel, videoChannel);
+}
+
 const launcher = mountLauncher({
   root: overlay,
   onConnect: async (entry, password) => {
-    lastHost = entry.host;
-    pendingEntry = entry;
-    resetDecoder();
-    const eventChannel = new Channel<ClientEvent>();
-    const videoChannel = new Channel<ArrayBuffer>();
-    eventChannel.onmessage = handleClientEvent;
-    videoChannel.onmessage = (data) => {
-      // Tauri は ArrayBuffer / number[] のどちらかで来る場合がある。
-      const buf = data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
-      handleVideoChunk(buf);
-    };
-    await connectToHost(entry.host, entry.port, password, eventChannel, videoChannel);
+    // 手動接続は進行中の自動再接続を打ち切る。
+    cancelReconnect();
+    await openSession(entry, password);
   },
 });
 
@@ -124,8 +132,61 @@ function switchDisplay(d: DisplayDto): void {
   showToast(`switching to ${dn} ${d.width}x${d.height}`);
 }
 
+// --- 自動再接続 ---
+// 通信断 (サーバ起因の切断) のとき、保存済みパスワード (DPAPI) で間隔を空けて
+// 接続し直す。ハンドシェイク成功時に password は必ず保存されるため、再接続は
+// password=null (Rust が復号) で行える。手動接続・接続成立で打ち切る。
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+const MAX_RECONNECT_ATTEMPTS = 10;
+let reconnecting = false;
+let reconnectAttempt = 0;
+let reconnectTimer: number | null = null;
+
+function cancelReconnect(): void {
+  reconnecting = false;
+  reconnectAttempt = 0;
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function startReconnect(): void {
+  if (reconnecting || !pendingEntry) return;
+  reconnecting = true;
+  reconnectAttempt = 0;
+  scheduleReconnect();
+}
+
+function scheduleReconnect(): void {
+  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+  launcher.setConnState(`再接続待機 ${Math.round(delay / 1000)}s… (試行 ${reconnectAttempt + 1})`, "connecting");
+  reconnectTimer = window.setTimeout(() => void attemptReconnect(), delay);
+}
+
+async function attemptReconnect(): Promise<void> {
+  reconnectTimer = null;
+  if (!reconnecting || !pendingEntry) return;
+  reconnectAttempt++;
+  launcher.setConnState(`再接続中… (試行 ${reconnectAttempt})`, "connecting");
+  showToast(`再接続を試行中… (${reconnectAttempt})`);
+  try {
+    // password=null で保存済み (DPAPI) を使う。成功確定は host_info イベントで cancelReconnect。
+    await openSession(pendingEntry, null);
+  } catch {
+    if (!reconnecting) return; // 途中で手動接続等にキャンセルされた
+    if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      cancelReconnect();
+      launcher.setConnState("再接続に失敗しました", "error");
+      showToast("再接続に失敗しました", "error");
+    } else {
+      scheduleReconnect();
+    }
+  }
+}
+
 /** 切断処理 (ユーザー操作・ホスト切断の両方から呼ぶ)。 */
-function doDisconnect(reason: string): void {
+function doDisconnect(reason: string, userInitiated = false): void {
   // サーバ起因の切断では reader/writer の両タスクが Disconnected を送るため二重に呼ばれる。
   // 既に未接続なら何もしない (トーストやランチャー復帰の重複を防ぐ)。
   if (!connected) return;
@@ -145,6 +206,10 @@ function doDisconnect(reason: string): void {
   launcher.show();
   void launcher.refreshHosts();
   showToast(reason, errored ? "error" : "info");
+  // ユーザー操作でない通信断なら、設定に応じて自動再接続を開始する。
+  if (!userInitiated && errored && pendingEntry && launcher.getSettings().auto_reconnect) {
+    startReconnect();
+  }
 }
 
 function handleClientEvent(ev: ClientEvent): void {
@@ -153,7 +218,9 @@ function handleClientEvent(ev: ClientEvent): void {
       launcher.setConnState("handshake complete…", "connecting");
       break;
     case "host_info": {
-      // 接続成立。ランチャーを隠してツールバー有効化。
+      // 接続成立。自動再接続が走っていれば確定として打ち切る。
+      cancelReconnect();
+      // ランチャーを隠してツールバー有効化。
       launcher.hide();
       launcher.setConnState(`connected · ${lastHost}`, "connected");
       if (pendingEntry) void saveRecentHost(pendingEntry);

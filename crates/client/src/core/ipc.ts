@@ -120,6 +120,7 @@ export type ClientSettings = {
   theme: ThemeId;
   fps: number;
   max_mbps: number;
+  auto_reconnect: boolean;
 };
 
 /// 接続先 host の履歴を読み込む (最新が先頭)。

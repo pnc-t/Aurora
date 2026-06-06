@@ -75,6 +75,9 @@ pub struct ClientSettings {
     /// 接続時にホストへ送るビットレート上限 (Mbps)。
     #[serde(default = "default_max_mbps")]
     pub max_mbps: u32,
+    /// 通信断などで切れたとき自動で再接続を試みる。
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
 }
 
 fn default_fps() -> u32 {
@@ -83,6 +86,10 @@ fn default_fps() -> u32 {
 
 fn default_max_mbps() -> u32 {
     15
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ClientSettings {
@@ -97,6 +104,7 @@ impl Default for ClientSettings {
             theme: default_theme(),
             fps: default_fps(),
             max_mbps: default_max_mbps(),
+            auto_reconnect: true,
         }
     }
 }
