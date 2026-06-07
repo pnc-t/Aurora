@@ -210,6 +210,9 @@ async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<Control
 }
 
 pub struct ServerConfig {
+    /// 待受アドレス。既定は Tailscale IP (tailnet 限定公開)、`--bind` で上書き可能。
+    /// Tailnet 外 (LAN/インターネット) への露出を絞り、総当たり・接続枠 DoS の面を減らす。
+    pub bind_ip: std::net::IpAddr,
     /// 待受ポート (TCP 制御 / UDP 映像で共用)。tray UI からのポート変更で書き換えられ、
     /// `reload` 通知で accept ループが TCP/UDP を貼り直す (再起動なしに反映)。
     pub port: std::sync::Arc<std::sync::atomic::AtomicU16>,
@@ -242,7 +245,7 @@ pub async fn run_server(
     // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
     loop {
         let port = cfg.port.load(Ordering::Relaxed);
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = SocketAddr::new(cfg.bind_ip, port);
         let tcp = TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind TCP {addr}"))?;

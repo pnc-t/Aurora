@@ -54,6 +54,11 @@ struct Args {
     port: u16,
     /// `--port` が明示指定されたか。明示時は保存値 (トレイ管理) より CLI を優先する。
     port_explicit: bool,
+    /// 待受アドレス (`--bind`)。未指定なら Tailscale IP を自動採用し、無ければ 0.0.0.0。
+    /// 本プロジェクトは Tailnet 前提のため、既定で tailnet インターフェースのみに公開して
+    /// LAN/インターネットへの露出 (総当たり・接続枠 DoS) を避ける。`--bind 0.0.0.0` で
+    /// 従来どおり全 NIC 公開 (tailnet 済みマシンでの LAN テスト用) に上書きできる。
+    bind: Option<String>,
     /// ログオン時自動起動タスクを登録して終了する。
     install: bool,
     /// 自動起動タスクを解除して終了する。
@@ -83,6 +88,7 @@ impl Default for Args {
             set_password: false,
             clear_password: false,
             log_level: None,
+            bind: None,
         }
     }
 }
@@ -146,6 +152,9 @@ fn parse_args() -> Args {
             "--clear-password" => args.clear_password = true,
             "--log-level" => {
                 args.log_level = Some(take_value(&mut it, "--log-level"));
+            }
+            "--bind" => {
+                args.bind = Some(take_value(&mut it, "--bind"));
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -219,7 +228,55 @@ fn main() -> Result<()> {
     } else {
         settings::load_port().unwrap_or(args.port)
     };
-    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port)
+    let bind_ip = resolve_bind_ip(args.bind.as_deref());
+    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port, bind_ip)
+}
+
+/// 待受アドレスを解決する。
+///
+/// 優先順位: `--bind` 明示 > Tailscale IP 自動検出 > `0.0.0.0`。本プロジェクトは Tailnet
+/// 前提のため、既定では tailnet インターフェースのみに公開して LAN/インターネットへの
+/// 露出を避ける。Tailscale 未導入 (CLI 不在 / IP 取得失敗) のときだけ `0.0.0.0` に
+/// フォールバックし、LAN/localhost での動作確認フローを壊さない。
+fn resolve_bind_ip(explicit: Option<&str>) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv4Addr};
+    if let Some(s) = explicit {
+        return s.parse().unwrap_or_else(|_| {
+            eprintln!("error: --bind expects an IP address (got '{s}')");
+            std::process::exit(2);
+        });
+    }
+    match tailscale_ip() {
+        Some(ip) => {
+            tracing::info!(%ip, "binding to Tailscale interface (default; override with --bind)");
+            ip
+        }
+        None => {
+            tracing::warn!(
+                "Tailscale IP not found; binding to 0.0.0.0 (all interfaces). \
+                 Install Tailscale or pass --bind to restrict exposure."
+            );
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        }
+    }
+}
+
+/// `tailscale ip -4` を実行して tailnet IPv4 を取得する。CLI 不在・非ゼロ終了・パース失敗は
+/// `None`。CGNAT 範囲 (100.64/10) のインターフェース誤検出を避けるため、権威ある CLI に問う。
+fn tailscale_ip() -> Option<std::net::IpAddr> {
+    let out = std::process::Command::new("tailscale")
+        .args(["ip", "-4"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    // 複数アドレスが返りうる (1 行 1 つ)。先頭の有効な IPv4 を採る。
+    text.lines()
+        .map(str::trim)
+        .find_map(|l| l.parse::<std::net::Ipv4Addr>().ok())
+        .map(std::net::IpAddr::V4)
 }
 
 /// ログフィルタを構築する。`--log-level` 引数が最優先。素のレベル (`debug`) は `aurora=`
@@ -444,7 +501,13 @@ fn read_secret_line() -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
-fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Result<()> {
+fn run_server(
+    perf: bool,
+    fps_cap: u32,
+    max_bitrate_bps: u32,
+    port: u16,
+    bind_ip: std::net::IpAddr,
+) -> Result<()> {
     // DPAPI で保存済みのパスワードがあればそれを使う (再起動しても固定・無人起動で読める)。
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
     // 方針のため、保存済みを使う場合は値を表示しない。
@@ -488,7 +551,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
             generated
         }
     };
-    println!("TCP/UDP: 0.0.0.0:{port}");
+    println!("TCP/UDP: {bind_ip}:{port}");
 
     // PSK は tray (UI スレッド) と net (接続受理) で共有する。tray でパスワードを変更すると
     // ここを書き換え、net が次の接続受理時に読むことで再起動なしに反映される。
@@ -629,6 +692,7 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let cfg = ServerConfig {
+            bind_ip,
             port: port_cell,
             reload,
             psk,
