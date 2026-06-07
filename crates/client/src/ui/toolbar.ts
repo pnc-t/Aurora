@@ -1,10 +1,12 @@
 // 接続中の操作ツールバー。
 // 既定で常時表示 (上端に固定オーバーレイ)。Ctrl+Alt+Shift+B で一時的に隠せる。
-// 構成: [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替] | [fps/Mbps] … [接続ラベル(ドラッグ移動)] [min/close]
-// 各操作はアイコン + ツールチップ。空き領域と接続ラベルは data-tauri-drag-region でウィンドウ移動に使う。
+// 構成: [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替] | [プリセット(+カスタム時のみ fps/Mbps)] … [pin] [min/close]
+// 各操作はアイコン + ツールチップ。バー全体 (#topbar) と構造スパンに data-tauri-drag-region を
+// 付け、ボタン/入力/select 以外の余白・隔て・グループ間どこを掴んでもウィンドウ移動できる。
+// 接続先情報は省スペース化のためバーの title (ホバー tooltip) に退避し、行内には常駐させない。
 
 import { formatDisplayName, type DisplayDto } from "../core/ipc";
-import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
+import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
 import "./toolbar.css";
@@ -34,31 +36,34 @@ export type ToolbarHandle = {
 
 export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   opts.topbar.innerHTML = `
-    <div class="tb-group">
+    <div class="tb-group" data-tauri-drag-region>
       <button type="button" id="tb-disconnect" class="tb-btn danger" title="切断">${icon("power")}</button>
     </div>
-    <span class="tb-sep"></span>
-    <div class="tb-group">
+    <span class="tb-sep" data-tauri-drag-region></span>
+    <div class="tb-group" data-tauri-drag-region>
       <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (F11 / Ctrl+Alt+Shift+F)">${icon("fullscreen")}</button>
       <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
       <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
       <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
     </div>
-    <span id="display-wrap" class="tb-group" title="表示するディスプレイ">
-      <span class="tb-ico">${icon("display")}</span>
+    <span id="display-wrap" class="tb-group" title="表示するディスプレイ" data-tauri-drag-region>
+      <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
       <select id="display-select"></select>
     </span>
-    <span class="tb-sep"></span>
-    <span class="tb-video" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限">
+    <span class="tb-sep" data-tauri-drag-region></span>
+    <span class="tb-video" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限" data-tauri-drag-region>
       <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
-      <input type="text" inputmode="numeric" id="tb-fps" />fps
-      <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
+      <span id="tb-custom" class="tb-custom">
+        <input type="text" inputmode="numeric" id="tb-fps" />fps
+        <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
+      </span>
     </span>
     <span class="spacer" data-tauri-drag-region title="ドラッグでウィンドウ移動"></span>
-    <span id="conn-label" data-tauri-drag-region title="ドラッグでウィンドウ移動">—</span>
     <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
     <span id="tb-winctl" class="window-controls"></span>
   `;
+  // バー本体 (余白・padding 領域) もウィンドウ移動の掴みどころにする。
+  opts.topbar.setAttribute("data-tauri-drag-region", "");
 
   // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。
   const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
@@ -71,14 +76,21 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const statsBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-stats");
   const captureBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-capture");
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
-  const connLabel = opts.topbar.querySelector<HTMLElement>("#conn-label");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
   const presetSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-preset");
+  const customWrap = opts.topbar.querySelector<HTMLElement>("#tb-custom");
   const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
   const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
 
+  // fps/Mbps の手動入力欄はプリセット=カスタムのときだけ出す (常時表示は情報重複で幅を食う)。
+  function applyCustomVisibility(presetId: string): void {
+    if (customWrap) customWrap.style.display = presetId === CUSTOM_PRESET_ID ? "inline-flex" : "none";
+  }
+
   function syncPreset(fps: number, mbps: number): void {
-    if (presetSelect) presetSelect.value = matchPreset(fps, mbps);
+    const id = matchPreset(fps, mbps);
+    if (presetSelect) presetSelect.value = id;
+    applyCustomVisibility(id);
   }
 
   function emitVideoParams(): void {
@@ -93,12 +105,15 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   mbpsInput?.addEventListener("change", emitVideoParams);
   // プリセット選択で fps/Mbps 欄を埋めて即適用 (カスタムは手動入力を維持)。
   presetSelect?.addEventListener("change", () => {
+    applyCustomVisibility(presetSelect.value);
     const p = findPreset(presetSelect.value);
     if (!p) return; // カスタム: 入力欄をそのまま使う
     if (fpsInput) fpsInput.value = String(p.fps);
     if (mbpsInput) mbpsInput.value = String(p.mbps);
     opts.onSetVideoParams(p.fps, p.mbps);
   });
+  // 初期表示 (まだ setVideoParams 前) でも custom 欄の出し分けを確定させる。
+  applyCustomVisibility(presetSelect?.value ?? "");
 
   let displays: DisplayDto[] = [];
   let connected = false;
@@ -158,7 +173,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
 
   return {
     setConnLabel(text: string): void {
-      if (connLabel) connLabel.textContent = text;
+      // 行内に常駐させず、バーのホバー tooltip として接続先情報を保持する。
+      opts.topbar.title = text;
     },
     setDisplays(list: DisplayDto[], selectedId?: number): void {
       displays = list;
