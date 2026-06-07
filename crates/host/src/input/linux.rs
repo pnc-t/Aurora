@@ -69,7 +69,7 @@ impl UinputInjector {
 
         let device = VirtualDeviceBuilder::new()
             .context("open /dev/uinput")?
-            .name("ddd-virtual-input")
+            .name("aurora-virtual-input")
             .with_keys(&keys)
             .context("with_keys")?
             .with_relative_axes(&rel)
