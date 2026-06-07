@@ -874,9 +874,17 @@ async fn fs_read(root: &Path, rel: &str, offset: u64, length: u32) -> (Vec<u8>, 
     (buf, None)
 }
 
-/// 書き込み系操作のパス解決。対象が未存在でも使えるよう canonicalize はせず、
-/// `..` / 絶対成分を弾いて root 配下に閉じ込める (レキシカルなトラバーサル防止)。
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// 書き込み系操作のパス解決。
+///
+/// レキシカルな `..` / 絶対成分の排除に加え、**シンボリックリンク / ジャンクション経由の
+/// ルート外脱出も防ぐ**。レキシカルチェックだけだと、共有ルート内に既存のジャンクション
+/// (例: `link` → `C:\`) があると `link/Windows/...` で OS がそれを辿り、共有外への書込・
+/// 削除を許してしまう (書込系 API はリンクを作れないが、利用者が事前に置いたリンクを
+/// 悪意あるホストが踏み台にできる)。読み取り側 `resolve_in_root` と同じく canonicalize で
+/// 実体を解決して封じ込める。対象が未存在でも使えるよう、**存在する最長の祖先**を
+/// canonicalize して root 配下か検証する (残りの未存在成分はリンクを含めないクリーンな
+/// 名前なので、その配下に作っても root 内に留まる)。
+async fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let mut p = root.to_path_buf();
     for comp in rel.split('/') {
         if comp.is_empty() || comp == "." {
@@ -887,12 +895,30 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
         }
         p.push(comp);
     }
+    let canon_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| format!("canonicalize root: {e}"))?;
+    // 存在する最長の祖先まで遡って実体解決する。途中にジャンクション/リンクがあれば
+    // canonicalize がその実体 (root 外) を返し、starts_with で弾かれる。
+    let mut probe = p.clone();
+    let resolved = loop {
+        match tokio::fs::canonicalize(&probe).await {
+            Ok(c) => break c,
+            Err(_) => match probe.parent() {
+                Some(par) => probe = par.to_path_buf(),
+                None => return Err("path escapes share root".into()),
+            },
+        }
+    };
+    if !resolved.starts_with(&canon_root) {
+        return Err("path escapes share root".into());
+    }
     Ok(p)
 }
 
 /// ファイル / ディレクトリを作成する (ファイルは 0 バイトに truncate)。
 async fn fs_create(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> {
-    let p = safe_join(root, rel)?;
+    let p = safe_join(root, rel).await?;
     if is_dir {
         tokio::fs::create_dir_all(&p)
             .await
@@ -910,7 +936,7 @@ async fn fs_create(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> {
 
 /// ファイルの `offset` 以降にバイトを書き込む (なければ作成、truncate はしない)。
 async fn fs_write(root: &Path, rel: &str, offset: u64, data: &[u8]) -> Result<(), String> {
-    let p = safe_join(root, rel)?;
+    let p = safe_join(root, rel).await?;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -928,7 +954,7 @@ async fn fs_write(root: &Path, rel: &str, offset: u64, data: &[u8]) -> Result<()
 
 /// ファイル / ディレクトリを削除する。
 async fn fs_delete(root: &Path, rel: &str) -> Result<(), String> {
-    let p = safe_join(root, rel)?;
+    let p = safe_join(root, rel).await?;
     match tokio::fs::metadata(&p).await {
         Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(&p)
             .await
@@ -942,8 +968,8 @@ async fn fs_delete(root: &Path, rel: &str) -> Result<(), String> {
 
 /// `from` を `to` にリネーム / 移動する。
 async fn fs_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
-    let src = safe_join(root, from)?;
-    let dst = safe_join(root, to)?;
+    let src = safe_join(root, from).await?;
+    let dst = safe_join(root, to).await?;
     if let Some(parent) = dst.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
