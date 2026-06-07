@@ -4,7 +4,7 @@
 //!
 //! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 
 /// host 全体で共有する接続 PSK。net 層が接続受理時に読み、tray がパスワード変更時に書く。
@@ -13,25 +13,44 @@ pub type SharedPsk = Arc<Mutex<[u8; 32]>>;
 /// 実パスワードが設定済みかを共有するフラグ。設定済みなら変更時に現在パスワードを要求する。
 pub type SharedHasPassword = Arc<AtomicBool>;
 
+/// host 全体で共有する待受ポート。tray がポート変更で書き、net が reload 後に読み直す。
+pub type SharedPort = Arc<AtomicU16>;
+
+/// ポート変更を net の accept ループへ伝える反映トリガ (`notify_one` で TCP/UDP 貼り直し)。
+pub type Reload = Arc<tokio::sync::Notify>;
+
 /// トレイ常駐 UI を別スレッドで起動する。`prompt_now` が真なら起動直後に変更ダイアログを
 /// 自動表示する (保存パスワードが無い初回向け)。
 #[cfg(target_os = "windows")]
-pub fn spawn(psk: SharedPsk, has_password: SharedHasPassword, prompt_now: bool) {
+pub fn spawn(
+    psk: SharedPsk,
+    has_password: SharedHasPassword,
+    port: SharedPort,
+    reload: Reload,
+    prompt_now: bool,
+) {
     let _ = std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            if let Err(e) = imp::run(psk, has_password, prompt_now) {
+            if let Err(e) = imp::run(psk, has_password, port, reload, prompt_now) {
                 tracing::warn!(error = %e, "tray UI disabled");
             }
         });
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn spawn(_psk: SharedPsk, _has_password: SharedHasPassword, _prompt_now: bool) {}
+pub fn spawn(
+    _psk: SharedPsk,
+    _has_password: SharedHasPassword,
+    _port: SharedPort,
+    _reload: Reload,
+    _prompt_now: bool,
+) {
+}
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{SharedHasPassword, SharedPsk};
+    use super::{Reload, SharedHasPassword, SharedPort, SharedPsk};
     use aurora_common::noise::psk_from_password;
     use std::ffi::c_void;
     use std::sync::atomic::Ordering;
@@ -52,16 +71,21 @@ mod imp {
     /// メニュー項目 ID。
     const ID_CHANGE: usize = 1001;
     const ID_EXIT: usize = 1002;
+    const ID_PORT: usize = 1003;
     /// 変更ダイアログ内コントロール ID。
     const ID_EDIT_CUR: i32 = 100;
     const ID_EDIT: i32 = 101;
     const ID_EDIT2: i32 = 102;
+    /// ポート変更ダイアログの入力欄 ID。
+    const ID_EDIT_PORT: i32 = 110;
 
     /// 隠しウィンドウに紐づける共有状態。パスワード変更で PSK を書き換え、設定済みフラグを
     /// 立てる。`GWLP_USERDATA` にこの Box のポインタを格納する。
     struct WndState {
         psk: SharedPsk,
         has_password: SharedHasPassword,
+        port: SharedPort,
+        reload: Reload,
     }
 
     /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
@@ -72,6 +96,8 @@ mod imp {
     pub fn run(
         psk: SharedPsk,
         has_password: SharedHasPassword,
+        port: SharedPort,
+        reload: Reload,
         prompt_now: bool,
     ) -> windows::core::Result<()> {
         unsafe {
@@ -89,7 +115,12 @@ mod imp {
             RegisterClassW(&wc);
 
             // 共有状態をウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
-            let boxed: *mut WndState = Box::into_raw(Box::new(WndState { psk, has_password }));
+            let boxed: *mut WndState = Box::into_raw(Box::new(WndState {
+                psk,
+                has_password,
+                port,
+                reload,
+            }));
 
             // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
             let hwnd = match CreateWindowExW(
@@ -173,6 +204,7 @@ mod imp {
                 WM_COMMAND => {
                     match wparam.0 & 0xffff {
                         ID_CHANGE => change_password(hwnd),
+                        ID_PORT => change_port(hwnd),
                         ID_EXIT => {
                             // host プロセス全体を終了する。
                             let _ = DestroyWindow(hwnd);
@@ -209,6 +241,7 @@ mod imp {
                 Err(_) => return,
             };
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
+            let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("終了"));
 
@@ -258,6 +291,61 @@ mod imp {
                 "Aurora Host",
             );
         }
+    }
+
+    /// ポート変更ダイアログを表示し、入力されたら保存 + 共有ポートを更新して reload を通知する
+    /// (net の accept ループが TCP/UDP を貼り直して再起動なしに反映)。
+    fn change_port(hwnd: HWND) {
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        // 接続中はソケット貼り直しで相手を切ってしまうため拒否する (パスワード変更と同じ方針)。
+        if crate::conn::is_active() {
+            message_box(
+                hwnd,
+                "クライアント接続中はポートを変更できません。\n切断してから操作してください。",
+                "Aurora Host",
+            );
+            return;
+        }
+        let current = state.port.load(Ordering::Relaxed);
+        if let Some(new_port) = prompt_port(hwnd, current) {
+            if new_port == current {
+                return; // 変更なし
+            }
+            // 新ポートで実際に bind できるか事前確認する。net 側の貼り直しが失敗すると host
+            // ごと終了してしまうため、使用中ポート等は保存前にここで弾く。
+            if let Err(e) = port_available(new_port) {
+                message_box(
+                    hwnd,
+                    &format!("ポート {new_port} は使用できません: {e}"),
+                    "Aurora Host",
+                );
+                return;
+            }
+            if let Err(e) = crate::settings::save_port(new_port) {
+                message_box(hwnd, &format!("保存に失敗しました: {e}"), "Aurora Host");
+                return;
+            }
+            state.port.store(new_port, Ordering::Relaxed);
+            // accept ループを起こして TCP/UDP を新ポートで貼り直させる。
+            state.reload.notify_one();
+            message_box(
+                hwnd,
+                &format!("待受ポートを {new_port} に変更しました。"),
+                "Aurora Host",
+            );
+        }
+    }
+
+    /// 新ポートで TCP/UDP を実際に bind できるか事前確認する。確認後ソケットは drop で解放され、
+    /// 直後に net 側が同ポートへ貼り直す (単一ユーザー host のため間の競合は実質起きない)。
+    fn port_available(port: u16) -> std::result::Result<(), String> {
+        use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        let _tcp = TcpListener::bind(addr).map_err(|e| format!("TCP {e}"))?;
+        let _udp = UdpSocket::bind(addr).map_err(|e| format!("UDP {e}"))?;
+        Ok(())
     }
 
     /// 簡易メッセージボックス。
@@ -536,6 +624,209 @@ mod imp {
             let mut buf = vec![0u16; len as usize + 1];
             let n = GetWindowTextW(edit, &mut buf);
             String::from_utf16_lossy(&buf[..n as usize])
+        }
+    }
+
+    // --- ポート入力ダイアログ (プログラム生成、リソース不要) ---
+
+    /// ポート変更ダイアログの入力結果。`GWLP_USERDATA` 経由で WndProc と受け渡しする。
+    struct PortDlgResult {
+        value: Option<u16>,
+    }
+
+    /// 待受ポート変更ダイアログを表示する。`current` を初期値に 1 欄だけ出し、1..=65535 を
+    /// 検証する。OK で有効値なら `Some(port)` を返す。
+    fn prompt_port(owner: HWND, current: u16) -> Option<u16> {
+        unsafe {
+            let hmod = GetModuleHandleW(None).ok()?;
+            let hinstance = HINSTANCE(hmod.0);
+            let class_name = w!("AuroraPortDlg");
+
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(port_dlg_proc),
+                hInstance: hinstance,
+                lpszClassName: class_name,
+                hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).ok()?,
+                hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            let mut result = Box::new(PortDlgResult { value: None });
+            let result_ptr: *mut PortDlgResult = result.as_mut();
+
+            let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+            let dlg = match CreateWindowExW(
+                WS_EX_DLGMODALFRAME,
+                class_name,
+                w!("待受ポートの変更"),
+                style,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                340,
+                184,
+                owner,
+                HMENU::default(),
+                hinstance,
+                Some(result_ptr as *const c_void),
+            ) {
+                Ok(h) => h,
+                Err(_) => return None,
+            };
+
+            let font = GetStockObject(DEFAULT_GUI_FONT);
+            let label = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("新しいポート (1-65535):"),
+                WS_CHILD | WS_VISIBLE,
+                16,
+                16,
+                300,
+                18,
+                dlg,
+                HMENU::default(),
+                hinstance,
+                None,
+            )
+            .ok();
+            if let Some(h) = label {
+                SendMessageW(h, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            }
+
+            // 数値専用 (ES_NUMBER) の入力欄。現在のポートを初期表示する。
+            let init = to_wide(&current.to_string());
+            let edit = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                w!("EDIT"),
+                PCWSTR(init.as_ptr()),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WINDOW_STYLE((ES_NUMBER | ES_AUTOHSCROLL) as u32),
+                16,
+                38,
+                300,
+                24,
+                dlg,
+                HMENU(ID_EDIT_PORT as *mut c_void),
+                hinstance,
+                None,
+            )
+            .ok();
+            if let Some(e) = edit {
+                SendMessageW(e, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            }
+
+            let button_y = 96;
+            let mk_button = |x: i32, id: usize, text: PCWSTR, default: bool| {
+                let extra = if default { BS_DEFPUSHBUTTON as u32 } else { 0 };
+                let b = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    text,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(extra),
+                    x,
+                    button_y,
+                    96,
+                    28,
+                    dlg,
+                    HMENU(id as *mut c_void),
+                    hinstance,
+                    None,
+                )
+                .ok();
+                if let Some(b) = b {
+                    SendMessageW(b, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                }
+            };
+            mk_button(120, IDOK.0 as usize, w!("OK"), true);
+            mk_button(224, IDCANCEL.0 as usize, w!("キャンセル"), false);
+
+            // モーダル化: オーナーを無効化し、破棄まで自前のメッセージループを回す。
+            let _ = EnableWindow(owner, BOOL::from(false));
+            let _ = ShowWindow(dlg, SW_SHOW);
+            let _ = SetForegroundWindow(dlg);
+            if let Ok(first) = GetDlgItem(dlg, ID_EDIT_PORT) {
+                let _ = SetFocus(first);
+            }
+
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+                if !IsWindow(dlg).as_bool() {
+                    break;
+                }
+                if !IsDialogMessageW(dlg, &msg).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            let _ = EnableWindow(owner, BOOL::from(true));
+            let _ = SetForegroundWindow(owner);
+
+            result.value.take()
+        }
+    }
+
+    /// ポート変更ダイアログのウィンドウプロシージャ。
+    extern "system" fn port_dlg_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            match msg {
+                WM_CREATE => {
+                    let cs = lparam.0 as *const CREATESTRUCTW;
+                    if !cs.is_null() {
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*cs).lpCreateParams as isize);
+                    }
+                    LRESULT(0)
+                }
+                WM_COMMAND => {
+                    let id = (wparam.0 & 0xffff) as i32;
+                    if id == IDOK.0 {
+                        on_port_ok(hwnd);
+                    } else if id == IDCANCEL.0 {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+    }
+
+    /// OK 押下: 入力を 1..=65535 で検証し、問題なければ結果へ格納して閉じる。不正値は
+    /// ダイアログを開いたままにする。
+    unsafe fn on_port_ok(hwnd: HWND) {
+        unsafe {
+            let text = match GetDlgItem(hwnd, ID_EDIT_PORT) {
+                Ok(h) => get_text(h),
+                Err(_) => return,
+            };
+            let port: u16 = match text.trim().parse() {
+                Ok(p) if p != 0 => p,
+                _ => {
+                    message_box(
+                        hwnd,
+                        "1〜65535 のポート番号を入力してください。",
+                        "Aurora Host",
+                    );
+                    return;
+                }
+            };
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PortDlgResult;
+            if !ptr.is_null() {
+                (*ptr).value = Some(port);
+            }
+            let _ = DestroyWindow(hwnd);
         }
     }
 }
