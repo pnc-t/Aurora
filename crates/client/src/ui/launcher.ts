@@ -27,7 +27,11 @@ import { icon } from "./icons";
 import "./launcher.css";
 
 // password に null を渡すと Rust 側が保存済みパスワード (DPAPI) を使って接続する。
-type ConnectCallback = (entry: HostEntry, password: string | null) => Promise<void>;
+type ConnectCallback = (
+  entry: HostEntry,
+  password: string | null,
+  save: boolean,
+) => Promise<void>;
 type ConnState = "idle" | "connecting" | "connected" | "error";
 
 export type LauncherHandle = {
@@ -352,6 +356,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <h3>${escapeHtml(entry.label || entry.host)}</h3>
         <div class="s-desc" style="font-family:monospace">${escapeHtml(entry.host)}:${entry.port}</div>
         <label>password<input id="d-pass" type="password" required /></label>
+        <label class="dlg-check"><input id="d-save" type="checkbox" checked /> このパスワードを保存する</label>
         <div class="dlg-status" id="d-status"></div>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="d-cancel">cancel</button>
@@ -369,12 +374,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       ev.preventDefault();
       const password = passInput?.value ?? "";
       if (!password) return;
+      const save = backdrop.querySelector<HTMLInputElement>("#d-save")?.checked ?? true;
       if (okBtn) {
         okBtn.disabled = true;
         okBtn.textContent = "connecting…";
       }
       if (statusEl) statusEl.textContent = `connecting to ${entry.host}…`;
-      void opts.onConnect(entry, password).catch((err) => {
+      void opts.onConnect(entry, password, save).catch((err) => {
         if (statusEl) {
           statusEl.textContent = `error: ${String(err)}`;
           statusEl.classList.add("error");
@@ -504,7 +510,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
           const entry = hosts[idx];
           handle.setConnecting(true);
-          void opts.onConnect(entry, null).catch(() => {
+          // 保存済み即接続: password=null (Rust が DPAPI 復号)。再保存は不要なので save=false。
+          void opts.onConnect(entry, null, false).catch(() => {
             handle.setConnState("", "idle");
             openConnectDialog(entry);
           });

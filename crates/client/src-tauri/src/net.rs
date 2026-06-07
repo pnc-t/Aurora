@@ -161,6 +161,10 @@ pub async fn connect_to_host(
     host: String,
     port: u16,
     password: Option<String>,
+    // パスワードを DPAPI ストアへ保存してよいか (接続ダイアログの「保存する」由来)。
+    // 手入力 (password = Some) かつ true のときだけ保存し、「今回だけ接続」を可能にする。
+    // 保存済み即接続/自動再接続 (password = None) では false 相当で、既存値に触れない。
+    save: bool,
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
@@ -224,10 +228,14 @@ pub async fn connect_to_host(
     let session = Arc::new(hs.into_transport().map_err(err)?);
     tracing::info!("noise handshake complete");
 
-    // ハンドシェイク成功 = PSK (パスワード) 一致。常に保存する (DPAPI 暗号化)。
-    // 失敗してもログのみで接続は続行する (保存は補助機能)。
-    if let Err(e) = crate::secret::put(&app, &host, &password) {
-        tracing::warn!(error = %e, "failed to save host password");
+    // ハンドシェイク成功 = PSK (パスワード) 一致。ユーザーが「保存する」を選んだときだけ
+    // DPAPI 暗号化保存する (無断永続化を避け「今回だけ接続」を可能にする)。失敗してもログ
+    // のみで接続は続行する (保存は補助機能)。`save=false` (今回だけ/保存済み即接続/再接続) は
+    // 既存の保存値に触れない (= 保存済みなら維持、未保存なら未保存のまま)。
+    if save {
+        if let Err(e) = crate::secret::put(&app, &host, &password) {
+            tracing::warn!(error = %e, "failed to save host password");
+        }
     }
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、

@@ -95,7 +95,11 @@ let pendingEntry: HostEntry | null = null;
 let connected = false;
 
 /** セッションを開く下回り。チャネルを張って connect_to_host を呼ぶ (再接続も共用)。 */
-async function openSession(entry: HostEntry, password: string | null): Promise<void> {
+async function openSession(
+  entry: HostEntry,
+  password: string | null,
+  save: boolean,
+): Promise<void> {
   lastHost = entry.host;
   pendingEntry = entry;
   resetDecoder();
@@ -107,15 +111,15 @@ async function openSession(entry: HostEntry, password: string | null): Promise<v
     const buf = data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
     handleVideoChunk(buf);
   };
-  await connectToHost(entry.host, entry.port, password, eventChannel, videoChannel);
+  await connectToHost(entry.host, entry.port, password, save, eventChannel, videoChannel);
 }
 
 const launcher = mountLauncher({
   root: overlay,
-  onConnect: async (entry, password) => {
+  onConnect: async (entry, password, save) => {
     // 手動接続は進行中の自動再接続を打ち切る。
     cancelReconnect();
-    await openSession(entry, password);
+    await openSession(entry, password, save);
   },
 });
 
@@ -171,8 +175,9 @@ async function attemptReconnect(): Promise<void> {
   launcher.setConnState(`再接続中… (試行 ${reconnectAttempt})`, "connecting");
   showToast(`再接続を試行中… (${reconnectAttempt})`);
   try {
-    // password=null で保存済み (DPAPI) を使う。成功確定は host_info イベントで cancelReconnect。
-    await openSession(pendingEntry, null);
+    // password=null で保存済み (DPAPI) を使う。再保存不要なので save=false。
+    // 成功確定は host_info イベントで cancelReconnect。
+    await openSession(pendingEntry, null, false);
   } catch {
     if (!reconnecting) return; // 途中で手動接続等にキャンセルされた
     if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
