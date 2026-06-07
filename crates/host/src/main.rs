@@ -170,7 +170,9 @@ fn main() -> Result<()> {
     // CLI のときだけ親プロセスのコンソールへ接続する (サーバ起動では開かない)。
     #[cfg(windows)]
     if needs_console {
-        attach_console(args.set_password);
+        // set/clear-password は現在パスワードを対話入力させるため、親コンソールが無ければ
+        // 新規割り当てする (ダブルクリック起動でも入力欄が出るように)。
+        attach_console(args.set_password || args.clear_password);
     }
 
     // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
@@ -195,6 +197,9 @@ fn main() -> Result<()> {
         return set_password_interactive();
     }
     if args.clear_password {
+        // set-password と対称に、接続中拒否 + 現在パスワード照合を要求してから削除する
+        // (素通しだと接続中の操作者が認証を消して締め出し/乗っ取りできてしまう)。
+        require_password_change_authorization()?;
         secret::clear_password()?;
         println!("stored password cleared");
         return Ok(());
@@ -348,10 +353,15 @@ fn dump_h264(n: usize) -> Result<()> {
 /// セキュリティ: リモートクライアントは入力注入で端末を開きこのコマンドを実行できる。
 /// (1) 稼働中サーバが接続中なら拒否する。(2) 既存パスワードがある場合は現在の
 /// パスワードを要求して照合する。これによりリモートからの締め出し/乗っ取りを防ぐ。
-fn set_password_interactive() -> Result<()> {
+/// パスワードの変更/削除を許可してよいか確認する共通ガード。接続中は拒否し、保存済み
+/// パスワードがあれば現在のパスワードを対話入力させて照合する。トレイ UI のパスワード変更と
+/// 対称の防御を CLI (`--set-password` / `--clear-password`) にも与える。接続中の判定は名前付き
+/// イベント経由でプロセス間共有される (`conn`)。リモート操作者は入力注入でホストの cmd を
+/// 開き CLI を叩けるため、トレイだけ硬化しても CLI が素通しでは締め出し/乗っ取りを防げない。
+fn require_password_change_authorization() -> Result<()> {
     use std::io::Write;
 
-    // 接続中は変更を拒否する (リモート操作者による乗っ取り防止)。
+    // 接続中は変更を拒否する (リモート操作者による締め出し/乗っ取り防止)。
     if conn::is_active() {
         return Err(anyhow!(
             "クライアント接続中はパスワードを変更できません。切断してから実行してください"
@@ -369,6 +379,13 @@ fn set_password_interactive() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn set_password_interactive() -> Result<()> {
+    use std::io::Write;
+
+    require_password_change_authorization()?;
 
     print!("Enter new Aurora password: ");
     std::io::stdout().flush().ok();
