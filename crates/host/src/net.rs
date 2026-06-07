@@ -123,7 +123,7 @@ async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
     let dir = upload_dir();
     tokio::fs::create_dir_all(&dir)
         .await
-        .context("create ddd-received dir")?;
+        .context("create aurora-received dir")?;
     // パス区切りを含む名前を弾き、ファイル名成分のみを採用する
     let safe = Path::new(name)
         .file_name()

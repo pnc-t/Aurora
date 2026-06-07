@@ -13,5 +13,5 @@ PLAN.md
 # ランタイム生成ディレクトリ (ProjFS 投影 / ファイル転送の保存先)
 # 起動時 CWD 次第で任意階層に作られるためアンカーしない
 aurora-remote/
-ddd-received/
+aurora-received/
 aurora-downloads/
