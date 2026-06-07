@@ -123,7 +123,7 @@ async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
     let dir = upload_dir();
     tokio::fs::create_dir_all(&dir)
         .await
-        .context("create ddd-received dir")?;
+        .context("create aurora-received dir")?;
     // パス区切りを含む名前を弾き、ファイル名成分のみを採用する
     let safe = Path::new(name)
         .file_name()
@@ -340,6 +340,29 @@ async fn handle_client(
     let session = hs.into_transport()?;
     tracing::info!(peer = %peer, "noise handshake complete");
 
+    // TCP を読み書きの 2 ハーフに分割する。読み取りは専用タスクへ隔離し、本体の select
+    // ループからは外す。理由: `read_tcp_frame` は `read_exact` を 2 回行う複数段の await で
+    // **キャンセル安全ではない**。これを select の枝に直接置くと、NAL 送信や FS 要求など別の
+    // 枝が ready になった瞬間に「長さは読んだが本体は途中」の future が drop され、TCP から
+    // 消費済みのバイトが失われてフレーム境界がズレる (= decrypt error / read len で切断)。
+    // 専用タスク内ならフレーム読み取りは決して途中キャンセルされない。読み取った生フレームは
+    // bounded チャネルで本体ループへ渡し、select 側はキャンセル安全な `recv()` だけにする。
+    let (mut read_half, mut write_half) = stream.into_split();
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
+    let reader_task = tokio::spawn(async move {
+        let mut rbuf = Vec::new();
+        loop {
+            if read_tcp_frame(&mut read_half, &mut rbuf).await.is_err() {
+                break; // EOF / 切断 / フレーム超過 → 読み取り終了 (frame_tx drop で本体へ伝播)
+            }
+            if frame_tx.send(std::mem::take(&mut rbuf)).await.is_err() {
+                break; // 本体ループ終了
+            }
+        }
+    });
+    // 本体ループ終了時に読み取りタスクを確実に止める (セッション置換でのリーク防止)。
+    let _reader_guard = AbortOnDrop(reader_task);
+
     // TCP 制御チャネルの nonce カウンタ (CTRL ドメイン)。送受で別カウンタを持ち、
     // TCP の順序保証により対向と歩調が合う。UDP メディアとは別ドメインなので衝突しない。
     let mut tcp_tx_nonce: u64 = 0;
@@ -350,7 +373,7 @@ async fn handle_client(
         displays: displays.iter().map(Display::from).collect(),
         audio,
     };
-    send_control_msg(&mut stream, &session, &host_info, &mut tcp_tx_nonce).await?;
+    send_control_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
 
     // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "AURHELLO" を送る想定。
     let peer_udp = wait_udp_hello(&udp).await?;
@@ -380,18 +403,21 @@ async fn handle_client(
 
     loop {
         tokio::select! {
-            // 制御メッセージ受信
-            res = read_tcp_frame(&mut stream, &mut buf) => {
-                res?;
+            // 制御メッセージ受信 (専用リーダタスクが読んだ生フレームをキャンセル安全に受け取る)
+            maybe_frame = frame_rx.recv() => {
+                let Some(frame) = maybe_frame else {
+                    // リーダタスク終了 = 切断 / 読み取りエラー。セッションを正常終了する。
+                    break;
+                };
                 let mut plain = Vec::new();
                 let rx_nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
                 tcp_rx_nonce += 1;
-                session.decrypt(rx_nonce, &buf, &mut plain)?;
+                session.decrypt(rx_nonce, &frame, &mut plain)?;
                 let msg: ControlMsg = bincode_opts.deserialize(&plain)
                     .context("decode ControlMsg")?;
                 match msg {
                     ControlMsg::Ping { ts_us } => {
-                        send_control_msg(&mut stream, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
+                        send_control_msg(&mut write_half, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
                     }
                     ControlMsg::RequestKeyframe => {
                         let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
@@ -450,7 +476,7 @@ async fn handle_client(
                             Err(e) => {
                                 tracing::warn!(error = %e, "open upload failed");
                                 let msg = ControlMsg::FileResult { id, ok: false, message: e.to_string() };
-                                send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                                send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                             }
                         }
                     }
@@ -464,13 +490,13 @@ async fn handle_client(
                                     tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch, aborting upload");
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
-                                    send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                                    send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
-                                    send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                                    send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else {
                                     u.written += data.len() as u64;
                                     if last {
@@ -484,7 +510,7 @@ async fn handle_client(
                                             }
                                             Err(e) => ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") },
                                         };
-                                        send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                                        send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                     }
                                 }
                             }
@@ -514,15 +540,15 @@ async fn handle_client(
             }
             // ダウンロード送信タスクからのメッセージ (FileOffer/FileChunk/FileResult)
             Some(msg) = out_rx.recv() => {
-                send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
             }
             // ProjFS コールバックからの FS RPC 要求 (FsList/FsRead) を TCP へ送る
             Some(msg) = fs_req_rx.recv() => {
-                send_control_msg(&mut stream, &session, &msg, &mut tcp_tx_nonce).await?;
+                send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
             }
             // ローカルクリップボード変化 → 制御チャネルで送信
             Some(text) = clip_change_rx.recv() => {
-                send_control_msg(&mut stream, &session, &ControlMsg::Clipboard { text }, &mut tcp_tx_nonce).await?;
+                send_control_msg(&mut write_half, &session, &ControlMsg::Clipboard { text }, &mut tcp_tx_nonce).await?;
             }
             // NAL 受信 → UDP 送信 (STREAM_VIDEO)
             Some(nal) = nal_rx.recv() => {
@@ -556,6 +582,16 @@ async fn handle_client(
                 udp.send_to(&dgram, peer_udp).await.context("UDP send audio")?;
             }
         }
+    }
+    Ok(())
+}
+
+/// drop でラップした tokio タスクを abort するガード。handle_client 終了時に
+/// 読み取りタスクを確実に停止させ、セッション置換でのリークを防ぐ。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -598,8 +634,8 @@ async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
     }
 }
 
-async fn send_control_msg(
-    stream: &mut TcpStream,
+async fn send_control_msg<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
     session: &TransportSession,
     msg: &ControlMsg,
     tcp_tx_nonce: &mut u64,
@@ -614,7 +650,7 @@ async fn send_control_msg(
     Ok(())
 }
 
-async fn read_tcp_frame(stream: &mut TcpStream, out: &mut Vec<u8>) -> Result<()> {
+async fn read_tcp_frame<R: AsyncReadExt + Unpin>(stream: &mut R, out: &mut Vec<u8>) -> Result<()> {
     let mut len_buf = [0u8; 2];
     stream.read_exact(&mut len_buf).await.context("read len")?;
     let len = u16::from_be_bytes(len_buf) as usize;
@@ -626,7 +662,7 @@ async fn read_tcp_frame(stream: &mut TcpStream, out: &mut Vec<u8>) -> Result<()>
     Ok(())
 }
 
-async fn write_tcp_frame(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(stream: &mut W, data: &[u8]) -> Result<()> {
     if data.len() > u16::MAX as usize {
         return Err(anyhow!("frame too large: {}", data.len()));
     }
