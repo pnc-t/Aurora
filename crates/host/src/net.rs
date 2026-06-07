@@ -210,6 +210,9 @@ async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<Control
 }
 
 pub struct ServerConfig {
+    /// 待受アドレス。既定は Tailscale IP (tailnet 限定公開)、`--bind` で上書き可能。
+    /// Tailnet 外 (LAN/インターネット) への露出を絞り、総当たり・接続枠 DoS の面を減らす。
+    pub bind_ip: std::net::IpAddr,
     /// 待受ポート (TCP 制御 / UDP 映像で共用)。tray UI からのポート変更で書き換えられ、
     /// `reload` 通知で accept ループが TCP/UDP を貼り直す (再起動なしに反映)。
     pub port: std::sync::Arc<std::sync::atomic::AtomicU16>,
@@ -242,7 +245,7 @@ pub async fn run_server(
     // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
     loop {
         let port = cfg.port.load(Ordering::Relaxed);
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = SocketAddr::new(cfg.bind_ip, port);
         let tcp = TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind TCP {addr}"))?;
@@ -395,7 +398,12 @@ async fn handle_client(
     send_control_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
 
     // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "AURHELLO" を送る想定。
-    let peer_udp = wait_udp_hello(&udp).await?;
+    // ハンドシェイクを完了した TCP ピアと同一 IP からの hello のみ受理する。これが無いと、
+    // 任意の送信元が AURHELLO を送るだけで映像の宛先を奪える (正規クライアントを締め出す
+    // ストリーム乗っ取り DoS)。さらに送信元 IP を詐称した単発 hello で、ホストが高ビットレート
+    // 映像を被害者へ流し続けるリフレクション増幅にも悪用できる。bind が 0.0.0.0 で全 NIC
+    // 公開のため Tailnet 外からも到達しうる。IP 一致の要求でこの両方を遮断する。
+    let peer_udp = wait_udp_hello(&udp, peer.ip()).await?;
     tracing::info!(peer_udp = %peer_udp, "UDP peer registered");
 
     let mut seq: u32 = 0;
@@ -639,7 +647,12 @@ fn encrypt_udp(
 /// hello は単発 UDP のためロスしうる。クライアントは映像受信が始まるまで再送するので、
 /// ここでは各受信に上限を設けるだけにし、長時間 hello が来なければ Err を返して
 /// セッションを諦める (無限ブロックで accept ループまで止めない安全弁)。
-async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
+///
+/// `expected_ip` はハンドシェイクを完了した TCP ピアの IP。これと一致する送信元からの
+/// hello のみ受理し、別 IP からの hello はストリーム乗っ取り/増幅の試みとして捨てる。
+/// Tailnet / LAN / localhost いずれも client の TCP と UDP は同一インターフェースから
+/// 出るため送信元 IP は一致する (ポートは異なってよい)。
+async fn wait_udp_hello(udp: &UdpSocket, expected_ip: std::net::IpAddr) -> Result<SocketAddr> {
     use std::time::Duration;
     let mut buf = [0u8; 64];
     loop {
@@ -647,7 +660,12 @@ async fn wait_udp_hello(udp: &UdpSocket) -> Result<SocketAddr> {
             .await
             .context("timed out waiting for UDP hello")??;
         if &buf[..n] == b"AURHELLO" {
-            return Ok(src);
+            if src.ip() == expected_ip {
+                return Ok(src);
+            }
+            // TCP ピア以外からの hello は乗っ取り/増幅の疑い。受理せず待機を続ける。
+            tracing::warn!(?src, expected = %expected_ip, "rejected UDP hello from unexpected source");
+            continue;
         }
         tracing::debug!(?src, n, "unexpected UDP probe");
     }
