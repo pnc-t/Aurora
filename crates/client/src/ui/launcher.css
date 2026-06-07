@@ -191,6 +191,9 @@ input[type="number"] { -moz-appearance: textfield; }
   border: 1px solid var(--panel-border); border-radius: 8px; padding: 8px 10px; font-size: 14px;
 }
 .dialog input:focus { outline: none; border-color: var(--accent); }
+/* 「保存する」チェックボックスは横並び。テキスト欄用の縦積み/全幅スタイルを打ち消す。 */
+.dialog label.dlg-check { flex-direction: row; align-items: center; gap: 8px; cursor: pointer; }
+.dialog label.dlg-check input { width: auto; padding: 0; }
 .dialog .dlg-status { min-height: 14px; font-size: 12px; font-family: monospace; color: var(--muted); }
 .dialog .dlg-status.error { color: var(--danger-fg); }
 .dialog .dlg-actions { display: flex; gap: 8px; margin-top: 4px; }
