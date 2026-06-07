@@ -210,8 +210,11 @@ async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<Control
 }
 
 pub struct ServerConfig {
-    pub tcp_addr: SocketAddr,
-    pub udp_addr: SocketAddr,
+    /// 待受ポート (TCP 制御 / UDP 映像で共用)。tray UI からのポート変更で書き換えられ、
+    /// `reload` 通知で accept ループが TCP/UDP を貼り直す (再起動なしに反映)。
+    pub port: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    /// ポート変更の反映トリガ。tray が `notify_one` し、accept ループが貼り直す。
+    pub reload: std::sync::Arc<tokio::sync::Notify>,
     /// 接続 PSK。tray UI からのパスワード変更で書き換えられるため共有可変で持つ。
     /// 各接続は受理時にスナップショットを取り、その値でハンドシェイクする。
     pub psk: std::sync::Arc<std::sync::Mutex<[u8; 32]>>,
@@ -233,19 +236,34 @@ pub async fn run_server(
     clip_apply_tx: mpsc::UnboundedSender<String>,
     mut clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
-    let tcp = TcpListener::bind(cfg.tcp_addr)
-        .await
-        .with_context(|| format!("bind TCP {}", cfg.tcp_addr))?;
-    let udp = Arc::new(
-        UdpSocket::bind(cfg.udp_addr)
-            .await
-            .with_context(|| format!("bind UDP {}", cfg.udp_addr))?,
-    );
-    tracing::info!(tcp = %cfg.tcp_addr, udp = %cfg.udp_addr, "host listening");
+    use std::sync::atomic::Ordering;
 
+    // 外側ループ: 現在のポートで TCP/UDP を bind する。tray でポートが変わると reload 通知で
+    // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
     loop {
-        let (stream, peer) = tcp.accept().await?;
-        tracing::info!(peer = %peer, "TCP client connected");
+        let port = cfg.port.load(Ordering::Relaxed);
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let tcp = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind TCP {addr}"))?;
+        let udp = Arc::new(
+            UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("bind UDP {addr}"))?,
+        );
+        tracing::info!(tcp = %addr, udp = %addr, "host listening");
+
+        // 内側ループ: 接続受理。reload が来たら break して外側で貼り直す。ポート変更は接続中
+        // には tray 側で拒否されるため、reload はセッション間 (idle) でのみ届く。
+        loop {
+            let (stream, peer) = tokio::select! {
+                accepted = tcp.accept() => accepted?,
+                _ = cfg.reload.notified() => {
+                    tracing::info!(new_port = cfg.port.load(Ordering::Relaxed), "port change requested; rebinding");
+                    break;
+                }
+            };
+            tracing::info!(peer = %peer, "TCP client connected");
         // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
         // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
         // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
@@ -286,6 +304,7 @@ pub async fn run_server(
         .await
         {
             tracing::warn!(error = %e, "client session ended");
+            }
         }
     }
 }

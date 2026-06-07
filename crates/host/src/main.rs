@@ -10,7 +10,6 @@ use anyhow::{Context, Result, anyhow};
 use aurora_common::noise::psk_from_password;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -26,6 +25,7 @@ mod net;
 mod perf;
 mod projfs;
 mod secret;
+mod settings;
 mod tray;
 
 use audio::EncodedAudio;
@@ -52,6 +52,8 @@ struct Args {
     max_bitrate_bps: u32,
     /// 待受ポート (TCP 制御 / UDP 映像で共用)。
     port: u16,
+    /// `--port` が明示指定されたか。明示時は保存値 (トレイ管理) より CLI を優先する。
+    port_explicit: bool,
     /// ログオン時自動起動タスクを登録して終了する。
     install: bool,
     /// 自動起動タスクを解除して終了する。
@@ -75,6 +77,7 @@ impl Default for Args {
             fps_cap: DEFAULT_FPS_CAP,
             max_bitrate_bps: MAX_BITRATE_BPS,
             port: DEFAULT_PORT,
+            port_explicit: false,
             install: false,
             uninstall: false,
             set_password: false,
@@ -135,6 +138,7 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 }
                 args.port = port;
+                args.port_explicit = true;
             }
             "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
@@ -203,7 +207,14 @@ fn main() -> Result<()> {
         return dump_h264(n);
     }
 
-    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, args.port)
+    // 待受ポートの解決: `--port` 明示なら CLI を、無ければ保存値 (トレイ管理) を、それも
+    // 無ければ既定を使う。
+    let port = if args.port_explicit {
+        args.port
+    } else {
+        settings::load_port().unwrap_or(args.port)
+    };
+    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port)
 }
 
 /// ログフィルタを構築する。`--log-level` 引数が最優先。素のレベル (`debug`) は `aurora=`
@@ -468,9 +479,19 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     // 実パスワードが設定済みか (= 現在パスワードの照合を要求するか)。初回 (保存なし) は
     // ランダム値なので「未設定」扱いで照合を求めない。tray で変更すると true になる。
     let has_password = Arc::new(std::sync::atomic::AtomicBool::new(have_stored));
+    // 待受ポートも tray と net で共有する。tray で変更すると port を書き換えて reload を
+    // 通知し、net (accept ループ) が TCP/UDP を貼り直すことで再起動なしに反映される。
+    let port_cell = Arc::new(std::sync::atomic::AtomicU16::new(port));
+    let reload = Arc::new(tokio::sync::Notify::new());
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
-    tray::spawn(psk.clone(), has_password, !have_stored);
+    tray::spawn(
+        psk.clone(),
+        has_password,
+        port_cell.clone(),
+        reload.clone(),
+        !have_stored,
+    );
 
     // 接続済みディスプレイを列挙する。失敗時は 1080p 単一ディスプレイで継続。
     let mut displays = match capture::enumerate_displays() {
@@ -591,8 +612,8 @@ fn run_server(perf: bool, fps_cap: u32, max_bitrate_bps: u32, port: u16) -> Resu
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let cfg = ServerConfig {
-            tcp_addr: SocketAddr::from(([0, 0, 0, 0], port)),
-            udp_addr: SocketAddr::from(([0, 0, 0, 0], port)),
+            port: port_cell,
+            reload,
             psk,
             displays,
             audio: audio_enabled,
