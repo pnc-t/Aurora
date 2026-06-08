@@ -4,6 +4,7 @@
 //!
 //! 単一セッションのみ保持し、`SessionState` (managed state) に置く。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +99,11 @@ pub struct SessionHandle {
     /// ファイル転送チャンク専用の bounded チャネル。満杯時に送信が待つことで
     /// JS 側の読み込みにバックプレッシャがかかり、入力など他の制御を詰まらせない。
     pub file_tx: mpsc::Sender<ControlMsg>,
+    /// ダウンロード要求済み (= ユーザーが明示的に取得を依頼した) 転送 id の集合。
+    /// reader ループはこの集合にある id の FileOffer だけを受理し、未要求のオファー
+    /// (悪意あるホストが押し付けるファイル) を拒否する。`request_file` で追加し、
+    /// reader が転送の終端で除去する。同期 Mutex だが await を跨いで保持しない。
+    pub pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
     /// 読み書き両タスクをまとめて止める
     pub tasks: Vec<JoinHandle<()>>,
     /// クリップボード同期ハンドル
@@ -293,6 +299,9 @@ pub async fn connect_to_host(
     // FS RPC 応答は制御チャネル経由で writer ループへ流す (host の同期コールバックを起こす)。
     let fs_reply_tx = ctrl_tx.clone();
     let share_root_for_reader = share_root.0.clone();
+    // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
+    let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
+    let pending_for_reader = pending_downloads.clone();
     let reader_task = tokio::spawn(async move {
         let res = tcp_reader_loop(
             read_half,
@@ -303,6 +312,7 @@ pub async fn connect_to_host(
             session_start,
             fs_reply_tx,
             share_root_for_reader,
+            pending_for_reader,
         )
         .await;
         let reason = match res {
@@ -404,6 +414,7 @@ pub async fn connect_to_host(
         ],
         clipboard: clip_handle,
         audio: audio_player,
+        pending_downloads,
     };
     *state.inner.lock().await = Some(handle);
     Ok(())
@@ -478,6 +489,11 @@ pub async fn request_file(
 ) -> Result<(), String> {
     let guard = state.inner.lock().await;
     let s = guard.as_ref().ok_or("not connected")?;
+    // この id を「要求済み」に登録してから送る。reader はこの集合にある id の FileOffer
+    // だけを受理するため、登録は送信より先に行う (オファー受信との競合を避ける)。
+    if let Ok(mut pending) = s.pending_downloads.lock() {
+        pending.insert(id);
+    }
     s.ctrl_tx
         .send(ControlMsg::FileRequest { id, path })
         .map_err(|_| "ctrl channel closed".to_string())
@@ -565,6 +581,9 @@ struct DownloadState {
     id: u32,
     file: tokio::fs::File,
     written: u64,
+    /// FileOffer で告知された総サイズ。これを超える書き込みは中断する
+    /// (悪意あるホストが告知より多く送ってディスクを埋めるのを防ぐ)。
+    total: u64,
     path: String,
 }
 
@@ -593,6 +612,7 @@ async fn tcp_reader_loop(
     session_start: Instant,
     fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
     share_root: Arc<Mutex<Option<PathBuf>>>,
+    pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
@@ -632,24 +652,40 @@ async fn tcp_reader_loop(
                 let _ = event_channel.send(ClientEvent::FileResult { id, ok, message });
             }
             // --- ダウンロード受信 (ホスト → クライアント) ---
-            ControlMsg::FileOffer { id, name, size } => match open_download(&name).await {
-                Ok((file, path)) => {
-                    tracing::info!(id, name = %name, size, path = %path, "download start");
-                    download = Some(DownloadState {
-                        id,
-                        file,
-                        written: 0,
-                        path,
-                    });
+            // ユーザーが request_file で明示的に要求した id の FileOffer だけを受理する。
+            // 未要求のオファーは、悪意あるホストがファイルを無断で押し付ける経路なので拒否する。
+            ControlMsg::FileOffer { id, name, size } => {
+                let solicited = pending_downloads
+                    .lock()
+                    .map(|s| s.contains(&id))
+                    .unwrap_or(false);
+                if !solicited {
+                    tracing::warn!(id, name = %name, "unsolicited FileOffer ignored (no matching request)");
+                } else {
+                    match open_download(&name).await {
+                        Ok((file, path)) => {
+                            tracing::info!(id, name = %name, size, path = %path, "download start");
+                            download = Some(DownloadState {
+                                id,
+                                file,
+                                written: 0,
+                                total: size,
+                                path,
+                            });
+                        }
+                        Err(e) => {
+                            if let Ok(mut s) = pending_downloads.lock() {
+                                s.remove(&id);
+                            }
+                            let _ = event_channel.send(ClientEvent::FileResult {
+                                id,
+                                ok: false,
+                                message: format!("open failed: {e}"),
+                            });
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = event_channel.send(ClientEvent::FileResult {
-                        id,
-                        ok: false,
-                        message: format!("open failed: {e}"),
-                    });
-                }
-            },
+            }
             ControlMsg::FileChunk {
                 id,
                 offset,
@@ -665,8 +701,28 @@ async fn tcp_reader_loop(
                             "download offset mismatch"
                         );
                     }
-                    if let Err(e) = d.file.write_all(&data).await {
+                    if d.written.saturating_add(data.len() as u64) > d.total {
+                        // 告知サイズ超過は中断する。悪意あるホストが告知より多く送り、
+                        // クライアントのディスクを埋めるのを防ぐ。
+                        tracing::warn!(
+                            id,
+                            total = d.total,
+                            "download exceeds declared size, aborting"
+                        );
+                        if let Ok(mut s) = pending_downloads.lock() {
+                            s.remove(&id);
+                        }
+                        let _ = event_channel.send(ClientEvent::FileResult {
+                            id,
+                            ok: false,
+                            message: "download exceeds declared size".into(),
+                        });
+                        download = None;
+                    } else if let Err(e) = d.file.write_all(&data).await {
                         let message = format!("write failed: {e}");
+                        if let Ok(mut s) = pending_downloads.lock() {
+                            s.remove(&id);
+                        }
                         let _ = event_channel.send(ClientEvent::FileResult {
                             id,
                             ok: false,
@@ -679,6 +735,9 @@ async fn tcp_reader_loop(
                             let (written, path) = (d.written, d.path.clone());
                             let res = d.file.flush().await;
                             download = None;
+                            if let Ok(mut s) = pending_downloads.lock() {
+                                s.remove(&id);
+                            }
                             let ev = match res {
                                 Ok(()) => {
                                     tracing::info!(id, written, path = %path, "download complete");
@@ -797,8 +856,10 @@ impl ListPage {
 
 /// 制御フレーム 64KB 上限に収めるための 1 ページあたりエントリ数上限。
 const LIST_PAGE: usize = 128;
-/// FsRead の上限 (host も 32KB ずつ要求するが念のためクランプ)。
-const MAX_READ: u32 = 64 * 1024;
+/// FsRead 1 回の上限。host は 32KB ずつ要求するが、悪意あるホストが大きい length を
+/// 送ってきても `FsReadReply` (data + bincode + AEAD タグ) が TCP フレーム上限
+/// (`u16::MAX`) を超えて自己切断しないよう、オーバーヘッド分を残してクランプする。
+const MAX_READ: u32 = 60 * 1024;
 
 /// 共有ルート相対パス (`/` 区切り) を実パスへ解決する。`..` によるルート外脱出を禁止。
 async fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
