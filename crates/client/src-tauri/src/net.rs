@@ -555,54 +555,6 @@ pub async fn upload_file_from_path(
     Ok(())
 }
 
-/// ファイル転送開始の告知。チャンク列の前に 1 回だけ呼ぶ。
-#[tauri::command]
-pub async fn send_file_offer(
-    id: u32,
-    name: String,
-    size: u64,
-    state: tauri::State<'_, SessionState>,
-) -> Result<(), String> {
-    let msg = ControlMsg::FileOffer { id, name, size };
-    send_file_msg(&state, msg).await
-}
-
-/// ファイルチャンクを 1 つ送る。bounded チャネル経由なので満杯時はここで待つ
-/// (= JS 側 invoke が待ち、読み込みにバックプレッシャがかかる)。
-#[tauri::command]
-pub async fn send_file_chunk(
-    id: u32,
-    offset: u64,
-    data: Vec<u8>,
-    last: bool,
-    state: tauri::State<'_, SessionState>,
-) -> Result<(), String> {
-    let msg = ControlMsg::FileChunk {
-        id,
-        offset,
-        data,
-        last,
-    };
-    send_file_msg(&state, msg).await
-}
-
-/// bounded file チャネルへ送る共通処理。ロックは send の await をまたがないよう
-/// Sender を clone してから解放する。
-async fn send_file_msg(
-    state: &tauri::State<'_, SessionState>,
-    msg: ControlMsg,
-) -> Result<(), String> {
-    let file_tx = {
-        let guard = state.inner.lock().await;
-        let s = guard.as_ref().ok_or("not connected")?;
-        s.file_tx.clone()
-    };
-    file_tx
-        .send(msg)
-        .await
-        .map_err(|_| "file channel closed".to_string())
-}
-
 // -------- internal loops --------
 
 async fn tcp_writer_loop(

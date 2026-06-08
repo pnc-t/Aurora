@@ -1,28 +1,23 @@
 // ファイル転送 UI。
-// - アップロード (クライアント → ホスト): ファイルを選んでチャンク送信。
+// - アップロード (クライアント → ホスト): キャプチャ画面へのドラッグ&ドロップで行う (main.ts)。
+//   ここには操作ヒントだけを置く。
 // - ダウンロード (ホスト → クライアント): ホスト上のパスを指定して取得。
 //   受信ファイルはクライアント側の aurora-downloads/ に自動保存される。
-// 完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
+// - 共有フォルダ (ProjFS): ホストの Explorer に投影するフォルダを設定する。
+// ダウンロードの完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
 
-import { requestFile, sendFileChunk, sendFileOffer, setShareRoot } from "../core/ipc";
+import { requestFile, setShareRoot } from "../core/ipc";
 import "./file-transfer.css";
 
-// TCP フレーム上限 (64KB) と bincode オーバーヘッドに収まるサイズ。
-const CHUNK = 32 * 1024;
-
-let uploadProgressEl: HTMLElement | null = null;
 let downloadProgressEl: HTMLElement | null = null;
-// 進行中転送の id (FileResult 照合用)。
-let activeUploadId: number | null = null;
+// 進行中ダウンロードの id (FileResult 照合用)。
 let activeDownloadId: number | null = null;
 
 export function mountFileTransfer(panel: HTMLElement): void {
   panel.innerHTML = `
     <div class="section-title">upload to host</div>
     <div class="row">
-      <input id="file-input" type="file" />
-      <button type="button" id="send-file-btn">send</button>
-      <span id="file-progress" class="progress"></span>
+      <span class="hint">ファイルをキャプチャ画面にドラッグ&ドロップ</span>
     </div>
     <div class="section-title">download from host</div>
     <div class="row">
@@ -38,10 +33,7 @@ export function mountFileTransfer(panel: HTMLElement): void {
     </div>
   `;
 
-  uploadProgressEl = panel.querySelector<HTMLElement>("#file-progress");
   downloadProgressEl = panel.querySelector<HTMLElement>("#download-progress");
-  const input = panel.querySelector<HTMLInputElement>("#file-input");
-  const sendBtn = panel.querySelector<HTMLButtonElement>("#send-file-btn");
   const pathInput = panel.querySelector<HTMLInputElement>("#download-path");
   const dlBtn = panel.querySelector<HTMLButtonElement>("#download-file-btn");
   const shareInput = panel.querySelector<HTMLInputElement>("#share-root");
@@ -63,20 +55,6 @@ export function mountFileTransfer(panel: HTMLElement): void {
       });
   });
 
-  sendBtn?.addEventListener("click", () => {
-    const file = input?.files?.[0];
-    if (!file) {
-      setUploadProgress("no file");
-      return;
-    }
-    sendBtn.disabled = true;
-    void sendFile(file)
-      .catch((err) => setUploadProgress(`error: ${String(err)}`))
-      .finally(() => {
-        sendBtn.disabled = false;
-      });
-  });
-
   dlBtn?.addEventListener("click", () => {
     const path = pathInput?.value?.trim();
     if (!path) {
@@ -90,49 +68,13 @@ export function mountFileTransfer(panel: HTMLElement): void {
   });
 }
 
-async function sendFile(file: File): Promise<void> {
-  // 32bit に収まる転送 id。FileResult の照合に使う。
-  const id = Date.now() >>> 0;
-  activeUploadId = id;
-  setUploadProgress("0%");
-
-  await sendFileOffer(id, file.name, file.size);
-
-  if (file.size === 0) {
-    // 空ファイルは last=true の空チャンクで完了させる。
-    await sendFileChunk(id, 0, [], true);
-    setUploadProgress("sent, waiting…");
-    return;
-  }
-
-  let offset = 0;
-  while (offset < file.size) {
-    const slice = file.slice(offset, offset + CHUNK);
-    const bytes = new Uint8Array(await slice.arrayBuffer());
-    const last = offset + bytes.length >= file.size;
-    // invoke 引数は JSON 化されるため number[] で渡す。
-    await sendFileChunk(id, offset, Array.from(bytes), last);
-    offset += bytes.length;
-    setUploadProgress(`${Math.floor((offset / file.size) * 100)}%`);
-  }
-  setUploadProgress("sent, waiting…");
-}
-
-/// host からの FileResult を反映する (アップロード / ダウンロード両方)。
+/// host からの FileResult を反映する (ダウンロード)。アップロード (D&D) は main.ts が
+/// トーストで通知するため、ここではダウンロードのみ照合する。
 export function handleFileResult(id: number, ok: boolean, message: string): void {
   if (id === activeDownloadId) {
     setDownloadProgress(ok ? `saved: ${message}` : `failed: ${message}`);
     activeDownloadId = null;
-    return;
   }
-  if (id === activeUploadId) {
-    setUploadProgress(ok ? `done: ${message}` : `failed: ${message}`);
-    activeUploadId = null;
-  }
-}
-
-function setUploadProgress(s: string): void {
-  if (uploadProgressEl) uploadProgressEl.textContent = s;
 }
 
 function setDownloadProgress(s: string): void {

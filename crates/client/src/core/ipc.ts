@@ -79,19 +79,6 @@ export async function setVideoParams(fps: number, maxBitrateBps: number): Promis
   await invoke("set_video_params", { fps, maxBitrateBps });
 }
 
-export async function sendFileOffer(id: number, name: string, size: number): Promise<void> {
-  await invoke("send_file_offer", { id, name, size });
-}
-
-export async function sendFileChunk(
-  id: number,
-  offset: number,
-  data: number[],
-  last: boolean,
-): Promise<void> {
-  await invoke("send_file_chunk", { id, offset, data, last });
-}
-
 export async function requestFile(id: number, path: string): Promise<void> {
   await invoke("request_file", { id, path });
 }
