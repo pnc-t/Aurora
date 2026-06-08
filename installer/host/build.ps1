@@ -41,4 +41,4 @@ Write-Host "==> Inno Setup でコンパイル ($iscc)" -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 
 Write-Host '==> 完了。出力:' -ForegroundColor Green
-Get-ChildItem (Join-Path $here 'dist') -Filter '*.exe' | ForEach-Object { Write-Host "    $($_.FullName)" }
+Get-ChildItem (Join-Path $here '..\dist') -Filter 'aurora-host-*.exe' | ForEach-Object { Write-Host "    $($_.FullName)" }

@@ -1,11 +1,25 @@
 # 配布インストーラ
 
-Aurora は配布物が 2 つに分かれる。
+Aurora は配布物が 2 つに分かれる。生成物はどちらも **`installer\dist\`** に集約する。
 
 | 配布物 | 中身 | インストーラ | 生成方法 |
 |--------|------|--------------|----------|
 | **client** | Tauri アプリ (`aurora-client`) | NSIS (per-user) | `cargo tauri build` |
 | **host** | 素のバイナリ (`aurora-host`) | Inno Setup (per-machine) | `installer\host\build.ps1` |
+
+## 一括ビルド (推奨)
+
+両方を生成して `installer\dist\` にまとめる:
+
+```powershell
+.\installer\build-all.ps1
+```
+
+出力:
+- `installer\dist\Aurora_0.1.0_x64-setup.exe` (client)
+- `installer\dist\aurora-host-setup-0.1.0.exe` (host)
+
+個別に作る場合は以下の各節を参照 (出力先は同じ `installer\dist\`)。
 
 共通の前提:
 - **Tailscale は同梱しない**。利用者が事前に導入・ログイン済みであること。
@@ -25,11 +39,13 @@ Aurora は配布物が 2 つに分かれる。
 ビルド:
 
 ```powershell
-cargo tauri build --manifest-path crates/client/src-tauri/Cargo.toml
+# tauri CLI は --manifest-path 非対応。src-tauri 直下で実行する
+pushd crates/client/src-tauri; cargo tauri build; popd
 ```
 
-出力: `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
-(初回は Tauri が makensis / WebView2 ブートストラッパを自動取得する)。
+Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
+(初回は makensis / WebView2 ブートストラッパを自動取得)。`build-all.ps1` は
+これを `installer\dist\` へコピーする。
 
 アンインストール: 「アプリと機能」または同梱アンインストーラから削除。
 ユーザー設定 (`%APPDATA%` の `recent_hosts.json` 等) は手動削除。
@@ -54,7 +70,7 @@ winget install JRSoftware.InnoSetup
 .\installer\host\build.ps1
 ```
 
-出力: `installer\host\dist\aurora-host-setup-0.1.0.exe`
+出力: `installer\dist\aurora-host-setup-0.1.0.exe`
 
 インストーラの挙動 (管理者権限):
 - `aurora-host.exe` を `C:\Program Files\Aurora Host\` に配置。

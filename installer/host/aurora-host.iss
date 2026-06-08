@@ -35,7 +35,8 @@ PrivilegesRequired=admin
 UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir=dist
+; client (Tauri NSIS) と同じ installer\dist に集約する。
+OutputDir=..\dist
 OutputBaseFilename=aurora-host-setup-{#AppVersion}
 SetupIconFile=..\..\crates\client\src-tauri\icons\icon.ico
 Compression=lzma2/max
