@@ -1,4 +1,8 @@
-# Aurora
+<div align="center">
+  <img src="docs/assets/aurora.png" alt="Aurora" width="160" />
+
+  # Aurora
+</div>
 
 出先の PC から自宅 PC に接続して操作する、自作の軽量リモートデスクトップアプリ。
 RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています。設計目標は **「軽く・早く・快適」**。
