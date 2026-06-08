@@ -499,6 +499,62 @@ pub async fn request_file(
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
+/// ローカルのファイルパス (キャプチャ画面への D&D 由来) を host へアップロードする。
+/// ファイルは Rust 側で読み、既存のアップロードプロトコル (FileOffer + FileChunk) を
+/// bounded file チャネル経由で流す。バイト列を WebView に載せず net 層を再利用する。
+/// 完了 / 失敗は host からの FileResult イベントで通知される。
+#[tauri::command]
+pub async fn upload_file_from_path(
+    id: u32,
+    path: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    const CHUNK: usize = 32 * 1024;
+    // file_tx を clone してロックは send の await を跨がない。
+    let file_tx = {
+        let guard = state.inner.lock().await;
+        let s = guard.as_ref().ok_or("not connected")?;
+        s.file_tx.clone()
+    };
+    let name = Path::new(&path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("upload.bin")
+        .to_string();
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| format!("open {path}: {e}"))?;
+    let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    file_tx
+        .send(ControlMsg::FileOffer { id, name, size })
+        .await
+        .map_err(|_| "file channel closed".to_string())?;
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        let last = n == 0 || offset + n as u64 >= size;
+        file_tx
+            .send(ControlMsg::FileChunk {
+                id,
+                offset,
+                data: buf[..n].to_vec(),
+                last,
+            })
+            .await
+            .map_err(|_| "file channel closed".to_string())?;
+        offset += n as u64;
+        if last {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// ファイル転送開始の告知。チャンク列の前に 1 回だけ呼ぶ。
 #[tauri::command]
 pub async fn send_file_offer(

@@ -96,6 +96,12 @@ export async function requestFile(id: number, path: string): Promise<void> {
   await invoke("request_file", { id, path });
 }
 
+/// ローカルのファイルパス (キャプチャ画面への D&D 由来) を host へアップロードする。
+/// Rust 側がファイルを読み、既存のアップロードプロトコルで送る。
+export async function uploadFileFromPath(id: number, path: string): Promise<void> {
+  await invoke("upload_file_from_path", { id, path });
+}
+
 /// ホストの Explorer に投影する共有フォルダ (ProjFS ドライブリダイレクト) を設定する。
 export async function setShareRoot(path: string): Promise<void> {
   await invoke("set_share_root", { path });

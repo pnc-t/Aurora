@@ -34,6 +34,7 @@ fn main() {
             net::send_file_offer,
             net::send_file_chunk,
             net::request_file,
+            net::upload_file_from_path,
             net::set_share_root,
             config::load_recent_hosts,
             config::save_recent_host,
