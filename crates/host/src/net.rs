@@ -518,6 +518,15 @@ async fn handle_client(
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                                } else if u.written.saturating_add(data.len() as u64) > u.total {
+                                    // 告知サイズ (FileOffer.size) を超える書き込みは拒否する。これが無いと
+                                    // size:0 を告知してから無限にチャンクを送り、ホストのディスクを埋められる
+                                    // (total の検証が抜けており実質デッドだった)。
+                                    let message = format!("upload exceeds declared size {}", u.total);
+                                    tracing::warn!(id, total = u.total, written = u.written, got = data.len(), "upload exceeds declared size, aborting");
+                                    upload = None;
+                                    let msg = ControlMsg::FileResult { id, ok: false, message };
+                                    send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
@@ -595,7 +604,18 @@ async fn handle_client(
                     let nonce = NONCE_DOMAIN_VIDEO | seq as u64;
                     let dgram = encrypt_udp(&session, nonce, STREAM_VIDEO, &framed)?;
                     udp.send_to(&dgram, peer_udp).await.context("UDP send")?;
-                    seq = seq.wrapping_add(1);
+                    // 映像 nonce は seq (u32) を下位に使うため、seq 一周で nonce が再利用される。
+                    // ChaChaPoly は nonce 再利用が機密性・完全性とも致命的なので、巻き戻る前に
+                    // セッションを終了する。クライアントが再接続すると新しいハンドシェイクで
+                    // 鍵が更新され nonce 空間がリセットされる (静かな nonce 再利用より安全)。
+                    seq = match seq.checked_add(1) {
+                        Some(s) => s,
+                        None => {
+                            return Err(anyhow!(
+                                "video nonce space exhausted; disconnecting to force rekey"
+                            ));
+                        }
+                    };
                     first = false;
                 }
             }
