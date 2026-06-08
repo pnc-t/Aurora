@@ -267,46 +267,46 @@ pub async fn run_server(
                 }
             };
             tracing::info!(peer = %peer, "TCP client connected");
-        // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
-        // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
-        // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
-        let _active = crate::conn::ActiveGuard::new();
-        // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
-        let psk = *cfg.psk.lock().expect("psk mutex poisoned");
-        let displays = cfg.displays.clone();
-        let audio = cfg.audio;
-        let max_bitrate_bps = cfg.max_bitrate_bps;
-        let udp = udp.clone();
-        let enc_tx2 = enc_tx.clone();
-        let input_tx2 = input_tx.clone();
-        let cap_select_tx2 = cap_select_tx.clone();
-        let fps_tx2 = fps_tx.clone();
-        let clip_apply_tx2 = clip_apply_tx.clone();
-        // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
-        // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
-        let nal_rx_ref = &mut nal_rx;
-        let audio_rx_ref = &mut audio_rx;
-        let clip_change_rx_ref = &mut clip_change_rx;
-        if let Err(e) = handle_client(
-            stream,
-            peer,
-            psk,
-            displays,
-            audio,
-            udp,
-            enc_tx2,
-            input_tx2,
-            cap_select_tx2,
-            fps_tx2,
-            clip_apply_tx2,
-            nal_rx_ref,
-            audio_rx_ref,
-            clip_change_rx_ref,
-            max_bitrate_bps,
-        )
-        .await
-        {
-            tracing::warn!(error = %e, "client session ended");
+            // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
+            // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
+            // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
+            let _active = crate::conn::ActiveGuard::new();
+            // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
+            let psk = *cfg.psk.lock().expect("psk mutex poisoned");
+            let displays = cfg.displays.clone();
+            let audio = cfg.audio;
+            let max_bitrate_bps = cfg.max_bitrate_bps;
+            let udp = udp.clone();
+            let enc_tx2 = enc_tx.clone();
+            let input_tx2 = input_tx.clone();
+            let cap_select_tx2 = cap_select_tx.clone();
+            let fps_tx2 = fps_tx.clone();
+            let clip_apply_tx2 = clip_apply_tx.clone();
+            // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
+            // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
+            let nal_rx_ref = &mut nal_rx;
+            let audio_rx_ref = &mut audio_rx;
+            let clip_change_rx_ref = &mut clip_change_rx;
+            if let Err(e) = handle_client(
+                stream,
+                peer,
+                psk,
+                displays,
+                audio,
+                udp,
+                enc_tx2,
+                input_tx2,
+                cap_select_tx2,
+                fps_tx2,
+                clip_apply_tx2,
+                nal_rx_ref,
+                audio_rx_ref,
+                clip_change_rx_ref,
+                max_bitrate_bps,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "client session ended");
             }
         }
     }
