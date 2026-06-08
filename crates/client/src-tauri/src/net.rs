@@ -125,21 +125,15 @@ pub struct SessionState {
 }
 
 /// ホストの ProjFS から見えるクライアント共有ルート。`set_share_root` で設定する。
-/// 未設定時はホームディレクトリを既定とする。spawn したリーダタスクと共有するため Arc。
-#[derive(Clone)]
-pub struct ShareRoot(pub Arc<Mutex<PathBuf>>);
+///
+/// **既定は `None` (共有無効)。** ユーザーが明示的に共有フォルダを設定するまで、ホストからの
+/// FS 操作 (列挙・読み取り・作成・書き込み・削除・改名) は一切受け付けない。既定でホーム
+/// ディレクトリ等を開くと、接続しただけで悪意あるホストにファイルを読み書き・削除されるため、
+/// 接続パスワード保存と同様に opt-in にする。spawn したリーダタスクと共有するため Arc。
+#[derive(Clone, Default)]
+pub struct ShareRoot(pub Arc<Mutex<Option<PathBuf>>>);
 
-impl Default for ShareRoot {
-    fn default() -> Self {
-        let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        ShareRoot(Arc::new(Mutex::new(home)))
-    }
-}
-
-/// ホストへ投影する共有フォルダを設定する。
+/// ホストへ投影する共有フォルダを設定する。これを呼ぶまで共有は無効。
 #[tauri::command]
 pub async fn set_share_root(
     path: String,
@@ -149,7 +143,7 @@ pub async fn set_share_root(
     if !p.is_dir() {
         return Err(format!("not a directory: {path}"));
     }
-    *state.0.lock().await = p;
+    *state.0.lock().await = Some(p);
     tracing::info!(path = %path, "share root set");
     Ok(())
 }
@@ -598,7 +592,7 @@ async fn tcp_reader_loop(
     stats: Arc<StatsCollector>,
     session_start: Instant,
     fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
-    share_root: Arc<Mutex<PathBuf>>,
+    share_root: Arc<Mutex<Option<PathBuf>>>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
@@ -707,13 +701,17 @@ async fn tcp_reader_loop(
                 _ => tracing::warn!(id, "download chunk without matching offer, ignored"),
             },
             // --- ProjFS ドライブリダイレクト: 自分のファイルをホストへ配信 ---
+            // いずれも共有ルートが設定済み (= ユーザーが明示的に共有を有効化) のときだけ処理する。
+            // 未設定なら read は error 応答、破壊系の書き戻しはログのみで無視し、無断アクセスを防ぐ。
             ControlMsg::FsList {
                 req_id,
                 path,
                 offset,
             } => {
-                let root = share_root.lock().await.clone();
-                let reply = fs_list(&root, &path, offset).await;
+                let reply = match share_root.lock().await.clone() {
+                    Some(root) => fs_list(&root, &path, offset).await,
+                    None => ListPage::err("sharing disabled".into()),
+                };
                 let _ = fs_reply_tx.send(reply.into_msg(req_id));
             }
             ControlMsg::FsRead {
@@ -722,8 +720,10 @@ async fn tcp_reader_loop(
                 offset,
                 length,
             } => {
-                let root = share_root.lock().await.clone();
-                let (data, error) = fs_read(&root, &path, offset, length).await;
+                let (data, error) = match share_root.lock().await.clone() {
+                    Some(root) => fs_read(&root, &path, offset, length).await,
+                    None => (Vec::new(), Some("sharing disabled".to_string())),
+                };
                 let _ = fs_reply_tx.send(ControlMsg::FsReadReply {
                     req_id,
                     data,
@@ -731,30 +731,40 @@ async fn tcp_reader_loop(
                 });
             }
             // --- 書き戻し (ホスト Explorer → クライアント、一方向) ---
-            ControlMsg::FsCreate { path, is_dir } => {
-                let root = share_root.lock().await.clone();
-                if let Err(e) = fs_create(&root, &path, is_dir).await {
-                    tracing::warn!(path = %path, error = %e, "FsCreate failed");
+            ControlMsg::FsCreate { path, is_dir } => match share_root.lock().await.clone() {
+                Some(root) => {
+                    if let Err(e) = fs_create(&root, &path, is_dir).await {
+                        tracing::warn!(path = %path, error = %e, "FsCreate failed");
+                    }
                 }
-            }
-            ControlMsg::FsWrite { path, offset, data } => {
-                let root = share_root.lock().await.clone();
-                if let Err(e) = fs_write(&root, &path, offset, &data).await {
-                    tracing::warn!(path = %path, error = %e, "FsWrite failed");
+                None => tracing::warn!(path = %path, "FsCreate rejected: sharing disabled"),
+            },
+            ControlMsg::FsWrite { path, offset, data } => match share_root.lock().await.clone() {
+                Some(root) => {
+                    if let Err(e) = fs_write(&root, &path, offset, &data).await {
+                        tracing::warn!(path = %path, error = %e, "FsWrite failed");
+                    }
                 }
-            }
-            ControlMsg::FsDelete { path } => {
-                let root = share_root.lock().await.clone();
-                if let Err(e) = fs_delete(&root, &path).await {
-                    tracing::warn!(path = %path, error = %e, "FsDelete failed");
+                None => tracing::warn!(path = %path, "FsWrite rejected: sharing disabled"),
+            },
+            ControlMsg::FsDelete { path } => match share_root.lock().await.clone() {
+                Some(root) => {
+                    if let Err(e) = fs_delete(&root, &path).await {
+                        tracing::warn!(path = %path, error = %e, "FsDelete failed");
+                    }
                 }
-            }
-            ControlMsg::FsRename { from, to } => {
-                let root = share_root.lock().await.clone();
-                if let Err(e) = fs_rename(&root, &from, &to).await {
-                    tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
+                None => tracing::warn!(path = %path, "FsDelete rejected: sharing disabled"),
+            },
+            ControlMsg::FsRename { from, to } => match share_root.lock().await.clone() {
+                Some(root) => {
+                    if let Err(e) = fs_rename(&root, &from, &to).await {
+                        tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
+                    }
                 }
-            }
+                None => {
+                    tracing::warn!(from = %from, to = %to, "FsRename rejected: sharing disabled")
+                }
+            },
             other => tracing::debug!(?other, "ignored control msg"),
         }
     }
@@ -797,8 +807,10 @@ async fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
         if comp.is_empty() || comp == "." {
             continue;
         }
-        if comp == ".." {
-            return Err("path traversal rejected".into());
+        // 書き込み側 `safe_join` と同じ字句ルールで弾く (`\`/`:` も拒否)。最終的に
+        // canonicalize で守られるが、防御を両系統で対称に揃える。
+        if comp == ".." || comp.contains('\\') || comp.contains(':') {
+            return Err(format!("unsafe path component: {comp}"));
         }
         p.push(comp);
     }
