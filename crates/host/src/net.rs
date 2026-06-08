@@ -420,7 +420,10 @@ async fn handle_client(
     // (FsBridge が満杯時に blocking_send で ProjFS スレッドを待たせ、ディスク読みを止める)。
     let (fs_req_tx, mut fs_req_rx) = mpsc::channel::<ControlMsg>(64);
     let fs_bridge = Arc::new(FsBridge::new(fs_req_tx));
-    let _virt = match projfs::start(fs_bridge.clone(), std::path::Path::new("aurora-remote")) {
+    // 投影ルートは CWD 相対ではなく固定の絶対パス (`%LOCALAPPDATA%\Aurora\remote`)。
+    // セッション中だけ This PC にドライブとして現れ、切断 (Drop) で消える。
+    let remote_root = projfs::remote_root();
+    let _virt = match projfs::start(fs_bridge.clone(), &remote_root) {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(error = %e, "ProjFS drive redirection disabled");

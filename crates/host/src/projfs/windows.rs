@@ -13,7 +13,10 @@ use anyhow::{Context, Result};
 use windows::Win32::Foundation::{
     BOOLEAN, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary, S_OK,
 };
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows::Win32::Storage::FileSystem::{
+    DDD_NO_BROADCAST_SYSTEM, DDD_REMOVE_DEFINITION, DefineDosDeviceW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, GetLogicalDrives,
+};
 use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
     PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
@@ -52,18 +55,66 @@ struct Provider {
     root: PathBuf,
 }
 
-/// 投影セッション。Drop で `PrjStopVirtualizing`。
+/// 投影セッション。Drop で割り当てたドライブを解除し `PrjStopVirtualizing`。
 pub struct WinVirtualization {
     ctx: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
     // instance context の実体。callbacks 実行中は生存している必要がある。
     _provider: Box<Provider>,
+    /// This PC「デバイスとドライブ」に出すため投影ルートへ subst したドライブレター
+    /// ('A'..='Z')。空きが無い / マウント失敗時は None (フォルダはパスで参照可)。
+    drive: Option<char>,
 }
 
 impl Drop for WinVirtualization {
     fn drop(&mut self) {
+        // 仮想化停止より先にドライブを外す (セッション終了で This PC から消える = 一時表示)。
+        if let Some(letter) = self.drive {
+            unmount_drive(letter);
+        }
         // SAFETY: ctx は start() で得た有効な仮想化コンテキスト。停止は drop で 1 回のみ。
         unsafe { PrjStopVirtualizing(self.ctx) };
     }
+}
+
+/// This PC に出すための空きドライブレターを探す。実ドライブ (C: 等) と衝突しないよう、
+/// `Z:` から `D:` に向かって最初の空きを返す。空きが無ければ None。
+fn pick_free_drive_letter() -> Option<char> {
+    // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
+    let used = unsafe { GetLogicalDrives() };
+    (3..26u32)
+        .rev()
+        .find(|i| used & (1 << i) == 0)
+        .map(|i| (b'A' + i as u8) as char)
+}
+
+/// 投影ルート `root` をドライブレター `letter` に subst してマウントする。
+/// `DefineDosDeviceW` は (DDD_RAW_TARGET_PATH 無しのとき) target に `\??\` を補って
+/// オブジェクトマネージャのシンボリックリンクを作る = `subst` と同じ挙動。This PC に
+/// ドライブとして現れる。
+fn mount_drive(letter: char, root: &Path) -> windows::core::Result<()> {
+    let device = wide(&format!("{letter}:"));
+    let target = wide(&root.to_string_lossy());
+    // SAFETY: device / target は null 終端の有効な PCWSTR。
+    unsafe {
+        DefineDosDeviceW(
+            DDD_NO_BROADCAST_SYSTEM,
+            PCWSTR(device.as_ptr()),
+            PCWSTR(target.as_ptr()),
+        )
+    }
+}
+
+/// マウントしたドライブを解除する (セッション終了時)。target=null で当該レターの定義を除去。
+fn unmount_drive(letter: char) {
+    let device = wide(&format!("{letter}:"));
+    // SAFETY: device は null 終端の有効な PCWSTR。失敗は無視 (既に消えている等)。
+    let _ = unsafe {
+        DefineDosDeviceW(
+            DDD_REMOVE_DEFINITION,
+            PCWSTR(device.as_ptr()),
+            PCWSTR::null(),
+        )
+    };
 }
 
 // SAFETY: ctx はスレッド間で移動しても安全 (ProjFS が内部同期する)。
@@ -213,9 +264,29 @@ pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
 
     tracing::info!(root = %root.display(), "ProjFS virtualization started");
 
+    // This PC「デバイスとドライブ」に一時的なドライブとして出す。失敗してもフォルダ自体は
+    // パスで参照できるので致命的ではない (ログのみ)。Drop でこのドライブを解除する。
+    let drive = match pick_free_drive_letter() {
+        Some(letter) => match mount_drive(letter, root) {
+            Ok(()) => {
+                tracing::info!(drive = %format!("{letter}:"), "ProjFS mounted as drive (visible in This PC)");
+                Some(letter)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to mount ProjFS drive; folder accessible by path only");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("no free drive letter for ProjFS; folder accessible by path only");
+            None
+        }
+    };
+
     Ok(WinVirtualization {
         ctx,
         _provider: provider,
+        drive,
     })
 }
 

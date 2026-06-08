@@ -183,7 +183,21 @@ impl FsBridge {
     }
 }
 
-/// 投影セッション。Drop で仮想化を停止する (CLAUDE.md: OS リソースは Drop 解放)。
+/// ProjFS 投影ルート (= This PC に出すドライブの実体) の絶対パス。
+///
+/// トレイ常駐 / 自動起動だと CWD が `System32` 等になり得るため、CWD 相対だと投影先が
+/// 予測不能になる (権限の無い場所に作ろうとして失敗もする)。`%LOCALAPPDATA%\Aurora\remote`
+/// に固定して discoverable にする。Windows 以外は ProjFS 自体が no-op なので値は使われない。
+pub fn remote_root() -> std::path::PathBuf {
+    #[cfg(windows)]
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        return std::path::PathBuf::from(base).join("Aurora").join("remote");
+    }
+    std::path::PathBuf::from("aurora-remote")
+}
+
+/// 投影セッション。Drop で仮想化を停止し、割り当てたドライブも解除する
+/// (CLAUDE.md: OS リソースは Drop 解放)。
 pub struct Virtualization {
     #[cfg(windows)]
     _inner: windows::WinVirtualization,
