@@ -15,3 +15,5 @@ PLAN.md
 aurora-remote/
 aurora-received/
 aurora-downloads/
+# host インストーラのビルド成果物 (ISCC 出力)
+installer/host/dist/

@@ -29,6 +29,10 @@ DefaultGroupName=Aurora Host
 UninstallDisplayIcon={app}\{#ExeName}
 ; ONLOGON /RL HIGHEST タスク登録と (任意の) ProjFS 有効化に管理者権限が要る。
 PrivilegesRequired=admin
+; 想定配置は単一ユーザーの自宅 PC。UAC 昇格でもプロファイルは切り替わらないため
+; {localappdata} は host を実行する対話ユーザーのものと一致する。よって管理者モードでの
+; per-user 領域 (LOCALAPPDATA\Aurora) 削除は意図どおり機能する → 警告を抑制する。
+UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=dist
