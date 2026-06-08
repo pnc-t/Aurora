@@ -5,7 +5,7 @@ Aurora は配布物が 2 つに分かれる。生成物はどちらも **`instal
 | 配布物 | 中身 | インストーラ | 生成方法 |
 |--------|------|--------------|----------|
 | **client** | Tauri アプリ (`aurora-client`) | NSIS (per-user) | `cargo tauri build` |
-| **host** | 素のバイナリ (`aurora-host`) | Inno Setup (per-machine) | `installer\host\build.ps1` |
+| **host** | 素のバイナリ (`aurora-host`) | NSIS (per-user) | `installer\host\build.ps1` |
 
 ## 一括ビルド (推奨)
 
@@ -52,19 +52,18 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 ---
 
-## host (Inno Setup)
+## host (NSIS)
 
-`installer/host/aurora-host.iss` がインストーラ定義。host 自身の
-`--install` / `--uninstall` (ONLOGON スケジュールタスク登録) に委譲しているので、
-インストーラは「exe 配置 + タスク登録 + 任意で ProjFS 有効化」だけを行う。
+`installer/host/aurora-host.nsi` がインストーラ定義。client と同じ NSIS で、
+**per-user インストール (管理者プロンプトなし)** + Apps & features 登録の
+クリーンアンインストーラを備える。自動起動タスクの登録/解除は host 自身の
+`--install` / `--uninstall` に委譲する。
 
-前提ツール (初回のみ):
+前提ツール: makensis。**client を一度 `cargo tauri build` していれば** Tauri が
+取得した NSIS (`%LOCALAPPDATA%\tauri\NSIS`) を自動再利用するので追加導入は不要。
+無い場合のみ `winget install NSIS.NSIS`。
 
-```powershell
-winget install JRSoftware.InnoSetup
-```
-
-ビルド:
+ビルド (バージョンは root Cargo.toml から自動取得):
 
 ```powershell
 .\installer\host\build.ps1
@@ -72,12 +71,13 @@ winget install JRSoftware.InnoSetup
 
 出力: `installer\dist\aurora-host-setup-0.1.0.exe`
 
-インストーラの挙動 (管理者権限):
-- `aurora-host.exe` を `C:\Program Files\Aurora Host\` に配置。
-- タスク「ログオン時に自動起動」(既定 ON) → `aurora-host --install` で
-  ONLOGON / RL HIGHEST のスケジュールタスク "Aurora Host" を登録。
-- タスク「ファイル転送機能を有効化」(既定 OFF) → `Client-ProjFS` を有効化
-  (再起動が必要な場合あり)。不要なら OFF のまま。
+インストーラの挙動:
+- `aurora-host.exe` を `%LOCALAPPDATA%\Programs\Aurora Host\` に配置 (per-user・UAC 不要)。
+- コンポーネント「ログオン時に自動起動」(既定 ON) → `aurora-host --install` で
+  ONLOGON / RL HIGHEST のスケジュールタスク "Aurora Host" を登録。タスク登録は
+  昇格が要るため、**この項目を選んだときだけ UAC が 1 回出る**。
+- コンポーネント「ファイル転送機能を有効化」(既定 OFF) → `Client-ProjFS` を有効化
+  (これも選択時のみ UAC 1 回。再起動が必要な場合あり)。不要なら OFF のまま。
 
 **接続パスワード**はインストーラでは設定しない。インストール後にトレイアイコン
 右クリック →「パスワード変更」、または端末から `aurora-host --set-password` を
@@ -85,11 +85,13 @@ winget install JRSoftware.InnoSetup
 
 ### クリーンアンインストール
 
-アンインストーラは痕跡を残さず削除する:
+「アプリと機能」または同梱アンインストーラから削除。痕跡を残さない:
 1. 常駐プロセス (`aurora-host.exe`) を停止。
-2. `aurora-host --uninstall` でスケジュールタスク "Aurora Host" を解除。
-3. exe とインストール先フォルダを削除。
+2. 自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
+   を解除 (タスク削除に昇格が要るため UAC が 1 回出る。未登録なら出ない)。
+3. exe / インストール先フォルダ / スタートメニューのショートカットを削除。
 4. `%LOCALAPPDATA%\Aurora\` (port / password.bin) を削除。
+5. HKCU のアンインストール登録を削除。
 
 ProjFS (`Client-ProjFS`) は他用途でも使う共有システム機能のため、
 アンインストールでは**無効化しない**。手動で戻す場合:
