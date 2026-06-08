@@ -512,6 +512,8 @@ fn run_server(
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
     // 方針のため、保存済みを使う場合は値を表示しない。
     println!("== aurora-host ready ==");
+    // 前回の異常終了で This PC に残った投影ドライブ (subst) があれば起動時に掃除する。
+    projfs::cleanup_drives();
     // 保存パスワードの有無を覚えておく。無ければトレイ起動直後に設定ダイアログを促す。
     let mut have_stored = false;
     let password = match secret::load_password() {

@@ -177,6 +177,9 @@ mod imp {
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
             drop(Box::from_raw(boxed));
         }
+        // process::exit は Drop を走らせないため、投影ドライブ (subst) を明示的に掃除する
+        // (これが無いと This PC に古い Aurora ドライブが残る)。
+        crate::projfs::cleanup_drives();
         tracing::info!("tray exit requested; shutting down host");
         std::process::exit(0);
     }

@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::FileSystem::{
     DDD_NO_BROADCAST_SYSTEM, DDD_REMOVE_DEFINITION, DefineDosDeviceW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, GetLogicalDrives,
+    FILE_ATTRIBUTE_NORMAL, GetLogicalDrives, QueryDosDeviceW,
 };
 use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
@@ -101,6 +101,36 @@ fn mount_drive(letter: char, root: &Path) -> windows::core::Result<()> {
             PCWSTR(device.as_ptr()),
             PCWSTR(target.as_ptr()),
         )
+    }
+}
+
+/// 投影ルート `root` に subst されているドライブを全て解除する。
+///
+/// プロセスがクラッシュ / 強制終了 / `std::process::exit` で死ぬと Drop が走らず subst が
+/// 残る (subst はログオンセッション存続)。起動時・セッション開始時・トレイ終了時にこれを呼び、
+/// 自分のルートを指す残骸ドライブを掃除して This PC に古いドライブが残らないようにする。
+pub(super) fn unmount_drives_for_root(root: &Path) {
+    // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
+    let used = unsafe { GetLogicalDrives() };
+    let needle = root.to_string_lossy().to_lowercase();
+    for i in 0..26u32 {
+        if used & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let device = wide(&format!("{letter}:"));
+        let mut buf = [0u16; 1024];
+        // SAFETY: device は null 終端の有効な PCWSTR。buf は出力先 (subst の NT ターゲットパス)。
+        let n = unsafe { QueryDosDeviceW(PCWSTR(device.as_ptr()), Some(&mut buf)) };
+        if n == 0 {
+            continue;
+        }
+        // subst のターゲットは `\??\C:\...\Aurora\remote` の形。ルートパスを含めば自分の残骸。
+        let target = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+        if target.contains(&needle) {
+            unmount_drive(letter);
+            tracing::info!(drive = %format!("{letter}:"), "removed stale ProjFS drive");
+        }
     }
 }
 
@@ -263,6 +293,9 @@ pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
     .context("PrjStartVirtualizing (Client-ProjFS feature が無効の可能性)")?;
 
     tracing::info!(root = %root.display(), "ProjFS virtualization started");
+
+    // 直前の異常終了 (クラッシュ / 強制終了 / process::exit) で残った自分のドライブを先に掃除する。
+    unmount_drives_for_root(root);
 
     // This PC「デバイスとドライブ」に一時的なドライブとして出す。失敗してもフォルダ自体は
     // パスで参照できるので致命的ではない (ログのみ)。Drop でこのドライブを解除する。
