@@ -896,7 +896,8 @@ async fn fs_read(root: &Path, rel: &str, offset: u64, length: u32) -> (Vec<u8>, 
 
 /// 書き込み系操作のパス解決。
 ///
-/// レキシカルな `..` / 絶対成分の排除に加え、**シンボリックリンク / ジャンクション経由の
+/// 空 / `.` のみのパス (= 共有ルート自身) を拒否し、レキシカルな `..` / 絶対成分の排除に
+/// 加え、**シンボリックリンク / ジャンクション経由の
 /// ルート外脱出も防ぐ**。レキシカルチェックだけだと、共有ルート内に既存のジャンクション
 /// (例: `link` → `C:\`) があると `link/Windows/...` で OS がそれを辿り、共有外への書込・
 /// 削除を許してしまう (書込系 API はリンクを作れないが、利用者が事前に置いたリンクを
@@ -906,6 +907,11 @@ async fn fs_read(root: &Path, rel: &str, offset: u64, length: u32) -> (Vec<u8>, 
 /// 名前なので、その配下に作っても root 内に留まる)。
 async fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let mut p = root.to_path_buf();
+    // 空 / `.` だけのパスは共有ルート自身を指す。破壊・改名・作成系でこれを許すと、
+    // 悪意あるホストが `FsDelete{path:""}` 1 通で共有ルートごと `remove_dir_all` させられる
+    // (ユーザーが共有を許可した範囲はルート「内」のファイル操作であり、ルート本体の削除/
+    // 改名は想定外)。最低 1 つの正当なコンポーネントを要求してルートへの直接作用を弾く。
+    let mut had_component = false;
     for comp in rel.split('/') {
         if comp.is_empty() || comp == "." {
             continue;
@@ -914,6 +920,10 @@ async fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
             return Err(format!("unsafe path component: {comp}"));
         }
         p.push(comp);
+        had_component = true;
+    }
+    if !had_component {
+        return Err("refusing operation on share root itself".into());
     }
     let canon_root = tokio::fs::canonicalize(root)
         .await
@@ -1203,4 +1213,29 @@ async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空 / `.` / `/` のみのパスは共有ルート自身を指すため、破壊系の `safe_join` は
+    /// canonicalize に到達する前に拒否する (ルートごと remove_dir_all される回帰を防ぐ)。
+    #[tokio::test]
+    async fn safe_join_rejects_share_root_itself() {
+        let root = Path::new("nonexistent-share-root");
+        for rel in ["", ".", "/", "./", "//", "/.//."] {
+            let r = safe_join(root, rel).await;
+            assert!(r.is_err(), "expected rejection for {rel:?}, got {r:?}");
+        }
+    }
+
+    /// `..` / 区切り混入はコンポーネント単位で拒否する。
+    #[tokio::test]
+    async fn safe_join_rejects_traversal_components() {
+        let root = Path::new("nonexistent-share-root");
+        for rel in ["..", "a/../b", "a\\b", "C:/x"] {
+            assert!(safe_join(root, rel).await.is_err(), "should reject {rel:?}");
+        }
+    }
 }
