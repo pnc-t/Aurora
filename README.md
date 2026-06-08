@@ -3,7 +3,27 @@
 出先の PC から自宅 PC に接続して操作する、自作の軽量リモートデスクトップアプリ。
 RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています。設計目標は **「軽く・早く・快適」**。
 
-> ⚠️ 個人プロジェクトです。**ネットワークは [Tailscale](https://tailscale.com/) (Tailnet) 直結を前提**にしており、NAT 越え・シグナリング・中継サーバは実装していません。
+> ⚠️ 個人プロジェクトです。**ネットワークは [Tailscale](https://tailscale.com/) (Tailnet) 直結を前提**にしており、NAT 越え・シグナリング・中継サーバは実装していません。独立した第三者によるセキュリティ監査は受けていません。自己責任で利用してください。
+
+| | |
+|--|--|
+| 言語 / ランタイム | Rust 2024 edition + `tokio` |
+| プラットフォーム | ホスト: Windows (主対象) / クライアント: Tauri v2 |
+| ネットワーク | Tailscale (Tailnet) 直結前提 |
+| ライセンス | MIT OR Apache-2.0 |
+
+---
+
+## ドキュメント
+
+詳しい解説は [`docs/`](docs/README.md) にあります。
+
+- [アーキテクチャ](docs/architecture.md) — クレート構成・パイプライン・タスク分割
+- [プロトコル](docs/protocol.md) — TCP 制御 / UDP 映像・音声のワイヤフォーマット
+- [セキュリティ](docs/security.md) — 暗号化・認証・脅威モデル・既知の制約
+- [ビルドと実行](docs/build.md) — 必要環境・ビルド手順・CLI オプション
+- [無人起動セットアップ](docs/remote-access-setup.md) — 自動起動 + WoL で出先から接続
+- [トラブルシュート](docs/troubleshooting.md)
 
 ---
 
@@ -61,7 +81,7 @@ crates/
 
 ## ビルドと実行
 
-> Windows / PowerShell 前提
+> Windows / PowerShell 前提。以下はクイックスタートです。CLI オプションや配布インストーラを含む詳細は [docs/build.md](docs/build.md) を参照してください。
 
 ### ホスト (操作される側)
 
@@ -92,6 +112,7 @@ cargo tauri build        # crates/client/src-tauri から実行
 | オプション | 説明 |
 |-----------|------|
 | `--port N` | 待ち受けポート (既定 7000) |
+| `--bind ADDR` | 待ち受けアドレス (既定: Tailscale IP 自動 → 無ければ `0.0.0.0`) |
 | `--set-password` / `--clear-password` | 接続パスワードの設定 / 削除 (DPAPI 保存) |
 | `--install` / `--uninstall` | ログオン時自動起動タスクの登録 / 解除 |
 | `--fps N` | 送出 fps 上限 (0 = 無制限) |
@@ -106,6 +127,9 @@ cargo tauri build        # crates/client/src-tauri から実行
 - **暗号化**: Noise XX-PSK でハンドシェイクし、以降のセッションを暗号化。PSK は接続パスワードから **Argon2id** (m=19MiB, t=2, p=1) で導出
 - 制御チャネル (TCP) と映像/音声チャネル (UDP) を分離し、ノンスドメインでクロスチャネル注入を多重防御
 - パスワードは OS の保護ストア (Windows: DPAPI) に保存し、ログには出しません
+- ホストは既定で **Tailscale インターフェースのみに bind** し、LAN/インターネットへの露出を避けます
+
+脅威モデルと既知の制約の詳細は [docs/security.md](docs/security.md) を参照してください。
 
 ---
 
@@ -126,4 +150,11 @@ Windows を優先して完成させ、Mac/Linux は OS ポート (`cfg` 分岐�
 
 ## ライセンス
 
-MIT OR Apache-2.0
+以下のいずれかを選択して利用できます。
+
+- Apache License 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+`SPDX-License-Identifier: MIT OR Apache-2.0`
+
+アイコン画像は ChatGPT (OpenAI) で生成したものです。
