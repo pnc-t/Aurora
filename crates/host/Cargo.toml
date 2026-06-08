@@ -13,6 +13,11 @@ path = "src/main.rs"
 name = "handshake_smoke"
 path = "examples/handshake_smoke.rs"
 
+[build-dependencies]
+# Windows exe にアイコン (とバージョン情報) を埋め込む。トレイ/エクスプローラ/タスクバーで
+# aurora アイコンを表示するため。非 Windows ターゲットでは build.rs 側で no-op にする。
+winresource = "0.1"
+
 [dependencies]
 aurora-common = { path = "../common" }
 tokio = { workspace = true }

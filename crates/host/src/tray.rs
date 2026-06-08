@@ -146,14 +146,17 @@ mod imp {
                 }
             };
 
-            // トレイアイコン登録。標準のアプリアイコンを使う。
+            // トレイアイコン登録。build.rs で exe へ埋め込んだ aurora アイコン (リソース
+            // ID = 1) を使う。万一読めなければ標準アプリアイコンへフォールバックする。
+            let hicon = LoadIconW(hinstance, PCWSTR(1 as *const u16))
+                .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))?;
             let mut nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: hwnd,
                 uID: 1,
                 uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
                 uCallbackMessage: WM_TRAY,
-                hIcon: LoadIconW(HINSTANCE::default(), IDI_APPLICATION)?,
+                hIcon: hicon,
                 ..Default::default()
             };
             let tip = to_wide("Aurora Host");
