@@ -15,3 +15,4 @@
 #file-panel button { background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
 #file-panel button:disabled { opacity: 0.5; cursor: default; }
 #file-panel .progress { font-family: monospace; font-size: 11px; color: var(--muted); min-width: 64px; text-align: right; }
+#file-panel .hint { font-size: 12px; color: var(--muted); }
