@@ -196,6 +196,16 @@ pub fn remote_root() -> std::path::PathBuf {
     std::path::PathBuf::from("aurora-remote")
 }
 
+/// 投影ルートを指す残骸ドライブ (異常終了で残った subst) を掃除する。
+///
+/// Drop は通常 (クライアント切断) のドライブ解除を担うが、`std::process::exit` (トレイ終了) や
+/// クラッシュ / 強制終了では走らないため subst が残る。ホスト起動時とトレイ終了時にこれを呼び、
+/// This PC に古い投影ドライブが残らないようにする。Windows 以外は no-op。
+pub fn cleanup_drives() {
+    #[cfg(windows)]
+    windows::unmount_drives_for_root(&remote_root());
+}
+
 /// 投影セッション。Drop で仮想化を停止し、割り当てたドライブも解除する
 /// (CLAUDE.md: OS リソースは Drop 解放)。
 pub struct Virtualization {
