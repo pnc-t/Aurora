@@ -1,4 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import "./styles/base.css";
 import {
   connectToHost,
@@ -6,6 +7,7 @@ import {
   saveRecentHost,
   selectDisplay,
   setVideoParams,
+  uploadFileFromPath,
   formatDisplayName,
   type ClientEvent,
   type DisplayDto,
@@ -279,3 +281,62 @@ function handleClientEvent(ev: ClientEvent): void {
       break;
   }
 }
+
+// --- キャプチャ画面へのファイル D&D アップロード (client → host) ---
+// 接続中のみ受け付ける。Tauri ネイティブの drag-drop はファイルの「パス」を返すので、
+// Rust 側 (upload_file_from_path) がそのファイルを読み、既存アップロードプロトコルで
+// host へ送る (バイト列を WebView に載せない)。完了/失敗は file_result のトーストで出る。
+let dropHint: HTMLElement | null = null;
+function showDropHint(on: boolean): void {
+  if (!dropHint) {
+    dropHint = document.createElement("div");
+    dropHint.id = "drop-hint";
+    dropHint.textContent = "ドロップしてホストへ転送";
+    Object.assign(dropHint.style, {
+      position: "fixed",
+      inset: "0",
+      display: "none",
+      placeItems: "center",
+      font: "600 18px system-ui, sans-serif",
+      color: "#fff",
+      background: "rgba(18,20,26,0.55)",
+      border: "3px dashed rgba(255,255,255,0.65)",
+      zIndex: "9999",
+      pointerEvents: "none",
+    });
+    document.body.appendChild(dropHint);
+  }
+  dropHint.style.display = on ? "grid" : "none";
+}
+
+async function uploadDroppedPaths(paths: string[]): Promise<void> {
+  // 複数ファイルは host が 1 転送ずつ処理するため逐次アップロードする
+  // (同時に流すと file チャネル上でチャンクが交錯し offset 不一致になる)。
+  for (const path of paths) {
+    const id = Date.now() >>> 0;
+    const name = path.replace(/^.*[\\/]/, "");
+    showToast(`アップロード中: ${name}`);
+    try {
+      await uploadFileFromPath(id, path);
+    } catch (e) {
+      showToast(`アップロード失敗: ${String(e)}`, "error");
+    }
+  }
+}
+
+void getCurrentWebview().onDragDropEvent((event) => {
+  const p = event.payload;
+  // 未接続 (ランチャー表示中) はファイルドロップを無視する。
+  if (!connected) {
+    showDropHint(false);
+    return;
+  }
+  if (p.type === "enter" || p.type === "over") {
+    showDropHint(true);
+  } else if (p.type === "leave") {
+    showDropHint(false);
+  } else if (p.type === "drop") {
+    showDropHint(false);
+    if (p.paths.length > 0) void uploadDroppedPaths(p.paths);
+  }
+});
