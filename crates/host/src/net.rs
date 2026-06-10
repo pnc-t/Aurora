@@ -236,6 +236,29 @@ pub struct ServerConfig {
     pub max_bitrate_bps: u32,
 }
 
+/// 同一アドレスで TCP/UDP を bind する。キャプチャ固着回復の re-exec 直後は、旧プロセスが
+/// まだポートを保持していてアドレス使用中になることがあるため、数秒間リトライしてから諦める
+/// (通常は旧プロセス終了で数十 ms 以内に空く)。通常起動では初回で成功する。
+async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>)> {
+    const ATTEMPTS: u32 = 25; // 25 × 200ms ≒ 5 秒
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match TcpListener::bind(addr).await {
+            Ok(tcp) => match UdpSocket::bind(addr).await {
+                Ok(udp) => return Ok((tcp, Arc::new(udp))),
+                Err(e) => {
+                    last_err = Some(anyhow::Error::new(e).context(format!("bind UDP {addr}")))
+                }
+            },
+            Err(e) => last_err = Some(anyhow::Error::new(e).context(format!("bind TCP {addr}"))),
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("bind {addr} failed")))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     cfg: ServerConfig,
@@ -255,14 +278,7 @@ pub async fn run_server(
     loop {
         let port = cfg.port.load(Ordering::Relaxed);
         let addr = SocketAddr::new(cfg.bind_ip, port);
-        let tcp = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("bind TCP {addr}"))?;
-        let udp = Arc::new(
-            UdpSocket::bind(addr)
-                .await
-                .with_context(|| format!("bind UDP {addr}"))?,
-        );
+        let (tcp, udp) = bind_listeners(addr).await?;
         tracing::info!(tcp = %addr, udp = %addr, "host listening");
 
         // 内側ループ: 接続受理。reload が来たら break して外側で貼り直す。ポート変更は接続中

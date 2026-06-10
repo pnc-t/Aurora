@@ -358,6 +358,42 @@ fn attach_console(alloc_if_none: bool) {
     }
 }
 
+/// 持続的なキャプチャ固着からの最終手段: 同じ実行ファイルを同じ引数で起動し直し、現プロセスを
+/// 終了する。HDR ディスプレイのロック→アンロック遷移後などに DXGI Desktop Duplication が
+/// ACCESS_LOST を返し続け、共有デバイスの作り直しもスレッドの入力デスクトップ貼り直しも効かず、
+/// プロセスを生かしたままでは二度と復帰しないケースがある (実機確認済)。固着は DXGI/DWM への
+/// プロセス単位の接続が壊れることに起因し、プロセス内のどの再生成 API でもリセットできない。
+/// 新プロセスはこの接続を張り直せるためキャプチャが復帰する。client は自動再接続する。
+///
+/// 起動に成功したら現プロセスを `exit(0)` で終える (戻らない)。spawn 自体に失敗した場合のみ戻り、
+/// 呼び出し側はキャプチャのリトライを続ける (動いている可能性を残すため自殺はしない)。
+fn reexec_self() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "re-exec: current_exe failed; continuing retries");
+            return;
+        }
+    };
+    // 自身の起動引数 (--port / --bind / --log-level 等) をそのまま引き継ぐ。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    tracing::warn!(
+        ?exe,
+        ?args,
+        "capture stuck unrecoverably; re-exec host to recover"
+    );
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => {
+            // 新プロセスがポートを bind できるよう、旧プロセスは速やかに終了してソケットを解放する
+            // (新プロセス側は bind をリトライして待つ)。
+            std::process::exit(0);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "re-exec: spawn failed; continuing retries");
+        }
+    }
+}
+
 fn dump_one_bmp() -> Result<()> {
     let device = capture::create_shared_device()?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
@@ -750,9 +786,19 @@ fn capture_loop(
         .checked_sub(min_interval)
         .unwrap_or_else(Instant::now);
 
+    // 持続的なキャプチャ固着がこの時間続いたら、プロセスを再起動して回復する (re-exec)。
+    // 一過性の ACCESS_LOST (UAC・解像度変更・短時間ロック) は安価な再構築で数秒以内に戻るため、
+    // それらを巻き込まないよう猶予を取る。実機で復帰不能と判明した HDR ロック遷移はこれを超える。
+    const REEXEC_AFTER: Duration = Duration::from_secs(8);
+
     let mut cur_id = initial_id;
     let mut cap = PlatformCapturer::new_for_output(device.clone(), cur_id)?;
     let mut reported = false;
+    // 一度でもフレームを取得できたか (= このプロセスでキャプチャが成立する環境か)。re-exec は
+    // 「動いていたのに固着した」場合に限定し、起動時から取得できない環境での再起動ループを防ぐ。
+    let mut captured_ok = false;
+    // 連続失敗が始まった時刻。Ok で None に戻す。
+    let mut first_fail: Option<Instant> = None;
     loop {
         // 実行時の fps 上限変更 (クライアント SetVideoParams) を反映する。
         while let Ok(fps) = fps_rx.try_recv() {
@@ -777,13 +823,27 @@ fn capture_loop(
         }
         // next_frame のエラーでスレッドを終わらせない。DXGI Desktop Duplication は
         // 画面ロック・UAC セキュアデスクトップ・解像度変更・フルスクリーン切替で
-        // DXGI_ERROR_ACCESS_LOST を返すのが正常動作で、capturer を作り直せば復帰できる。
+        // DXGI_ERROR_ACCESS_LOST を返すのが正常動作で、多くは capturer を作り直せば復帰する。
         // ここで `?` で抜けるとホスト再起動まで映像が永久に止まる (無人運用で致命的)。
         // 再構築に失敗する間 (ロック画面中など) は 500ms 間隔でリトライし続ける。
+        //
+        // ただし HDR ディスプレイのロック→アンロック遷移後などは、capturer を作り直しても
+        // (新しい共有デバイスでも、スレッドの入力デスクトップを貼り直しても) AcquireNextFrame が
+        // ACCESS_LOST を返し続け、プロセスを生かしたままでは永久に復帰しないケースがある
+        // (実機確認済: 固着は DXGI/DWM へのプロセス単位の接続が壊れることに起因)。一度は取得
+        // できていたのに REEXEC_AFTER を超えて固着が続いたら、プロセスを再起動して回復する。
         let acquired = match cap.next_frame(Duration::from_millis(100)) {
-            Ok(f) => f,
+            Ok(f) => {
+                first_fail = None;
+                f
+            }
             Err(e) => {
-                tracing::warn!(error = %e, id = cur_id, "capture failed; rebuilding capturer");
+                let stuck_for = first_fail.get_or_insert_with(Instant::now).elapsed();
+                tracing::warn!(error = %e, id = cur_id, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
+                if captured_ok && stuck_for >= REEXEC_AFTER {
+                    // プロセス内のどの再生成でも復帰しないと判断。再起動で回復する (戻らない)。
+                    reexec_self();
+                }
                 std::thread::sleep(Duration::from_millis(500));
                 match PlatformCapturer::new_for_output(device.clone(), cur_id) {
                     Ok(c) => {
@@ -799,6 +859,7 @@ fn capture_loop(
             }
         };
         if let Some(f) = acquired {
+            captured_ok = true;
             // (再)構築直後の最初のフレーム寸法を実解像度として通知する。
             if !reported {
                 let _ = res_tx.try_send((f.width, f.height));
