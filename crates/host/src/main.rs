@@ -454,8 +454,11 @@ fn set_password_interactive() -> Result<()> {
     if pw1 != pw2 {
         return Err(anyhow!("passwords do not match"));
     }
-    if pw1.is_empty() {
-        return Err(anyhow!("password must not be empty"));
+    if pw1.chars().count() < aurora_common::noise::MIN_PASSWORD_LEN {
+        return Err(anyhow!(
+            "password must be at least {} characters",
+            aurora_common::noise::MIN_PASSWORD_LEN
+        ));
     }
     secret::save_password(&pw1)?;
     println!("password saved to secure store (DPAPI, current user)");

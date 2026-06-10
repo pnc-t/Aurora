@@ -13,7 +13,14 @@ use tokio::sync::mpsc;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 同期する最大テキスト長 (バイト)。これを超えるものは無視する。
-const MAX_TEXT_BYTES: usize = 1024 * 1024;
+///
+/// 制御メッセージは TCP フレーム (長さ u16 = 最大 65535B) に収める必要がある。
+/// `ControlMsg::Clipboard{text}` は text 本体に加え bincode の enum タグ・文字列長
+/// プレフィックス・Noise AEAD タグ (16B) が乗るため、これらのオーバーヘッドを引いた
+/// 安全側の 60KiB を上限にする。これより大きいと送信がフレーム超過で失敗し、host/client
+/// とも `?` でセッションごと切断していた (長文コピーで自爆する可用性バグ)。超過分は
+/// 黙って無視し、同期しないだけで接続は維持する。
+const MAX_TEXT_BYTES: usize = 60 * 1024;
 
 /// クリップボードアクターのハンドル。`apply_tx` は複数所有者で送れるよう Clone 可能。
 /// 別途返される `change_rx` を読むのは単一の所有者。

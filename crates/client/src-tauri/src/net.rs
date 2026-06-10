@@ -617,15 +617,11 @@ fn download_dir() -> PathBuf {
 
 /// `download_dir()` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
 async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> {
-    use std::path::Path;
     let dir = download_dir();
     tokio::fs::create_dir_all(&dir).await?;
-    let safe = Path::new(name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("download.bin");
-    let path = dir.join(safe);
+    // パス区切り・ADS (`:`) を中和し、ファイル名成分のみを採用する (host open_upload と対称)。
+    let safe = aurora_common::fsname::sanitize_filename(name, "download.bin");
+    let path = dir.join(&safe);
     let file = tokio::fs::File::create(&path).await?;
     Ok((file, path.display().to_string()))
 }

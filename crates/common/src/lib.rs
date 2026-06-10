@@ -2,6 +2,7 @@
 
 pub mod clipboard;
 pub mod framing;
+pub mod fsname;
 pub mod noise;
 pub mod proto;
 

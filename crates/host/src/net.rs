@@ -119,18 +119,13 @@ fn upload_dir() -> std::path::PathBuf {
 /// `%USERPROFILE%\Aurora\received` 配下に保存先ファイルを作る。
 /// ファイル名はパス区切りを除去して安全化する。
 async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
-    use std::path::Path;
     let dir = upload_dir();
     tokio::fs::create_dir_all(&dir)
         .await
         .context("create aurora-received dir")?;
-    // パス区切りを含む名前を弾き、ファイル名成分のみを採用する
-    let safe = Path::new(name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("upload.bin");
-    let path = dir.join(safe);
+    // パス区切り・ADS (`:`) を中和し、ファイル名成分のみを採用する (client open_download と対称)。
+    let safe = aurora_common::fsname::sanitize_filename(name, "upload.bin");
+    let path = dir.join(&safe);
     let file = tokio::fs::File::create(&path)
         .await
         .with_context(|| format!("create {}", path.display()))?;
@@ -353,27 +348,42 @@ async fn handle_client(
     // TCP 接続だけして何も送らないとここで永久にブロックし、単一クライアントモデルでは
     // accept ループが進まず正規ユーザーまで締め出される (認証前 DoS)。
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    // 認証/ハンドシェイク失敗時に切断前へ入れる遅延。snow は PSK 不一致を最終メッセージの
+    // 復号失敗として返すため、ここに来る = パスワード誤りかプロトコル不正。オンライン総当たりの
+    // 試行レートを落とす。正規ユーザーの成功パスは遅延しない。HANDSHAKE_TIMEOUT より十分短く、
+    // 単一クライアントモデルでの正規ユーザー締め出し (既知の認証前 DoS) を大きく悪化させない。
+    const AUTH_FAIL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-    // <- e
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
-        .await
-        .context("handshake timed out (e)")??;
-    hs.read_msg(&buf, &mut tmp)?;
-    // -> e, ee, s, es
-    let mut out_msg = Vec::new();
-    hs.write_msg(&[], &mut out_msg)?;
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, write_tcp_frame(&mut stream, &out_msg))
-        .await
-        .context("handshake timed out (e,ee,s,es)")??;
-    // <- s, se, psk
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
-        .await
-        .context("handshake timed out (s,se,psk)")??;
-    hs.read_msg(&buf, &mut tmp)?;
-
-    // session は単一 handle_client タスク内でのみ使う。snow の StatelessTransportState は
-    // encrypt/decrypt とも &self なので Arc<Mutex> は不要 (映像 UDP のパケット毎ロックを排除)。
-    let session = hs.into_transport()?;
+    // ハンドシェイク 3 メッセージ + transport 確立を 1 ブロックにまとめ、失敗時に遅延を挟む。
+    let session = match async {
+        // <- e
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
+            .await
+            .context("handshake timed out (e)")??;
+        hs.read_msg(&buf, &mut tmp)?;
+        // -> e, ee, s, es
+        let mut out_msg = Vec::new();
+        hs.write_msg(&[], &mut out_msg)?;
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, write_tcp_frame(&mut stream, &out_msg))
+            .await
+            .context("handshake timed out (e,ee,s,es)")??;
+        // <- s, se, psk
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
+            .await
+            .context("handshake timed out (s,se,psk)")??;
+        hs.read_msg(&buf, &mut tmp)?;
+        // snow の StatelessTransportState は encrypt/decrypt とも &self なので Arc<Mutex> は
+        // 不要 (映像 UDP のパケット毎ロックを排除)。
+        hs.into_transport().map_err(anyhow::Error::from)
+    }
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tokio::time::sleep(AUTH_FAIL_DELAY).await;
+            return Err(e);
+        }
+    };
     tracing::info!(peer = %peer, "noise handshake complete");
 
     // TCP を読み書きの 2 ハーフに分割する。読み取りは専用タスクへ隔離し、本体の select
