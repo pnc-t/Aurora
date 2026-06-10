@@ -772,7 +772,30 @@ fn capture_loop(
                 }
             }
         }
-        if let Some(f) = cap.next_frame(Duration::from_millis(100))? {
+        // next_frame のエラーでスレッドを終わらせない。DXGI Desktop Duplication は
+        // 画面ロック・UAC セキュアデスクトップ・解像度変更・フルスクリーン切替で
+        // DXGI_ERROR_ACCESS_LOST を返すのが正常動作で、capturer を作り直せば復帰できる。
+        // ここで `?` で抜けるとホスト再起動まで映像が永久に止まる (無人運用で致命的)。
+        // 再構築に失敗する間 (ロック画面中など) は 500ms 間隔でリトライし続ける。
+        let acquired = match cap.next_frame(Duration::from_millis(100)) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, id = cur_id, "capture failed; rebuilding capturer");
+                std::thread::sleep(Duration::from_millis(500));
+                match PlatformCapturer::new_for_output(device.clone(), cur_id) {
+                    Ok(c) => {
+                        cap = c;
+                        reported = false;
+                        tracing::info!(id = cur_id, "capturer rebuilt");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, id = cur_id, "capturer rebuild failed; retrying");
+                    }
+                }
+                continue;
+            }
+        };
+        if let Some(f) = acquired {
             // (再)構築直後の最初のフレーム寸法を実解像度として通知する。
             if !reported {
                 let _ = res_tx.try_send((f.width, f.height));
