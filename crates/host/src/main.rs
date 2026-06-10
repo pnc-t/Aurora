@@ -367,7 +367,7 @@ fn attach_console(alloc_if_none: bool) {
 ///
 /// 起動に成功したら現プロセスを `exit(0)` で終える (戻らない)。spawn 自体に失敗した場合のみ戻り、
 /// 呼び出し側はキャプチャのリトライを続ける (動いている可能性を残すため自殺はしない)。
-fn reexec_self() {
+fn reexec_self(current_port: u16) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -375,8 +375,20 @@ fn reexec_self() {
             return;
         }
     };
-    // 自身の起動引数 (--port / --bind / --log-level 等) をそのまま引き継ぐ。
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 自身の起動引数 (--bind / --log-level 等) を引き継ぐ。ただし --port は元の CLI 値を
+    // そのまま再生すると、起動後にトレイで変更したポートへ巻き戻ってしまう (明示 --port は
+    // 保存値より優先のため)。元の --port を除去し、現在の実効ポートに置き換えて渡す。
+    let mut args: Vec<String> = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--port" {
+            let _ = it.next(); // 値も読み飛ばす
+            continue;
+        }
+        args.push(a);
+    }
+    args.push("--port".into());
+    args.push(current_port.to_string());
     tracing::warn!(
         ?exe,
         ?args,
@@ -679,6 +691,8 @@ fn run_server(
     // 実行時 fps 変更 (クライアントの SetVideoParams) を capture スレッドへ届けるチャネル。
     let (fps_tx, fps_rx) = std::sync::mpsc::channel::<u32>();
     let cap_device = device.clone();
+    // re-exec 時に現在の実効ポート (トレイ変更反映済み) を引き継ぐため共有して渡す。
+    let cap_port = port_cell.clone();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
@@ -690,6 +704,7 @@ fn run_server(
                 initial_id,
                 fps_cap,
                 fps_rx,
+                cap_port,
             ) {
                 tracing::error!(error = %e, "capture loop ended");
             }
@@ -756,6 +771,7 @@ fn run_server(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_loop(
     device: capture::SharedDevice,
     tx: mpsc::Sender<Frame>,
@@ -764,6 +780,7 @@ fn capture_loop(
     initial_id: u32,
     fps_cap: u32,
     fps_rx: std::sync::mpsc::Receiver<u32>,
+    port: Arc<std::sync::atomic::AtomicU16>,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
     #[cfg(target_os = "windows")]
@@ -842,7 +859,7 @@ fn capture_loop(
                 tracing::warn!(error = %e, id = cur_id, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
                 if captured_ok && stuck_for >= REEXEC_AFTER {
                     // プロセス内のどの再生成でも復帰しないと判断。再起動で回復する (戻らない)。
-                    reexec_self();
+                    reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 match PlatformCapturer::new_for_output(device.clone(), cur_id) {

@@ -237,26 +237,26 @@ pub struct ServerConfig {
 }
 
 /// 同一アドレスで TCP/UDP を bind する。キャプチャ固着回復の re-exec 直後は、旧プロセスが
-/// まだポートを保持していてアドレス使用中になることがあるため、数秒間リトライしてから諦める
-/// (通常は旧プロセス終了で数十 ms 以内に空く)。通常起動では初回で成功する。
+/// まだポートを保持していてアドレス使用中 (AddrInUse) になることがあるため、その場合のみ
+/// 数秒間リトライする (通常は旧プロセス終了で数十 ms 以内に空く)。それ以外のエラー
+/// (--bind の IP がマシンに無い等の設定ミス) はリトライしても直らないので即時失敗させる。
 async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>)> {
     const ATTEMPTS: u32 = 25; // 25 × 200ms ≒ 5 秒
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..ATTEMPTS {
-        match TcpListener::bind(addr).await {
+    let mut attempt = 0u32;
+    loop {
+        let (what, e) = match TcpListener::bind(addr).await {
             Ok(tcp) => match UdpSocket::bind(addr).await {
                 Ok(udp) => return Ok((tcp, Arc::new(udp))),
-                Err(e) => {
-                    last_err = Some(anyhow::Error::new(e).context(format!("bind UDP {addr}")))
-                }
+                Err(e) => ("UDP", e),
             },
-            Err(e) => last_err = Some(anyhow::Error::new(e).context(format!("bind TCP {addr}"))),
+            Err(e) => ("TCP", e),
+        };
+        attempt += 1;
+        if e.kind() != std::io::ErrorKind::AddrInUse || attempt >= ATTEMPTS {
+            return Err(anyhow::Error::new(e).context(format!("bind {what} {addr}")));
         }
-        if attempt + 1 < ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("bind {addr} failed")))
 }
 
 #[allow(clippy::too_many_arguments)]
