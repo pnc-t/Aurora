@@ -480,7 +480,7 @@ pub async fn set_video_params(
 }
 
 /// ホスト上のファイルのダウンロードを要求する。受信は reader ループが
-/// `aurora-downloads/` に保存し、完了を FileResult イベントで通知する。
+/// `%USERPROFILE%\Aurora\downloads` に保存し、完了を FileResult イベントで通知する。
 #[tauri::command]
 pub async fn request_file(
     id: u32,
@@ -525,7 +525,13 @@ pub async fn upload_file_from_path(
     let mut file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| format!("open {path}: {e}"))?;
-    let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    // size=0 を誤って告知すると host 側が「告知サイズ超過」で初回チャンクから拒否して
+    // しまうため、metadata 失敗はここでエラーにする。
+    let size = file
+        .metadata()
+        .await
+        .map(|m| m.len())
+        .map_err(|e| format!("metadata {path}: {e}"))?;
     file_tx
         .send(ControlMsg::FileOffer { id, name, size })
         .await
@@ -595,11 +601,25 @@ struct DownloadState {
     path: String,
 }
 
-/// `aurora-downloads/` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
+/// ダウンロード保存ディレクトリ (`%USERPROFILE%\Aurora\downloads`)。
+///
+/// インストール版アプリはショートカット起動で CWD が不定 (書き込み不可の場所もある) の
+/// ため、CWD 相対では保存に失敗したり場所が予測不能になる。host 側 `upload_dir` と対称に、
+/// ユーザープロファイル配下の固定パスへ絶対化して discoverable にする。
+/// `USERPROFILE` (非 Windows では `HOME`) が無ければ最後の手段としてカレントディレクトリ。
+fn download_dir() -> PathBuf {
+    let base = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("Aurora").join("downloads")
+}
+
+/// `download_dir()` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
 async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> {
     use std::path::Path;
-    let dir = Path::new("aurora-downloads");
-    tokio::fs::create_dir_all(dir).await?;
+    let dir = download_dir();
+    tokio::fs::create_dir_all(&dir).await?;
     let safe = Path::new(name)
         .file_name()
         .and_then(|s| s.to_str())
@@ -702,14 +722,28 @@ async fn tcp_reader_loop(
             } => match download.as_mut() {
                 Some(d) if d.id == id => {
                     if offset != d.written {
+                        // TCP は順序保証があるため offset 不一致は本来起きない。発生したら
+                        // データ欠落/重複の可能性が高く、書き込むと破損ファイルを残すため
+                        // 中断する (host 側アップロード受信と対称の防御)。
                         tracing::warn!(
                             id,
                             expected = d.written,
                             got = offset,
-                            "download offset mismatch"
+                            "download offset mismatch, aborting"
                         );
-                    }
-                    if d.written.saturating_add(data.len() as u64) > d.total {
+                        if let Ok(mut s) = pending_downloads.lock() {
+                            s.remove(&id);
+                        }
+                        let _ = event_channel.send(ClientEvent::FileResult {
+                            id,
+                            ok: false,
+                            message: format!(
+                                "download offset mismatch: expected {}, got {offset}",
+                                d.written
+                            ),
+                        });
+                        download = None;
+                    } else if d.written.saturating_add(data.len() as u64) > d.total {
                         // 告知サイズ超過は中断する。悪意あるホストが告知より多く送り、
                         // クライアントのディスクを埋めるのを防ぐ。
                         tracing::warn!(
@@ -1110,13 +1144,31 @@ async fn udp_reader_loop(
     let mut last_keyframe_req = Instant::now() - Duration::from_secs(1);
 
     loop {
+        // recv エラーでループを終了させない。Windows の connected UDP ソケットは
+        // ICMP Port Unreachable (対向ポートの一時不達等) を WSAECONNRESET として recv
+        // エラーで返すため、`?` で抜けると映像タスクだけが静かに死ぬ (TCP セッションは
+        // 生きているので Disconnected も自動再接続も発火しない)。捨てて受信を続ける。
         let n = if established {
-            udp.recv(&mut recv_buf).await?
+            match udp.recv(&mut recv_buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!(error = %e, "UDP recv error ignored");
+                    continue;
+                }
+            }
         } else {
             tokio::select! {
                 r = udp.recv(&mut recv_buf) => {
-                    established = true;
-                    r?
+                    match r {
+                        Ok(n) => {
+                            established = true;
+                            n
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "UDP recv error ignored");
+                            continue;
+                        }
+                    }
                 }
                 _ = hello_interval.tick() => {
                     let _ = udp.send(b"AURHELLO").await;
@@ -1257,10 +1309,9 @@ async fn read_tcp_frame<R: AsyncReadExt + Unpin>(
 ) -> anyhow::Result<()> {
     let mut len_buf = [0u8; 2];
     stream.read_exact(&mut len_buf).await?;
+    // 長さは u16 なので最大 65535。受信サイズはこれで自然に有界で、メッセージ本体の
+    // 上限は復号後の bincode (with_limit MAX_TCP_FRAME) が守る。
     let len = u16::from_be_bytes(len_buf) as usize;
-    if len > MAX_TCP_FRAME {
-        anyhow::bail!("frame too large: {len}");
-    }
     out.resize(len, 0);
     stream.read_exact(out).await?;
     Ok(())
