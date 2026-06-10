@@ -605,8 +605,12 @@ mod imp {
                 Ok(h) => get_text(h),
                 Err(_) => return,
             };
-            if pw1.is_empty() {
-                message_box(hwnd, "パスワードを入力してください。", "Aurora Host");
+            if pw1.chars().count() < aurora_common::noise::MIN_PASSWORD_LEN {
+                let msg = format!(
+                    "パスワードは{}文字以上で入力してください。",
+                    aurora_common::noise::MIN_PASSWORD_LEN
+                );
+                message_box(hwnd, &msg, "Aurora Host");
                 return;
             }
             if pw1 != pw2 {

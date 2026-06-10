@@ -15,6 +15,14 @@ use thiserror::Error;
 
 pub const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 
+/// 接続パスワードの最低長 (文字数)。
+///
+/// XX-PSK は接続を試みた相手にハンドシェイク転写を渡すため、弱いパスワードは Argon2id を
+/// 通してもオフライン辞書攻撃で破られうる。空・極短パスワードを設定段階で禁止し、オン/
+/// オフライン双方の総当たり探索空間を最低限確保する。host の `--set-password` と tray の
+/// パスワード変更ダイアログの両方で強制すること (設定経路を対称に硬化する)。
+pub const MIN_PASSWORD_LEN: usize = 8;
+
 /// Nonce 空間のドメイン分割。
 ///
 /// TCP 制御・UDP 映像・UDP 音声は同一 UDP/TCP 接続上で **同一 Noise 方向 (= 同一鍵)**
