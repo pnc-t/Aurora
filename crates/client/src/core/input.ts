@@ -67,6 +67,9 @@ export function detachInput(): void {
   document.removeEventListener("pointerlockchange", onPointerLockChange);
   document.removeEventListener("pointerlockerror", onPointerLockError);
   releaseAllInput();
+  // ホイールの端数累積をセッションを跨いで持ち越さない。
+  wheelAccX = 0;
+  wheelAccY = 0;
   // キャプチャ中なら解除する。
   if (document.pointerLockElement) document.exitPointerLock();
   state.captured = false;

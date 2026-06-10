@@ -97,18 +97,25 @@ let pendingEntry: HostEntry | null = null;
 let connected = false;
 
 /** セッションを開く下回り。チャネルを張って connect_to_host を呼ぶ (再接続も共用)。 */
+// セッション世代。openSession ごとに進め、旧セッションのチャネルに残っていたイベント
+// (遅れて届く Disconnected 等) が新しい接続の状態を壊さないようにする。
+let sessionGen = 0;
+
 async function openSession(
   entry: HostEntry,
   password: string | null,
   save: boolean,
 ): Promise<void> {
+  const gen = ++sessionGen;
   lastHost = entry.host;
   pendingEntry = entry;
+  disconnectHandled = false;
   resetDecoder();
   const eventChannel = new Channel<ClientEvent>();
   const videoChannel = new Channel<ArrayBuffer>();
-  eventChannel.onmessage = handleClientEvent;
+  eventChannel.onmessage = (ev) => handleClientEvent(ev, gen);
   videoChannel.onmessage = (data) => {
+    if (gen !== sessionGen) return; // 旧セッションの残映像は捨てる
     // Tauri は ArrayBuffer / number[] のどちらかで来る場合がある。
     const buf = data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
     handleVideoChunk(buf);
@@ -158,13 +165,21 @@ function cancelReconnect(): void {
 }
 
 function startReconnect(): void {
-  if (reconnecting || !pendingEntry) return;
-  reconnecting = true;
-  reconnectAttempt = 0;
+  if (!pendingEntry) return;
+  if (!reconnecting) {
+    reconnecting = true;
+    reconnectAttempt = 0;
+  } else if (reconnectTimer !== null) {
+    // 次の試行が予約済みならそれに任せる。reconnecting 中でも timer が無い
+    // (試行したセッションが確立後に死んだ等) なら再予約して継続する。
+    return;
+  }
   scheduleReconnect();
 }
 
 function scheduleReconnect(): void {
+  // doDisconnect 経由と attemptReconnect の catch の両方から来ても timer を重複させない。
+  if (reconnectTimer !== null) clearTimeout(reconnectTimer);
   const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
   launcher.setConnState(`再接続待機 ${Math.round(delay / 1000)}s… (試行 ${reconnectAttempt + 1})`, "connecting");
   reconnectTimer = window.setTimeout(() => void attemptReconnect(), delay);
@@ -192,11 +207,16 @@ async function attemptReconnect(): Promise<void> {
   }
 }
 
+// セッションごとの切断処理の実行済みフラグ。サーバ起因の切断では reader/writer の
+// 両タスクが Disconnected を送るため二重に呼ばれる。`connected` での判定だと、接続確立前
+// (host_info 受信前) にセッションが死んだとき切断が握りつぶされ UI が固まる/再接続が
+// 走らないため、openSession でリセットする専用フラグで重複だけを抑止する。
+let disconnectHandled = true;
+
 /** 切断処理 (ユーザー操作・ホスト切断の両方から呼ぶ)。 */
 function doDisconnect(reason: string, userInitiated = false): void {
-  // サーバ起因の切断では reader/writer の両タスクが Disconnected を送るため二重に呼ばれる。
-  // 既に未接続なら何もしない (トーストやランチャー復帰の重複を防ぐ)。
-  if (!connected) return;
+  if (disconnectHandled) return;
+  disconnectHandled = true;
   void disconnect();
   connected = false;
   detachInput(); // ポインタロックも解除される
@@ -219,7 +239,8 @@ function doDisconnect(reason: string, userInitiated = false): void {
   }
 }
 
-function handleClientEvent(ev: ClientEvent): void {
+function handleClientEvent(ev: ClientEvent, gen: number): void {
+  if (gen !== sessionGen) return; // 旧セッションの残イベントは無視
   switch (ev.kind) {
     case "connected":
       launcher.setConnState("handshake complete…", "connecting");
@@ -309,11 +330,15 @@ function showDropHint(on: boolean): void {
   dropHint.style.display = on ? "grid" : "none";
 }
 
+// アップロード転送 id。同一ミリ秒の複数ファイルで衝突しないよう、時刻シードの連番にする。
+let nextUploadId = Date.now() >>> 0;
+
 async function uploadDroppedPaths(paths: string[]): Promise<void> {
   // 複数ファイルは host が 1 転送ずつ処理するため逐次アップロードする
   // (同時に流すと file チャネル上でチャンクが交錯し offset 不一致になる)。
   for (const path of paths) {
-    const id = Date.now() >>> 0;
+    const id = nextUploadId;
+    nextUploadId = (nextUploadId + 1) >>> 0;
     const name = path.replace(/^.*[\\/]/, "");
     showToast(`アップロード中: ${name}`);
     try {

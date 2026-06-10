@@ -156,7 +156,21 @@ async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<Control
             return;
         }
     };
-    let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    // size=0 を誤って告知すると受信側が「告知サイズ超過」で初回チャンクから拒否して
+    // しまうため、metadata 失敗は転送エラーとして通知する。
+    let size = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            let _ = out_tx
+                .send(ControlMsg::FileResult {
+                    id,
+                    ok: false,
+                    message: format!("metadata failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
     let name = std::path::Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -713,10 +727,9 @@ async fn send_control_msg<W: AsyncWriteExt + Unpin>(
 async fn read_tcp_frame<R: AsyncReadExt + Unpin>(stream: &mut R, out: &mut Vec<u8>) -> Result<()> {
     let mut len_buf = [0u8; 2];
     stream.read_exact(&mut len_buf).await.context("read len")?;
+    // 長さは u16 なので最大 65535。受信サイズはこれで自然に有界で、メッセージ本体の
+    // 上限は復号後の bincode (with_limit 64KiB) が守る。
     let len = u16::from_be_bytes(len_buf) as usize;
-    if len > 64 * 1024 {
-        return Err(anyhow!("frame too large: {len}"));
-    }
     out.resize(len, 0);
     stream.read_exact(out).await.context("read frame body")?;
     Ok(())
