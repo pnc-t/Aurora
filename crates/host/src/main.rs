@@ -634,6 +634,9 @@ fn run_server(
     // 通知し、net (accept ループ) が TCP/UDP を貼り直すことで再起動なしに反映される。
     let port_cell = Arc::new(std::sync::atomic::AtomicU16::new(port));
     let reload = Arc::new(tokio::sync::Notify::new());
+    // 認証失敗の累計カウンタ。net (接続受理) が加算し、tray がメニューに表示することで、
+    // オーナーが「総当たりに晒されているか」に気付けるようにする (#2 可視化)。
+    let auth_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
     tray::spawn(
@@ -641,6 +644,7 @@ fn run_server(
         has_password,
         port_cell.clone(),
         reload.clone(),
+        auth_failures.clone(),
         !have_stored,
     );
 
@@ -773,6 +777,7 @@ fn run_server(
             displays,
             audio: audio_enabled,
             max_bitrate_bps,
+            auth_failures,
         };
         net::run_server(
             cfg,

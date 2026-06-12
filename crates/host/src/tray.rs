@@ -4,7 +4,7 @@
 //!
 //! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
 
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32};
 use std::sync::{Arc, Mutex};
 
 /// host 全体で共有する接続 PSK。net 層が接続受理時に読み、tray がパスワード変更時に書く。
@@ -15,6 +15,9 @@ pub type SharedHasPassword = Arc<AtomicBool>;
 
 /// host 全体で共有する待受ポート。tray がポート変更で書き、net が reload 後に読み直す。
 pub type SharedPort = Arc<AtomicU16>;
+
+/// 認証失敗の累計カウンタ。net が接続受理で加算し、tray がメニューに表示する。
+pub type SharedAuthFailures = Arc<AtomicU32>;
 
 /// ポート変更を net の accept ループへ伝える反映トリガ (`notify_one` で TCP/UDP 貼り直し)。
 pub type Reload = Arc<tokio::sync::Notify>;
@@ -27,12 +30,13 @@ pub fn spawn(
     has_password: SharedHasPassword,
     port: SharedPort,
     reload: Reload,
+    auth_failures: SharedAuthFailures,
     prompt_now: bool,
 ) {
     let _ = std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            if let Err(e) = imp::run(psk, has_password, port, reload, prompt_now) {
+            if let Err(e) = imp::run(psk, has_password, port, reload, auth_failures, prompt_now) {
                 tracing::warn!(error = %e, "tray UI disabled");
             }
         });
@@ -44,13 +48,14 @@ pub fn spawn(
     _has_password: SharedHasPassword,
     _port: SharedPort,
     _reload: Reload,
+    _auth_failures: SharedAuthFailures,
     _prompt_now: bool,
 ) {
 }
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{Reload, SharedHasPassword, SharedPort, SharedPsk};
+    use super::{Reload, SharedAuthFailures, SharedHasPassword, SharedPort, SharedPsk};
     use aurora_common::noise::psk_from_password;
     use std::ffi::c_void;
     use std::sync::atomic::Ordering;
@@ -86,6 +91,7 @@ mod imp {
         has_password: SharedHasPassword,
         port: SharedPort,
         reload: Reload,
+        auth_failures: SharedAuthFailures,
     }
 
     /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
@@ -98,6 +104,7 @@ mod imp {
         has_password: SharedHasPassword,
         port: SharedPort,
         reload: Reload,
+        auth_failures: SharedAuthFailures,
         prompt_now: bool,
     ) -> windows::core::Result<()> {
         unsafe {
@@ -120,6 +127,7 @@ mod imp {
                 has_password,
                 port,
                 reload,
+                auth_failures,
             }));
 
             // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
@@ -246,6 +254,17 @@ mod imp {
                 Ok(m) => m,
                 Err(_) => return,
             };
+            // 認証失敗の累計を情報行 (操作不可) として先頭に出す。0 のときは出さない。
+            // 総当たりに晒されていればここで数が伸びるので、オーナーが気付ける。
+            if let Some(state) = wnd_state(hwnd) {
+                let n = state.auth_failures.load(Ordering::Relaxed);
+                if n > 0 {
+                    let label = to_wide(&format!("認証失敗: {n} 回 (起動以降)"));
+                    // AppendMenuW は文字列を内部コピーするので label は直後に drop してよい。
+                    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(label.as_ptr()));
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                }
+            }
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
