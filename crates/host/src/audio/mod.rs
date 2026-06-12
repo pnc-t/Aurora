@@ -89,12 +89,22 @@ fn build_capture_stream(tx: mpsc::Sender<EncodedAudio>) -> Result<cpal::Stream> 
     let mut acc: Vec<f32> = Vec::with_capacity(FRAME_INTERLEAVED * 2);
     let mut out_buf = vec![0u8; MAX_PAYLOAD];
     let mut seq: u32 = 0;
+    // nonce 空間 (u32 seq) 枯渇フラグ。net 層は `NONCE_DOMAIN_AUDIO | seq` を nonce に
+    // 使うため、seq が一周すると同一セッション鍵で nonce が再利用され ChaChaPoly の
+    // 機密性・完全性が破れる。映像側 (net.rs の checked_add + 切断) と対称の防御。
+    // 音声スレッドはセッションをまたいでプロセスと同寿命のため、枯渇時は切断ではなく
+    // 音声送出を恒久停止する (2^32 フレーム ≒ 連続 2.7 年で到達)。
+    let mut exhausted = false;
 
     let err_fn = |e| tracing::warn!(error = %e, "audio input stream error");
     let stream = device
         .build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if exhausted {
+                    acc.clear();
+                    return;
+                }
                 acc.extend_from_slice(data);
                 while acc.len() >= FRAME_INTERLEAVED {
                     match encoder.encode_float(&acc[..FRAME_INTERLEAVED], &mut out_buf) {
@@ -103,7 +113,16 @@ fn build_capture_stream(tx: mpsc::Sender<EncodedAudio>) -> Result<cpal::Stream> 
                                 seq,
                                 data: out_buf[..n].to_vec(),
                             };
-                            seq = seq.wrapping_add(1);
+                            seq = match seq.checked_add(1) {
+                                Some(s) => s,
+                                None => {
+                                    tracing::error!(
+                                        "audio nonce space exhausted; stopping audio capture"
+                                    );
+                                    exhausted = true;
+                                    return;
+                                }
+                            };
                             // バックプレッシャ時は捨てる (音声は次フレームで自然回復)。
                             let _ = tx.try_send(frame);
                         }
