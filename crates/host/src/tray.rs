@@ -636,6 +636,24 @@ mod imp {
                 message_box(hwnd, "確認用パスワードが一致しません。", "Aurora Host");
                 return;
             }
+            // 最低長は満たすが弱い兆候があればソフト警告 (はい=続行 / いいえ=再考)。CLI の
+            // --set-password と同じ判定を使い、設定経路の防御を対称に保つ。
+            if let Some(reason) = aurora_common::noise::weak_password_reason(&pw1) {
+                let text = to_wide(&format!(
+                    "{reason}。\nより強いパスワードを推奨します (例: {})。\n\nこのまま設定しますか?",
+                    crate::suggest_passphrase()
+                ));
+                let caption = to_wide("Aurora Host");
+                let r = MessageBoxW(
+                    hwnd,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(caption.as_ptr()),
+                    MB_YESNO | MB_ICONWARNING,
+                );
+                if r != IDYES {
+                    return; // ダイアログは開いたまま (パスワードを選び直せる)
+                }
+            }
             if !ptr.is_null() {
                 (*ptr).value = Some(pw1);
             }

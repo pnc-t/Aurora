@@ -510,6 +510,11 @@ fn set_password_interactive() -> Result<()> {
 
     require_password_change_authorization()?;
 
+    // 弱いパスワード選択を避けてもらうため、強いパスフレーズ候補を先に提示する。
+    println!(
+        "Tip: 長いパスフレーズを推奨します (例: \"{}\")",
+        suggest_passphrase()
+    );
     print!("Enter new Aurora password: ");
     std::io::stdout().flush().ok();
     let pw1 = read_secret_line()?;
@@ -526,9 +531,39 @@ fn set_password_interactive() -> Result<()> {
             aurora_common::noise::MIN_PASSWORD_LEN
         ));
     }
+    // 最低長は満たすが弱い兆候があればソフト警告 (保存は続行する)。
+    if let Some(reason) = aurora_common::noise::weak_password_reason(&pw1) {
+        eprintln!("warning: {reason}。より強いパスワードを推奨します (このまま保存します)。");
+    }
     secret::save_password(&pw1)?;
     println!("password saved to secure store (DPAPI, current user)");
     Ok(())
+}
+
+/// 推奨パスフレーズ候補を生成する (語彙から 4 語をランダムにハイフン連結)。パスワード設定時の
+/// ヒントとして提示し、利用者が弱いパスワードを選びにくくする。提案専用 (強制はしない)。
+pub(crate) fn suggest_passphrase() -> String {
+    use rand::seq::SliceRandom;
+    /// 打ちやすい一般的な短い英単語。提案用の小さな語彙 (網羅性より打鍵しやすさ重視)。
+    const WORDS: &[&str] = &[
+        "amber", "anchor", "apple", "arrow", "autumn", "bamboo", "beacon", "birch", "bison",
+        "bloom", "branch", "breeze", "bridge", "bright", "canyon", "cedar", "cherry", "cloud",
+        "clover", "cobalt", "comet", "copper", "coral", "cotton", "crater", "crisp", "crystal",
+        "dawn", "delta", "ember", "falcon", "feather", "fern", "flint", "forest", "garnet",
+        "glacier", "granite", "harbor", "hazel", "heron", "indigo", "island", "ivory", "jade",
+        "jasmine", "juniper", "kettle", "lagoon", "lantern", "ledge", "lemon", "lilac", "lotus",
+        "lumen", "maple", "marble", "meadow", "mellow", "meteor", "mint", "moss", "nectar",
+        "nimbus", "oak", "ocean", "olive", "onyx", "opal", "orchid", "otter", "pebble", "pepper",
+        "pine", "plum", "pollen", "poppy", "prairie", "quartz", "quill", "raven", "ridge", "river",
+        "rowan", "saffron", "sage", "salmon", "sapphire", "sierra", "silver", "spruce", "summit",
+        "sunset", "tamarind", "thistle", "timber", "topaz", "tulip", "umber", "valley", "velvet",
+        "violet", "walnut", "willow", "winter", "zephyr",
+    ];
+    let mut rng = rand::thread_rng();
+    (0..4)
+        .map(|_| *WORDS.choose(&mut rng).unwrap_or(&"aurora"))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// 標準入力から 1 行をエコーなしで読み取る (パスワード入力用)。
