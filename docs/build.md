@@ -32,7 +32,8 @@ cargo run -p aurora-host -- --set-password
 ```
 
 既定で TCP/UDP ともポート `7000` を待ち受けます。bind 先は既定で Tailscale インターフェース
-のみ (未導入時は `0.0.0.0`)。リリースビルドはコンソール無しでバックグラウンド + システム
+のみ (未導入時は `127.0.0.1` loopback に fail-closed。LAN/インターネットへは到達不能で、公開は
+`--bind <ip>` で明示)。リリースビルドはコンソール無しでバックグラウンド + システム
 トレイ常駐になり、トレイアイコンからパスワード変更・終了ができます。
 
 無人起動 (自動起動 + 固定パスワード + WoL) の構成は
@@ -43,7 +44,7 @@ cargo run -p aurora-host -- --set-password
 | オプション | 説明 |
 |------|------|
 | `--port N` | 待ち受けポート (既定 7000) |
-| `--bind ADDR` | 待ち受けアドレス。未指定なら Tailscale IP を自動採用し、無ければ `0.0.0.0`。`--bind 0.0.0.0` で全 NIC に公開 (LAN テスト用) |
+| `--bind ADDR` | 待ち受けアドレス。未指定なら Tailscale IP を自動採用し、無ければ `127.0.0.1` (loopback) に fail-closed。LAN テストや公開は明示指定 (LAN IP、または全 NIC なら `--bind 0.0.0.0`) |
 | `--set-password` / `--clear-password` | 接続パスワードの設定 / 削除 (DPAPI 保存)。接続中は拒否・現在のパスワード照合あり |
 | `--install` / `--uninstall` | ログオン時自動起動タスク "Aurora Host" の登録 / 解除 (`--install` は他の引数をタスクへ転送) |
 | `--fps N` | 送出 fps 上限 (0 = 無制限) |

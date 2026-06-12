@@ -54,10 +54,11 @@ struct Args {
     port: u16,
     /// `--port` が明示指定されたか。明示時は保存値 (トレイ管理) より CLI を優先する。
     port_explicit: bool,
-    /// 待受アドレス (`--bind`)。未指定なら Tailscale IP を自動採用し、無ければ 0.0.0.0。
-    /// 本プロジェクトは Tailnet 前提のため、既定で tailnet インターフェースのみに公開して
-    /// LAN/インターネットへの露出 (総当たり・接続枠 DoS) を避ける。`--bind 0.0.0.0` で
-    /// 従来どおり全 NIC 公開 (tailnet 済みマシンでの LAN テスト用) に上書きできる。
+    /// 待受アドレス (`--bind`)。未指定なら Tailscale IP を自動採用し、無ければ 127.0.0.1
+    /// (loopback) に fail-closed する。本プロジェクトは Tailnet 前提のため、既定で tailnet
+    /// インターフェースのみに公開して LAN/インターネットへの露出 (総当たり・接続枠 DoS) を
+    /// 避ける。LAN テストや意図的な公開は `--bind <ip>` の明示指定 (例: LAN IP、全 NIC なら
+    /// `--bind 0.0.0.0`) でオプトインする。
     bind: Option<String>,
     /// ログオン時自動起動タスクを登録して終了する。
     install: bool,
@@ -234,10 +235,16 @@ fn main() -> Result<()> {
 
 /// 待受アドレスを解決する。
 ///
-/// 優先順位: `--bind` 明示 > Tailscale IP 自動検出 > `0.0.0.0`。本プロジェクトは Tailnet
-/// 前提のため、既定では tailnet インターフェースのみに公開して LAN/インターネットへの
-/// 露出を避ける。Tailscale 未導入 (CLI 不在 / IP 取得失敗) のときだけ `0.0.0.0` に
-/// フォールバックし、LAN/localhost での動作確認フローを壊さない。
+/// 優先順位: `--bind` 明示 > Tailscale IP 自動検出 > `127.0.0.1` (loopback)。本プロジェクトは
+/// Tailnet 前提のため、既定では tailnet インターフェースのみに公開して LAN/インターネットへの
+/// 露出を避ける。
+///
+/// Tailscale 未導入 (CLI 不在 / IP 取得失敗) のときは **loopback に fail-closed する**。
+/// 以前は `0.0.0.0` (全 NIC) へフォールバックしていたが、これは設計が前提にした「tailnet 限定
+/// 公開」という境界を、最も無防備な環境 (Tailscale が無い PC) で逆向き (全公開) に倒す
+/// fail-open だった。loopback なら localhost での動作確認フローは保てる一方、LAN/インター
+/// ネットへは到達不能になる。LAN テストや意図的な公開は `--bind <ip>` の明示オプトイン
+/// (露出は設定ミスではなく意識的な選択にする)。`--bind 0.0.0.0` で従来挙動も選べる。
 fn resolve_bind_ip(explicit: Option<&str>) -> std::net::IpAddr {
     use std::net::{IpAddr, Ipv4Addr};
     if let Some(s) = explicit {
@@ -253,10 +260,11 @@ fn resolve_bind_ip(explicit: Option<&str>) -> std::net::IpAddr {
         }
         None => {
             tracing::warn!(
-                "Tailscale IP not found; binding to 0.0.0.0 (all interfaces). \
-                 Install Tailscale or pass --bind to restrict exposure."
+                "Tailscale IP not found; binding to 127.0.0.1 (loopback only). \
+                 LAN/internet are NOT reachable. Install Tailscale, or pass \
+                 --bind <ip> (e.g. a LAN IP, or 0.0.0.0 for all interfaces) to expose."
             );
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
         }
     }
 }

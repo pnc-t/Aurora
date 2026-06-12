@@ -116,7 +116,7 @@ cargo tauri build        # crates/client/src-tauri から実行
 | オプション | 説明 |
 |-----------|------|
 | `--port N` | 待ち受けポート (既定 7000) |
-| `--bind ADDR` | 待ち受けアドレス (既定: Tailscale IP 自動 → 無ければ `0.0.0.0`) |
+| `--bind ADDR` | 待ち受けアドレス (既定: Tailscale IP 自動 → 無ければ `127.0.0.1` loopback に fail-closed。公開は `--bind <ip>` で明示) |
 | `--set-password` / `--clear-password` | 接続パスワードの設定 / 削除 (DPAPI 保存) |
 | `--install` / `--uninstall` | ログオン時自動起動タスクの登録 / 解除 |
 | `--fps N` | 送出 fps 上限 (0 = 無制限) |
