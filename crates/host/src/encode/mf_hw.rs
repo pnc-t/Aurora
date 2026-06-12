@@ -343,7 +343,16 @@ impl Inner {
                 }
 
                 let keyframe = is_keyframe_annexb(&data);
-                let frame_id = self.in_flight.pop_front().unwrap_or(0);
+                // 投入時に積んだ frame_id と 1:1 で突き合わせる。キューが空 = 対応が崩れて
+                // いる。frame_id を捏造 (0 等) して送るとクライアントの再組立てが静かに
+                // 狂うため、このサンプルは破棄して警告を残す (次のキーフレームで回復する)。
+                let Some(frame_id) = self.in_flight.pop_front() else {
+                    tracing::warn!(
+                        len = data.len(),
+                        "encoder output without matching submitted frame; dropping sample"
+                    );
+                    return Ok(());
+                };
                 self.out_queue.push_back(EncodedNal {
                     data,
                     keyframe,

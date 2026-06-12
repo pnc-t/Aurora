@@ -210,10 +210,20 @@ fn copy_bgra_into(dst: &mut VideoFrame, bgra: &[u8], src_stride: usize, w: u32, 
     for y in 0..h {
         let src_off = y * src_stride;
         let dst_off = y * dst_stride;
-        if src_off + row_bytes <= bgra.len() && dst_off + row_bytes <= dst_data.len() {
-            dst_data[dst_off..dst_off + row_bytes]
-                .copy_from_slice(&bgra[src_off..src_off + row_bytes]);
+        if src_off + row_bytes > bgra.len() || dst_off + row_bytes > dst_data.len() {
+            // 想定外のバッファ不足 (stride×height と実バッファ長の不一致)。黙って行を
+            // 落とすと「フレーム下端の乱れ」の原因調査が困難になるため、警告して打ち切る
+            // (このフレームは不完全だが次フレームで回復する)。
+            tracing::warn!(
+                y,
+                h,
+                src_len = bgra.len(),
+                dst_len = dst_data.len(),
+                "BGRA row copy out of bounds; truncating frame"
+            );
+            return;
         }
+        dst_data[dst_off..dst_off + row_bytes].copy_from_slice(&bgra[src_off..src_off + row_bytes]);
     }
 }
 
