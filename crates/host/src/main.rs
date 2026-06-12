@@ -395,10 +395,20 @@ fn reexec_self(current_port: u16) {
         "capture stuck unrecoverably; re-exec host to recover"
     );
     match std::process::Command::new(&exe).args(&args).spawn() {
-        Ok(_) => {
-            // 新プロセスがポートを bind できるよう、旧プロセスは速やかに終了してソケットを解放する
-            // (新プロセス側は bind をリトライして待つ)。
-            std::process::exit(0);
+        Ok(mut child) => {
+            // spawn 成功 = 回復成功ではない。子が引数不正や初期化失敗で即死しているのに
+            // exit(0) すると誰も残らない (完全停止)。少しだけ待って生存確認し、即死して
+            // いたら旧プロセスを生かしてリトライを続ける。子は bind の AddrInUse を 5 秒
+            // リトライして待つため、この待ちが子の bind を失敗させることはない。
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::error!(%status, "re-exec: child died immediately; keeping old process");
+                }
+                // 生存中 (None) / 確認失敗: 子に委ね、旧プロセスは速やかに終了してソケットを
+                // 解放する (新プロセス側は bind をリトライして待つ)。
+                _ => std::process::exit(0),
+            }
         }
         Err(e) => {
             tracing::error!(error = %e, "re-exec: spawn failed; continuing retries");
@@ -809,7 +819,18 @@ fn capture_loop(
     const REEXEC_AFTER: Duration = Duration::from_secs(8);
 
     let mut cur_id = initial_id;
-    let mut cap = PlatformCapturer::new_for_output(device.clone(), cur_id)?;
+    // 初回の capturer 構築も失敗でスレッドを終わらせない。`?` で抜けると net 側の待受は
+    // 続くのに映像が永久に出ない「ゾンビホスト」になる (特に re-exec 直後は DXGI が
+    // 一時的に失敗しうる)。成功するまで 500ms 間隔でリトライする。
+    let mut cap = loop {
+        match PlatformCapturer::new_for_output(device.clone(), cur_id) {
+            Ok(c) => break c,
+            Err(e) => {
+                tracing::warn!(error = %e, id = cur_id, "initial capturer create failed; retrying");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    };
     let mut reported = false;
     // 一度でもフレームを取得できたか (= このプロセスでキャプチャが成立する環境か)。re-exec は
     // 「動いていたのに固着した」場合に限定し、起動時から取得できない環境での再起動ループを防ぐ。
@@ -855,11 +876,23 @@ fn capture_loop(
                 f
             }
             Err(e) => {
-                let stuck_for = first_fail.get_or_insert_with(Instant::now).elapsed();
-                tracing::warn!(error = %e, id = cur_id, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
-                if captured_ok && stuck_for >= REEXEC_AFTER {
-                    // プロセス内のどの再生成でも復帰しないと判断。再起動で回復する (戻らない)。
-                    reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
+                // ロック画面・UAC セキュアデスクトップ中の ACCESS_LOST は、デスクトップが
+                // 戻れば復帰する正常動作。固着時間に数えると 8 秒を超える通常のロックや
+                // UAC 放置のたびに re-exec (= セッション切断) してしまうため、入力デスク
+                // トップが Default のときだけ数える。HDR 固着はアンロック後 (Default 復帰後)
+                // も ACCESS_LOST が続くので、この条件でも確実に検出できる。
+                if !capture::input_desktop_is_default() {
+                    first_fail = None;
+                    tracing::debug!(error = %e, id = cur_id, "capture failed on lock/secure desktop; not counted as stuck");
+                } else {
+                    let stuck_for = first_fail.get_or_insert_with(Instant::now).elapsed();
+                    tracing::warn!(error = %e, id = cur_id, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
+                    if captured_ok && stuck_for >= REEXEC_AFTER {
+                        // プロセス内のどの再生成でも復帰しないと判断。再起動で回復する (戻らない)。
+                        // 固着原因は Windows/DXGI 固有だが、再起動による回復自体は OS 非依存で、
+                        // captured_ok ガードにより再起動ループにもならないため共通コードに置く。
+                        reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 match PlatformCapturer::new_for_output(device.clone(), cur_id) {
