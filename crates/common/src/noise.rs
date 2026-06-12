@@ -23,6 +23,75 @@ pub const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 /// パスワード変更ダイアログの両方で強制すること (設定経路を対称に硬化する)。
 pub const MIN_PASSWORD_LEN: usize = 8;
 
+/// 最低長は満たすが弱いことが多い代表的パスワード (小文字化して比較)。網羅的辞書ではなく、
+/// 設定時にソフト警告を出すための代表例。
+const COMMON_WEAK: &[&str] = &[
+    "password",
+    "password1",
+    "passw0rd",
+    "12345678",
+    "123456789",
+    "1234567890",
+    "qwertyui",
+    "qwerty123",
+    "11111111",
+    "00000000",
+    "aaaaaaaa",
+    "iloveyou",
+    "admin123",
+    "administrator",
+    "letmein1",
+    "welcome1",
+    "abc12345",
+    "football",
+    "baseball",
+    "sunshine",
+    "princess",
+    "trustno1",
+    "superman",
+    "starwars",
+    "whatever",
+    "computer",
+    "changeme",
+    "aurora123",
+];
+
+/// パスワードに弱い兆候があれば理由を返す (`None` = 明白な弱さ無し)。最低長
+/// ([`MIN_PASSWORD_LEN`]) チェックを通った後の **ソフト警告** 用 (ハード禁止はしない)。
+///
+/// host の `--set-password` (CLI) と tray のパスワード変更ダイアログの両方で使い、設定経路の
+/// 防御を対称に保つ。長いパスフレーズ (12 文字以上) は文字種が単一でも許容する (これらは
+/// オフライン耐性が十分で、無用な警告を出さないため)。
+pub fn weak_password_reason(password: &str) -> Option<&'static str> {
+    let lower = password.to_ascii_lowercase();
+    if COMMON_WEAK.contains(&lower.as_str()) {
+        return Some("よく使われるパスワードです");
+    }
+    // 全部同じ文字 (例: "aaaaaaaa")。空文字列は None に落とす。
+    if let Some(first) = password.chars().next() {
+        if password.chars().all(|c| c == first) {
+            return Some("同じ文字の繰り返しです");
+        }
+    }
+    // 全部数字 (例: 生年月日・連番)。
+    if !password.is_empty() && password.chars().all(|c| c.is_ascii_digit()) {
+        return Some("数字だけで構成されています");
+    }
+    // 文字種が 1 種類だけ かつ 短め (12 文字未満)。長いパスフレーズは許容する。
+    let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+    let has_other = password.chars().any(|c| !c.is_ascii_alphanumeric());
+    let kinds = [has_lower, has_upper, has_digit, has_other]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if kinds <= 1 && password.chars().count() < 12 {
+        return Some("文字種が少なく短いパスワードです");
+    }
+    None
+}
+
 /// Nonce 空間のドメイン分割。
 ///
 /// TCP 制御・UDP 映像・UDP 音声は同一 UDP/TCP 接続上で **同一 Noise 方向 (= 同一鍵)**
@@ -235,5 +304,26 @@ mod tests {
         let psk = [0u8; 32];
         let hs = HandshakeState::new_initiator(&psk).unwrap();
         assert!(matches!(hs.into_transport(), Err(NoiseError::NotFinished)));
+    }
+
+    #[test]
+    fn weak_password_flags_common_and_low_diversity() {
+        // よくあるパスワード (大文字小文字無視)。
+        assert!(weak_password_reason("password").is_some());
+        assert!(weak_password_reason("PassW0rd").is_some());
+        // 全部数字 / 全部同じ文字。
+        assert!(weak_password_reason("12345678").is_some());
+        assert!(weak_password_reason("aaaaaaaa").is_some());
+        // 文字種 1 種類で短い。
+        assert!(weak_password_reason("abcdefgh").is_some());
+    }
+
+    #[test]
+    fn weak_password_allows_strong_and_long() {
+        // 文字種が多い短めのパスワード。
+        assert!(weak_password_reason("Tr0ub4dor&3").is_none());
+        // 長いパスフレーズ (文字種が単一でも 12 文字以上なら許容)。
+        assert!(weak_password_reason("correcthorsebatterystaple").is_none());
+        assert!(weak_password_reason("correct-horse-battery-staple").is_none());
     }
 }
