@@ -11,8 +11,11 @@ Aurora は自宅 PC の画面・入力をネットワーク越しに開放する
 - **Tailscale (Tailnet) 直結が前提**。NAT 越え・シグナリング・中継サーバは実装しません。
   通信は Tailnet 内 (`100.x.x.x`) に閉じ、外側からは Tailscale の認証・ACL で守られます。
 - ホストは既定で **Tailscale インターフェースのみに bind** します (`main.rs` の `resolve_bind_ip`)。
-  優先順位は `--bind` 明示 > Tailscale IP 自動検出 > `0.0.0.0`。Tailscale 未導入のときだけ
-  全 NIC (`0.0.0.0`) にフォールバックし、LAN/localhost での動作確認を壊しません。
+  優先順位は `--bind` 明示 > Tailscale IP 自動検出 > `127.0.0.1` (loopback)。Tailscale 未導入の
+  ときは **loopback に fail-closed** します (localhost での動作確認は可能、LAN/インターネットへは
+  到達不能)。以前は `0.0.0.0` (全 NIC) へフォールバックしていましたが、これは Tailscale が無い
+  最も無防備な環境で境界を全公開側へ倒す fail-open だったため改めました。LAN テストや意図的な
+  公開は `--bind <ip>` (例: LAN IP、全 NIC なら `--bind 0.0.0.0`) で明示的にオプトインします。
   → 既定で LAN/インターネットへ露出せず、総当たりや接続枠 DoS の的を減らします。
 
 ## 暗号化と認証

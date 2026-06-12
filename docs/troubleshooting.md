@@ -8,7 +8,7 @@
 | 症状 | 確認点 |
 |------|------|
 | 接続できない | `tailscale status` で双方がオンラインか。client の接続先 `<port>` が host の `--port` と一致しているか |
-| host に届かない (Tailnet 経由) | host が Tailscale IP に bind しているか。Tailscale 未導入だと `0.0.0.0` にフォールバックする。意図的に LAN 公開するなら `--bind 0.0.0.0` |
+| host に届かない (Tailnet 経由) | host が Tailscale IP に bind しているか (起動ログで確認)。Tailscale 未導入だと `127.0.0.1` (loopback) に fail-closed し外部から到達不能。LAN 公開するなら `--bind <LAN IP>`、全 NIC なら `--bind 0.0.0.0` を明示する |
 | パスワードが通らない | client の入力値が host の保存値と一致しているか。`--set-password` をタスクと**同じユーザー**で (昇格せず) 実行したか。`%LOCALAPPDATA%\Aurora\password.bin` があるか |
 | ハンドシェイクで切れる | パスワード (PSK) 不一致が最有力。各ステップ 10 秒でタイムアウトするため、無応答だと切断される |
 | 2 台目から接続できない | host は同時に 1 接続のみ受理する。先のセッションを切ってから接続する |
