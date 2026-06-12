@@ -37,6 +37,51 @@ pub struct DxgiCapturer {
     converter: Converter,
 }
 
+/// 現在の入力デスクトップが既定の "Default" (通常のユーザーデスクトップ) かを返す。
+///
+/// ロック画面や UAC のセキュアデスクトップ中は `OpenInputDesktop` 自体が失敗するか、
+/// 名前が "Winlogon" になるため false を返す。判定不能 (名前取得失敗) は true
+/// (= 従来挙動: 固着時間に数える) へ安全側に倒す。
+///
+/// capture_loop の re-exec 判定に使う: ロック/UAC 中の ACCESS_LOST はデスクトップが
+/// 戻れば復帰する正常動作であり、「プロセス再起動が必要な固着」として数えてはならない。
+pub fn input_desktop_is_default() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetUserObjectInformationW,
+        OpenInputDesktop, UOI_NAME,
+    };
+
+    // SAFETY: 入力デスクトップを読み取り最小権限で開くだけ。失敗 = セキュアデスクトップ等で
+    // 開けない状態なので false (Default ではない) と判定できる。
+    let desk =
+        match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+    let mut name = [0u16; 64];
+    let mut needed = 0u32;
+    // SAFETY: desk は直前に取得した有効ハンドル。バッファ長 (バイト) を渡し UTF-16 名を受ける。
+    let got = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desk.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            (name.len() * 2) as u32,
+            Some(&mut needed),
+        )
+    };
+    // SAFETY: 上で開いたデスクトップハンドルを閉じる (リーク防止)。
+    let _ = unsafe { CloseDesktop(desk) };
+    match got {
+        Ok(()) => {
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("default")
+        }
+        Err(_) => true,
+    }
+}
+
 /// 列挙専用の使い捨て D3D11 デバイスを作る (起動時 1 回)。共有デバイスとは別。
 fn create_enum_device() -> Result<ID3D11Device> {
     // SAFETY: D3D11CreateDevice は OUT パラメータを初期化する。out-only。

@@ -85,7 +85,17 @@ pub mod device;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{DxgiCapturer as PlatformCapturer, debug_frame_to_bgra, enumerate_displays};
+pub use windows::{
+    DxgiCapturer as PlatformCapturer, debug_frame_to_bgra, enumerate_displays,
+    input_desktop_is_default,
+};
+
+/// Windows 以外: ロック画面/セキュアデスクトップ相当の概念を扱わないため常に true
+/// (= capture_loop の固着時間は常に数える)。
+#[cfg(not(target_os = "windows"))]
+pub fn input_desktop_is_default() -> bool {
+    true
+}
 
 #[cfg(target_os = "linux")]
 mod linux;
