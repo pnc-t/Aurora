@@ -10,7 +10,7 @@ use aurora_common::framing::{
 use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_VIDEO, TransportSession,
 };
-use aurora_common::proto::{ControlMsg, Display, InputEvent};
+use aurora_common::proto::{ControlMsg, Display, InputEvent, MouseButton};
 use bincode::Options;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -471,6 +471,12 @@ async fn handle_client(
         }
     };
 
+    // セッション中に押下されたまま解放されていないキー/ボタンの追跡。切断時 (正常・異常
+    // どちらでも) に解放イベントを注入し、ネットワーク断の瞬間に押していたキーがホスト側で
+    // 押しっぱなしになる (stuck key) のを防ぐ。本体ループを async ブロックに包むのは、
+    // ループ内の `?` による早期 return でもこの後始末を必ず通すため。
+    let mut held = HeldInputs::default();
+    let result: Result<()> = async {
     loop {
         tokio::select! {
             // 制御メッセージ受信 (専用リーダタスクが読んだ生フレームをキャンセル安全に受け取る)
@@ -508,6 +514,7 @@ async fn handle_client(
                         }
                     }
                     ControlMsg::Input(ev) => {
+                        held.observe(&ev);
                         if input_tx.send(InputCmd::Event(ev)).await.is_err() {
                             tracing::warn!("input channel closed");
                         }
@@ -674,6 +681,84 @@ async fn handle_client(
         }
     }
     Ok(())
+    }
+    .await;
+
+    // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
+    // 1) stuck key 防止: 押下中のキー/マウスボタンへ解放イベントを注入する。
+    let releases = held.release_events();
+    if !releases.is_empty() {
+        tracing::info!(
+            count = releases.len(),
+            "releasing held inputs on disconnect"
+        );
+        for ev in releases {
+            let _ = input_tx.send(InputCmd::Event(ev)).await;
+        }
+    }
+    // 2) ProjFS RPC を閉じる: 待機中のコールバックを即時エラーで起こし、以後の要求も
+    //    即時失敗にする。`_virt` の Drop (PrjStopVirtualizing = コールバック完了待ち) が
+    //    RPC_TIMEOUT まで引きずられ、次セッションの受理と Explorer が固まるのを防ぐ。
+    fs_bridge.close();
+    fs_req_rx.close();
+
+    result
+}
+
+/// セッション中に押下されたまま解放されていない入力の追跡 (切断時の stuck key 防止)。
+/// クライアントから届いた `InputEvent` を観察して押下状態を保持し、切断時に
+/// [`HeldInputs::release_events`] で解放イベント列を合成する。OS 非依存のここで
+/// 追跡することで、各 OS の injector に状態を持たせず host/client の対称性も保つ。
+#[derive(Default)]
+struct HeldInputs {
+    keys: std::collections::HashSet<u32>,
+    left: bool,
+    right: bool,
+    middle: bool,
+}
+
+impl HeldInputs {
+    fn observe(&mut self, ev: &InputEvent) {
+        match *ev {
+            InputEvent::Key { vk, down } => {
+                if down {
+                    self.keys.insert(vk);
+                } else {
+                    self.keys.remove(&vk);
+                }
+            }
+            InputEvent::MouseButton { button, down } => match button {
+                MouseButton::Left => self.left = down,
+                MouseButton::Right => self.right = down,
+                MouseButton::Middle => self.middle = down,
+            },
+            _ => {}
+        }
+    }
+
+    /// 押下中の全ボタン/キーに対する解放イベント列を返す。ボタンを先に上げる
+    /// (ドラッグ中の切断で「修飾キーだけ先に上がる」中途半端な状態を避ける)。
+    fn release_events(&self) -> Vec<InputEvent> {
+        let mut evs = Vec::new();
+        for (down, button) in [
+            (self.left, MouseButton::Left),
+            (self.right, MouseButton::Right),
+            (self.middle, MouseButton::Middle),
+        ] {
+            if down {
+                evs.push(InputEvent::MouseButton {
+                    button,
+                    down: false,
+                });
+            }
+        }
+        evs.extend(
+            self.keys
+                .iter()
+                .map(|&vk| InputEvent::Key { vk, down: false }),
+        );
+        evs
+    }
 }
 
 /// drop でラップした tokio タスクを abort するガード。handle_client 終了時に

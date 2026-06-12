@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aurora_common::proto::{ControlMsg, FsEntry};
@@ -50,6 +50,8 @@ pub struct FsBridge {
     next_id: AtomicU64,
     /// ディレクトリ一覧の短期キャッシュ (相対パス → (取得時刻, エントリ))。
     dir_cache: Mutex<HashMap<String, (Instant, Vec<FsEntry>)>>,
+    /// セッション終了フラグ。[`FsBridge::close`] 以降の RPC は即時エラーにする。
+    closed: AtomicBool,
 }
 
 impl FsBridge {
@@ -59,6 +61,19 @@ impl FsBridge {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             dir_cache: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// セッション終了時に net ループが呼ぶ。以後の RPC を即時エラーにし、待機中の
+    /// 全 RPC を起こす (pending の tx を drop すると `recv_timeout` が Disconnected で
+    /// 即返る)。これが無いと in-flight のコールバックが `RPC_TIMEOUT` をフルに待ち、
+    /// `PrjStopVirtualizing` (コールバック完了待ち) → 次セッションの受理が最大
+    /// `RPC_TIMEOUT` 遅れる (Explorer もその間固まる)。
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Ok(mut map) = self.pending.lock() {
+            map.clear();
         }
     }
 
@@ -70,6 +85,9 @@ impl FsBridge {
     /// 応答は待たない (ベストエフォート)。bounded チャネルなので満杯時はここで待つ (ProjFS
     /// 同期スレッド上なので blocking 安全)。構造変化 (作成/削除/リネーム) は一覧キャッシュを無効化する。
     pub fn push(&self, msg: ControlMsg) -> bool {
+        if self.closed.load(Ordering::Relaxed) {
+            return false;
+        }
         match &msg {
             ControlMsg::FsCreate { path, .. } | ControlMsg::FsDelete { path } => {
                 self.invalidate_dir_of(path);
@@ -102,6 +120,9 @@ impl FsBridge {
 
     /// 1 件の RPC を発行し、応答 (または timeout) を同期待ちする。
     fn call(&self, make: impl FnOnce(u64) -> ControlMsg) -> Result<FsReply, String> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err("session closed".into());
+        }
         let id = self.next_id();
         let (tx, rx) = std::sync::mpsc::channel();
         self.pending
@@ -111,6 +132,14 @@ impl FsBridge {
         if self.req_tx.blocking_send(make(id)).is_err() {
             self.pending.lock().ok().and_then(|mut m| m.remove(&id));
             return Err("control channel closed".into());
+        }
+        // close() との競合窓を塞ぐ: 先頭の closed 判定後〜insert/send の間に close() が走ると
+        // clear に巻き込まれず RPC_TIMEOUT をフルに待ってしまう。send 後に再確認すれば、
+        // (a) ここで closed を観測して即エラー、(b) close() 側の clear が tx を drop して
+        // recv が Disconnected で即返る、のどちらかに必ず倒れる。
+        if self.closed.load(Ordering::Relaxed) {
+            self.pending.lock().ok().and_then(|mut m| m.remove(&id));
+            return Err("session closed".into());
         }
         match rx.recv_timeout(RPC_TIMEOUT) {
             Ok(r) => Ok(r),
