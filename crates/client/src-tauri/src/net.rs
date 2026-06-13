@@ -204,11 +204,16 @@ pub async fn connect_to_host(
 
     let psk = psk_from_password(&password);
 
+    // この端末の永続 ID 鍵を読み込む (無ければ生成保存)。host のデバイスピン留めで端末を
+    // 識別できるよう、毎回同じ静的公開鍵で接続する。取得失敗時は None=従来の使い捨て鍵。
+    let identity = crate::secret::load_or_create_identity(&app);
+    let identity_priv = identity.as_ref().map(|id| id.private.as_slice());
+
     // --- Noise XX-PSK initiator ---
     // ハンドシェイク I/O には全てタイムアウトを設ける。これが無いと、ポートは開いているが
     // 応答しないホスト (別アプリがポートを掴んでいる等) に対して connect_to_host が永久に
     // 返らず、UI が「connecting…」のままキャンセル不能になる (host 側の HANDSHAKE_TIMEOUT と対)。
-    let mut hs = HandshakeState::new_initiator(&psk).map_err(err)?;
+    let mut hs = HandshakeState::new_initiator(&psk, identity_priv).map_err(err)?;
     let mut buf = Vec::new();
     let mut tmp = Vec::new();
     // -> e
