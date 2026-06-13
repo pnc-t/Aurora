@@ -178,11 +178,13 @@ fn main() -> Result<()> {
         || args.dump_h264.is_some();
 
     // CLI のときだけ親プロセスのコンソールへ接続する (サーバ起動では開かない)。
+    // set/clear-password は現在パスワードを対話入力させる。これらは専用コンソールを確保し
+    // (親 cmd と入力を共有しない)、他のサブコマンドは親コンソールへ出力する。
+    #[allow(unused_mut, unused_assignments)]
+    let mut owns_console = false;
     #[cfg(windows)]
     if needs_console {
-        // set/clear-password は現在パスワードを対話入力させるため、親コンソールが無ければ
-        // 新規割り当てする (ダブルクリック起動でも入力欄が出るように)。
-        attach_console(args.set_password || args.clear_password);
+        owns_console = attach_console(args.set_password || args.clear_password);
     }
 
     // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
@@ -204,15 +206,18 @@ fn main() -> Result<()> {
         return autostart::uninstall();
     }
     if args.set_password {
-        return set_password_interactive();
+        return finish_console_command(set_password_interactive(), owns_console);
     }
     if args.clear_password {
         // set-password と対称に、接続中拒否 + 現在パスワード照合を要求してから削除する
         // (素通しだと接続中の操作者が認証を消して締め出し/乗っ取りできてしまう)。
-        require_password_change_authorization()?;
-        secret::clear_password()?;
-        println!("stored password cleared");
-        return Ok(());
+        let result = (|| -> Result<()> {
+            require_password_change_authorization()?;
+            secret::clear_password()?;
+            println!("stored password cleared");
+            Ok(())
+        })();
+        return finish_console_command(result, owns_console);
     }
 
     if args.dump_bmp {
@@ -352,16 +357,114 @@ fn open_log_file() -> Option<std::fs::File> {
 }
 
 /// CLI サブコマンドのためにコンソールを用意する。端末から起動された場合は親プロセスの
-/// コンソールへ接続して入出力する。`alloc_if_none` が真で親コンソールが無い場合 (例:
-/// ダブルクリック起動) は新規コンソールを割り当てる (`--set-password` の対話入力用)。
-/// デバッグビルドは既にコンソールサブシステムなので `AttachConsole` は失敗するが無害。
+/// コンソールへ接続して入出力する。
+///
+/// `interactive` (= `--set-password`/`--clear-password`) のときは**専用コンソールを確保**する。
+/// リリースは GUI サブシステムのため cmd から起動されても cmd はプロセスを待たずコンソール
+/// 入力を握り続ける。親コンソールへ attach すると入力が cmd に奪われ `stdin` が即 EOF になり
+/// 対話入力が読めない (入力文字が親シェルへ漏れる)。`AllocConsole` で自前のコンソールを持てば
+/// 入力所有権を握れる。`interactive` でなければ (出力のみの `--install` 等) 親コンソールへ出す。
+///
+/// デバッグビルドは既にコンソールサブシステムで `stdin`/`stdout` が機能するため何もしない。
+///
+/// 戻り値は**自前の専用コンソールを割り当てたか** (`true` ならプロセス終了時に窓が即閉じるため、
+/// 結果を見せるには終了前のポーズが要る — [`finish_console_command`] 参照)。
 #[cfg(windows)]
-fn attach_console(alloc_if_none: bool) {
-    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
-    // SAFETY: コンソールへの接続/割り当てのみ。失敗は無視する (接続済み・親無し等)。
+fn attach_console(interactive: bool) -> bool {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, FreeConsole,
+    };
+
+    // コンソールサブシステムのデバッグビルドは標準入出力がそのまま使えるので触らない。
+    if cfg!(debug_assertions) {
+        return false;
+    }
+
+    // SAFETY: コンソールの確保/接続と標準ハンドルの結線のみ。失敗は無視する。
     unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() && alloc_if_none {
-            let _ = AllocConsole();
+        if interactive {
+            // 親 cmd と入力を共有しないよう、既存接続を切ってから専用コンソールを割り当てる。
+            let _ = FreeConsole();
+            if AllocConsole().is_ok() {
+                reopen_std_to_console();
+                return true;
+            }
+            false
+        } else {
+            if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+                reopen_std_to_console();
+            }
+            false
+        }
+    }
+}
+
+/// 自前の専用コンソールを確保した対話コマンド (`--set-password` / `--clear-password`) の終了処理。
+///
+/// `owns_console` が真だと、プロセス終了時に確保したコンソール窓が即閉じて結果 (保存成功・弱パス
+/// 警告・エラー) が読めない。失敗時はエラーを表示し、いずれも Enter 待ちでポーズしてから閉じる。
+/// 既に表示済みのため `Ok` を返し、`anyhow` による二重表示を避ける。親コンソール接続時や
+/// デバッグ (コンソールサブシステム) では `owns_console` が偽で、そのまま結果を返す。
+fn finish_console_command(result: Result<()>, owns_console: bool) -> Result<()> {
+    if !owns_console {
+        return result;
+    }
+    use std::io::Write;
+    if let Err(e) = &result {
+        eprintln!("Error: {e}");
+    }
+    print!("\nEnter キーで閉じます...");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    Ok(())
+}
+
+/// 接続/割り当てたコンソールの読み書きハンドルを開き直し、標準入出力ハンドルに再設定する。
+///
+/// GUI サブシステム (リリース) では `AttachConsole` が `STD_INPUT_HANDLE` 等を繋ぎ直さない
+/// ため、`std::io::stdin().read_line()` が即 EOF を返し対話入力 (`--set-password` /
+/// `--clear-password`) が一切読めない (入力文字が親シェルへ漏れる)。`CONIN$`/`CONOUT$` を
+/// 開いて `SetStdHandle` で差し替えることで標準入出力をコンソールへ正しく結線する。
+#[cfg(windows)]
+fn reopen_std_to_console() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    use windows::core::w;
+
+    let access = (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0;
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+    // SAFETY: コンソールのデバイス名を読み書きで開き、標準ハンドルへ設定するだけ。失敗は無視。
+    unsafe {
+        if let Ok(input) = CreateFileW(
+            w!("CONIN$"),
+            access,
+            share,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            HANDLE::default(),
+        ) {
+            let _ = SetStdHandle(STD_INPUT_HANDLE, input);
+        }
+        if let Ok(output) = CreateFileW(
+            w!("CONOUT$"),
+            access,
+            share,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            HANDLE::default(),
+        ) {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, output);
+            let _ = SetStdHandle(STD_ERROR_HANDLE, output);
         }
     }
 }
