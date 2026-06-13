@@ -25,14 +25,29 @@ fn main() {
         println!("cargo:rustc-link-arg=delayimp.lib");
     }
 
-    // exe へのアイコン埋め込み (Windows のみ)。失敗しても起動はするため warning に留める。
+    // exe へのアイコン埋め込み + マニフェスト (Windows のみ)。失敗しても起動はするため
+    // warning に留める。
     println!("cargo:rerun-if-changed=assets/icon.ico");
     if target_os == "windows" {
         let mut res = winresource::WindowsResource::new();
         // リソース ID を 1 に固定し、tray から MAKEINTRESOURCE(1) で確実に参照できるようにする。
         res.set_icon_with_id("assets/icon.ico", "1");
+        // ComCtl32 v6 への依存を宣言し、ビジュアルスタイル (テーマ) を有効化する。これが無いと
+        // BUTTON/EDIT が Win95 風のフラットなグレー 3D 表示になる。宣言すると tray の設定
+        // ダイアログのボタン/入力欄が現行 Windows のテーマで描画される。DPI awareness は
+        // capture が実行時に SetProcessDpiAwarenessContext で設定するためマニフェストには書かない。
+        res.set_manifest(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>"#,
+        );
         if let Err(e) = res.compile() {
-            println!("cargo:warning=failed to embed icon: {e}");
+            println!("cargo:warning=failed to embed icon/manifest: {e}");
         }
     }
 }
