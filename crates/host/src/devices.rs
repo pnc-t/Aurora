@@ -67,12 +67,32 @@ impl DeviceGuard {
         self.pairing.store(true, Ordering::Relaxed);
     }
 
+    /// 開いているペアリング窓を閉じる (登録せずに取り消す)。
+    pub fn disarm_pairing(&self) {
+        self.pairing.store(false, Ordering::Relaxed);
+    }
+
     pub fn pairing_armed(&self) -> bool {
         self.pairing.load(Ordering::Relaxed)
     }
 
-    pub fn trusted_count(&self) -> usize {
-        self.trusted.lock().map(|t| t.len()).unwrap_or(0)
+    /// 登録済み端末のラベル一覧 (メニュー表示順 = 内部の保持順)。
+    pub fn labels(&self) -> Vec<String> {
+        self.trusted
+            .lock()
+            .map(|t| t.iter().map(|d| d.label.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `index` 番目の登録端末を削除して永続化する。削除したラベルを返す (範囲外は `None`)。
+    pub fn remove(&self, index: usize) -> Option<String> {
+        let mut trusted = self.trusted.lock().ok()?;
+        if index >= trusted.len() {
+            return None;
+        }
+        let removed = trusted.remove(index);
+        let _ = save_trusted(&trusted);
+        Some(removed.label)
     }
 
     /// 許可リストを全消去して永続化する (端末の総入れ替え用)。
@@ -298,6 +318,17 @@ mod tests {
 
         // 別の未知端末は窓が閉じているので拒否。
         assert!(matches!(g.admit(Some(&[7, 7])), Admit::Rejected));
-        assert_eq!(g.trusted_count(), 1);
+        assert_eq!(g.labels().len(), 1);
+
+        // disarm でペアリング窓を閉じられる。
+        g.arm_pairing();
+        assert!(g.pairing_armed());
+        g.disarm_pairing();
+        assert!(!g.pairing_armed());
+
+        // remove で個別削除できる。
+        assert!(g.remove(0).is_some());
+        assert_eq!(g.labels().len(), 0);
+        assert!(g.remove(0).is_none()); // 範囲外
     }
 }
