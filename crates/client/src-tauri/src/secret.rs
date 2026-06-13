@@ -10,6 +10,7 @@
 //! 非 Windows は未対応 (Windows 優先)。`get` は `None`、`put` はエラー、`delete` は no-op。
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager};
 
@@ -34,21 +35,37 @@ fn identity_path(app: &AppHandle) -> Option<std::path::PathBuf> {
         .map(|dir| dir.join(IDENTITY_FILE))
 }
 
-/// この端末の永続 ID 鍵ペアを返す。無ければ生成して DPAPI で暗号化保存する。
+/// プロセス内の ID 鍵キャッシュ。接続ごとに再生成せず、一度確定した鍵を使い回す。
+///
+/// これが無いと、自動再接続が重なって `load_or_create_identity` が並行に走ったとき、
+/// `identity.bin` の読み書きが競合して毎回別の鍵を生成してしまい、host のデバイスピン留めが
+/// 「登録した直後の接続が別の鍵で未登録扱い」になって永久に繋がらない。Mutex で生成を直列化し、
+/// 一度確定した鍵をプロセス生存中ずっと返すことで端末の身元を安定させる。
+static IDENTITY_CACHE: Mutex<Option<aurora_common::noise::StaticKeypair>> = Mutex::new(None);
+
+/// この端末の永続 ID 鍵ペアを返す。プロセス内でキャッシュし、無ければ生成して DPAPI で暗号化保存する。
 ///
 /// host のデバイスピン留め (許可リスト照合) が端末を識別するための、セッションを跨いで
 /// 安定した公開鍵を提供する。秘密鍵は機密のため DPAPI でユーザー鍵に紐づけて保存する。
 /// 取得・生成に失敗した場合 (非 Windows 等) は `None` を返し、接続は従来の使い捨て鍵に
 /// フォールバックする (ピン留め未使用なら影響なし)。
 pub fn load_or_create_identity(app: &AppHandle) -> Option<aurora_common::noise::StaticKeypair> {
+    // 生成を直列化し、確定済みの鍵があればそれを返す (接続ごとの鍵ブレを防ぐ)。
+    let mut cache = IDENTITY_CACHE.lock().ok()?;
+    if let Some(id) = cache.as_ref() {
+        return Some(id.clone());
+    }
     let path = identity_path(app)?;
+    // 保存済みを読む。復号/パースできればそれを採用。
     if let Ok(bytes) = std::fs::read(&path) {
         if let Some(id) = decrypt(&bytes).and_then(|p| serde_json::from_slice::<Identity>(&p).ok())
         {
-            return Some(aurora_common::noise::StaticKeypair {
+            let kp = aurora_common::noise::StaticKeypair {
                 private: id.private,
                 public: id.public,
-            });
+            };
+            *cache = Some(kp.clone());
+            return Some(kp);
         }
     }
     // 未保存 / 復号不能 → 新規生成して保存する。
@@ -62,9 +79,14 @@ pub fn load_or_create_identity(app: &AppHandle) -> Option<aurora_common::noise::
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&path, enc);
+            // 一時ファイルへ書いてから rename し、並行書き込みでの破損を避ける (atomic 置換)。
+            let tmp = path.with_extension("bin.tmp");
+            if std::fs::write(&tmp, &enc).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
     }
+    *cache = Some(kp.clone());
     Some(kp)
 }
 

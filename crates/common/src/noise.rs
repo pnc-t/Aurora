@@ -151,6 +151,7 @@ pub fn psk_from_password(password: &str) -> [u8; 32] {
 /// ため端末を識別できない。クライアントがこの鍵ペアを永続化し秘密鍵を毎回渡すことで、
 /// `public` がその端末の安定した身元になり、host 側の許可リスト照合 (デバイスピン留め) が
 /// 可能になる。秘密鍵は機密 (DPAPI 等で保護)、公開鍵は非機密 (許可リストに平文保存可)。
+#[derive(Clone)]
 pub struct StaticKeypair {
     pub private: Vec<u8>,
     pub public: Vec<u8>,
