@@ -14,9 +14,58 @@ use std::collections::BTreeMap;
 use tauri::{AppHandle, Manager};
 
 const FILE: &str = "passwords.bin";
+const IDENTITY_FILE: &str = "identity.bin";
 
 fn key(host: &str) -> String {
     host.trim().to_lowercase()
+}
+
+/// この端末の永続 ID 鍵 (Noise 静的鍵ペア) をシリアライズした中身。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Identity {
+    private: Vec<u8>,
+    public: Vec<u8>,
+}
+
+fn identity_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(IDENTITY_FILE))
+}
+
+/// この端末の永続 ID 鍵ペアを返す。無ければ生成して DPAPI で暗号化保存する。
+///
+/// host のデバイスピン留め (許可リスト照合) が端末を識別するための、セッションを跨いで
+/// 安定した公開鍵を提供する。秘密鍵は機密のため DPAPI でユーザー鍵に紐づけて保存する。
+/// 取得・生成に失敗した場合 (非 Windows 等) は `None` を返し、接続は従来の使い捨て鍵に
+/// フォールバックする (ピン留め未使用なら影響なし)。
+pub fn load_or_create_identity(app: &AppHandle) -> Option<aurora_common::noise::StaticKeypair> {
+    let path = identity_path(app)?;
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Some(id) = decrypt(&bytes).and_then(|p| serde_json::from_slice::<Identity>(&p).ok())
+        {
+            return Some(aurora_common::noise::StaticKeypair {
+                private: id.private,
+                public: id.public,
+            });
+        }
+    }
+    // 未保存 / 復号不能 → 新規生成して保存する。
+    let kp = aurora_common::noise::generate_static_keypair().ok()?;
+    let id = Identity {
+        private: kp.private.clone(),
+        public: kp.public.clone(),
+    };
+    if let Ok(plain) = serde_json::to_vec(&id) {
+        if let Ok(enc) = encrypt(&plain) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, enc);
+        }
+    }
+    Some(kp)
 }
 
 fn store_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {

@@ -39,7 +39,8 @@ fn main() -> Result<()> {
     let psk = psk_from_password(&password);
 
     let mut stream = TcpStream::connect("127.0.0.1:7000").context("connect 127.0.0.1:7000")?;
-    let mut hs = HandshakeState::new_initiator(&psk)?;
+    // スモークテストは使い捨て鍵でよい (デバイスピン留めを使わない経路)。
+    let mut hs = HandshakeState::new_initiator(&psk, None)?;
     let mut out = Vec::new();
     let mut tmp = Vec::new();
 

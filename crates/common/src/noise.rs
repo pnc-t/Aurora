@@ -3,7 +3,7 @@
 //! 使い方:
 //! ```ignore
 //! let psk = psk_from_password("hunter2");
-//! let mut hs = HandshakeState::new_responder(&psk)?;
+//! let mut hs = HandshakeState::new_responder(&psk, None)?;
 //! // TCP で 3 メッセージ往復: read_msg / write_msg を交互に呼ぶ
 //! let session = hs.into_transport()?;
 //! let mut out = Vec::new();
@@ -145,29 +145,75 @@ pub fn psk_from_password(password: &str) -> [u8; 32] {
     out
 }
 
+/// 永続的な静的鍵ペア (X25519)。デバイスの身元として使う。
+///
+/// XXpsk3 は双方の静的公開鍵を交換するが、既定では毎ハンドシェイクで使い捨て鍵を生成する
+/// ため端末を識別できない。クライアントがこの鍵ペアを永続化し秘密鍵を毎回渡すことで、
+/// `public` がその端末の安定した身元になり、host 側の許可リスト照合 (デバイスピン留め) が
+/// 可能になる。秘密鍵は機密 (DPAPI 等で保護)、公開鍵は非機密 (許可リストに平文保存可)。
+pub struct StaticKeypair {
+    pub private: Vec<u8>,
+    pub public: Vec<u8>,
+}
+
+/// 永続 ID 用の静的鍵ペアを 1 つ生成する。秘密鍵は安全に保存し、以降
+/// [`HandshakeState::new_initiator`] に渡して同じ身元で接続する。
+pub fn generate_static_keypair() -> Result<StaticKeypair, NoiseError> {
+    let kp = Builder::new(NOISE_PARAMS.parse()?).generate_keypair()?;
+    Ok(StaticKeypair {
+        private: kp.private,
+        public: kp.public,
+    })
+}
+
 pub struct HandshakeState {
     inner: Option<SnowHandshake>,
 }
 
 impl HandshakeState {
-    pub fn new_initiator(psk: &[u8; 32]) -> Result<Self, NoiseError> {
-        let builder = Builder::new(NOISE_PARAMS.parse()?);
-        let kp = builder.generate_keypair()?;
-        let hs = Builder::new(NOISE_PARAMS.parse()?)
-            .local_private_key(&kp.private)
-            .psk(3, psk)
-            .build_initiator()?;
+    /// イニシエータ (クライアント) を構築する。`static_priv` に永続秘密鍵を渡すと端末の
+    /// 身元が安定する (host のデバイスピン留めで照合できる)。`None` なら毎回使い捨て鍵。
+    pub fn new_initiator(psk: &[u8; 32], static_priv: Option<&[u8]>) -> Result<Self, NoiseError> {
+        Self::build(psk, static_priv, true)
+    }
+
+    /// レスポンダ (ホスト) を構築する。host は許可リスト照合を相手公開鍵
+    /// ([`Self::remote_static`]) で行うため、自分の静的鍵は使い捨て (`None`) でよい。
+    pub fn new_responder(psk: &[u8; 32], static_priv: Option<&[u8]>) -> Result<Self, NoiseError> {
+        Self::build(psk, static_priv, false)
+    }
+
+    fn build(
+        psk: &[u8; 32],
+        static_priv: Option<&[u8]>,
+        initiator: bool,
+    ) -> Result<Self, NoiseError> {
+        // 永続鍵が無ければ使い捨て鍵を生成する (従来挙動)。`generated` は借用が生きる間保持。
+        let generated;
+        let priv_key: &[u8] = match static_priv {
+            Some(k) => k,
+            None => {
+                generated = Builder::new(NOISE_PARAMS.parse()?)
+                    .generate_keypair()?
+                    .private;
+                &generated
+            }
+        };
+        let builder = Builder::new(NOISE_PARAMS.parse()?)
+            .local_private_key(priv_key)
+            .psk(3, psk);
+        let hs = if initiator {
+            builder.build_initiator()?
+        } else {
+            builder.build_responder()?
+        };
         Ok(Self { inner: Some(hs) })
     }
 
-    pub fn new_responder(psk: &[u8; 32]) -> Result<Self, NoiseError> {
-        let builder = Builder::new(NOISE_PARAMS.parse()?);
-        let kp = builder.generate_keypair()?;
-        let hs = Builder::new(NOISE_PARAMS.parse()?)
-            .local_private_key(&kp.private)
-            .psk(3, psk)
-            .build_responder()?;
-        Ok(Self { inner: Some(hs) })
+    /// ハンドシェイクで判明した相手の静的公開鍵を返す (XXpsk3 では相手の `s` 受信後に有効)。
+    /// host がクライアントの身元として許可リスト照合に使う。
+    pub fn remote_static(&self) -> Option<Vec<u8>> {
+        self.inner.as_ref()?.get_remote_static().map(|s| s.to_vec())
     }
 
     pub fn write_msg(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<usize, NoiseError> {
@@ -251,8 +297,8 @@ mod tests {
     #[test]
     fn xx_psk_roundtrip_and_transport() {
         let psk = psk_from_password("hunter2");
-        let mut ini = HandshakeState::new_initiator(&psk).unwrap();
-        let mut res = HandshakeState::new_responder(&psk).unwrap();
+        let mut ini = HandshakeState::new_initiator(&psk, None).unwrap();
+        let mut res = HandshakeState::new_responder(&psk, None).unwrap();
 
         let mut buf = Vec::new();
         let mut tmp = Vec::new();
@@ -300,9 +346,40 @@ mod tests {
     }
 
     #[test]
+    fn responder_sees_persistent_initiator_public_key() {
+        // クライアントが永続鍵を使うと、host は同じ公開鍵を相手身元として観測でき、
+        // かつ毎回同じ値になる (= 許可リスト照合の土台)。
+        let psk = psk_from_password("hunter2");
+        let id = generate_static_keypair().unwrap();
+
+        let run = |id_priv: &[u8]| -> Vec<u8> {
+            let mut ini = HandshakeState::new_initiator(&psk, Some(id_priv)).unwrap();
+            let mut res = HandshakeState::new_responder(&psk, None).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = Vec::new();
+            ini.write_msg(&[], &mut buf).unwrap();
+            res.read_msg(&buf, &mut tmp).unwrap();
+            res.write_msg(&[], &mut buf).unwrap();
+            ini.read_msg(&buf, &mut tmp).unwrap();
+            ini.write_msg(&[], &mut buf).unwrap();
+            res.read_msg(&buf, &mut tmp).unwrap();
+            res.remote_static()
+                .expect("remote static known after handshake")
+        };
+
+        let seen1 = run(&id.private);
+        let seen2 = run(&id.private);
+        assert_eq!(
+            seen1, id.public,
+            "host observes the client's persistent key"
+        );
+        assert_eq!(seen1, seen2, "same identity yields a stable public key");
+    }
+
+    #[test]
     fn into_transport_before_finish_errors() {
         let psk = [0u8; 32];
-        let hs = HandshakeState::new_initiator(&psk).unwrap();
+        let hs = HandshakeState::new_initiator(&psk, None).unwrap();
         assert!(matches!(hs.into_transport(), Err(NoiseError::NotFinished)));
     }
 

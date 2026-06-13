@@ -19,6 +19,9 @@ pub type SharedPort = Arc<AtomicU16>;
 /// 認証失敗の累計カウンタ。net が接続受理で加算し、tray がメニューに表示する。
 pub type SharedAuthFailures = Arc<AtomicU32>;
 
+/// デバイスピン留めの実行時状態。net が照合し、tray が有効化/ペアリング/削除を操作する。
+pub type SharedDevices = Arc<crate::devices::DeviceGuard>;
+
 /// ポート変更を net の accept ループへ伝える反映トリガ (`notify_one` で TCP/UDP 貼り直し)。
 pub type Reload = Arc<tokio::sync::Notify>;
 
@@ -31,12 +34,21 @@ pub fn spawn(
     port: SharedPort,
     reload: Reload,
     auth_failures: SharedAuthFailures,
+    devices: SharedDevices,
     prompt_now: bool,
 ) {
     let _ = std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            if let Err(e) = imp::run(psk, has_password, port, reload, auth_failures, prompt_now) {
+            if let Err(e) = imp::run(
+                psk,
+                has_password,
+                port,
+                reload,
+                auth_failures,
+                devices,
+                prompt_now,
+            ) {
                 tracing::warn!(error = %e, "tray UI disabled");
             }
         });
@@ -49,13 +61,16 @@ pub fn spawn(
     _port: SharedPort,
     _reload: Reload,
     _auth_failures: SharedAuthFailures,
+    _devices: SharedDevices,
     _prompt_now: bool,
 ) {
 }
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{Reload, SharedAuthFailures, SharedHasPassword, SharedPort, SharedPsk};
+    use super::{
+        Reload, SharedAuthFailures, SharedDevices, SharedHasPassword, SharedPort, SharedPsk,
+    };
     use aurora_common::noise::psk_from_password;
     use std::ffi::c_void;
     use std::sync::atomic::Ordering;
@@ -77,6 +92,10 @@ mod imp {
     const ID_CHANGE: usize = 1001;
     const ID_EXIT: usize = 1002;
     const ID_PORT: usize = 1003;
+    /// デバイスピン留めのメニュー項目 ID。
+    const ID_PIN_TOGGLE: usize = 1004;
+    const ID_PIN_PAIR: usize = 1005;
+    const ID_PIN_CLEAR: usize = 1006;
     /// 変更ダイアログ内コントロール ID。
     const ID_EDIT_CUR: i32 = 100;
     const ID_EDIT: i32 = 101;
@@ -92,6 +111,7 @@ mod imp {
         port: SharedPort,
         reload: Reload,
         auth_failures: SharedAuthFailures,
+        devices: SharedDevices,
     }
 
     /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
@@ -99,12 +119,14 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         psk: SharedPsk,
         has_password: SharedHasPassword,
         port: SharedPort,
         reload: Reload,
         auth_failures: SharedAuthFailures,
+        devices: SharedDevices,
         prompt_now: bool,
     ) -> windows::core::Result<()> {
         unsafe {
@@ -128,6 +150,7 @@ mod imp {
                 port,
                 reload,
                 auth_failures,
+                devices,
             }));
 
             // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
@@ -219,6 +242,9 @@ mod imp {
                     match wparam.0 & 0xffff {
                         ID_CHANGE => change_password(hwnd),
                         ID_PORT => change_port(hwnd),
+                        ID_PIN_TOGGLE => toggle_pinning(hwnd),
+                        ID_PIN_PAIR => arm_pairing(hwnd),
+                        ID_PIN_CLEAR => clear_devices(hwnd),
                         ID_EXIT => {
                             // host プロセス全体を終了する。
                             let _ = DestroyWindow(hwnd);
@@ -267,6 +293,39 @@ mod imp {
             }
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
+
+            // デバイスピン留め (2 要素目)。有効時のみペアリング/削除を出す。to_wide の
+            // バッファは AppendMenuW がコピーするまで生かせばよく、ブロック末尾まで保持される。
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            if let Some(state) = wnd_state(hwnd) {
+                let enabled = state.devices.enabled();
+                let toggle = to_wide(if enabled {
+                    "デバイスピン留め: 有効 (クリックで無効化)"
+                } else {
+                    "デバイスピン留め: 無効 (クリックで有効化)"
+                });
+                let toggle_flags = MF_STRING | if enabled { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(menu, toggle_flags, ID_PIN_TOGGLE, PCWSTR(toggle.as_ptr()));
+                if enabled {
+                    let armed = state.devices.pairing_armed();
+                    let pair = to_wide(if armed {
+                        "次の接続を登録 (ペアリング窓: 開いています)"
+                    } else {
+                        "次の接続を登録 (ペアリング)..."
+                    });
+                    let _ = AppendMenuW(menu, MF_STRING, ID_PIN_PAIR, PCWSTR(pair.as_ptr()));
+                    let count = state.devices.trusted_count();
+                    let clear = to_wide(&format!("登録端末をすべて削除 ({count} 台)..."));
+                    let clear_flags = MF_STRING
+                        | if count == 0 {
+                            MF_GRAYED
+                        } else {
+                            MENU_ITEM_FLAGS(0)
+                        };
+                    let _ = AppendMenuW(menu, clear_flags, ID_PIN_CLEAR, PCWSTR(clear.as_ptr()));
+                }
+            }
+
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("終了"));
 
@@ -361,6 +420,86 @@ mod imp {
                 "Aurora Host",
             );
         }
+    }
+
+    /// デバイスピン留めの有効/無効を切り替える。**無効化は接続中拒否**: 接続中の操作者が
+    /// 入力注入でトレイを操作してピン留めを外す (= 2 要素目の無効化) のを防ぐ (パスワード/
+    /// ポート変更と同じ方針)。有効化は保護を強める方向なので接続中でも許可する。
+    fn toggle_pinning(hwnd: HWND) {
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        let currently_on = state.devices.enabled();
+        if currently_on && crate::conn::is_active() {
+            message_box(
+                hwnd,
+                "クライアント接続中はデバイスピン留めを無効化できません。\n切断してから操作してください。",
+                "Aurora Host",
+            );
+            return;
+        }
+        state.devices.set_enabled(!currently_on);
+        let msg = if currently_on {
+            "デバイスピン留めを無効化しました (パスワードのみで接続可)。"
+        } else {
+            "デバイスピン留めを有効化しました。\n登録済みの端末のみ接続できます。\n新しい端末は「次の接続を登録」で追加してください。"
+        };
+        message_box(hwnd, msg, "Aurora Host");
+    }
+
+    /// ペアリング窓を開く (次に PSK 認証を通した 1 台を信頼登録)。**接続中拒否**: 接続中の
+    /// 操作者が自分の別端末を信頼登録して永続アクセスを得るのを防ぐ。
+    fn arm_pairing(hwnd: HWND) {
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        if crate::conn::is_active() {
+            message_box(
+                hwnd,
+                "クライアント接続中は新しい端末を登録できません。\n切断してから操作してください。",
+                "Aurora Host",
+            );
+            return;
+        }
+        state.devices.arm_pairing();
+        message_box(
+            hwnd,
+            "ペアリング窓を開きました。\n登録したい端末から今すぐ 1 回接続してください\n(次に認証を通した 1 台が信頼登録され、窓は閉じます)。",
+            "Aurora Host",
+        );
+    }
+
+    /// 登録済み信頼端末をすべて削除する (確認付き)。**接続中拒否** + 破壊的操作のため確認。
+    fn clear_devices(hwnd: HWND) {
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        if crate::conn::is_active() {
+            message_box(
+                hwnd,
+                "クライアント接続中は登録端末を削除できません。\n切断してから操作してください。",
+                "Aurora Host",
+            );
+            return;
+        }
+        let text = to_wide(
+            "登録済みの信頼端末をすべて削除しますか?\nピン留め有効中はどの端末も接続できなくなります (再ペアリングが必要)。",
+        );
+        let caption = to_wide("Aurora Host");
+        // SAFETY: text/caption は NUL 終端の UTF-16 で、呼び出し中は生存している。
+        let r = unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(caption.as_ptr()),
+                MB_YESNO | MB_ICONWARNING,
+            )
+        };
+        if r != IDYES {
+            return;
+        }
+        state.devices.clear();
+        message_box(hwnd, "登録端末をすべて削除しました。", "Aurora Host");
     }
 
     /// 新ポートで TCP/UDP を実際に bind できるか事前確認する。確認後ソケットは drop で解放され、

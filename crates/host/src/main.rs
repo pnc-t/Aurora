@@ -19,6 +19,7 @@ mod audio;
 mod autostart;
 mod capture;
 mod conn;
+mod devices;
 mod encode;
 mod input;
 mod net;
@@ -775,6 +776,9 @@ fn run_server(
     // 認証失敗の累計カウンタ。net (接続受理) が加算し、tray がメニューに表示することで、
     // オーナーが「総当たりに晒されているか」に気付けるようにする (#2 可視化)。
     let auth_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // デバイスピン留め (クライアント静的鍵の許可リスト) の実行時状態。既定無効。永続化済みの
+    // 有効フラグ・許可リストを読み込む。net (照合) と tray (操作) で共有する。
+    let devices = Arc::new(devices::DeviceGuard::load());
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
     tray::spawn(
@@ -783,6 +787,7 @@ fn run_server(
         port_cell.clone(),
         reload.clone(),
         auth_failures.clone(),
+        devices.clone(),
         !have_stored,
     );
 
@@ -916,6 +921,7 @@ fn run_server(
             audio: audio_enabled,
             max_bitrate_bps,
             auth_failures,
+            devices,
         };
         net::run_server(
             cfg,

@@ -42,6 +42,26 @@ Aurora は自宅 PC の画面・入力をネットワーク越しに開放する
 - これらは主防御 (強いパスワード + Argon2id) を補助するレイヤです。XX-PSK は接続を試みた
   相手にハンドシェイク転写を渡すため、弱いパスワードはオフライン辞書攻撃で破られうる点に
   引き続き注意してください。
+
+### デバイスピン留め (任意の 2 要素目)
+
+パスワードは「知識要素」で、漏れると任意端末から接続できてしまいます。これを補う「所持要素」
+として、**クライアントの永続静的公開鍵を許可リストで照合**する機能があります (既定 **無効**、
+opt-in)。Noise XX は元々双方の静的鍵を交換するため**ワイヤ形式は不変**で、クライアントは
+ID 鍵を生成・DPAPI 保存して毎回同じ鍵で接続し (`identity.bin`)、host は接続の `remote_static`
+を許可リスト (`trusted_devices.txt`、公開鍵のみで非機密) と照合します (`DeviceGuard`)。
+
+- 有効化・端末登録・削除はすべて**トレイメニュー**から行います (CLI 経路は持たないので、CLI
+  バイパスの非対称が生じない)。
+- 登録は**ペアリング窓**方式: トレイで「次の接続を登録」を押した 1 回だけ、次に PSK 認証を
+  通した端末を信頼登録します。パスワード漏洩時に攻撃者が勝手に登録される窓を、オーナーが
+  能動的に開いた瞬間に限定します。
+- ピン留め有効中に未登録端末が PSK を正しく出しても**拒否**し (IP バックオフを伸ばす)、
+  登録端末のみ接続できます。接続中の操作者が入力注入でトレイを操作してピン留めを**無効化/
+  端末削除/新規登録**するのを防ぐため、これらは接続中は拒否します (パスワード/ポート変更と
+  同じ対称ガード)。
+- Tailscale (網側の到達制御) + 強パスワードで足りる多くの個人用途では不要ですが、Tailnet を
+  他者と共有する等で網の信頼境界が緩い場合に「登録端末以外は一切接続させない」を強制できます。
 - Noise XX は相互に静的鍵を交換するため、PSK 検証と合わせてセッションごとに前方秘匿性の
   ある鍵を確立します。パラメータ (`NOISE_PARAMS` / Argon2 設定 / `PSK_SALT`) を変えると
   PSK が変わり旧クライアントと非互換になります。
@@ -100,6 +120,8 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 - 受信ファイル名による保存先ディレクトリ外への書き出し・NTFS 代替データストリーム (ADS)
   生成 (host/client 対称のファイル名サニタイズ。`crates/common/src/fsname.rs`)。
 - LAN/インターネットへの不用意な露出 (既定 Tailscale-only bind)。
+- パスワード漏洩時の任意端末からの接続 (任意の 2 要素目=デバイスピン留めを有効化した場合のみ。
+  既定無効)。
 
 **守らない/前提に委ねるもの**
 - **ネットワーク到達制御は Tailscale に委譲**。Tailnet への参加可否・ACL は Tailscale 側で
@@ -136,4 +158,6 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 | bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_ip`) |
 | パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray.rs` |
 | パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net.rs` |
+| デバイスピン留め (静的鍵許可リスト) | `crates/host/src/devices.rs` / `crates/host/src/net.rs` / `crates/host/src/tray.rs` |
+| クライアント永続 ID 鍵 (静的鍵) | `crates/common/src/noise.rs` (`generate_static_keypair`/`remote_static`) / `crates/client/src-tauri/src/secret.rs` |
 | 受信ファイル名サニタイズ | `crates/common/src/fsname.rs` |

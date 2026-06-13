@@ -240,6 +240,9 @@ pub struct ServerConfig {
     /// 認証失敗の累計カウンタ (起動以降)。net がハンドシェイク失敗で加算し、tray が
     /// メニューに表示する (総当たりに晒されているかをオーナーが気付けるようにする)。
     pub auth_failures: Arc<AtomicU32>,
+    /// デバイスピン留め (クライアント静的鍵の許可リスト照合)。既定無効。tray が有効化/
+    /// ペアリングを操作し、net が PSK 認証後に相手公開鍵を照合する (= 2 要素目)。
+    pub devices: Arc<crate::devices::DeviceGuard>,
 }
 
 /// 送信元 IP ごとの認証失敗を追跡し、連続失敗で接続応答を指数的に遅らせるスロットル。
@@ -402,6 +405,7 @@ pub async fn run_server(
                 clip_change_rx_ref,
                 max_bitrate_bps,
                 &throttle,
+                &cfg.devices,
             )
             .await
             {
@@ -429,9 +433,11 @@ async fn handle_client(
     clip_change_rx: &mut mpsc::UnboundedReceiver<String>,
     max_bitrate_bps: u32,
     throttle: &AuthThrottle,
+    devices: &Arc<crate::devices::DeviceGuard>,
 ) -> Result<()> {
-    // Noise XX-PSK レスポンダ
-    let mut hs = HandshakeState::new_responder(&psk)?;
+    // Noise XX-PSK レスポンダ。host 自身の静的鍵は使い捨て (None) でよい。デバイス識別は
+    // 相手 (クライアント) の永続公開鍵 = remote_static で行う。
+    let mut hs = HandshakeState::new_responder(&psk, None)?;
     let mut buf = Vec::new();
     let mut tmp = Vec::new();
 
@@ -441,7 +447,9 @@ async fn handle_client(
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     // ハンドシェイク 3 メッセージ + transport 確立を 1 ブロックにまとめ、失敗時に遅延を挟む。
-    let session = match async {
+    // 相手 (クライアント) の静的公開鍵は transport 確立で hs が消費される前に控える
+    // (デバイスピン留めの許可リスト照合に使う)。
+    let (session, remote_key) = match async {
         // <- e
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
             .await
@@ -458,13 +466,15 @@ async fn handle_client(
             .await
             .context("handshake timed out (s,se,psk)")??;
         hs.read_msg(&buf, &mut tmp)?;
+        let remote_key = hs.remote_static();
         // snow の StatelessTransportState は encrypt/decrypt とも &self なので Arc<Mutex> は
         // 不要 (映像 UDP のパケット毎ロックを排除)。
-        hs.into_transport().map_err(anyhow::Error::from)
+        let session = hs.into_transport().map_err(anyhow::Error::from)?;
+        Ok::<_, anyhow::Error>((session, remote_key))
     }
     .await
     {
-        Ok(s) => s,
+        Ok(pair) => pair,
         Err(e) => {
             // 認証/ハンドシェイク失敗。snow は PSK 不一致を最終メッセージの復号失敗として
             // 返すため、ここに来る = パスワード誤りかプロトコル不正。送信元 IP 単位の指数
@@ -476,8 +486,23 @@ async fn handle_client(
             return Err(e);
         }
     };
-    // 認証成功。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規ユーザーを罰しない)。
+
+    // デバイスピン留め (有効時のみ): PSK は正しくても、登録済み端末以外を拒否する 2 要素目。
+    // PSK 漏洩でも「登録した端末の秘密鍵」を持たない相手を弾く。判定は record_success の前に
+    // 行い、拒否はバックオフを伸ばす (= 履歴を消さない) ことで未許可端末の連投も減速させる。
+    let admit = devices.admit(remote_key.as_deref());
+    if let crate::devices::Admit::Rejected = &admit {
+        let delay = throttle.record_failure(peer.ip());
+        tracing::warn!(peer = %peer, delay_ms = delay.as_millis() as u64, "device not in allowlist; rejecting (device pinning)");
+        tokio::time::sleep(delay).await;
+        return Err(anyhow::anyhow!("device not in allowlist"));
+    }
+    // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
+    // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
+    if let crate::devices::Admit::Enrolled = &admit {
+        tracing::info!(peer = %peer, "device pinning: enrolled this device via pairing window");
+    }
     tracing::info!(peer = %peer, "noise handshake complete");
 
     // TCP を読み書きの 2 ハーフに分割する。読み取りは専用タスクへ隔離し、本体の select
