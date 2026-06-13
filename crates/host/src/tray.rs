@@ -96,6 +96,10 @@ mod imp {
     const ID_PIN_TOGGLE: usize = 1004;
     const ID_PIN_PAIR: usize = 1005;
     const ID_PIN_CLEAR: usize = 1006;
+    /// 登録端末リストの各項目 ID のベース (`ID_DEVICE_BASE + index`)。クリックでその端末を削除。
+    const ID_DEVICE_BASE: usize = 2000;
+    /// リスト表示する登録端末の上限 (ID 空間を有界にする。通常これを超える端末は持たない)。
+    const MAX_DEVICE_ITEMS: usize = 64;
     /// 変更ダイアログ内コントロール ID。
     const ID_EDIT_CUR: i32 = 100;
     const ID_EDIT: i32 = 101;
@@ -239,15 +243,20 @@ mod imp {
                     LRESULT(0)
                 }
                 WM_COMMAND => {
-                    match wparam.0 & 0xffff {
+                    let cmd = wparam.0 & 0xffff;
+                    match cmd {
                         ID_CHANGE => change_password(hwnd),
                         ID_PORT => change_port(hwnd),
                         ID_PIN_TOGGLE => toggle_pinning(hwnd),
-                        ID_PIN_PAIR => arm_pairing(hwnd),
+                        ID_PIN_PAIR => toggle_pairing(hwnd),
                         ID_PIN_CLEAR => clear_devices(hwnd),
                         ID_EXIT => {
                             // host プロセス全体を終了する。
                             let _ = DestroyWindow(hwnd);
+                        }
+                        // 登録端末リストの項目: その端末を削除する。
+                        c if (ID_DEVICE_BASE..ID_DEVICE_BASE + MAX_DEVICE_ITEMS).contains(&c) => {
+                            remove_device(hwnd, c - ID_DEVICE_BASE);
                         }
                         _ => {}
                     }
@@ -294,9 +303,14 @@ mod imp {
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
 
-            // デバイスピン留め (2 要素目)。有効時のみペアリング/削除を出す。to_wide の
-            // バッファは AppendMenuW がコピーするまで生かせばよく、ブロック末尾まで保持される。
+            // デバイスピン留め (2 要素目)。有効時のみペアリング/端末一覧を出す。
+            // `_keep` は AppendMenuW へ渡す UTF-16 バッファを TrackPopupMenu まで生かすための保持先
+            // (AppendMenuW は文字列をコピーするが、サブメニュー構築をまたぐので明示的に束ねる)。
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let mut _keep: Vec<Vec<u16>> = Vec::new();
+            // サブメニューは menu に MF_POPUP で挿入すると所有権が menu 側に移り、menu 破棄時に
+            // 一緒に破棄される (個別破棄しない)。
+            let mut _submenus: Vec<HMENU> = Vec::new();
             if let Some(state) = wnd_state(hwnd) {
                 let enabled = state.devices.enabled();
                 let toggle = to_wide(if enabled {
@@ -306,23 +320,48 @@ mod imp {
                 });
                 let toggle_flags = MF_STRING | if enabled { MF_CHECKED } else { MF_UNCHECKED };
                 let _ = AppendMenuW(menu, toggle_flags, ID_PIN_TOGGLE, PCWSTR(toggle.as_ptr()));
+                _keep.push(toggle);
                 if enabled {
+                    // ペアリング: 開いていれば「取消」、閉じていれば「次の接続を登録」。
                     let armed = state.devices.pairing_armed();
                     let pair = to_wide(if armed {
-                        "次の接続を登録 (ペアリング窓: 開いています)"
+                        "ペアリング窓を閉じる (登録待機を取消)"
                     } else {
                         "次の接続を登録 (ペアリング)..."
                     });
                     let _ = AppendMenuW(menu, MF_STRING, ID_PIN_PAIR, PCWSTR(pair.as_ptr()));
-                    let count = state.devices.trusted_count();
-                    let clear = to_wide(&format!("登録端末をすべて削除 ({count} 台)..."));
-                    let clear_flags = MF_STRING
-                        | if count == 0 {
-                            MF_GRAYED
+                    _keep.push(pair);
+
+                    // 登録済みデバイスをサブメニューに列挙する (各項目クリックでその端末を削除)。
+                    let labels = state.devices.labels();
+                    if let Ok(sub) = CreatePopupMenu() {
+                        if labels.is_empty() {
+                            let none = to_wide("(登録なし)");
+                            let _ =
+                                AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, PCWSTR(none.as_ptr()));
+                            _keep.push(none);
                         } else {
-                            MENU_ITEM_FLAGS(0)
-                        };
-                    let _ = AppendMenuW(menu, clear_flags, ID_PIN_CLEAR, PCWSTR(clear.as_ptr()));
+                            for (i, label) in labels.iter().take(MAX_DEVICE_ITEMS).enumerate() {
+                                let item = to_wide(&format!("{label}  (クリックで削除)"));
+                                let _ = AppendMenuW(
+                                    sub,
+                                    MF_STRING,
+                                    ID_DEVICE_BASE + i,
+                                    PCWSTR(item.as_ptr()),
+                                );
+                                _keep.push(item);
+                            }
+                            let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
+                            let clear = to_wide("すべて削除...");
+                            let _ =
+                                AppendMenuW(sub, MF_STRING, ID_PIN_CLEAR, PCWSTR(clear.as_ptr()));
+                            _keep.push(clear);
+                        }
+                        let head = to_wide(&format!("登録済みデバイス ({} 台)", labels.len()));
+                        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(head.as_ptr()));
+                        _keep.push(head);
+                        _submenus.push(sub);
+                    }
                 }
             }
 
@@ -447,12 +486,23 @@ mod imp {
         message_box(hwnd, msg, "Aurora Host");
     }
 
-    /// ペアリング窓を開く (次に PSK 認証を通した 1 台を信頼登録)。**接続中拒否**: 接続中の
-    /// 操作者が自分の別端末を信頼登録して永続アクセスを得るのを防ぐ。
-    fn arm_pairing(hwnd: HWND) {
+    /// ペアリング窓をトグルする。開いていれば取り消し、閉じていれば開く。**開く操作は接続中
+    /// 拒否**: 接続中の操作者が自分の別端末を信頼登録して永続アクセスを得るのを防ぐ (取消は
+    /// 保護を弱めないので接続中でも許可)。窓は開いたままだと「次の認証成功端末を登録」状態が
+    /// 続くため、誤って開けたままにしたときに閉じられるよう取消を用意する。
+    fn toggle_pairing(hwnd: HWND) {
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
+        if state.devices.pairing_armed() {
+            state.devices.disarm_pairing();
+            message_box(
+                hwnd,
+                "ペアリング窓を閉じました (登録待機を取り消しました)。",
+                "Aurora Host",
+            );
+            return;
+        }
         if crate::conn::is_active() {
             message_box(
                 hwnd,
@@ -464,9 +514,59 @@ mod imp {
         state.devices.arm_pairing();
         message_box(
             hwnd,
-            "ペアリング窓を開きました。\n登録したい端末から今すぐ 1 回接続してください\n(次に認証を通した 1 台が信頼登録され、窓は閉じます)。",
+            "ペアリング窓を開きました。\n登録したい端末から今すぐ 1 回接続してください\n(次に認証を通した 1 台が信頼登録され、窓は閉じます)。\n登録しない場合はメニューから取り消せます。",
             "Aurora Host",
         );
+    }
+
+    /// 登録端末リストの `index` 番目を削除する (確認付き)。**接続中拒否** + 破壊的操作のため確認。
+    fn remove_device(hwnd: HWND, index: usize) {
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        if crate::conn::is_active() {
+            message_box(
+                hwnd,
+                "クライアント接続中は登録端末を削除できません。\n切断してから操作してください。",
+                "Aurora Host",
+            );
+            return;
+        }
+        // 表示時のラベルで確認する (index は表示順と一致)。
+        let label = state
+            .devices
+            .labels()
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
+        let text = to_wide(&format!(
+            "登録端末「{label}」を削除しますか?\nこの端末はピン留め有効中に接続できなくなります (再ペアリングが必要)。"
+        ));
+        let caption = to_wide("Aurora Host");
+        // SAFETY: text/caption は NUL 終端の UTF-16 で、呼び出し中は生存している。
+        let r = unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(caption.as_ptr()),
+                MB_YESNO | MB_ICONWARNING,
+            )
+        };
+        if r != IDYES {
+            return;
+        }
+        match state.devices.remove(index) {
+            Some(removed) => message_box(
+                hwnd,
+                &format!("「{removed}」を削除しました。"),
+                "Aurora Host",
+            ),
+            None => message_box(
+                hwnd,
+                "削除できませんでした (一覧が変わった可能性)。",
+                "Aurora Host",
+            ),
+        }
     }
 
     /// 登録済み信頼端末をすべて削除する (確認付き)。**接続中拒否** + 破壊的操作のため確認。
@@ -510,6 +610,20 @@ mod imp {
         let _tcp = TcpListener::bind(addr).map_err(|e| format!("TCP {e}"))?;
         let _udp = UdpSocket::bind(addr).map_err(|e| format!("UDP {e}"))?;
         Ok(())
+    }
+
+    /// 指定サイズのウィンドウを画面中央に置くための左上座標を返す。プログラム生成ダイアログは
+    /// `CW_USEDEFAULT` だと画面左上に寄って使いにくいため、これで中央寄せする。取得失敗時は
+    /// `CW_USEDEFAULT` を返してフォールバックする。
+    fn centered_pos(w: i32, h: i32) -> (i32, i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+        // SAFETY: スクリーンメトリクスを読むだけ。
+        let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        if sw > 0 && sh > 0 {
+            (((sw - w) / 2).max(0), ((sh - h) / 2).max(0))
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        }
     }
 
     /// 簡易メッセージボックス。
@@ -569,13 +683,14 @@ mod imp {
             } else {
                 (340, 200)
             };
+            let (x, y) = centered_pos(w, h);
             let dlg = match CreateWindowExW(
                 WS_EX_DLGMODALFRAME,
                 class_name,
                 w!("接続パスワードの設定"),
                 style,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                x,
+                y,
                 w,
                 h,
                 owner,
@@ -842,15 +957,17 @@ mod imp {
             let result_ptr: *mut PortDlgResult = result.as_mut();
 
             let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+            let (dlg_w, dlg_h) = (340, 184);
+            let (x, y) = centered_pos(dlg_w, dlg_h);
             let dlg = match CreateWindowExW(
                 WS_EX_DLGMODALFRAME,
                 class_name,
                 w!("待受ポートの変更"),
                 style,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                340,
-                184,
+                x,
+                y,
+                dlg_w,
+                dlg_h,
                 owner,
                 HMENU::default(),
                 hinstance,
