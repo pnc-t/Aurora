@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "handshake_smoke"
 path = "examples/handshake_smoke.rs"
 
+[[example]]
+name = "reconnect_probe"
+path = "examples/reconnect_probe.rs"
+
 [build-dependencies]
 # Windows exe にアイコン (とバージョン情報) を埋め込む。トレイ/エクスプローラ/タスクバーで
 # aurora アイコンを表示するため。非 Windows ターゲットでは build.rs 側で no-op にする。
@@ -52,9 +56,11 @@ features = [
     "Win32_System_StationsAndDesktops",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_Security_Cryptography",
     "Win32_Media_MediaFoundation",
+    "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_Storage_ProjectedFileSystem",
 ]
