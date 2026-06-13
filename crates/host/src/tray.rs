@@ -76,7 +76,7 @@ mod imp {
     use std::sync::atomic::Ordering;
     use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush,
+        COLOR_BTNFACE, CreateFontW, DeleteObject, GetSysColorBrush, HFONT, HGDIOBJ,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
@@ -121,6 +121,34 @@ mod imp {
     /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// ダイアログ用の現代的なフォント (Segoe UI 9pt, ClearType) を生成する。既定の
+    /// `DEFAULT_GUI_FONT` は古い Tahoma 系で見た目が古臭いため置き換える。返した `HFONT` は
+    /// 呼び出し側がダイアログ破棄後に `DeleteObject` で解放すること。
+    fn ui_font() -> HFONT {
+        let face = to_wide("Segoe UI");
+        // SAFETY: face は NUL 終端の UTF-16。返る HFONT の所有権は呼び出し側 (DeleteObject)。
+        // 負の高さ = キャラクタ高さ指定 (96dpi で 9pt 相当)。weight 400=Normal, charset 1=DEFAULT、
+        // precision 0=OUT/CLIP_DEFAULT_PRECIS, quality 5=CLEARTYPE_QUALITY, pitch 0=DEFAULT。
+        unsafe {
+            CreateFontW(
+                -12,
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                5,
+                0,
+                PCWSTR(face.as_ptr()),
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -679,9 +707,9 @@ mod imp {
             let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
             // 現在パスワード欄の有無で 1 行ぶん高さを変える。
             let (w, h) = if require_current {
-                (340, 254)
+                (340, 280)
             } else {
-                (340, 200)
+                (340, 216)
             };
             let (x, y) = centered_pos(w, h);
             let dlg = match CreateWindowExW(
@@ -702,7 +730,7 @@ mod imp {
                 Err(_) => return None,
             };
 
-            let font = GetStockObject(DEFAULT_GUI_FONT);
+            let font = ui_font();
             let mk_label = |y: i32, text: PCWSTR| {
                 let h = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -735,7 +763,7 @@ mod imp {
                     16,
                     y,
                     300,
-                    24,
+                    26,
                     dlg,
                     HMENU(id as *mut c_void),
                     hinstance,
@@ -746,18 +774,18 @@ mod imp {
                 Some(edit)
             };
 
-            // 現在パスワードを要求する場合は先頭に 1 行追加し、以降を 54px ずつ下げる。
-            let mut y = 12;
+            // 現在パスワードを要求する場合は先頭に 1 行追加し、以降を 58px ずつ下げる。
+            let mut y = 16;
             if require_current {
-                mk_label(y, w!("現在のパスワード:"));
+                mk_label(y, w!("現在のパスワード"));
                 let _ = mk_edit(y + 20, ID_EDIT_CUR);
-                y += 54;
+                y += 58;
             }
-            mk_label(y, w!("新しいパスワード:"));
+            mk_label(y, w!("新しいパスワード"));
             let _ = mk_edit(y + 20, ID_EDIT);
-            mk_label(y + 54, w!("確認のため再入力:"));
-            let _ = mk_edit(y + 74, ID_EDIT2);
-            let button_y = y + 116;
+            mk_label(y + 58, w!("新しいパスワード (確認)"));
+            let _ = mk_edit(y + 78, ID_EDIT2);
+            let button_y = y + 120;
 
             // OK / キャンセルボタン。
             let mk_button = |x: i32, id: usize, text: PCWSTR, default: bool| {
@@ -813,6 +841,8 @@ mod imp {
 
             let _ = EnableWindow(owner, BOOL::from(true));
             let _ = SetForegroundWindow(owner);
+            // 生成したフォントを解放する (ダイアログ破棄後)。
+            let _ = DeleteObject(HGDIOBJ(font.0));
 
             result.value.take()
         }
@@ -957,7 +987,7 @@ mod imp {
             let result_ptr: *mut PortDlgResult = result.as_mut();
 
             let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-            let (dlg_w, dlg_h) = (340, 184);
+            let (dlg_w, dlg_h) = (340, 192);
             let (x, y) = centered_pos(dlg_w, dlg_h);
             let dlg = match CreateWindowExW(
                 WS_EX_DLGMODALFRAME,
@@ -977,7 +1007,7 @@ mod imp {
                 Err(_) => return None,
             };
 
-            let font = GetStockObject(DEFAULT_GUI_FONT);
+            let font = ui_font();
             let label = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("STATIC"),
@@ -1008,9 +1038,9 @@ mod imp {
                     | WS_TABSTOP
                     | WINDOW_STYLE((ES_NUMBER | ES_AUTOHSCROLL) as u32),
                 16,
-                38,
+                40,
                 300,
-                24,
+                26,
                 dlg,
                 HMENU(ID_EDIT_PORT as *mut c_void),
                 hinstance,
@@ -1021,7 +1051,7 @@ mod imp {
                 SendMessageW(e, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
             }
 
-            let button_y = 96;
+            let button_y = 102;
             let mk_button = |x: i32, id: usize, text: PCWSTR, default: bool| {
                 let extra = if default { BS_DEFPUSHBUTTON as u32 } else { 0 };
                 let b = CreateWindowExW(
@@ -1067,6 +1097,8 @@ mod imp {
 
             let _ = EnableWindow(owner, BOOL::from(true));
             let _ = SetForegroundWindow(owner);
+            // 生成したフォントを解放する (ダイアログ破棄後)。
+            let _ = DeleteObject(HGDIOBJ(font.0));
 
             result.value.take()
         }
