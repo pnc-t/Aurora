@@ -314,13 +314,55 @@ impl AuthThrottle {
 /// まだポートを保持していてアドレス使用中 (AddrInUse) になることがあるため、その場合のみ
 /// 数秒間リトライする (通常は旧プロセス終了で数十 ms 以内に空く)。それ以外のエラー
 /// (--bind の IP がマシンに無い等の設定ミス) はリトライしても直らないので即時失敗させる。
+/// Windows の UDP ソケットで `SIO_UDP_CONNRESET` を無効化する。
+///
+/// 既定では、過去に `send_to` した宛先ポートが閉じている (= 切断済みクライアント) と OS が
+/// ICMP port-unreachable を受け、次の `recv_from`/`send_to` を `WSAECONNRESET` (10054) で
+/// 失敗させる。映像を送り続けるホストでは再接続のたびにこれが起き、共有 UDP ソケットが
+/// 毒されて以後の UDP hello 待ちが即死する。FALSE を設定してこの挙動を切る。失敗は無視
+/// (致命ではなく、無効化できなくても従来どおり動くだけ)。
+#[cfg(windows)]
+fn disable_udp_conn_reset(udp: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, WSAIoctl};
+
+    let socket = SOCKET(udp.as_raw_socket() as usize);
+    let enable: u32 = 0; // FALSE
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: socket は live な tokio UdpSocket の raw handle。WSAIoctl は in バッファ (u32 1 個)
+    // を読み out は使わない。所有権は移らない。
+    unsafe {
+        let _ = WSAIoctl(
+            socket,
+            SIO_UDP_CONNRESET,
+            Some(&enable as *const u32 as *const core::ffi::c_void),
+            std::mem::size_of::<u32>() as u32,
+            None,
+            0,
+            &mut bytes_returned,
+            None,
+            None,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_udp_conn_reset(_udp: &UdpSocket) {}
+
 async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>)> {
     const ATTEMPTS: u32 = 25; // 25 × 200ms ≒ 5 秒
     let mut attempt = 0u32;
     loop {
         let (what, e) = match TcpListener::bind(addr).await {
             Ok(tcp) => match UdpSocket::bind(addr).await {
-                Ok(udp) => return Ok((tcp, Arc::new(udp))),
+                Ok(udp) => {
+                    // Windows: 切断済みクライアントへの UDP 送信で返る ICMP port-unreachable が
+                    // 後続の recv_from を WSAECONNRESET で即失敗させる (SIO_UDP_CONNRESET の既定
+                    // 挙動)。これを無効化しないと、数回の再接続でこの共有 UDP ソケットが毒され、
+                    // 以後の wait_udp_hello が即 10054 になり全セッションが UDP hello 待ちで死ぬ。
+                    disable_udp_conn_reset(&udp);
+                    return Ok((tcp, Arc::new(udp)));
+                }
                 Err(e) => ("UDP", e),
             },
             Err(e) => ("TCP", e),
