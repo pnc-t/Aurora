@@ -151,29 +151,58 @@ function switchDisplay(d: DisplayDto): void {
 // password=null (Rust が復号) で行える。手動接続・接続成立で打ち切る。
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
 const MAX_RECONNECT_ATTEMPTS = 10;
+// 接続成立 (host_info) からこの時間生存して初めて「安定」とみなし、再接続カウンタを 0 に
+// 戻す。host_info は Noise ハンドシェイク直後・映像確立前に届くため、ここで即リセットすると、
+// 直後に落ちる接続 (例: 単一接続ホストへの再接続が重なり host が古い socket を掴んで切断) が
+// 毎回「成功」扱いになりバックオフが伸びず 1 秒間隔のフラップが永久に続く。生存時間で判定して
+// すぐ落ちるフラップはバックオフを伸ばし、最大試行で打ち切る。
+const RECONNECT_STABLE_MS = 6000;
 let reconnecting = false;
 let reconnectAttempt = 0;
 let reconnectTimer: number | null = null;
+let stabilizeTimer: number | null = null;
+
+function clearStabilizeTimer(): void {
+  if (stabilizeTimer !== null) {
+    clearTimeout(stabilizeTimer);
+    stabilizeTimer = null;
+  }
+}
 
 function cancelReconnect(): void {
   reconnecting = false;
   reconnectAttempt = 0;
+  clearStabilizeTimer();
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 }
 
+/** 接続成立時 (host_info)。再接続ループは止めるが、カウンタは安定後に初めてリセットする。 */
+function markSessionEstablished(): void {
+  reconnecting = false;
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  // すぐ落ちるフラップではバックオフを伸ばすため、一定時間生存して初めて attempt をリセット。
+  clearStabilizeTimer();
+  stabilizeTimer = window.setTimeout(() => {
+    stabilizeTimer = null;
+    reconnectAttempt = 0;
+  }, RECONNECT_STABLE_MS);
+}
+
 function startReconnect(): void {
   if (!pendingEntry) return;
-  if (!reconnecting) {
-    reconnecting = true;
-    reconnectAttempt = 0;
-  } else if (reconnectTimer !== null) {
-    // 次の試行が予約済みならそれに任せる。reconnecting 中でも timer が無い
-    // (試行したセッションが確立後に死んだ等) なら再予約して継続する。
+  // attempt カウンタはリセットしない (安定接続後の stabilize か手動接続の cancelReconnect でのみ
+  // 0 に戻る)。これによりフラップ時はバックオフが累積する。
+  if (reconnecting && reconnectTimer !== null) {
+    // 次の試行が予約済みならそれに任せる。
     return;
   }
+  reconnecting = true;
   scheduleReconnect();
 }
 
@@ -188,22 +217,24 @@ function scheduleReconnect(): void {
 async function attemptReconnect(): Promise<void> {
   reconnectTimer = null;
   if (!reconnecting || !pendingEntry) return;
+  // 上限到達で打ち切る。openSession が成功 (host_info) しても直後に落ちるフラップでは catch を
+  // 通らないため、ここで毎試行チェックして無限フラップを止める。
+  if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+    cancelReconnect();
+    launcher.setConnState("再接続に失敗しました", "error");
+    showToast("再接続に失敗しました", "error");
+    return;
+  }
   reconnectAttempt++;
   launcher.setConnState(`再接続中… (試行 ${reconnectAttempt})`, "connecting");
   showToast(`再接続を試行中… (${reconnectAttempt})`);
   try {
     // password=null で保存済み (DPAPI) を使う。再保存不要なので save=false。
-    // 成功確定は host_info イベントで cancelReconnect。
+    // 成功確定は host_info イベントで markSessionEstablished (安定後にカウンタリセット)。
     await openSession(pendingEntry, null, false);
   } catch {
     if (!reconnecting) return; // 途中で手動接続等にキャンセルされた
-    if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-      cancelReconnect();
-      launcher.setConnState("再接続に失敗しました", "error");
-      showToast("再接続に失敗しました", "error");
-    } else {
-      scheduleReconnect();
-    }
+    scheduleReconnect();
   }
 }
 
@@ -217,6 +248,8 @@ let disconnectHandled = true;
 function doDisconnect(reason: string, userInitiated = false): void {
   if (disconnectHandled) return;
   disconnectHandled = true;
+  // 安定判定タイマを止める (このセッションは終わったのでカウンタを 0 に戻させない)。
+  clearStabilizeTimer();
   void disconnect();
   connected = false;
   detachInput(); // ポインタロックも解除される
@@ -246,8 +279,9 @@ function handleClientEvent(ev: ClientEvent, gen: number): void {
       launcher.setConnState("handshake complete…", "connecting");
       break;
     case "host_info": {
-      // 接続成立。自動再接続が走っていれば確定として打ち切る。
-      cancelReconnect();
+      // 接続成立。再接続ループは止めるが、カウンタは一定時間生存後にリセットする
+      // (host_info は映像確立前に届くため、即リセットするとフラップが減衰しない)。
+      markSessionEstablished();
       // ランチャーを隠してツールバー有効化。
       launcher.hide();
       launcher.setConnState(`connected · ${lastHost}`, "connected");
