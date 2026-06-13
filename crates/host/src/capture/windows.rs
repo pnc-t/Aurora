@@ -16,11 +16,12 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_NV12, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_NV12, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIDevice, IDXGIOutput,
-    IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
+    IDXGIOutput1, IDXGIOutput5, IDXGIOutput6, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -161,9 +162,23 @@ impl DxgiCapturer {
             .trim_end_matches('\0')
             .to_string();
 
-        // このディスプレイの HDR 有効状態と SDR white level を取得する。
-        let (hdr_active, scale) = hdr_info(&gdi_name);
-        tracing::info!(display = %gdi_name, hdr_active, sdr_white_scale = scale, "capture color");
+        // このディスプレイの advancedColorEnabled と SDR white level を取得する。
+        let (adv_color_enabled, scale) = hdr_info(&gdi_name);
+        // 本物の HDR 判定はデスクトップ合成の色空間を優先する。advancedColorEnabled は
+        // Windows 11 の Automatic Color Management 対応モニタで HDR をオフにしても true の
+        // まま残り、ACM-SDR を HDR と誤検知して常時 FP16/トーンマップ経路に入れてしまう。
+        // 色空間が取れる場合はそれ (= G2084 のときだけ HDR) を採用し、取れない古い環境のみ
+        // advancedColorEnabled にフォールバックする。
+        let color_space_hdr = output_color_space_is_hdr(&output);
+        let hdr_active = color_space_hdr.unwrap_or(adv_color_enabled);
+        tracing::info!(
+            display = %gdi_name,
+            hdr_active,
+            advanced_color_enabled = adv_color_enabled,
+            color_space_hdr = ?color_space_hdr,
+            sdr_white_scale = scale,
+            "capture color"
+        );
 
         // HDR 有効時のみ FP16(scRGB) 取得する。HDR デスクトップは MPO により通常の
         // DuplicateOutput だと FP16/BGRA8 が混在するため、DuplicateOutput1 で scRGB に固定する。
@@ -248,9 +263,25 @@ impl ScreenCapturer for DxgiCapturer {
     }
 }
 
-/// 指定 GDI デバイス名 (`\\.\DISPLAYn`) の (HDR 有効か, scRGB 正規化係数) を返す。
-/// HDR 有効 = advancedColorEnabled。係数 = SDRWhiteLevel/1000 (= white_nits/80)。
-/// 取得失敗時は `(false, 1.0)` (= SDR とみなす)。
+/// DXGI 出力の現在のデスクトップ合成色空間が本物の HDR (PQ/scRGB) かを返す。
+///
+/// `IDXGIOutput6::GetDesc1` の `ColorSpace` が `RGB_FULL_G2084_NONE_P2020` のときだけ
+/// 本物の HDR (FP16 取得 + トーンマップが要る) と判定する。`advancedColorEnabled`
+/// (DisplayConfig) は Windows 11 の Automatic Color Management 対応モニタで HDR をオフに
+/// しても true のまま残り ACM-SDR を誤検知するため、色空間という確実な信号で上書きする。
+/// `IDXGIOutput6` が無い古い環境では `None` を返し、呼び出し側が従来判定にフォールバックする。
+fn output_color_space_is_hdr(output: &IDXGIOutput) -> Option<bool> {
+    let output6: IDXGIOutput6 = output.cast().ok()?;
+    // SAFETY: output6 は live。GetDesc1 は DXGI_OUTPUT_DESC1 を値で返す。
+    let desc = unsafe { output6.GetDesc1() }.ok()?;
+    Some(desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+}
+
+/// 指定 GDI デバイス名 (`\\.\DISPLAYn`) の (advancedColorEnabled, scRGB 正規化係数) を返す。
+/// 係数 = SDRWhiteLevel/1000 (= white_nits/80)。取得失敗時は `(false, 1.0)`。
+/// `advancedColorEnabled` だけでは ACM-SDR を誤検知するため、HDR の最終判定は呼び出し側で
+/// [`output_color_space_is_hdr`] (色空間) を優先する。本関数は white level (scale) の取得と、
+/// 色空間が取れない古い環境向けのフォールバック信号の供給を担う。
 fn hdr_info(gdi_device_name: &str) -> (bool, f32) {
     use std::mem::size_of;
     use windows::Win32::Devices::Display::{
