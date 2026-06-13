@@ -100,12 +100,18 @@ let connected = false;
 // セッション世代。openSession ごとに進め、旧セッションのチャネルに残っていたイベント
 // (遅れて届く Disconnected 等) が新しい接続の状態を壊さないようにする。
 let sessionGen = 0;
+// 接続処理が in-flight か。手動接続と自動再接続が重なって connect_to_host を並行に走らせると、
+// 単一接続ホストに TCP が重なり、host が古い接続を 10054 で切ってフラップになる。1 本だけに絞る。
+let connectInFlight = false;
 
 async function openSession(
   entry: HostEntry,
   password: string | null,
   save: boolean,
 ): Promise<void> {
+  // 既に接続処理中なら重複起動しない (進行中の 1 本に任せる)。
+  if (connectInFlight) return;
+  connectInFlight = true;
   const gen = ++sessionGen;
   lastHost = entry.host;
   pendingEntry = entry;
@@ -120,7 +126,11 @@ async function openSession(
     const buf = data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
     handleVideoChunk(buf);
   };
-  await connectToHost(entry.host, entry.port, password, save, eventChannel, videoChannel);
+  try {
+    await connectToHost(entry.host, entry.port, password, save, eventChannel, videoChannel);
+  } finally {
+    connectInFlight = false;
+  }
 }
 
 const launcher = mountLauncher({
