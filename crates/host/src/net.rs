@@ -656,6 +656,8 @@ async fn handle_client(
     // 押しっぱなしになる (stuck key) のを防ぐ。本体ループを async ブロックに包むのは、
     // ループ内の `?` による早期 return でもこの後始末を必ず通すため。
     let mut held = HeldInputs::default();
+    // 音声ミュート状態 (クライアントの SetAudioMuted)。true の間は音声 UDP を送らない。
+    let mut audio_muted = false;
     let result: Result<()> = async {
     loop {
         tokio::select! {
@@ -685,6 +687,10 @@ async fn handle_client(
                         // ビットレート上限を更新し、新しい現在値を即エンコーダへ反映。
                         let new_bps = bitrate.set_max(max_bitrate_bps);
                         let _ = enc_tx.send(EncoderCommand::SetBitrate(new_bps)).await;
+                    }
+                    ControlMsg::SetAudioMuted { muted } => {
+                        tracing::info!(muted, "client set audio muted");
+                        audio_muted = muted;
                     }
                     ControlMsg::Stats { bitrate_kbps, fps, rtt_us, loss_permille } => {
                         tracing::debug!(bitrate_kbps, fps, rtt_us, loss_permille, "client stats");
@@ -851,12 +857,17 @@ async fn handle_client(
             }
             // 音声フレーム受信 → UDP 送信 (STREAM_AUDIO)
             Some(au) = audio_rx.recv() => {
-                let pkt = AudioPacket { seq: au.seq, payload: &au.data };
-                let mut framed = Vec::with_capacity(au.data.len() + 4);
-                pkt.encode(&mut framed).context("encode AudioPacket")?;
-                let nonce = NONCE_DOMAIN_AUDIO | au.seq as u64;
-                let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed)?;
-                udp.send_to(&dgram, peer_udp).await.context("UDP send audio")?;
+                // ミュート中はチャネルをドレインするだけで送らない (帯域節約 + 詰まり防止)。
+                // seq は送出時のみ進めればよいが、AudioPacket は au.seq をそのまま使い nonce も
+                // au.seq 由来なので、送らない=その seq の nonce を消費しないだけで一貫性は保たれる。
+                if !audio_muted {
+                    let pkt = AudioPacket { seq: au.seq, payload: &au.data };
+                    let mut framed = Vec::with_capacity(au.data.len() + 4);
+                    pkt.encode(&mut framed).context("encode AudioPacket")?;
+                    let nonce = NONCE_DOMAIN_AUDIO | au.seq as u64;
+                    let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed)?;
+                    udp.send_to(&dgram, peer_udp).await.context("UDP send audio")?;
+                }
             }
         }
     }

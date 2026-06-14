@@ -7,6 +7,7 @@ import {
   saveRecentHost,
   selectDisplay,
   setVideoParams,
+  setAudioMuted,
   uploadFileFromPath,
   formatDisplayName,
   type ClientEvent,
@@ -84,6 +85,10 @@ const toolbar = mountToolbar({
   onToggleFilePanel: () => setFilePanel(!fileVisible),
   onToggleFullscreen: () => void doToggleFullscreen(),
   onToggleCapture: () => setCaptureMode(!isCaptured()),
+  onToggleMute: (muted) => {
+    void setAudioMuted(muted);
+    showToast(muted ? "音声ミュート" : "音声ミュート解除");
+  },
   onSetVideoParams: (fps, mbps) => void setVideoParams(fps, mbps * 1_000_000),
 });
 
@@ -297,6 +302,8 @@ function handleClientEvent(ev: ClientEvent, gen: number): void {
       launcher.setConnState(`connected · ${lastHost}`, "connected");
       if (pendingEntry) void saveRecentHost(pendingEntry);
       toolbar.setConnected(true);
+      // ホストが音声対応のときだけミュートボタンを出す (毎接続でミュート解除から)。
+      toolbar.setAudioAvailable(ev.audio);
       connected = true;
       // 接続中はウィンドウのリサイズを許可 (未接続のランチャーは固定サイズ)。
       void setResizable(true);

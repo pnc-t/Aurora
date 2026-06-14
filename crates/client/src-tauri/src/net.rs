@@ -484,6 +484,19 @@ pub async fn set_video_params(
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
+/// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
+#[tauri::command]
+pub async fn set_audio_muted(
+    muted: bool,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.as_ref().ok_or("not connected")?;
+    s.ctrl_tx
+        .send(ControlMsg::SetAudioMuted { muted })
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
 /// ホスト上のファイルのダウンロードを要求する。受信は reader ループが
 /// `%USERPROFILE%\Aurora\downloads` に保存し、完了を FileResult イベントで通知する。
 #[tauri::command]
