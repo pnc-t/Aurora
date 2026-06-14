@@ -79,6 +79,11 @@ export async function setVideoParams(fps: number, maxBitrateBps: number): Promis
   await invoke("set_video_params", { fps, maxBitrateBps });
 }
 
+/// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
+export async function setAudioMuted(muted: boolean): Promise<void> {
+  await invoke("set_audio_muted", { muted });
+}
+
 export async function requestFile(id: number, path: string): Promise<void> {
   await invoke("request_file", { id, path });
 }

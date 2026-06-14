@@ -31,6 +31,7 @@ fn main() {
             net::request_keyframe,
             net::select_display,
             net::set_video_params,
+            net::set_audio_muted,
             net::request_file,
             net::upload_file_from_path,
             net::set_share_root,

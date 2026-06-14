@@ -21,6 +21,7 @@ type ToolbarOpts = {
   onToggleFilePanel: () => void;
   onToggleFullscreen: () => void;
   onToggleCapture: () => void;
+  onToggleMute: (muted: boolean) => void;
   onSetVideoParams: (fps: number, mbps: number) => void;
 };
 
@@ -31,6 +32,8 @@ export type ToolbarHandle = {
   setFileToggled: (on: boolean) => void;
   setFullscreenToggled: (on: boolean) => void;
   setCaptureToggled: (on: boolean) => void;
+  /** ホストが音声対応かをツールバーに伝える (非対応ならミュートボタンを隠す)。 */
+  setAudioAvailable: (available: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
   setConnected: (connected: boolean) => void;
@@ -48,6 +51,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
         <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
         <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
         <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
+        <button type="button" id="tb-audio" class="tb-btn" title="音声ミュート">${icon("volume")}</button>
       </div>
       <span id="display-wrap" class="tb-group" title="表示するディスプレイ" data-tauri-drag-region>
         <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
@@ -78,6 +82,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const displaySelect = opts.topbar.querySelector<HTMLSelectElement>("#display-select");
   const filesBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-files");
   const statsBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-stats");
+  const audioBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-audio");
   const captureBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-capture");
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
@@ -121,6 +126,19 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
 
   let displays: DisplayDto[] = [];
   let connected = false;
+  // 音声ミュート状態。ホストが音声非対応ならボタン自体を隠す (audioAvailable=false)。
+  let muted = false;
+  let audioAvailable = false;
+  // ミュートボタンは既定で非表示。host_info で音声対応が分かったら出す。
+  if (audioBtn) audioBtn.style.display = "none";
+
+  function applyAudioBtn(): void {
+    if (!audioBtn) return;
+    audioBtn.style.display = audioAvailable ? "inline-flex" : "none";
+    audioBtn.classList.toggle("toggled", muted);
+    audioBtn.title = muted ? "音声ミュート解除" : "音声ミュート";
+    audioBtn.innerHTML = icon(muted ? "mute" : "volume");
+  }
   // ピン留め (常時表示)。既定は false = 自動格納し、上端ホバーで一時表示する。
   let pinned = false;
   // 上端ホバーで一時表示中か (ピン留め時は無関係)。
@@ -166,6 +184,11 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   disconnectBtn?.addEventListener("click", () => opts.onDisconnect());
   filesBtn?.addEventListener("click", () => opts.onToggleFilePanel());
   statsBtn?.addEventListener("click", () => opts.onToggleStats());
+  audioBtn?.addEventListener("click", () => {
+    muted = !muted;
+    applyAudioBtn();
+    opts.onToggleMute(muted);
+  });
   captureBtn?.addEventListener("click", () => opts.onToggleCapture());
   fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
   pinBtn?.addEventListener("click", () => setPinned(!pinned));
@@ -208,6 +231,12 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     },
     setCaptureToggled(on: boolean): void {
       captureBtn?.classList.toggle("toggled", on);
+    },
+    setAudioAvailable(available: boolean): void {
+      audioAvailable = available;
+      // 新規接続のたびにミュートは解除状態から始める (前セッションの状態を持ち越さない)。
+      muted = false;
+      applyAudioBtn();
     },
     setVideoParams(fps: number, mbps: number): void {
       if (fpsInput) fpsInput.value = String(fps);
