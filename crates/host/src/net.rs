@@ -41,16 +41,26 @@ pub enum InputCmd {
     SetDisplay(DisplayGeom),
 }
 
-/// クライアント Stats を元にしたビットレート適応制御 (AIMD)。
+/// クライアント Stats を元にしたビットレート適応制御 (輻輳回避型)。
 ///
-/// - 損失率が高い → 乗算的に下げる (Multiplicative Decrease)
-/// - 損失が少なく RTT も良好 → 加算的に上げる (Additive Increase)
+/// 単純な AIMD (+1Mbps/秒で上げ続け、ロスで ×0.7 急降下) は持続可能上限を毎回オーバーシュート
+/// してクラッシュする「ノコギリ波」になり、体感が「軽い ↔ 重い+ブロックノイズ」で激しく振動する
+/// (実測: 天井 ~20-25Mbps を +1Mbps/秒で突き抜けては急降下、15-20 秒周期)。
+///
+/// そこで直近で輻輳した rate を `ceiling_bps` (持続可能上限の推定) として記憶し、そこに**近づいたら
+/// 増速を fast(+1Mbps) から slow(+250kbps) に落として張り付かせる** (TCP の輻輳回避相当)。これで
+/// 持続可能なレートに安定収束し波が小さくなる。`ceiling_bps` は非輻輳時に緩やかに上方回復させ、
+/// 条件が改善したら再び上を探る。
 ///
 /// 制御は `MIN_BITRATE_BPS`..=`max_bps` にクランプする (上限は `--max-bitrate` で可変)。
 struct BitrateController {
     current_bps: u32,
     /// 適応制御の上限 (bps)。`--max-bitrate` 由来。エンコーダのピーク上限と揃える。
     max_bps: u32,
+    /// 持続可能上限の推定 (直近の輻輳点)。増速を緩める閾値に使う。
+    ceiling_bps: u32,
+    /// 直前サンプルが輻輳だったか。輻輳の立ち上がりでのみ ceiling を記録するため。
+    in_congestion: bool,
 }
 
 impl BitrateController {
@@ -61,14 +71,20 @@ impl BitrateController {
         Self {
             current_bps: DEFAULT_BITRATE_BPS.clamp(MIN_BITRATE_BPS, max_bps),
             max_bps,
+            ceiling_bps: max_bps,
+            in_congestion: false,
         }
     }
 
-    /// クライアントからビットレート上限を明示変更する。上限を新しい値にし、現在値は
-    /// その上限から開始する (即反映)。以後 `on_stats` が loss/RTT で下げる。新しい現在値を返す。
+    /// クライアントからビットレート上限を明示変更する。上限を更新し、**現在値は据え置き**
+    /// (新上限でクランプのみ)。旧実装は上限へ即ジャンプしていたが、それが接続直後に天井を
+    /// 突き抜けてロス→急降下する初期の波の元だったため、下から `on_stats` で滑らかに上げる。
+    /// 天井推定はリセットして新上限まで再探索させる。新しい現在値を返す。
     fn set_max(&mut self, max_bps: u32) -> u32 {
         self.max_bps = max_bps.max(MIN_BITRATE_BPS);
-        self.current_bps = self.max_bps;
+        self.current_bps = self.current_bps.clamp(MIN_BITRATE_BPS, self.max_bps);
+        self.ceiling_bps = self.max_bps;
+        self.in_congestion = false;
         self.current_bps
     }
 
@@ -77,16 +93,35 @@ impl BitrateController {
         const LOSS_HIGH: u16 = 50; // 5% 超で輻輳とみなす
         const LOSS_LOW: u16 = 10; // 1% 未満なら余裕あり
         const RTT_OK_US: u32 = 80_000; // 80ms 未満なら増速を許可
-        const STEP_UP_BPS: u32 = 1_000_000;
+        const STEP_UP_FAST: u32 = 1_000_000; // ceiling から遠いとき
+        const STEP_UP_SLOW: u32 = 250_000; // ceiling 付近 (輻輳回避でゆっくり張り付く)
+        const DECREASE: f32 = 0.8;
 
-        let next = if loss_permille > LOSS_HIGH {
-            (self.current_bps as f32 * 0.7) as u32
+        let congested = loss_permille > LOSS_HIGH;
+
+        // 非輻輳時は ceiling をゆっくり上方回復させ、条件改善に追従する (低い値での固着防止)。
+        if !congested {
+            self.ceiling_bps = (self.ceiling_bps + self.ceiling_bps / 128).min(self.max_bps);
+        }
+
+        let next = if congested {
+            // 輻輳の立ち上がりでのみ ceiling を記録する。持続中に連続記録すると、減速途中の
+            // 低い rate を天井と誤認して過小評価してしまう。
+            if !self.in_congestion {
+                self.ceiling_bps = self.current_bps;
+            }
+            (self.current_bps as f32 * DECREASE) as u32
         } else if loss_permille < LOSS_LOW && rtt_us < RTT_OK_US {
-            self.current_bps.saturating_add(STEP_UP_BPS)
+            // ceiling に近いか遠いかで増速量を変える: 近ければ輻輳回避でゆっくり張り付く。
+            let near = (self.current_bps as u64) * 100 >= (self.ceiling_bps as u64) * 85;
+            let step = if near { STEP_UP_SLOW } else { STEP_UP_FAST };
+            self.current_bps.saturating_add(step)
         } else {
             self.current_bps
         }
         .clamp(MIN_BITRATE_BPS, self.max_bps);
+
+        self.in_congestion = congested;
 
         if next != self.current_bps {
             self.current_bps = next;
@@ -1000,4 +1035,36 @@ async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(stream: &mut W, data: &[u8]) 
     stream.write_all(data).await.context("write body")?;
     stream.flush().await.ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ceiling から遠いときは fast(+1Mbps)、近い (>=85%) ときは slow(+250kbps) で張り付く。
+    /// 単純 AIMD のノコギリ波 (毎回 +1Mbps で天井突き抜け) を防ぐ核心。
+    #[test]
+    fn ramps_fast_far_below_ceiling_then_crawls_near_it() {
+        let mut bc = BitrateController::new(30_000_000);
+        bc.ceiling_bps = 20_000_000;
+        bc.current_bps = 10_000_000; // 天井の 50% → fast
+        assert_eq!(bc.on_stats(0, 1000), Some(11_000_000));
+        bc.current_bps = 18_000_000; // 天井の 90% → slow
+        assert_eq!(bc.on_stats(0, 1000), Some(18_250_000));
+    }
+
+    /// 輻輳では ×0.8 減速し、ceiling は**立ち上がりで 1 度だけ**記録する (持続中の連続記録で
+    /// 減速途中の低い rate を天井と誤認しない)。
+    #[test]
+    fn congestion_decreases_and_records_ceiling_once() {
+        let mut bc = BitrateController::new(30_000_000);
+        bc.current_bps = 25_000_000;
+        bc.ceiling_bps = 30_000_000;
+        // 立ち上がり: ceiling=25M を記録、25M→20M。
+        assert_eq!(bc.on_stats(200, 1000), Some(20_000_000));
+        assert_eq!(bc.ceiling_bps, 25_000_000);
+        // 持続: ceiling 据え置き、20M→16M。
+        assert_eq!(bc.on_stats(200, 1000), Some(16_000_000));
+        assert_eq!(bc.ceiling_bps, 25_000_000);
+    }
 }
