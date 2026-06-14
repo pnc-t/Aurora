@@ -1,8 +1,10 @@
 // 接続中の操作ツールバー。
-// 既定で常時表示 (上端に固定オーバーレイ)。Ctrl+Alt+Shift+B で一時的に隠せる。
-// 構成: [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替] | [プリセット(+カスタム時のみ fps/Mbps)] … [pin] [min/close]
-// 各操作はアイコン + ツールチップ。バー全体 (#topbar) と構造スパンに data-tauri-drag-region を
-// 付け、ボタン/入力/select 以外の余白・隔て・グループ間どこを掴んでもウィンドウ移動できる。
+// 既定で常時表示 (上端の透明な帯に、角丸+影のピルを 1 枚浮かせて中央配置するフローティング型)。
+// Ctrl+Alt+Shift+B で一時的に隠せる。
+// 構成 (ピル内): [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替] | [プリセット(+カスタム時のみ fps/Mbps)] | [pin] | [min/close]
+// 各操作はフラットなアイコンボタン + ツールチップ。ピル本体 (.tb-pill) と透明な帯 (#topbar)、
+// 構造スパンに data-tauri-drag-region を付け、ボタン/入力/select 以外の余白・隔て・帯の余白どこを
+// 掴んでもウィンドウ移動できる。
 // 接続先情報は省スペース化のためバーの title (ホバー tooltip) に退避し、行内には常駐させない。
 
 import { formatDisplayName, type DisplayDto } from "../core/ipc";
@@ -36,33 +38,35 @@ export type ToolbarHandle = {
 
 export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   opts.topbar.innerHTML = `
-    <div class="tb-group" data-tauri-drag-region>
-      <button type="button" id="tb-disconnect" class="tb-btn danger" title="切断">${icon("power")}</button>
-    </div>
-    <span class="tb-sep" data-tauri-drag-region></span>
-    <div class="tb-group" data-tauri-drag-region>
-      <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (F11 / Ctrl+Alt+Shift+F)">${icon("fullscreen")}</button>
-      <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
-      <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
-      <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
-    </div>
-    <span id="display-wrap" class="tb-group" title="表示するディスプレイ" data-tauri-drag-region>
-      <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
-      <select id="display-select"></select>
-    </span>
-    <span class="tb-sep" data-tauri-drag-region></span>
-    <span class="tb-video" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限" data-tauri-drag-region>
-      <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
-      <span id="tb-custom" class="tb-custom">
-        <input type="text" inputmode="numeric" id="tb-fps" />fps
-        <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
+    <div class="tb-pill" data-tauri-drag-region>
+      <div class="tb-group" data-tauri-drag-region>
+        <button type="button" id="tb-disconnect" class="tb-btn danger" title="切断">${icon("power")}</button>
+      </div>
+      <span class="tb-sep" data-tauri-drag-region></span>
+      <div class="tb-group" data-tauri-drag-region>
+        <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (F11 / Ctrl+Alt+Shift+F)">${icon("fullscreen")}</button>
+        <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
+        <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
+        <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
+      </div>
+      <span id="display-wrap" class="tb-group" title="表示するディスプレイ" data-tauri-drag-region>
+        <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
+        <select id="display-select"></select>
       </span>
-    </span>
-    <span class="spacer" data-tauri-drag-region title="ドラッグでウィンドウ移動"></span>
-    <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
-    <span id="tb-winctl" class="window-controls"></span>
+      <span class="tb-sep" data-tauri-drag-region></span>
+      <span class="tb-video" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限" data-tauri-drag-region>
+        <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
+        <span id="tb-custom" class="tb-custom">
+          <input type="text" inputmode="numeric" id="tb-fps" />fps
+          <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
+        </span>
+      </span>
+      <span class="tb-sep" data-tauri-drag-region></span>
+      <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
+      <span id="tb-winctl" class="window-controls"></span>
+    </div>
   `;
-  // バー本体 (余白・padding 領域) もウィンドウ移動の掴みどころにする。
+  // 透明な帯 (ピル周囲の余白) もウィンドウ移動の掴みどころにする。
   opts.topbar.setAttribute("data-tauri-drag-region", "");
 
   // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。

@@ -1,66 +1,89 @@
 /* 接続中の操作ツールバー (toolbar.ts)。
- * 既定で上端に常時表示。Ctrl+Alt+Shift+B で隠す/戻すときだけ transform でスライドする。
- * 操作はアイコンボタン (.tb-btn) を機能ごとに .tb-group へまとめ、.tb-sep で区切る。 */
+ * フローティングのピル型: 上端に張り付く全幅バーではなく、透明な帯 (#topbar) の中に
+ * 角丸+影のピル (.tb-pill) を 1 枚浮かせて中央に配置する。既定で常時表示。
+ * Ctrl+Alt+Shift+B で隠す/戻すときだけ transform で帯ごとスライドする。
+ * 操作はフラットなアイコンボタン (.tb-btn) を機能ごとに .tb-group へまとめ、.tb-sep で区切る。 */
 
+/* 上端の透明な帯。ピルを中央に浮かべるだけのコンテナ。背景・枠は持たない。
+ * 帯の余白部分も data-tauri-drag-region でウィンドウ移動の掴みどころにする。 */
 #topbar {
   position: fixed; top: 0; left: 0; right: 0; z-index: 30;
-  display: flex; gap: 6px; align-items: center;
-  padding: 4px 8px;
-  background: var(--toolbar-bg);
-  border-bottom: 1px solid var(--panel-border);
-  transform: translateY(-100%);
-  transition: transform 0.18s ease;
+  display: flex; justify-content: center; align-items: flex-start;
+  padding: 8px 12px;
+  background: none; border: none;
+  transform: translateY(-130%);
+  transition: transform 0.2s ease;
 }
 #topbar.visible { transform: translateY(0); }
 
-/* 機能グループと区切り線 */
-.tb-group { display: inline-flex; align-items: center; gap: 4px; }
-.tb-sep { width: 1px; align-self: stretch; margin: 2px 4px; background: var(--panel-border); }
+/* 浮島ピル本体。角丸 + 影 + 薄い枠で映像の上にふわっと浮かせる。 */
+.tb-pill {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 5px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px var(--shadow), 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
 
-/* アイコンボタン共通 */
+/* 機能グループと区切り線 (ピル内なので短く控えめに) */
+.tb-group { display: inline-flex; align-items: center; gap: 2px; }
+.tb-sep { width: 1px; height: 18px; align-self: center; margin: 0 4px; background: var(--panel-border); opacity: 0.8; }
+
+/* フラットなアイコンボタン: 既定は枠なし・透明、ホバー時だけ淡い背景。 */
 .tb-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 32px; height: 28px; padding: 0; font-size: 16px;
-  background: var(--control); color: var(--fg);
-  border: 1px solid var(--panel-border); border-radius: 7px; cursor: pointer;
+  width: 34px; height: 30px; padding: 0; font-size: 17px;
+  background: transparent; color: var(--fg);
+  border: none; border-radius: 9px; cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
 }
-.tb-btn:hover { background: var(--control-hover); }
-.tb-btn.toggled { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-.tb-btn.danger { color: var(--danger-fg); border-color: var(--danger); }
+.tb-btn:hover { background: var(--menu-hover); }
+.tb-btn:active { background: var(--control-hover); }
+.tb-btn.toggled { background: var(--accent); color: var(--accent-fg); }
+.tb-btn.toggled:hover { background: var(--accent); filter: brightness(1.08); }
+.tb-btn.danger { color: var(--danger-fg); }
 .tb-btn.danger:hover { background: var(--danger); color: #fff; }
 
 /* ディスプレイ切替 (複数ディスプレイ時のみ表示。display は JS が制御) */
-#display-wrap { display: none; align-items: center; gap: 4px; }
+#display-wrap { display: none; align-items: center; gap: 4px; margin-left: 2px; }
 #display-wrap .tb-ico { display: inline-flex; align-items: center; font-size: 17px; color: var(--muted); }
+
+/* select はフラット化。地は透明にしてホバー/フォーカス時だけ面を出す。 */
 #topbar select {
-  background: var(--control); color: var(--fg);
-  border: 1px solid var(--panel-border); border-radius: 6px;
-  padding: 5px 8px; cursor: pointer; font-size: 12px;
+  background: transparent; color: var(--fg);
+  border: none; border-radius: 8px;
+  padding: 4px 6px; cursor: pointer; font-size: 12px;
+  transition: background 0.12s ease;
 }
+#topbar select:hover { background: var(--menu-hover); }
+#topbar select:focus { outline: none; background: var(--menu-hover); }
 
 /* 画質プリセット + (カスタム時のみ) fps/Mbps 手動入力 */
 .tb-video { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
 /* fps/Mbps 欄。既定は非表示で、プリセット=カスタムのとき JS が inline-flex にする。 */
 .tb-custom { display: none; align-items: center; gap: 4px; }
 .tb-video input {
-  width: 44px; text-align: right; background: var(--control); color: var(--fg);
-  border: 1px solid var(--panel-border); border-radius: 6px; padding: 5px 6px;
+  width: 42px; text-align: right; background: var(--control); color: var(--fg);
+  border: 1px solid transparent; border-radius: 7px; padding: 4px 6px;
 }
 .tb-video input:focus { outline: none; border-color: var(--accent); }
 
-/* ドラッグ移動用の空き領域 (バー右側の大半を占め、掴みどころを広く取る) */
-.spacer { flex: 1 1 auto; min-width: 48px; align-self: stretch; }
 /* ドラッグ可能領域は移動カーソルにして掴めることを示す。 */
 [data-tauri-drag-region] { cursor: grab; }
 /* 操作要素はドラッグ領域内でも通常カーソルに戻す。 */
 .tb-btn, #topbar select, #topbar input, .winctl { cursor: pointer; }
 #topbar input { cursor: text; }
 
-/* ツールバー右端のウィンドウ操作 (フレームレス用)。共有 .winctl の見た目を打ち消す。 */
-#topbar .window-controls { position: static; display: flex; height: auto; margin-left: 4px; }
+/* ピル右端のウィンドウ操作 (フレームレス用)。共有 .winctl の見た目を打ち消し、
+ * ボタンと同じフラットな佇まいに揃える。 */
+#topbar .window-controls { position: static; display: flex; height: auto; margin-left: 2px; gap: 2px; }
 #topbar .winctl {
-  width: 38px; height: 28px; padding: 0; border: none; border-radius: 6px;
+  width: 34px; height: 30px; padding: 0; border: none; border-radius: 9px;
   background: transparent; color: var(--muted);
+  transition: background 0.12s ease, color 0.12s ease;
 }
 #topbar .winctl:hover { background: var(--winctl-hover); color: var(--fg); }
 #topbar .winctl.close:hover { background: var(--danger); color: #fff; }
