@@ -147,16 +147,19 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 button { font: inherit; }
 
 /* --- 全面 canvas (最背面) --- */
+/* 映像エリアは常にウィンドウ全体を占める。フローティングのツールバー (ピル) は
+ * 場所を予約せず映像の上端に重ねて浮かせる (自動格納される floating バー本来の挙動)。
+ * 高さを予約すると映像エリアが 16:9 より横長になり、16:9 映像が左右にレターボックス
+ * されて横黒帯が出るため予約しない。 */
 #screen-wrap {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
   background: #000;
-  transition: top 0.18s ease;
 }
-/* ツールバー表示中は映像エリアをバーの高さ分下げ、バーと重ならないようにする
- * (--topbar-h は toolbar.ts が実測値を設定。bar-open は接続中かつ非表示でない間)。 */
-body.bar-open #screen-wrap { top: var(--topbar-h, 44px); }
-#screen { max-width: 100%; max-height: 100%; background: #000; outline: none; }
+/* アスペクト比を保ったまま映像エリア全体にフィットさせる (フレームがウィンドウより
+ * 小さくても拡大する)。max-width/height だけだと縮小のみで、フルスクリーンや低解像度
+ * 送出時にネイティブサイズのまま中央に小さく表示されてしまうため object-fit で拡縮する。 */
+#screen { width: 100%; height: 100%; object-fit: contain; background: #000; outline: none; }
 
 /* --- アイコン共通 (icons.ts の出力。launcher / topbar 双方で使用) --- */
 /* SVG アイコン共通: ベースライン隙間を消し、サイズは font-size 継承 (currentColor) */

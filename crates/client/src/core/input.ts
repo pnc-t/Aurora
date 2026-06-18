@@ -134,11 +134,21 @@ function toDisplayCoords(e: MouseEvent): { x: number; y: number } | null {
   if (!canvas || !display) return null;
   const rect = canvas.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return null;
-  const nx = (e.clientX - rect.left) / rect.width;
-  const ny = (e.clientY - rect.top) / rect.height;
+  // canvas は CSS で object-fit:contain。映像はアスペクト比を保って canvas 要素「内部」に
+  // レターボックス配置されるため、要素全体 (rect) で正規化すると黒帯のぶんだけ座標がズレる。
+  // 実際に映像が描かれている矩形 (contain 計算) を求め、その中での相対位置で正規化する。
+  const scale = Math.min(rect.width / display.width, rect.height / display.height);
+  const videoW = display.width * scale;
+  const videoH = display.height * scale;
+  const offsetX = (rect.width - videoW) / 2;
+  const offsetY = (rect.height - videoH) / 2;
+  const vx = e.clientX - rect.left - offsetX;
+  const vy = e.clientY - rect.top - offsetY;
+  // 黒帯部分 (映像外) のクリックはホストへ送らない (端へ吸着させると誤操作になる)。
+  if (vx < 0 || vy < 0 || vx > videoW || vy > videoH) return null;
   return {
-    x: Math.round(nx * display.width),
-    y: Math.round(ny * display.height),
+    x: Math.round((vx / videoW) * display.width),
+    y: Math.round((vy / videoH) * display.height),
   };
 }
 
