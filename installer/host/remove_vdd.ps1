@@ -5,6 +5,14 @@
 # PowerShell 5.1), which decodes BOM-less files as ANSI -- Japanese text would
 # be mojibake and break string parsing. Keep this file ASCII.
 
+# Resolve the REAL 64-bit pnputil.exe. NSIS uninstall is 32-bit, so the elevated
+# powershell.exe is 32-bit; a bare 'pnputil' there resolves under System32 which WOW64
+# redirects to SysWOW64 (no pnputil) and silently no-ops -- that would leave the driver
+# package behind. 'Sysnative' reaches the true System32 from a 32-bit process; on 64-bit
+# PowerShell it does not exist, so fall back to System32.
+$pnputil = Join-Path $env:SystemRoot 'Sysnative\pnputil.exe'
+if (-not (Test-Path $pnputil)) { $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe' }
+
 # 1. Remove devices (matched by hardware id / friendly name).
 #    MTT1337 = virtual monitor (child). Root\MttVDD (HardwareID 'MttVDD') =
 #    the parent node created by nefconw. Remove both so no empty node is left.
@@ -19,7 +27,7 @@ for ($pass = 1; $pass -le 2; $pass++) {
     if ($devs.Count -eq 0) { break }
     foreach ($dev in $devs) {
         Write-Host "Removing device (pass $pass): $($dev.FriendlyName) ($($dev.InstanceId))"
-        & pnputil /remove-device $dev.InstanceId /subtree
+        & $pnputil /remove-device $dev.InstanceId /subtree
         if ($LASTEXITCODE -ne 0) { Write-Host "  pnputil /remove-device exit=$LASTEXITCODE" }
     }
     Start-Sleep -Seconds 2
@@ -37,14 +45,14 @@ try {
     if ($pkg) {
         foreach ($p in $pkg) {
             Write-Host "Removing driver: $($p.Driver) (orig: $($p.OriginalFileName))"
-            & pnputil /delete-driver $p.Driver /uninstall /force
+            & $pnputil /delete-driver $p.Driver /uninstall /force
         }
     } else {
         Write-Host "MttVDD driver package not found (already removed)"
     }
 } catch {
     # Fallback: search pnputil /enum-drivers directly.
-    $lines = & pnputil /enum-drivers
+    $lines = & $pnputil /enum-drivers
     $oemName = $null
     foreach ($line in $lines) {
         if ($line -match 'oem\d+\.inf') {
@@ -52,7 +60,7 @@ try {
         }
         if ($oemName -and $line -match 'mttvdd') {
             Write-Host "Removing driver (fallback): $oemName"
-            & pnputil /delete-driver $oemName /uninstall /force
+            & $pnputil /delete-driver $oemName /uninstall /force
             $oemName = $null
         }
     }
