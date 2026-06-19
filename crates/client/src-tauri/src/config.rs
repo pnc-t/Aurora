@@ -78,6 +78,10 @@ pub struct ClientSettings {
     /// 通信断などで切れたとき自動で再接続を試みる。
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
+    /// 接続時にホストの仮想ディスプレイ (IDD / MttVDD) をキャプチャ対象にする (RDP 風)。
+    /// 既定 OFF (物理ディスプレイをキャプチャ)。ホストに仮想ディスプレイが無ければ無視される。
+    #[serde(default)]
+    pub use_virtual_display: bool,
 }
 
 fn default_fps() -> u32 {
@@ -105,6 +109,7 @@ impl Default for ClientSettings {
             fps: default_fps(),
             max_mbps: default_max_mbps(),
             auto_reconnect: true,
+            use_virtual_display: false,
         }
     }
 }

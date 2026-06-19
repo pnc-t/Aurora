@@ -8,6 +8,9 @@ pub struct Display {
     pub width: u32,
     pub height: u32,
     pub name: String,
+    /// 仮想ディスプレイ (IDD / MttVDD) か。クライアントが「仮想ディスプレイを使う」設定の
+    /// とき、接続時にこの id を自動選択してキャプチャ対象にする。
+    pub is_virtual: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -158,5 +161,25 @@ pub enum ControlMsg {
     /// 送らない (音が止まるのに加え、わずかだが帯域も止まる)。末尾に追加しタグ互換を保つ。
     SetAudioMuted {
         muted: bool,
+    },
+    /// クライアント → ホスト。送出する映像の最大高さ (px)。0 = キャプチャ解像度のまま。
+    /// ホストは GPU で縮小 (アスペクト比維持) してからエンコードし、帯域と負荷を下げる。
+    SetResolution {
+        max_height: u32,
+    },
+    /// クライアント → ホスト。クライアントの映像表示領域サイズ (物理 px)。ホストは
+    /// キャプチャ対象ディスプレイの解像度を、これに最も近い対応モードへ変更する (RDP 風)。
+    /// 黒帯を無くし 1:1 表示にするのが狙い。末尾に追加しタグ互換を保つ。
+    SetClientViewport {
+        width: u32,
+        height: u32,
+    },
+    /// ホスト → クライアント。解像度変更 (SetClientViewport / ディスプレイ切替) の結果、
+    /// アクティブなキャプチャ対象ディスプレイの実解像度が変わったことを通知する。
+    /// クライアントは入力スケールとデコーダを更新する。末尾に追加しタグ互換を保つ。
+    DisplayResized {
+        id: u32,
+        width: u32,
+        height: u32,
     },
 }

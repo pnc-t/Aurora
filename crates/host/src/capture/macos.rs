@@ -147,6 +147,11 @@ impl ScreenCaptureKitCapturer {
         Self::new_primary(_device)
     }
 
+    /// macOS は MVP では primary 固定。名前は無視する (Windows のテイクオーバー用 API との対称)。
+    pub fn new_for_name(_device: super::SharedDevice, _name: &str) -> Result<Self> {
+        Self::new_primary(_device)
+    }
+
     pub fn new_primary(_device: super::SharedDevice) -> Result<Self> {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);
 

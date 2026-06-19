@@ -36,6 +36,10 @@ unsafe impl Send for SendTexture {}
 
 pub trait ScreenCapturer: Send {
     fn next_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Frame>>;
+
+    /// 送出する映像の最大高さを設定する (0 = キャプチャ解像度のまま)。アスペクト比は維持。
+    /// 既定は no-op (縮小未対応の OS 実装はそのまま)。Windows は GPU 縮小で実装する。
+    fn set_target_height(&mut self, _max_height: u32) {}
 }
 
 /// capture・convert・encode で共有するデバイス。Windows は `Arc<DeviceBundle>`、
@@ -74,6 +78,9 @@ impl From<&DisplayInfo> for aurora_common::proto::Display {
             width: d.width,
             height: d.height,
             name: d.name.clone(),
+            // 仮想ディスプレイ判定は net 側で virtualdisplay::detect() の GDI 名と
+            // 突き合わせて設定する (ここでは判定材料を持たないため既定 false)。
+            is_virtual: false,
         }
     }
 }
@@ -86,7 +93,7 @@ pub mod device;
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    DxgiCapturer as PlatformCapturer, debug_frame_to_bgra, enumerate_displays,
+    DxgiCapturer as PlatformCapturer, debug_frame_to_bgra, debug_list_outputs, enumerate_displays,
     input_desktop_is_default,
 };
 

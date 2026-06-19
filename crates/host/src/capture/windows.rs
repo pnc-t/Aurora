@@ -142,6 +142,147 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
     Ok(displays)
 }
 
+/// GDI 名 (`\\.\DISPLAYn`) に一致する DXGI 出力を、**毎回新しいファクトリ**で全アダプタ×出力を
+/// 走査して返す。出力名はシステム全体で一意なので名前一致で特定でき、トポロジ変更直後の
+/// 古い index に依存しない。見つからない (= デタッチ中) なら Err。
+fn find_output_by_name(target: &str) -> Result<IDXGIOutput> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+    // SAFETY: CreateDXGIFactory1 は OUT パラメータ (factory) を初期化する。
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    // 見つからなかったときに「いま実際に存在する出力名」を診断できるよう収集する。
+    // テイクオーバーのリサイズ後に GDI 名が振り直されて cur_name が stale 化する仮説の判定に使う。
+    let mut available: Vec<String> = Vec::new();
+    let mut ai = 0u32;
+    loop {
+        // SAFETY: EnumAdapters1 は範囲外で NOT_FOUND を返す。
+        let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(ai) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        ai += 1;
+        let mut oi = 0u32;
+        loop {
+            // SAFETY: EnumOutputs は範囲外で NOT_FOUND を返す。
+            let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(oi) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            oi += 1;
+            // SAFETY: output live。GetDesc は値返し。
+            let desc = unsafe { output.GetDesc() }.context("output GetDesc")?;
+            let name = String::from_utf16_lossy(&desc.DeviceName)
+                .trim_end_matches('\0')
+                .to_string();
+            if name == target {
+                return Ok(output);
+            }
+            available.push(name);
+        }
+    }
+    Err(anyhow!(
+        "no DXGI output named {target} (detached?); available: [{}]",
+        available.join(", ")
+    ))
+}
+
+/// 全 DXGI アダプタ × 全出力を列挙して人間可読な行にする (`--list-displays` 診断用)。
+///
+/// 仮想ディスプレイ (IDD / VDD) は **別アダプタ** (例: "IddSampleDriver Device" や
+/// Indirect Display 用の仮想アダプタ) に出ることが多い。本アプリの [`enumerate_displays`] は
+/// 単一アダプタ (enum デバイスの GetAdapter) の出力しか見ないため、仮想ディスプレイを
+/// 捕捉対象にできるか (= どのアダプタ/output index に出るか・desktop に attach されるか) を
+/// 実機で確認するための診断。Desktop Duplication は「そのアダプタで作った D3D11 デバイス」が
+/// 要るため、仮想ディスプレイが別アダプタなら capture 側もそのアダプタで device を作る必要がある。
+pub fn debug_list_outputs() -> Result<Vec<String>> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+
+    // GDI デバイス名 (`\\.\DISPLAYn`) が提供する解像度モード (distinct な w×h) を列挙する。
+    // ChangeDisplaySettingsEx で設定できる候補 = ここに出る解像度。仮想ディスプレイが
+    // クライアント実寸に近い任意サイズを提供するか (= display.rs で解像度を合わせられるか) を見る。
+    let mode_summary = |gdi_name: &str| -> String {
+        use windows::Win32::Graphics::Gdi::{
+            DEVMODEW, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
+        };
+        use windows::core::PCWSTR;
+        let wide: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut set: std::collections::BTreeSet<(u32, u32)> = std::collections::BTreeSet::new();
+        let mut i = 0u32;
+        loop {
+            let mut dm = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            // SAFETY: wide は NUL 終端の有効な GDI 名。dm は dmSize 設定済みで OUT を埋める。
+            let ok = unsafe {
+                EnumDisplaySettingsW(
+                    PCWSTR(wide.as_ptr()),
+                    ENUM_DISPLAY_SETTINGS_MODE(i),
+                    &mut dm,
+                )
+            };
+            if !ok.as_bool() {
+                break;
+            }
+            set.insert((dm.dmPelsWidth, dm.dmPelsHeight));
+            i += 1;
+        }
+        let list: Vec<String> = set.iter().map(|(w, h)| format!("{w}x{h}")).collect();
+        format!("    modes({}): {}", list.len(), list.join(", "))
+    };
+
+    // SAFETY: CreateDXGIFactory1 は OUT パラメータ (factory) を初期化する。
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    let mut lines = Vec::new();
+    let mut ai = 0u32;
+    loop {
+        // SAFETY: EnumAdapters1 は範囲外で DXGI_ERROR_NOT_FOUND を返す。
+        let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(ai) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        // SAFETY: adapter live。GetDesc1 は値返し。
+        let adesc = unsafe { adapter.GetDesc1() }.context("adapter GetDesc1")?;
+        let aname = String::from_utf16_lossy(&adesc.Description)
+            .trim_end_matches('\0')
+            .to_string();
+
+        let mut oi = 0u32;
+        let mut any = false;
+        loop {
+            // SAFETY: EnumOutputs は範囲外で NOT_FOUND を返す。
+            let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(oi) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            any = true;
+            // SAFETY: output live。GetDesc は値返し。
+            let odesc = unsafe { output.GetDesc() }.context("output GetDesc")?;
+            let r = odesc.DesktopCoordinates;
+            let oname = String::from_utf16_lossy(&odesc.DeviceName)
+                .trim_end_matches('\0')
+                .to_string();
+            lines.push(format!(
+                "adapter[{ai}] \"{aname}\"  output[{oi}] {oname}  {}x{} @ ({},{})  attached_to_desktop={}",
+                r.right - r.left,
+                r.bottom - r.top,
+                r.left,
+                r.top,
+                odesc.AttachedToDesktop.as_bool(),
+            ));
+            lines.push(mode_summary(&oname));
+            oi += 1;
+        }
+        if !any {
+            lines.push(format!("adapter[{ai}] \"{aname}\"  (no outputs)"));
+        }
+        ai += 1;
+    }
+    if lines.is_empty() {
+        lines.push("(no DXGI adapters/outputs found)".to_string());
+    }
+    Ok(lines)
+}
+
 impl DxgiCapturer {
     pub fn new_primary(device: SharedDevice) -> Result<Self> {
         Self::new_for_output(device, 0)
@@ -150,12 +291,28 @@ impl DxgiCapturer {
     /// 指定インデックスの DXGI 出力をキャプチャ対象にする。共有デバイスを受け取る。
     pub fn new_for_output(device: SharedDevice, output_index: u32) -> Result<Self> {
         let d3d = &device.device;
-
         // SAFETY: device は live。cast は同 COM オブジェクトの別 IID。
         let dxgi_device: IDXGIDevice = d3d.cast().context("cast IDXGIDevice")?;
         let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
         let output: IDXGIOutput = unsafe { adapter.EnumOutputs(output_index) }
             .with_context(|| format!("EnumOutputs({output_index}) -- no such display?"))?;
+        Self::from_output(device, output)
+    }
+
+    /// GDI 名 (`\\.\DISPLAYn`) で DXGI 出力を選びキャプチャする。
+    ///
+    /// インデックスではなく**新しい DXGI ファクトリで出力を引き直す**ため、テイクオーバー等で
+    /// ディスプレイのアタッチ/デタッチが起きて出力レイアウト (index) が変わった直後でも、
+    /// 正しい出力を捕捉できる。共有デバイスの GetAdapter はキャッシュされ古いレイアウトを返す
+    /// ことがあり (= EnumOutputs(n) が "no such display" になる)、その回避が目的。複製
+    /// (DuplicateOutput) は共有デバイスのまま行う (同一物理アダプタなので有効)。
+    pub fn new_for_name(device: SharedDevice, target_name: &str) -> Result<Self> {
+        let output = find_output_by_name(target_name)?;
+        Self::from_output(device, output)
+    }
+
+    fn from_output(device: SharedDevice, output: IDXGIOutput) -> Result<Self> {
+        let d3d = &device.device;
         // SAFETY: output live。GetDesc は値返し。GDI デバイス名 (\\.\DISPLAYn) を得る。
         let out_desc = unsafe { output.GetDesc() }.context("IDXGIOutput::GetDesc")?;
         let gdi_name = String::from_utf16_lossy(&out_desc.DeviceName)
@@ -221,6 +378,10 @@ impl DxgiCapturer {
 }
 
 impl ScreenCapturer for DxgiCapturer {
+    fn set_target_height(&mut self, max_height: u32) {
+        self.converter.set_target_height(max_height);
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();

@@ -58,6 +58,11 @@ impl PipewireCapturer {
         Self::new_primary(_device)
     }
 
+    /// Linux はポータルがソースを選ぶため名前は無視し primary を開く (API 対称用)。
+    pub fn new_for_name(_device: super::SharedDevice, _name: &str) -> Result<Self> {
+        Self::new_primary(_device)
+    }
+
     pub fn new_primary(_device: super::SharedDevice) -> Result<Self> {
         // フレーム送出用。詰まったら捨てる (try_send) ためのバウンデッドチャネル。
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(2);

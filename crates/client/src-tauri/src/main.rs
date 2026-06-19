@@ -32,6 +32,8 @@ fn main() {
             net::select_display,
             net::set_video_params,
             net::set_audio_muted,
+            net::set_resolution,
+            net::set_client_viewport,
             net::request_file,
             net::upload_file_from_path,
             net::set_share_root,

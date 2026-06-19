@@ -55,6 +55,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   fps: 60,
   max_mbps: 15,
   auto_reconnect: true,
+  use_virtual_display: false,
 };
 
 /** ラベル/host から決定的に淡い色を作りアバター背景に使う。 */
@@ -163,6 +164,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <label class="switch"><input type="checkbox" id="set-capture" /><span class="slider"></span></label>
             </div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
+                <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
+            </div>
             <div class="setting-group">外観・既定値</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -211,6 +219,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
   const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
+  const virtualToggle = $<HTMLInputElement>("#set-virtual");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
   const portInput = $<HTMLInputElement>("#set-port");
@@ -549,6 +558,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, auto_reconnect: reconnectToggle.checked };
     persist();
   });
+  virtualToggle?.addEventListener("change", () => {
+    settings = { ...settings, use_virtual_display: virtualToggle.checked };
+    persist();
+  });
   accentInput?.addEventListener("input", () => {
     settings = { ...settings, accent_color: accentInput.value };
     applyAccent(accentInput.value);
@@ -639,6 +652,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (statsToggle) statsToggle.checked = settings.show_stats;
     if (captureToggle) captureToggle.checked = settings.default_capture;
     if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
+    if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
     if (accentInput) accentInput.value = settings.accent_color;
     if (themeSelect) themeSelect.value = settings.theme;
     if (portInput) portInput.value = String(settings.default_port);

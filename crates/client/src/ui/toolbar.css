@@ -13,11 +13,16 @@
   background: none; border: none;
   transform: translateY(-130%);
   transition: transform 0.2s ease;
+  /* 帯 (ピル以外の余白) はクリックを素通しさせ、背後の映像 canvas (リモート操作) へ
+   * 届かせる。これが無いと全幅の帯がポインタを食い、上端でリモートを操作できず、
+   * ドラッグ領域指定と相まってウィンドウ移動になってしまう。操作可なのはピルのみ。 */
+  pointer-events: none;
 }
 #topbar.visible { transform: translateY(0); }
 
 /* 浮島ピル本体。角丸 + 影 + 薄い枠で映像の上にふわっと浮かせる。 */
 .tb-pill {
+  pointer-events: auto; /* 帯は素通しだがピル自身は操作/ドラッグ移動可 */
   display: inline-flex; align-items: center; gap: 3px;
   padding: 5px;
   background: var(--toolbar-bg);

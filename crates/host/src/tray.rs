@@ -246,6 +246,9 @@ mod imp {
         // process::exit は Drop を走らせないため、投影ドライブ (subst) を明示的に掃除する
         // (これが無いと This PC に古い Aurora ドライブが残る)。
         crate::projfs::cleanup_drives();
+        // テイクオーバー中にトレイから終了されると net の cleanup (end_takeover) を経ずに死に、
+        // 物理が暗転したまま残る (穴①)。残骸トポロジがあれば復元してから終了する。
+        crate::display::recover_takeover_if_any();
         tracing::info!("tray exit requested; shutting down host");
         std::process::exit(0);
     }

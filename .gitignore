@@ -17,3 +17,5 @@ aurora-received/
 aurora-downloads/
 # インストーラのビルド成果物 (host ISCC 出力 + client NSIS のコピー)
 installer/dist/
+# VDD ドライバファイル (build.ps1 がビルド時にコピー、バイナリなので git 管理しない)
+installer/host/vdd/

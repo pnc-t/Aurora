@@ -20,6 +20,7 @@ mod autostart;
 mod capture;
 mod conn;
 mod devices;
+mod display;
 mod encode;
 mod input;
 mod net;
@@ -28,6 +29,7 @@ mod projfs;
 mod secret;
 mod settings;
 mod tray;
+mod virtualdisplay;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
@@ -43,6 +45,12 @@ const DEFAULT_PORT: u16 = 7000;
 #[derive(Debug)]
 struct Args {
     dump_bmp: bool,
+    /// 全 DXGI アダプタ × 出力を列挙して終了する (仮想ディスプレイの出現位置の診断)。
+    list_displays: bool,
+    /// 仮想ディスプレイ (MttVDD) の解像度モード一覧を補完して reload し終了する (手動補完)。
+    vdd_enrich: bool,
+    /// 仮想ディスプレイで解像度変更→復元を実測して終了する (復元バグの切り分け診断)。
+    vdd_test_restore: bool,
     dump_h264: Option<usize>,
     /// エンコード遅延・ソースビットレートを 1 秒窓で info ログに出す。
     perf: bool,
@@ -79,6 +87,9 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             dump_bmp: false,
+            list_displays: false,
+            vdd_enrich: false,
+            vdd_test_restore: false,
             dump_h264: None,
             perf: false,
             fps_cap: DEFAULT_FPS_CAP,
@@ -123,6 +134,9 @@ fn parse_args() -> Args {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dump-bmp" => args.dump_bmp = true,
+            "--list-displays" => args.list_displays = true,
+            "--vdd-enrich" => args.vdd_enrich = true,
+            "--vdd-test-restore" => args.vdd_test_restore = true,
             "--perf" => args.perf = true,
             "--dump-h264" => {
                 args.dump_h264 = Some(parse_value(&mut it, "--dump-h264", "an integer N"));
@@ -176,6 +190,9 @@ fn main() -> Result<()> {
         || args.set_password
         || args.clear_password
         || args.dump_bmp
+        || args.list_displays
+        || args.vdd_enrich
+        || args.vdd_test_restore
         || args.dump_h264.is_some();
 
     // CLI のときだけ親プロセスのコンソールへ接続する (サーバ起動では開かない)。
@@ -221,6 +238,15 @@ fn main() -> Result<()> {
         return finish_console_command(result, owns_console);
     }
 
+    if args.list_displays {
+        return list_displays_cmd();
+    }
+    if args.vdd_enrich {
+        return vdd_enrich_cmd();
+    }
+    if args.vdd_test_restore {
+        return vdd_test_restore_cmd();
+    }
     if args.dump_bmp {
         return dump_one_bmp();
     }
@@ -528,6 +554,90 @@ fn reexec_self(current_port: u16) {
     }
 }
 
+/// 全 DXGI アダプタ × 出力を列挙して表示する (`--list-displays`)。仮想ディスプレイ (VDD/IDD) が
+/// どのアダプタ・output index に出るか、desktop に attach されるかを実機確認する診断コマンド。
+/// VDD インストール前後で実行して差分を見る用途。
+fn list_displays_cmd() -> Result<()> {
+    println!("== DXGI adapters/outputs ==");
+    #[cfg(target_os = "windows")]
+    {
+        for line in capture::debug_list_outputs()? {
+            println!("{line}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for d in capture::enumerate_displays()? {
+            println!(
+                "output[{}] {}  {}x{} @ ({},{})",
+                d.id, d.name, d.width, d.height, d.x, d.y
+            );
+        }
+    }
+    match virtualdisplay::detect() {
+        Some(vdd) => println!("\nvirtual display detected: {} (MttVDD)", vdd.gdi_name),
+        None => println!("\nvirtual display: not detected"),
+    }
+    Ok(())
+}
+
+/// 仮想ディスプレイ (MttVDD) の解像度モード一覧を補完して reload する (`--vdd-enrich`)。
+/// run_server 起動時の自動補完と同じ処理を、サーバ本体を起動せず手動で実行・確認するための
+/// 診断/メンテナンスコマンド。実行後の対応モードも表示する。
+#[cfg_attr(not(target_os = "windows"), allow(clippy::unnecessary_wraps))]
+fn vdd_enrich_cmd() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        if virtualdisplay::detect().is_none() {
+            println!("no virtual display (MttVDD) detected; install/enable the VDD first");
+            return Ok(());
+        }
+        match virtualdisplay::ensure_common_resolutions()? {
+            true => {
+                println!("added missing resolutions to vdd_settings.xml.");
+                println!(
+                    "NOTE: applying new modes needs a driver device-restart (admin). Click \
+                     \"Restart Driver\" in the Virtual Driver Control app (run as admin), or run \
+                     `pnputil /restart-device \"ROOT\\DISPLAY\\0000\"` from an elevated prompt. \
+                     (RELOAD_DRIVER via pipe does NOT regenerate modes and drops the display.)"
+                );
+            }
+            false => println!("resolution list already complete; nothing to add."),
+        }
+        println!("\n== current outputs/modes ==");
+        for line in capture::debug_list_outputs()? {
+            println!("{line}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("virtual display enrichment is Windows-only");
+    }
+    Ok(())
+}
+
+/// 仮想ディスプレイで解像度変更→復元を実測する (`--vdd-test-restore`)。「切断後に解像度/fps が
+/// 戻らない」原因を、安全な仮想ディスプレイ上で ChangeDisplaySettings の戻り値込みで切り分ける。
+#[cfg_attr(not(target_os = "windows"), allow(clippy::unnecessary_wraps))]
+fn vdd_test_restore_cmd() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(vdd) = virtualdisplay::detect() else {
+            println!("no virtual display (MttVDD) detected; enable the VDD first");
+            return Ok(());
+        };
+        println!("testing display mode apply/restore on {}", vdd.gdi_name);
+        for line in display::debug_test_cycle(&vdd.gdi_name) {
+            println!("{line}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("display mode test is Windows-only");
+    }
+    Ok(())
+}
+
 fn dump_one_bmp() -> Result<()> {
     let device = capture::create_shared_device()?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
@@ -722,6 +832,25 @@ fn run_server(
     println!("== aurora-host ready ==");
     // 前回の異常終了で This PC に残った投影ドライブ (subst) があれば起動時に掃除する。
     projfs::cleanup_drives();
+    // 前回のテイクオーバー (仮想ディスプレイ化で物理をデタッチ) がクラッシュ等で残っていたら、
+    // ディスクに保存したトポロジから復元する (物理画面が暗いまま固着しないための安全網)。
+    display::recover_takeover_if_any();
+    // テイクオーバー中の panic で物理が暗転したまま死ぬのを防ぐ (穴①)。既定フックの前に、
+    // 残骸トポロジがあれば復元する。recover_takeover_if_any は冪等で、テイクオーバー中は
+    // begin_takeover がディスクに書いたトポロジが残っているので物理が再アタッチされる。
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            display::recover_takeover_if_any();
+            default_hook(info);
+        }));
+    }
+    // VDD がデスクトップにアタッチされていたら切り離す。
+    // 未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。
+    // テイクオーバーが接続時に再アタッチするため、接続の妨げにはならない。
+    if let Some(vdd) = virtualdisplay::detect() {
+        display::detach_vdd_if_attached(&vdd.gdi_name);
+    }
     // 保存パスワードの有無を覚えておく。無ければトレイ起動直後に設定ダイアログを促す。
     let mut have_stored = false;
     let password = match secret::load_password() {
@@ -806,11 +935,16 @@ fn run_server(
             }]
         }
     };
+    // 注: 仮想ディスプレイの解像度モード一覧の補完 (vdd_settings.xml への追記) は、反映に
+    // ドライバのデバイス再起動 (= 管理者権限) が必要で、ユーザー権限のホスト実行時にはできない
+    // (RELOAD_DRIVER パイプはモードを再生成せず仮想ディスプレイを落とすだけと実機確認)。よって
+    // 解像度の充実はインストール時 (管理者) に行う方針とし、実行時は VDD が提供する既存モードから
+    // ChangeDisplaySettingsEx で最近傍を選ぶ。手動補完は `--vdd-enrich` (XML 書込みのみ)。
     for d in &displays {
         tracing::info!(id = d.id, name = %d.name, w = d.width, h = d.height, x = d.x, y = d.y, "display");
     }
     // 初期キャプチャ対象 (先頭 = primary)。
-    let initial_id = displays[0].id;
+    let initial_name = displays[0].name.clone();
 
     // capture・convert・encode で共有する D3D11 デバイスを 1 つだけ生成する
     // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
@@ -822,7 +956,7 @@ fn run_server(
     let (input_tx, input_rx) = mpsc::channel::<InputCmd>(256);
     let (audio_tx, audio_rx) = mpsc::channel::<EncodedAudio>(64);
     // 制御スレッド → capture スレッドへ「キャプチャ対象ディスプレイ id」を渡す。
-    let (cap_select_tx, cap_select_rx) = std::sync::mpsc::channel::<u32>();
+    let (cap_select_tx, cap_select_rx) = std::sync::mpsc::channel::<String>();
     let (clip_handle, clip_change_rx) = aurora_common::clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
 
@@ -855,6 +989,9 @@ fn run_server(
     }
     // 実行時 fps 変更 (クライアントの SetVideoParams) を capture スレッドへ届けるチャネル。
     let (fps_tx, fps_rx) = std::sync::mpsc::channel::<u32>();
+    // 実行時の解像度変更 (クライアントの SetResolution) を capture スレッドへ届けるチャネル
+    // (送出する映像の最大高さ。0 = キャプチャ解像度のまま)。
+    let (scale_tx, scale_rx) = std::sync::mpsc::channel::<u32>();
     let cap_device = device.clone();
     // re-exec 時に現在の実効ポート (トレイ変更反映済み) を引き継ぐため共有して渡す。
     let cap_port = port_cell.clone();
@@ -866,9 +1003,10 @@ fn run_server(
                 frame_tx,
                 res_tx,
                 cap_select_rx,
-                initial_id,
+                initial_name,
                 fps_cap,
                 fps_rx,
+                scale_rx,
                 cap_port,
             ) {
                 tracing::error!(error = %e, "capture loop ended");
@@ -931,6 +1069,7 @@ fn run_server(
             input_tx,
             cap_select_tx,
             fps_tx,
+            scale_tx,
             clip_apply_tx,
             clip_change_rx,
         )
@@ -943,10 +1082,11 @@ fn capture_loop(
     device: capture::SharedDevice,
     tx: mpsc::Sender<Frame>,
     res_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
-    select_rx: std::sync::mpsc::Receiver<u32>,
-    initial_id: u32,
+    select_rx: std::sync::mpsc::Receiver<String>,
+    initial_name: String,
     fps_cap: u32,
     fps_rx: std::sync::mpsc::Receiver<u32>,
+    scale_rx: std::sync::mpsc::Receiver<u32>,
     port: Arc<std::sync::atomic::AtomicU16>,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
@@ -974,16 +1114,21 @@ fn capture_loop(
     // 一過性の ACCESS_LOST (UAC・解像度変更・短時間ロック) は安価な再構築で数秒以内に戻るため、
     // それらを巻き込まないよう猶予を取る。実機で復帰不能と判明した HDR ロック遷移はこれを超える。
     const REEXEC_AFTER: Duration = Duration::from_secs(8);
+    // テイクオーバー中の永続固着の救済猶予。テイクオーバー中は re-exec を抑止する (CCD 直後の
+    // 一過性 ACCESS_LOST で点滅ループになるため) が、永続固着すると物理を巻き込んだ暗転が
+    // 「きれいな切断 or ホスト再起動」まで治らない。この猶予を超えたら capture スレッド自身が
+    // end_takeover で物理を復帰させる。一過性 settle (数秒) を巻き込まないよう REEXEC_AFTER より長く取る。
+    const TAKEOVER_RESTORE_AFTER: Duration = Duration::from_secs(15);
 
-    let mut cur_id = initial_id;
+    let mut cur_name = initial_name;
     // 初回の capturer 構築も失敗でスレッドを終わらせない。`?` で抜けると net 側の待受は
     // 続くのに映像が永久に出ない「ゾンビホスト」になる (特に re-exec 直後は DXGI が
     // 一時的に失敗しうる)。成功するまで 500ms 間隔でリトライする。
     let mut cap = loop {
-        match PlatformCapturer::new_for_output(device.clone(), cur_id) {
+        match PlatformCapturer::new_for_name(device.clone(), &cur_name) {
             Ok(c) => break c,
             Err(e) => {
-                tracing::warn!(error = %e, id = cur_id, "initial capturer create failed; retrying");
+                tracing::warn!(error = %e, name = %cur_name, "initial capturer create failed; retrying");
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -994,24 +1139,33 @@ fn capture_loop(
     let mut captured_ok = false;
     // 連続失敗が始まった時刻。Ok で None に戻す。
     let mut first_fail: Option<Instant> = None;
+    // 現在の送出最大高さ (0 = キャプチャ解像度)。capturer 再構築をまたいで保持し再適用する。
+    let mut cur_target_h: u32 = 0;
     loop {
         // 実行時の fps 上限変更 (クライアント SetVideoParams) を反映する。
         while let Ok(fps) = fps_rx.try_recv() {
             min_interval = fps_to_interval(fps);
             tracing::info!(fps, "fps cap updated");
         }
+        // 実行時の解像度変更 (クライアント SetResolution) を反映する。
+        while let Ok(h) = scale_rx.try_recv() {
+            cur_target_h = h;
+            tracing::info!(max_height = h, "target resolution updated");
+        }
+        // 毎反復で適用する (ディスプレイ切替や ACCESS_LOST で capturer を作り直しても維持)。
+        cap.set_target_height(cur_target_h);
         // ディスプレイ切替要求を吸う。新規 capturer 構築に失敗したら現状維持。
-        while let Ok(id) = select_rx.try_recv() {
-            if id != cur_id {
-                match PlatformCapturer::new_for_output(device.clone(), id) {
+        while let Ok(name) = select_rx.try_recv() {
+            if name != cur_name {
+                match PlatformCapturer::new_for_name(device.clone(), &name) {
                     Ok(c) => {
                         cap = c;
-                        cur_id = id;
+                        cur_name = name;
                         reported = false;
-                        tracing::info!(id, "switched capture display");
+                        tracing::info!(name = %cur_name, "switched capture display");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, id, "switch capture failed; keeping current");
+                        tracing::warn!(error = %e, name = %name, "switch capture failed; keeping current");
                     }
                 }
             }
@@ -1040,26 +1194,64 @@ fn capture_loop(
                 // も ACCESS_LOST が続くので、この条件でも確実に検出できる。
                 if !capture::input_desktop_is_default() {
                     first_fail = None;
-                    tracing::debug!(error = %e, id = cur_id, "capture failed on lock/secure desktop; not counted as stuck");
+                    tracing::debug!(error = %e, name = %cur_name, "capture failed on lock/secure desktop; not counted as stuck");
                 } else {
                     let stuck_for = first_fail.get_or_insert_with(Instant::now).elapsed();
-                    tracing::warn!(error = %e, id = cur_id, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
-                    if captured_ok && stuck_for >= REEXEC_AFTER {
+                    tracing::warn!(error = %e, name = %cur_name, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
+                    // テイクオーバー中の永続固着の救済 (暗転が治らない問題の本命対策)。re-exec は
+                    // 下で抑止される / クライアント切断まで net 側の end_takeover も走らないため、
+                    // このまま固着すると物理を含め全画面が永久に暗転する。settle を超えて固着し続けたら
+                    // capture スレッド自身が end_takeover で物理を復帰させる。end_takeover が
+                    // is_takeover_active() を false にするので、直下の通常 re-exec 経路がこのイテレーションで
+                    // 有効になり、クリーンなプロセス作り直しまで一気に回復する (トポロジファイルは
+                    // end_takeover が削除するので再起動後の recover は再テイクオーバーしない=点滅ループ防止)。
+                    if captured_ok
+                        && stuck_for >= TAKEOVER_RESTORE_AFTER
+                        && crate::display::is_takeover_active()
+                    {
+                        tracing::error!(
+                            stuck_ms = stuck_for.as_millis() as u64,
+                            "takeover capture stuck; restoring physical displays (end_takeover) to clear blackout"
+                        );
+                        if let Err(e) = crate::display::end_takeover() {
+                            tracing::warn!(error = %e, "watchdog end_takeover failed");
+                        }
+                    }
+                    // テイクオーバー中は re-exec を抑止する。CCD のトポロジ変更直後は仮想の複製が
+                    // 一時的に ACCESS_LOST になるが、再起動するとトポロジ復元→再接続→再テイクオーバーの
+                    // 点滅ループになる。再構築を続けて落ち着くのを待つ (固着が一過性なら復帰する)。
+                    if captured_ok
+                        && stuck_for >= REEXEC_AFTER
+                        && !crate::display::is_takeover_active()
+                    {
                         // プロセス内のどの再生成でも復帰しないと判断。再起動で回復する (戻らない)。
                         // 固着原因は Windows/DXGI 固有だが、再起動による回復自体は OS 非依存で、
                         // captured_ok ガードにより再起動ループにもならないため共通コードに置く。
                         reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
                     }
                 }
+                // テイクオーバー中は、解像度変更後に Windows が仮想ディスプレイの GDI 名を振り直し、
+                // cur_name が stale 化して find_output_by_name が永久に失敗→映像固着することがある
+                // (リサイズで固まる症状の最有力仮説)。MTT1337 で現在の GDI 名を引き直し、変わって
+                // いれば乗り換える。cur_name と再構築を所有する capture 層で直すのが確実。
+                if crate::display::is_takeover_active() {
+                    if let Some(v) = crate::virtualdisplay::detect() {
+                        if v.gdi_name != cur_name {
+                            tracing::info!(old = %cur_name, new = %v.gdi_name, "takeover stall: virtual GDI name changed; retargeting capture");
+                            cur_name = v.gdi_name;
+                            first_fail = None;
+                        }
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(500));
-                match PlatformCapturer::new_for_output(device.clone(), cur_id) {
+                match PlatformCapturer::new_for_name(device.clone(), &cur_name) {
                     Ok(c) => {
                         cap = c;
                         reported = false;
-                        tracing::info!(id = cur_id, "capturer rebuilt");
+                        tracing::info!(name = %cur_name, "capturer rebuilt");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, id = cur_id, "capturer rebuild failed; retrying");
+                        tracing::warn!(error = %e, name = %cur_name, "capturer rebuild failed; retrying");
                     }
                 }
                 continue;

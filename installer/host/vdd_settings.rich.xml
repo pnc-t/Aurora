@@ -1,0 +1,96 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  Aurora 同梱用の「リッチ」VDD 設定 (案A)。
+
+  MttVDD は提供解像度を vdd_settings.xml の <resolutions> からのみ読む。一覧に無い解像度は
+  ChangeDisplaySettingsEx が BADMODE(-2) で弾くため、上流既定の 5 モード (800x600/1366x768/
+  1920x1080/2560x1440/3840x2160) だと 1920x1200 ですら拒否され、仮想ディスプレイの解像度を
+  クライアント窓に合わせきれず黒帯が残る。
+
+  そこで主要アスペクト比 (4:3 / 5:4 / 16:9 / 16:10 / 3:2 / 21:9) と一般的なノート/外部モニタの
+  実解像度を網羅し、最近傍 (host display::pick_nearest) が実質ピクセル一致になるようにする。
+  リフレッシュは全解像度 60Hz 単一にする (<global> を空に保つ)。理由: global の高リフレッシュを
+  全解像度へ複製すると総モード数が数百に膨れ、かつ 4K超×244Hz 等の異常なピクセルクロックを生み、
+  MttVDD がモニタ生成に失敗する (実機確認: 245 モードで MTT1337 が出ず、5モードに戻すと出現)。
+  リモートデスクトップ用途では仮想側 60Hz で十分。これで総モード数 = 解像度数 (約34) に収まる。
+
+  反映はインストール時の管理者デバイス登録で行う (RELOAD_DRIVER pipe は EDID を再生成しないため
+  実行時には反映できない)。Control アプリの Install/Restart は本ファイルを既定 5 モードで上書き
+  するため、Aurora インストーラは Control を介さず本ファイルを直接配置する。
+  ※ host 側 virtualdisplay::COMMON_RESOLUTIONS と同期を保つこと。
+-->
+<vdd_settings>
+    <monitors>
+        <count>1</count>
+    </monitors>
+    <gpu>
+        <friendlyname>default</friendlyname>
+    </gpu>
+	<global>
+		<!-- global refresh rates are replicated to EVERY resolution. We keep this
+		     EMPTY on purpose: for a remote-desktop virtual display only 60 Hz is
+		     needed, and multiplying many resolutions by several refresh rates both
+		     explodes the mode count and generates absurd pixel clocks (e.g. 4K@244)
+		     that make MttVDD fail to create the monitor. Each <resolution> below
+		     carries its own 60 Hz instead. -->
+	</global>
+    <resolutions>
+        <!-- 小型 / 互換 -->
+        <resolution><width>800</width><height>600</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1024</width><height>600</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- 4:3 -->
+        <resolution><width>1024</width><height>768</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1600</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2048</width><height>1536</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- 5:4 -->
+        <resolution><width>1280</width><height>1024</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- 16:9 -->
+        <resolution><width>1280</width><height>720</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1366</width><height>768</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1536</width><height>864</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1600</width><height>900</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1920</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2560</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3200</width><height>1800</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3840</width><height>2160</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- 16:10 -->
+        <resolution><width>1280</width><height>800</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1440</width><height>900</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1680</width><height>1050</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1920</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2304</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2560</width><height>1600</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2880</width><height>1800</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3840</width><height>2400</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- 3:2 -->
+        <resolution><width>1920</width><height>1280</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2160</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2256</width><height>1504</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2496</width><height>1664</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3000</width><height>2000</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3240</width><height>2160</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- 21:9 ウルトラワイド -->
+        <resolution><width>2560</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3440</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3840</width><height>1600</height><refresh_rate>60</refresh_rate></resolution>
+        <!-- ノート PC 実解像度 (16:10 寄り) -->
+        <resolution><width>2048</width><height>1280</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2240</width><height>1400</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3456</width><height>2160</height><refresh_rate>60</refresh_rate></resolution>
+    </resolutions>
+    <options>
+		<CustomEdid>false</CustomEdid> <!-- Custom Edid should be named "user_edid.bin"! This does not support emulating resolutions!-->
+		<PreventSpoof>false</PreventSpoof> <!--Enable this to prevent manufacturer spoofing when using custom edid. Please only do so if you need to!-->
+		<EdidCeaOverride>false</EdidCeaOverride> <!--Enable this to override or add hard coded cea-extension block to custom Edid support allowing you to enable HDR-->
+		<HardwareCursor>true</HardwareCursor>
+		<SDR10bit>false</SDR10bit>
+		<HDRPlus>false</HDRPlus> <!-- If you have SDR10 bit enabled, HDRPlus wont work - there’s a conflict because the display system cannot simultaneously handle both high dynamic range 12-bit and standard dynamic range 10-bit settings. -->
+		<logging>false</logging>
+        <!-- DEBUG LOGGING FOR EXPERTS ONLY!-->
+        <debuglogging>false</debuglogging>
+        <!-- DEBUG LOGS CAN GENERATE 1000+ LINES-->
+		<!-- Warning: Leaving logging on too long can lead to excessive filesize. Especially DebugLogging, which should only be used for short periods to log errors. -->
+		<!-- Logging: Useful to troubleshoot and determine which GPUs are being used, and if displays are working as intended.-->
+		<!-- Debug Logging: Logs local system information with every driver function/event/process. Useful for GitHub Help Tickets.-->
+	</options>
+</vdd_settings>
