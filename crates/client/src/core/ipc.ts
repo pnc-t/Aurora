@@ -6,6 +6,7 @@ export type DisplayDto = {
   width: number;
   height: number;
   name: string;
+  is_virtual: boolean;
 };
 
 /**
@@ -22,6 +23,7 @@ export function formatDisplayName(raw: string): string {
 export type ClientEvent =
   | { kind: "connected" }
   | { kind: "host_info"; displays: DisplayDto[]; audio: boolean }
+  | { kind: "display_resized"; id: number; width: number; height: number }
   | { kind: "pong"; rtt_us: number }
   | { kind: "stats"; bitrate_kbps: number; fps: number; rtt_us: number; loss_permille: number }
   | { kind: "file_result"; id: number; ok: boolean; message: string }
@@ -84,6 +86,18 @@ export async function setAudioMuted(muted: boolean): Promise<void> {
   await invoke("set_audio_muted", { muted });
 }
 
+/// 送出する映像の最大高さ (px、0 = キャプチャ解像度のまま) をホストへ送る。
+/// ホストが GPU で縮小 (アスペクト比維持) してからエンコードする。
+export async function setResolution(maxHeight: number): Promise<void> {
+  await invoke("set_resolution", { maxHeight });
+}
+
+/// クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
+/// 対応モードへ解像度を変更する (RDP 風・黒帯解消)。
+export async function setClientViewport(width: number, height: number): Promise<void> {
+  await invoke("set_client_viewport", { width, height });
+}
+
 export async function requestFile(id: number, path: string): Promise<void> {
   await invoke("request_file", { id, path });
 }
@@ -121,6 +135,7 @@ export type ClientSettings = {
   fps: number;
   max_mbps: number;
   auto_reconnect: boolean;
+  use_virtual_display: boolean;
 };
 
 /// 接続先 host の履歴を読み込む (最新が先頭)。

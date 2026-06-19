@@ -42,6 +42,71 @@ if (-not $makensis) {
     throw "makensis.exe が見つかりません。client を一度 `cargo tauri build` するか、NSIS を入れてください: winget install NSIS.NSIS"
 }
 
+# VDD ドライバファイルを installer/host/vdd/ にコピーする (NSIS が File 命令で同梱)。
+# VDD_SOURCE は環境変数で上書き可能。未指定時はユーザーの既知パスを探す。
+$vddSource = if ($env:VDD_SOURCE) { $env:VDD_SOURCE } else {
+    # よくある配置場所を順に探す。
+    @(
+        "$env:USERPROFILE\vdd\VirtualDisplayDriver",
+        'C:\VirtualDisplayDriver',
+        "$env:LOCALAPPDATA\VirtualDisplayDriver"
+    ) | Where-Object { Test-Path (Join-Path $_ 'MttVDD.inf') } | Select-Object -First 1
+}
+if (-not $vddSource) {
+    Write-Warning "VDD ドライバが見つかりません。SecVDD セクションはスキップしてください。`n  VDD_SOURCE 環境変数でパスを指定できます (例: MttVDD.inf が入ったフォルダ)"
+} else {
+    Write-Host "==> VDD ファイルをコピー中 ($vddSource)" -ForegroundColor Cyan
+    $vddDest = Join-Path $here 'vdd'
+    New-Item -ItemType Directory -Force $vddDest | Out-Null
+    # ドライバ本体のみ上流からコピーする。vdd_settings.xml は**上流の既定 5 モード版を使わず**、
+    # Aurora 同梱のリッチ版 (案A) で置き換える (下記)。上流 XML を取り込むと黒帯が残る。
+    foreach ($f in @('MttVDD.dll', 'MttVDD.inf', 'mttvdd.cat')) {
+        $src = Join-Path $vddSource $f
+        if (Test-Path $src) {
+            Copy-Item $src $vddDest -Force
+        } else {
+            Write-Warning "  見つかりません: $src"
+        }
+    }
+
+    # 案A: リッチな vdd_settings.xml (主要アスペクト比 + 一般的解像度を網羅) を同梱する。
+    # 反映はインストール時の管理者デバイス登録で行われる (新規ノード作成時に読まれる)。
+    # 上流 XML を使うと 5 モードのみで 1920x1200 すら拒否され黒帯が残るため、必ず置き換える。
+    $richXml = Join-Path $here 'vdd_settings.rich.xml'
+    if (-not (Test-Path $richXml)) { throw "リッチ XML が見つかりません: $richXml" }
+    Copy-Item $richXml (Join-Path $vddDest 'vdd_settings.xml') -Force
+    Write-Host "==> リッチ vdd_settings.xml を同梱 ($richXml)" -ForegroundColor Cyan
+
+    # nefconw.exe を同梱する。MttVDD は Root\MttVDD の root 列挙デバイスで、pnputil /add-driver
+    # だけではデバイスノードが作られない (= 仮想ディスプレイ 0 個)。インストーラ (SecVDD) が
+    # nefconw でノードを作るため、ここで取得しておく。NEFCON_SOURCE (nefconw.exe があるフォルダ)
+    # で上書き可、無ければ nefarius/nefcon の固定リリースから x64 を取得する。
+    $nefconDest = Join-Path $vddDest 'nefconw.exe'
+    if (Test-Path $nefconDest) {
+        Write-Host "==> nefconw.exe は既に存在 (再取得しない)" -ForegroundColor Cyan
+    }
+    elseif ($env:NEFCON_SOURCE -and (Test-Path (Join-Path $env:NEFCON_SOURCE 'nefconw.exe'))) {
+        Copy-Item (Join-Path $env:NEFCON_SOURCE 'nefconw.exe') $nefconDest -Force
+        Write-Host "==> nefconw.exe をコピー ($env:NEFCON_SOURCE)" -ForegroundColor Cyan
+    }
+    else {
+        $nefconVer = 'v1.17.40'
+        $nefconUrl = "https://github.com/nefarius/nefcon/releases/download/$nefconVer/nefcon_$nefconVer.zip"
+        Write-Host "==> nefconw.exe を取得中 ($nefconUrl)" -ForegroundColor Cyan
+        $nefTmp = Join-Path $env:TEMP "nefcon_$nefconVer"
+        New-Item -ItemType Directory -Force $nefTmp | Out-Null
+        $nefZip = Join-Path $nefTmp 'nefcon.zip'
+        try {
+            Invoke-WebRequest -Uri $nefconUrl -OutFile $nefZip -Headers @{ 'User-Agent' = 'Aurora-Installer' }
+            Expand-Archive -Path $nefZip -DestinationPath $nefTmp -Force
+            Copy-Item (Join-Path $nefTmp 'x64\nefconw.exe') $nefconDest -Force
+        } finally {
+            Remove-Item $nefTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-Path $nefconDest)) { throw "nefconw.exe の取得に失敗しました" }
+    }
+}
+
 Write-Host "==> NSIS でコンパイル ($makensis)" -ForegroundColor Cyan
 & $makensis "/DAPPVERSION=$version" (Join-Path $here 'aurora-host.nsi')
 if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }

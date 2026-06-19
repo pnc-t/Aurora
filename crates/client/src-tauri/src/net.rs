@@ -54,6 +54,13 @@ pub enum ClientEvent {
         displays: Vec<DisplayDto>,
         audio: bool,
     },
+    /// ホストが解像度を変更した (SetClientViewport / ディスプレイ切替の結果)。
+    /// クライアントは入力スケールとデコーダを新解像度へ更新する。
+    DisplayResized {
+        id: u32,
+        width: u32,
+        height: u32,
+    },
     Pong {
         rtt_us: i64,
     },
@@ -79,6 +86,7 @@ pub struct DisplayDto {
     pub width: u32,
     pub height: u32,
     pub name: String,
+    pub is_virtual: bool,
 }
 
 impl From<Display> for DisplayDto {
@@ -88,6 +96,7 @@ impl From<Display> for DisplayDto {
             width: d.width,
             height: d.height,
             name: d.name,
+            is_virtual: d.is_virtual,
         }
     }
 }
@@ -254,16 +263,14 @@ pub async fn connect_to_host(
     let host_info: ControlMsg = opts.deserialize(&plain).map_err(err)?;
 
     event_channel.send(ClientEvent::Connected).ok();
-    if let ControlMsg::HostInfo { displays, audio } = host_info {
-        event_channel
-            .send(ClientEvent::HostInfo {
-                displays: displays.into_iter().map(Into::into).collect(),
-                audio,
-            })
-            .ok();
-    } else {
-        return Err(format!("expected HostInfo, got {host_info:?}"));
-    }
+    // HostInfo の中身を取り出すだけにし、フロントへの通知はセッションハンドルを管理状態へ
+    // 格納した後に行う (関数末尾)。先に通知すると、フロントが host_info を受けて即
+    // selectDisplay/setClientViewport を invoke した時にハンドル未格納 (再接続時は古い閉じた
+    // ctrl_tx) で送信が失敗し、仮想ディスプレイのテイクオーバーが起動しないレースになる。
+    let (host_displays, host_audio) = match host_info {
+        ControlMsg::HostInfo { displays, audio } => (displays, audio),
+        other => return Err(format!("expected HostInfo, got {other:?}")),
+    };
 
     // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "AURHELLO"。
     // 高 fps 時のバースト受信での取りこぼし (= 映像ノイズ) を抑えるため受信バッファを拡大する。
@@ -422,6 +429,15 @@ pub async fn connect_to_host(
         pending_downloads,
     };
     *state.inner.lock().await = Some(handle);
+
+    // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
+    // 受けて即 selectDisplay/setClientViewport を呼んでも ctrl_tx に確実に届く。
+    event_channel
+        .send(ClientEvent::HostInfo {
+            displays: host_displays.into_iter().map(Into::into).collect(),
+            audio: host_audio,
+        })
+        .ok();
     Ok(())
 }
 
@@ -494,6 +510,34 @@ pub async fn set_audio_muted(
     let s = guard.as_ref().ok_or("not connected")?;
     s.ctrl_tx
         .send(ControlMsg::SetAudioMuted { muted })
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
+/// 送出する映像の最大高さ (0 = キャプチャ解像度) をホストへ送る。
+#[tauri::command]
+pub async fn set_resolution(
+    max_height: u32,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.as_ref().ok_or("not connected")?;
+    s.ctrl_tx
+        .send(ControlMsg::SetResolution { max_height })
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
+/// クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
+/// 対応モードへキャプチャ対象ディスプレイの解像度を変更する (RDP 風・黒帯解消)。
+#[tauri::command]
+pub async fn set_client_viewport(
+    width: u32,
+    height: u32,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.as_ref().ok_or("not connected")?;
+    s.ctrl_tx
+        .send(ControlMsg::SetClientViewport { width, height })
         .map_err(|_| "ctrl channel closed".to_string())
 }
 
@@ -684,6 +728,9 @@ async fn tcp_reader_loop(
                     displays: displays.into_iter().map(Into::into).collect(),
                     audio,
                 });
+            }
+            ControlMsg::DisplayResized { id, width, height } => {
+                let _ = event_channel.send(ClientEvent::DisplayResized { id, width, height });
             }
             ControlMsg::Clipboard { text } => {
                 if clip_apply_tx.send(text).is_err() {

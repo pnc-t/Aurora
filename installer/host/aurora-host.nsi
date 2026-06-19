@@ -66,6 +66,8 @@ Section "Aurora Host 本体" SecCore
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "..\..\target\release\${EXENAME}"
+  ; VDD 削除スクリプトを同梱しておく (アンインストール時に使用)。
+  File "remove_vdd.ps1"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -92,6 +94,40 @@ Section "ログオン時に自動起動 (推奨)" SecAutostart
   WriteRegDWORD HKCU "${REGROOT}" "Autostart" 1
 SectionEnd
 
+Section /o "仮想ディスプレイドライバ (VDD) をインストール" SecVDD
+  ; MttVDD (Virtual Display Driver) を C:\VirtualDisplayDriver に展開し、デバイスノード作成 +
+  ; ドライバ束縛まで行う。ドライバのインストールは昇格が要るため runas で一回だけ UAC を出す。
+  ; アンインストールではドライバは削除しない (システム共有コンポーネント、手動削除を推奨)。
+  ; $TEMP はユーザー権限で書き込み可能。コピーと nefconw/pnputil は runas で昇格して実行。
+  ;
+  ; 重要: MttVDD は Root\MttVDD の root 列挙ソフトウェアデバイス。`pnputil /add-driver /install`
+  ; はドライバをストアに入れるだけでデバイスノードを作らない (= 仮想ディスプレイが 0 個のまま)。
+  ; そこで nefconw でデバイスノード (Root\MttVDD, Display クラス) を先に作ってから pnputil で
+  ; ドライバを束縛する。これで初めて仮想モニタ (MTT1337) が出現し host が検出できる。
+  ;
+  ; 旧版は cmd の "&" チェーンで copy/nefconw/pnputil を繋いでいたが、クォートが脆弱でエラー検知も
+  ; 検証も無く、実機で pnputil の add-driver が黙って失敗してもそのまま完了扱いになっていた。
+  ; そこで導入ロジックを専用 PowerShell スクリプト install_vdd.ps1 (ASCII・ログ出力・MTT1337 検証
+  ; +再試行付き) に集約し、ここからは昇格して呼ぶだけにする。失敗時は C:\VirtualDisplayDriver\
+  ; install_log.txt に原因が残る。
+  SetOutPath "$TEMP\AuroraVDDSetup"
+  File "vdd\MttVDD.dll"
+  File "vdd\MttVDD.inf"
+  File "vdd\mttvdd.cat"
+  File "vdd\vdd_settings.xml"
+  File "vdd\nefconw.exe"
+  File "install_vdd.ps1"
+
+  ; 配置 + ノード作成 + ドライバ束縛 + 検証を install_vdd.ps1 が行う (昇格が 1 回必要)。
+  ExecShellWait "runas" "powershell.exe" \
+    '-NoProfile -ExecutionPolicy Bypass -File "$TEMP\AuroraVDDSetup\install_vdd.ps1"' SW_HIDE
+
+  ; 一時ファイルを削除。
+  RMDir /r "$TEMP\AuroraVDDSetup"
+
+  WriteRegDWORD HKCU "${REGROOT}" "VDDInstalled" 1
+SectionEnd
+
 Section /o "ファイル転送機能を有効化 (Client-ProjFS)" SecProjFS
   ; Windows オプション機能の有効化は昇格が要る。再起動が必要な場合あり。
   ; 共有機能なのでアンインストールでは戻さない。
@@ -102,6 +138,7 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      "aurora-host 本体を %LOCALAPPDATA%\Programs に配置します (必須)。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecAutostart} "ログオン時に自動起動する ONLOGON タスクを登録します (昇格が 1 回必要)。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecVDD}       "仮想ディスプレイドライバ (MttVDD) をインストールします。RDP 風の仮想画面で接続するのに必要です (昇格が 1 回必要)。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecProjFS}    "RDP 風ファイル転送に使う Windows 機能 Client-ProjFS を有効化します (昇格が 1 回必要)。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
@@ -117,16 +154,25 @@ Section "Uninstall"
     ExecShellWait "runas" "$INSTDIR\${EXENAME}" "--uninstall" SW_HIDE
   ${EndIf}
 
-  ; 3) ファイル / ショートカットを削除。
+  ; 3) VDD ドライバを削除 (インストールした場合のみ)。
+  ;    デバイス削除・ドライバストア削除・C:\VirtualDisplayDriver 削除を一括で行う。
+  ReadRegDWORD $0 HKCU "${REGROOT}" "VDDInstalled"
+  ${If} $0 == 1
+    ExecShellWait "runas" "powershell.exe" \
+      '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\remove_vdd.ps1"' SW_HIDE
+  ${EndIf}
+
+  ; 4) ファイル / ショートカットを削除。
   Delete "$INSTDIR\${EXENAME}"
+  Delete "$INSTDIR\remove_vdd.ps1"
   Delete "$INSTDIR\uninstall.exe"
   RMDir  "$INSTDIR"
   Delete "$SMPROGRAMS\Aurora Host.lnk"
 
-  ; 4) 設定・暗号化パスワードを完全削除 (per-user なので昇格不要)。
+  ; 5) 設定・暗号化パスワード・ログを完全削除 (per-user なので昇格不要)。
   RMDir /r "$LOCALAPPDATA\Aurora"
 
-  ; 5) レジストリを掃除。
+  ; 6) レジストリを掃除。
   DeleteRegKey HKCU "${UNINSTKEY}"
   DeleteRegKey HKCU "${REGROOT}"
 SectionEnd

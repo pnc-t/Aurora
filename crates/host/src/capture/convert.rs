@@ -18,12 +18,13 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_RASTERIZER_DESC,
-    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SHADER_RESOURCE_VIEW_DESC,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
-    D3D11_VIEWPORT, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader,
+    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CULL_NONE, D3D11_FILL_SOLID,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_VIEW_DESC,
+    D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
+    ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11SamplerState,
+    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -105,6 +106,22 @@ float2 PSUV(VSOut i) : SV_Target {
     float3 c = (c0 + c1 + c2 + c3) * 0.25;
     return bt601_uv(c);
 }
+
+// --- 縮小ブリット (解像度変更) ---
+// src を線形サンプルして「小さい同フォーマット RT」へ描く前段パス。色/HDR には触れず
+// (フォーマット維持の純リサンプル)、出力は縮小後サイズ。フル解像度時はこのパスを通さない。
+SamplerState g_samp : register(s0);
+struct BlitOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+BlitOut VSBlit(uint vid : SV_VertexID) {
+    BlitOut o;
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    o.uv = uv;
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+float4 PSBlit(BlitOut i) : SV_Target {
+    return g_src.Sample(g_samp, i.uv);
+}
 "#;
 
 #[repr(C)]
@@ -121,12 +138,23 @@ struct Nv12Target {
     rtv_uv: ID3D11RenderTargetView,
 }
 
+/// 縮小ブリットの出力 (src と同フォーマット・縮小後サイズ)。RTV (描画先) + SRV (Y/UV 入力)。
+struct ScaledTarget {
+    rtv: ID3D11RenderTargetView,
+    srv: ID3D11ShaderResourceView,
+    #[allow(dead_code)] // tex は rtv/srv の寿命確保のため保持 (直接読まない)
+    tex: ID3D11Texture2D,
+}
+
 pub struct Converter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
+    vs_blit: ID3D11VertexShader,
+    ps_blit: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
     cbuffer: ID3D11Buffer,
     raster: ID3D11RasterizerState,
 
@@ -136,6 +164,13 @@ pub struct Converter {
     src_w: u32,
     src_h: u32,
     src_copy_format: DXGI_FORMAT,
+
+    // 縮小ブリットの出力 (target_h で縮小するときだけ使う)。
+    scaled: Option<ScaledTarget>,
+    scaled_w: u32,
+    scaled_h: u32,
+    /// 目標の最大高さ (0 = フル解像度 = 縮小なし)。クライアントの SetResolution で更新。
+    target_h: u32,
 
     // NV12 出力プール。
     pool: Vec<Nv12Target>,
@@ -151,10 +186,12 @@ impl Converter {
         let context = bundle.context.clone();
 
         // SAFETY: 各 D3DCompile / Create* は OUT パラメータを初期化する。HLSL は静的文字列。
-        let (vs, ps_y, ps_uv) = unsafe {
+        let (vs, ps_y, ps_uv, vs_blit, ps_blit) = unsafe {
             let vs_blob = compile_shader(s!("VSMain"), s!("vs_4_0"))?;
             let psy_blob = compile_shader(s!("PSY"), s!("ps_4_0"))?;
             let psuv_blob = compile_shader(s!("PSUV"), s!("ps_4_0"))?;
+            let vsb_blob = compile_shader(s!("VSBlit"), s!("vs_4_0"))?;
+            let psb_blob = compile_shader(s!("PSBlit"), s!("ps_4_0"))?;
 
             let mut vs = None;
             device
@@ -168,11 +205,39 @@ impl Converter {
             device
                 .CreatePixelShader(blob_bytes(&psuv_blob), None, Some(&mut ps_uv))
                 .context("CreatePixelShader(UV)")?;
+            let mut vs_blit = None;
+            device
+                .CreateVertexShader(blob_bytes(&vsb_blob), None, Some(&mut vs_blit))
+                .context("CreateVertexShader(blit)")?;
+            let mut ps_blit = None;
+            device
+                .CreatePixelShader(blob_bytes(&psb_blob), None, Some(&mut ps_blit))
+                .context("CreatePixelShader(blit)")?;
             (
                 vs.ok_or_else(|| anyhow!("VS null"))?,
                 ps_y.ok_or_else(|| anyhow!("PS(Y) null"))?,
                 ps_uv.ok_or_else(|| anyhow!("PS(UV) null"))?,
+                vs_blit.ok_or_else(|| anyhow!("VS(blit) null"))?,
+                ps_blit.ok_or_else(|| anyhow!("PS(blit) null"))?,
             )
+        };
+
+        // 縮小ブリット用の線形サンプラ (アスペクト維持・端はクランプ)。
+        let sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut s = None;
+            device
+                .CreateSamplerState(&desc, Some(&mut s))
+                .context("CreateSamplerState")?;
+            s.ok_or_else(|| anyhow!("sampler null"))?
         };
 
         // 定数バッファ (is_hdr / inv_scale)。ディスプレイ毎に固定なので IMMUTABLE。
@@ -222,6 +287,9 @@ impl Converter {
             vs,
             ps_y,
             ps_uv,
+            vs_blit,
+            ps_blit,
+            sampler,
             cbuffer,
             raster,
             src_copy: None,
@@ -229,6 +297,10 @@ impl Converter {
             src_w: 0,
             src_h: 0,
             src_copy_format: DXGI_FORMAT_B8G8R8A8_TYPELESS,
+            scaled: None,
+            scaled_w: 0,
+            scaled_h: 0,
+            target_h: 0,
             pool: Vec::new(),
             pool_idx: 0,
             nv12_w: 0,
@@ -236,22 +308,62 @@ impl Converter {
         })
     }
 
+    /// 目標の最大高さを設定する (0 = フル解像度)。次フレームの convert から反映する。
+    /// アスペクト比は維持し、ソース高さがこれ以下なら縮小しない。
+    pub fn set_target_height(&mut self, max_height: u32) {
+        self.target_h = max_height;
+    }
+
     /// キャプチャテクスチャ 1 枚を NV12 テクスチャへ変換する。返り値はプールの 1 枚 (COM 参照)。
+    /// `target_h` で縮小指定があれば、Y/UV 変換の前に線形サンプルの縮小ブリットを 1 パス挟む
+    /// (色/HDR 経路は不変)。フル解像度時は従来どおり縮小パスを通さない。
     pub fn convert(&mut self, src_tex: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: src_tex は live。GetDesc は OUT を埋める。
         unsafe { src_tex.GetDesc(&mut desc) };
-        let (w, h) = (desc.Width, desc.Height);
+        let (src_w, src_h, src_format) = (desc.Width, desc.Height, desc.Format);
 
-        self.ensure_src_copy(w, h, desc.Format)?;
-        self.ensure_pool(w, h)?;
-
+        self.ensure_src_copy(src_w, src_h, src_format)?;
         let src_copy = self.src_copy.as_ref().unwrap().clone();
-        let srv = self.src_srv.as_ref().unwrap().clone();
+        let src_srv = self.src_srv.as_ref().unwrap().clone();
 
         // SAFETY: 同 device・互換フォーマット・同サイズ間の GPU 内コピー。
         unsafe { self.context.CopyResource(&src_copy, src_tex) };
 
+        // 目標サイズ (アスペクト維持・偶数)。target_h==0 か src 以下なら元サイズ (= フル)。
+        let (out_w, out_h) = scaled_dims(src_w, src_h, self.target_h);
+        let downscale = out_w != src_w || out_h != src_h;
+
+        // 縮小時: src を線形サンプルで scaled へ描き、それを Y/UV の入力にする。
+        let input_srv = if downscale {
+            self.ensure_scaled(out_w, out_h, src_format)?;
+            let scaled = self.scaled.as_ref().unwrap();
+            let scaled_rtv = scaled.rtv.clone();
+            let scaled_srv = scaled.srv.clone();
+            let ctx = &self.context;
+            // SAFETY: 縮小ブリット。src_srv → scaled (同フォーマット) を線形サンプルで描く。
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_blit, None);
+                ctx.PSSetShader(&self.ps_blit, None);
+                ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+                ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+                ctx.RSSetState(&self.raster);
+                let vp = viewport(out_w as f32, out_h as f32);
+                ctx.RSSetViewports(Some(&[vp]));
+                ctx.OMSetRenderTargets(Some(&[Some(scaled_rtv)]), None);
+                ctx.Draw(3, 0);
+                // scaled を次に SRV として読むため入力/出力束縛を外す。
+                ctx.OMSetRenderTargets(Some(&[None]), None);
+                ctx.PSSetShaderResources(0, Some(&[None]));
+            }
+            scaled_srv
+        } else {
+            src_srv
+        };
+
+        self.ensure_pool(out_w, out_h)?;
         let idx = self.pool_idx;
         self.pool_idx = (self.pool_idx + 1) % self.pool.len();
         let target = &self.pool[idx];
@@ -263,19 +375,19 @@ impl Converter {
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs, None);
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuffer.clone())]));
-            ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(input_srv.clone())]));
             ctx.RSSetState(&self.raster);
 
-            // Y パス: フル解像度。
+            // Y パス: 出力解像度。
             ctx.PSSetShader(&self.ps_y, None);
-            let vp_y = viewport(w as f32, h as f32);
+            let vp_y = viewport(out_w as f32, out_h as f32);
             ctx.RSSetViewports(Some(&[vp_y]));
             ctx.OMSetRenderTargets(Some(&[Some(target.rtv_y.clone())]), None);
             ctx.Draw(3, 0);
 
             // UV パス: 1/2 解像度。
             ctx.PSSetShader(&self.ps_uv, None);
-            let vp_uv = viewport((w / 2) as f32, (h / 2) as f32);
+            let vp_uv = viewport((out_w / 2) as f32, (out_h / 2) as f32);
             ctx.RSSetViewports(Some(&[vp_uv]));
             ctx.OMSetRenderTargets(Some(&[Some(target.rtv_uv.clone())]), None);
             ctx.Draw(3, 0);
@@ -286,6 +398,74 @@ impl Converter {
         }
 
         Ok(target.tex.clone())
+    }
+
+    /// 縮小ブリット出力テクスチャ (src と同フォーマット・指定サイズ・RT+SR) を (再)用意する。
+    fn ensure_scaled(&mut self, w: u32, h: u32, src_format: DXGI_FORMAT) -> Result<()> {
+        if self.scaled.is_some() && self.scaled_w == w && self.scaled_h == h {
+            return Ok(());
+        }
+        let (copy_format, view_format) = map_formats(src_format)?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: copy_format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        // SAFETY: device live、desc 初期化済み。RT かつ SR として作成する。
+        let tex = unsafe {
+            let mut tex = None;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .context("CreateTexture2D(scaled)")?;
+            tex.ok_or_else(|| anyhow!("scaled texture null"))?
+        };
+
+        let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: view_format,
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        srv_desc.Anonymous.Texture2D.MostDetailedMip = 0;
+        srv_desc.Anonymous.Texture2D.MipLevels = 1;
+        // SAFETY: tex live、srv_desc は TEXTURE2D 用に初期化済み。
+        let srv = unsafe {
+            let mut srv = None;
+            self.device
+                .CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut srv))
+                .context("CreateShaderResourceView(scaled)")?;
+            srv.ok_or_else(|| anyhow!("scaled SRV null"))?
+        };
+
+        let mut rtv_desc = D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: view_format,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        rtv_desc.Anonymous.Texture2D.MipSlice = 0;
+        // SAFETY: tex live、rtv_desc は TEXTURE2D 用に初期化済み。
+        let rtv = unsafe {
+            let mut rtv = None;
+            self.device
+                .CreateRenderTargetView(&tex, Some(&rtv_desc), Some(&mut rtv))
+                .context("CreateRenderTargetView(scaled)")?;
+            rtv.ok_or_else(|| anyhow!("scaled RTV null"))?
+        };
+
+        self.scaled = Some(ScaledTarget { tex, srv, rtv });
+        self.scaled_w = w;
+        self.scaled_h = h;
+        tracing::info!(w, h, "downscale target ready");
+        Ok(())
     }
 
     /// シェーダ可読なコピー先テクスチャと SRV を (再)用意する。
@@ -419,6 +599,22 @@ impl Converter {
 // SAFETY: Converter は capture スレッドでのみ使用する。内部 COM は multithread-protected
 // device に紐づくため、別スレッドへの move は安全。`MfH264Encoder` の Send 実装と同流儀。
 unsafe impl Send for Converter {}
+
+/// 2 の倍数へ切り下げる (NV12 は幅・高さとも偶数が必要)。
+fn even(v: u32) -> u32 {
+    v & !1
+}
+
+/// アスペクト比を維持して (src_w, src_h) を高さ `max_height` 以下へ縮小したサイズ (偶数)。
+/// `max_height == 0` または src がそれ以下なら元サイズをそのまま返す (= フル解像度)。
+fn scaled_dims(src_w: u32, src_h: u32, max_height: u32) -> (u32, u32) {
+    if max_height == 0 || src_h <= max_height {
+        return (src_w, src_h);
+    }
+    let out_h = even(max_height).max(2);
+    let out_w = even(((src_w as u64 * out_h as u64) / src_h as u64) as u32).max(2);
+    (out_w, out_h)
+}
 
 fn viewport(w: f32, h: f32) -> D3D11_VIEWPORT {
     D3D11_VIEWPORT {

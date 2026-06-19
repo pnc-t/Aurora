@@ -23,6 +23,8 @@ type ToolbarOpts = {
   onToggleCapture: () => void;
   onToggleMute: (muted: boolean) => void;
   onSetVideoParams: (fps: number, mbps: number) => void;
+  /** 送出する映像の最大高さ (0 = フル解像度)。 */
+  onSetResolution: (maxHeight: number) => void;
 };
 
 export type ToolbarHandle = {
@@ -64,14 +66,21 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
           <input type="text" inputmode="numeric" id="tb-fps" />fps
           <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
         </span>
+        <select id="tb-resolution" title="解像度 (送出する映像の高さ・アスペクト比維持)">
+          <option value="0">フル</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+        </select>
       </span>
       <span class="tb-sep" data-tauri-drag-region></span>
       <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
       <span id="tb-winctl" class="window-controls"></span>
     </div>
   `;
-  // 透明な帯 (ピル周囲の余白) もウィンドウ移動の掴みどころにする。
-  opts.topbar.setAttribute("data-tauri-drag-region", "");
+  // 注: 以前は帯 (#topbar) 全体を data-tauri-drag-region にしていたが、全幅の帯がポインタを
+  // 食い、上端でリモート操作ができず (クリックがウィンドウ移動になる) という不具合になった。
+  // 帯は CSS で pointer-events:none にして素通しさせ、ドラッグ移動はピル (.tb-pill 内の
+  // data-tauri-drag-region 余白) でのみ行う。よってここで #topbar には付けない。
 
   // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。
   const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
@@ -87,6 +96,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
   const presetSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-preset");
+  const resolutionSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-resolution");
   const customWrap = opts.topbar.querySelector<HTMLElement>("#tb-custom");
   const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
   const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
@@ -190,6 +200,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     opts.onToggleMute(muted);
   });
   captureBtn?.addEventListener("click", () => opts.onToggleCapture());
+  resolutionSelect?.addEventListener("change", () => {
+    opts.onSetResolution(Math.max(0, Math.floor(Number(resolutionSelect.value) || 0)));
+  });
   fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
   pinBtn?.addEventListener("click", () => setPinned(!pinned));
   displaySelect?.addEventListener("change", () => {
@@ -250,6 +263,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     },
     setConnected(isConnected: boolean): void {
       connected = isConnected;
+      // 新規接続のたびに解像度はフルから始める (ホスト capture スレッドは
+      // セッションをまたいで設定を保持するため、UI と確実に揃える)。
+      if (isConnected && resolutionSelect) resolutionSelect.value = "0";
       // 既定はピン留め (常時表示・映像とは重ならない)。ピンを外すと自動格納 (RDP の接続バー風)。
       pinned = isConnected;
       revealed = false;

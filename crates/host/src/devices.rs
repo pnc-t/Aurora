@@ -103,6 +103,19 @@ impl DeviceGuard {
         }
     }
 
+    /// 接続レベルのピン留め有効/無効に**関係なく**、鍵が許可リストに登録済みかを返す。
+    /// 仮想ディスプレイ (RDP 風テイクオーバー) のような特権機能を「ホストに登録済みの端末だけ」に
+    /// 限定するゲートに使う。未登録端末は通常接続 (物理キャプチャ) はできても仮想は使えない。
+    pub fn is_trusted(&self, key: Option<&[u8]>) -> bool {
+        let Some(key) = key else {
+            return false;
+        };
+        self.trusted
+            .lock()
+            .map(|t| t.iter().any(|d| d.pubkey == key))
+            .unwrap_or(false)
+    }
+
     /// クライアント公開鍵 (ハンドシェイクの `remote_static`) を判定する。ペアリング窓が開いて
     /// いれば未知鍵をここで登録して消費する (1 回限り)。`Admit` で結果を返す。
     pub fn admit(&self, key: Option<&[u8]>) -> Admit {

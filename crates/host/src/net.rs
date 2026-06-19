@@ -417,8 +417,9 @@ pub async fn run_server(
     mut audio_rx: mpsc::Receiver<EncodedAudio>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputCmd>,
-    cap_select_tx: std::sync::mpsc::Sender<u32>,
+    cap_select_tx: std::sync::mpsc::Sender<String>,
     fps_tx: std::sync::mpsc::Sender<u32>,
+    scale_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     mut clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
@@ -459,6 +460,7 @@ pub async fn run_server(
             let input_tx2 = input_tx.clone();
             let cap_select_tx2 = cap_select_tx.clone();
             let fps_tx2 = fps_tx.clone();
+            let scale_tx2 = scale_tx.clone();
             let clip_apply_tx2 = clip_apply_tx.clone();
             // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
             // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
@@ -476,6 +478,7 @@ pub async fn run_server(
                 input_tx2,
                 cap_select_tx2,
                 fps_tx2,
+                scale_tx2,
                 clip_apply_tx2,
                 nal_rx_ref,
                 audio_rx_ref,
@@ -492,18 +495,23 @@ pub async fn run_server(
     }
 }
 
+/// 合成した仮想ディスプレイ (デスクトップ非アタッチで DXGI に出ないもの) に付ける id。
+/// 実 DXGI 出力 index (0..) とは衝突しない番兵。テイクオーバー成立時に実 index へ差し替える。
+const VIRTUAL_SENTINEL_ID: u32 = u32::MAX;
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut stream: TcpStream,
     peer: SocketAddr,
     psk: [u8; 32],
-    displays: Vec<DisplayInfo>,
+    mut displays: Vec<DisplayInfo>,
     audio: bool,
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputCmd>,
-    cap_select_tx: std::sync::mpsc::Sender<u32>,
+    cap_select_tx: std::sync::mpsc::Sender<String>,
     fps_tx: std::sync::mpsc::Sender<u32>,
+    scale_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     nal_rx: &mut mpsc::Receiver<EncodedNal>,
     audio_rx: &mut mpsc::Receiver<EncodedAudio>,
@@ -610,9 +618,56 @@ async fn handle_client(
     let mut tcp_tx_nonce: u64 = 0;
     let mut tcp_rx_nonce: u64 = 0;
 
-    // HostInfo を即時送信 (全ディスプレイを提示)
+    // HostInfo を即時送信 (全ディスプレイを提示)。仮想ディスプレイ (MttVDD) があれば、その
+    // GDI 名と一致する Display に is_virtual を立て、クライアントが「仮想ディスプレイを使う」
+    // 設定のとき自動選択できるようにする。
+    //
+    // **セキュリティゲート**: 仮想ディスプレイ (RDP 風テイクオーバー = 物理を暗転させる特権操作) は
+    // **ホストに登録済み (許可リスト) の端末だけ**に許可する。未登録端末には detect() を None 扱いに
+    // し、仮想を一切提示しない (is_virtual も立たず、SetClientViewport のテイクオーバー経路にも入れない)。
+    // 接続レベルのピン留め (devices.admit) が無効でもこのゲートは独立に効く。
+    let client_trusted = devices.is_trusted(remote_key.as_deref());
+    let vdd = if client_trusted {
+        crate::virtualdisplay::detect()
+    } else {
+        tracing::info!(peer = %peer, "virtual display gated off (device not registered/allowlisted)");
+        None
+    };
+    let vdd_gdi_name = vdd.as_ref().map(|v| v.gdi_name.clone());
+    // 仮想ディスプレイは未接続時にデスクトップからデタッチされており (cursor 迷い込み防止)、
+    // その間は DXGI 出力に出ない = enumerate_displays に載らない。これだとクライアントが
+    // is_virtual な display を選べずテイクオーバーを起動できないため、検出済みだが未列挙の
+    // 仮想ディスプレイを番兵 id で合成エントリとして足す。選択されると SetClientViewport の
+    // begin_takeover がアタッチし、resolve_output が実 DXGI index へ差し替える。
+    if let Some(v) = vdd.as_ref() {
+        if !displays.iter().any(|d| d.name == v.gdi_name) {
+            displays.push(DisplayInfo {
+                id: VIRTUAL_SENTINEL_ID,
+                name: v.gdi_name.clone(),
+                width: v.width,
+                height: v.height,
+                x: 0,
+                y: 0,
+            });
+            tracing::info!(name = %v.gdi_name, "advertising detached virtual display");
+        }
+    }
+    // 仮想ディスプレイ検出と各ディスプレイ名を残す。クライアントの自動選択 (is_virtual)
+    // が効かない場合に「検出名 ↔ 列挙名」の不一致を実機ログから切り分けるため。
+    tracing::info!(
+        vdd = vdd_gdi_name.as_deref().unwrap_or("(none)"),
+        names = ?displays.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        "virtual display detection"
+    );
     let host_info = ControlMsg::HostInfo {
-        displays: displays.iter().map(Display::from).collect(),
+        displays: displays
+            .iter()
+            .map(|d| {
+                let mut pd = Display::from(d);
+                pd.is_virtual = vdd_gdi_name.as_deref() == Some(d.name.as_str());
+                pd
+            })
+            .collect(),
         audio,
     };
     send_control_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
@@ -658,6 +713,10 @@ async fn handle_client(
     let mut held = HeldInputs::default();
     // 音声ミュート状態 (クライアントの SetAudioMuted)。true の間は音声 UDP を送らない。
     let mut audio_muted = false;
+    // 現在キャプチャ中のディスプレイの index (SelectDisplay で更新)。初期は先頭 (= initial_id)。
+    let mut active_idx = 0usize;
+    // 仮想ディスプレイのテイクオーバー (物理オフ+仮想 primary) を実施済みか。切断時の復元判定に使う。
+    let mut taken_over = false;
     let result: Result<()> = async {
     loop {
         tokio::select! {
@@ -692,6 +751,12 @@ async fn handle_client(
                         tracing::info!(muted, "client set audio muted");
                         audio_muted = muted;
                     }
+                    ControlMsg::SetResolution { max_height } => {
+                        tracing::info!(max_height, "client set resolution");
+                        // capture スレッドへ最大高さを伝える (GPU 縮小)。新キーフレームで即反映。
+                        let _ = scale_tx.send(max_height);
+                        let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                    }
                     ControlMsg::Stats { bitrate_kbps, fps, rtt_us, loss_permille } => {
                         tracing::debug!(bitrate_kbps, fps, rtt_us, loss_permille, "client stats");
                         if let Some(new_bps) = bitrate.on_stats(loss_permille, rtt_us) {
@@ -706,23 +771,143 @@ async fn handle_client(
                         }
                     }
                     ControlMsg::SelectDisplay { id } => {
-                        match displays.iter().find(|d| d.id == id) {
-                            Some(d) => {
+                        match displays.iter().position(|d| d.id == id) {
+                            Some(idx) => {
+                                // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
+                                // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
+                                // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
+                                if taken_over && id != VIRTUAL_SENTINEL_ID {
+                                    let _ =
+                                        tokio::task::spawn_blocking(crate::display::end_takeover)
+                                            .await;
+                                    taken_over = false;
+                                    tracing::info!(
+                                        "ended takeover: switching to physical display"
+                                    );
+                                }
+                                // 物理ディスプレイの解像度は変更しないので、切替時の復元は不要。
+                                active_idx = idx;
+                                let d = &displays[idx];
                                 tracing::info!(id, name = %d.name, "select display");
-                                // capture スレッドへ切替指示。
-                                let _ = cap_select_tx.send(id);
-                                // input スレッドの座標系を新ディスプレイへ更新。
-                                let geom = DisplayGeom {
-                                    x: d.x,
-                                    y: d.y,
-                                    width: d.width,
-                                    height: d.height,
-                                };
-                                let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
-                                // 新キャプチャの最初の出力を keyframe にしてクライアント復帰を促す。
-                                let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                                // 合成した仮想ディスプレイ (番兵 id) はまだ DXGI 出力が無い
+                                // (デタッチ中)。ここで cap_select すると EnumOutputs が外れて
+                                // 失敗するので送らない。直後の SetClientViewport で begin_takeover
+                                // がアタッチし、resolve_output が実 index で cap_select+座標系を
+                                // 張り替える。実 index を持つ通常ディスプレイのみ即切替する。
+                                if id != VIRTUAL_SENTINEL_ID {
+                                    // capture スレッドへ切替指示 (GDI 名で。index はトポロジ変更で
+                                    // 変わるため名前で引き直す)。
+                                    let _ = cap_select_tx.send(d.name.clone());
+                                    // input スレッドの座標系を新ディスプレイへ更新。
+                                    let geom = DisplayGeom {
+                                        x: d.x,
+                                        y: d.y,
+                                        width: d.width,
+                                        height: d.height,
+                                    };
+                                    let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
+                                    // 新キャプチャの最初の出力を keyframe にしてクライアント復帰を促す。
+                                    let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                                }
                             }
                             None => tracing::warn!(id, "SelectDisplay for unknown display id"),
+                        }
+                    }
+                    ControlMsg::SetClientViewport { width, height } => {
+                        // クライアントの表示領域にホスト解像度を合わせる。0 は無視。
+                        // アクティブが仮想ディスプレイなら RDP 風テイクオーバー (物理オフ+仮想 primary)、
+                        // そうでなければ物理ディスプレイの解像度変更 (方式B) を行う。
+                        if width > 0 && height > 0 {
+                            let active_name = displays[active_idx].name.clone();
+                            let is_virtual =
+                                vdd_gdi_name.as_deref() == Some(active_name.as_str());
+                            // 「リサイズで固まる」のライブ再現用 (RUST_LOG=aurora=debug)。どの viewport が
+                            // いつ来てテイクオーバー/リサイズのどちらに入ったかを追える。
+                            tracing::debug!(
+                                width,
+                                height,
+                                taken_over,
+                                is_virtual,
+                                active = %active_name,
+                                "SetClientViewport"
+                            );
+                            if is_virtual {
+                                // --- 仮想ディスプレイ: テイクオーバー ---
+                                let applied = if !taken_over {
+                                    let vn = active_name.clone();
+                                    let r = tokio::task::spawn_blocking(move || {
+                                        crate::display::begin_takeover(&vn, width, height)
+                                    })
+                                    .await;
+                                    match r {
+                                        Ok(Ok(dims)) => {
+                                            taken_over = true;
+                                            // テイクオーバーで仮想は主 (0,0) になった。CCD で物理を
+                                            // 落とすと仮想の GDI 名が変わることがあるため MTT1337 で
+                                            // 再検出し、capture 対象 (名前ベース) と座標系を更新する。
+                                            let new_name = tokio::task::spawn_blocking(
+                                                crate::virtualdisplay::detect,
+                                            )
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .map(|v| v.gdi_name)
+                                            .unwrap_or_else(|| active_name.clone());
+                                            displays[active_idx].name = new_name.clone();
+                                            displays[active_idx].x = 0;
+                                            displays[active_idx].y = 0;
+                                            let _ = cap_select_tx.send(new_name);
+                                            Some(dims)
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::warn!(error = %e, "begin_takeover failed");
+                                            None
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "begin_takeover task failed");
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    // テイクオーバー中のリサイズ追従 (仮想解像度の動的変更) は**行わない**。
+                                    // アクティブな Desktop Duplication 中に仮想ディスプレイの解像度を
+                                    // 変えると、duplication が回復不能の DXGI_ERROR_ACCESS_LOST に陥り
+                                    // (同じ共有 D3D11 デバイス上では作り直しても復帰しない)、テイクオーバー中の
+                                    // re-exec 抑止と相まって映像が永久固着する (実機ログ 2026-06-19 で確定)。
+                                    // 解像度は接続時テイクオーバーで一度だけ確定し、以降の窓サイズ差は
+                                    // クライアントの object-fit が吸収する。再フィットしたい場合は再接続する。
+                                    tracing::debug!(
+                                        width,
+                                        height,
+                                        "resize ignored during takeover (virtual resolution is fixed at connect to avoid capture ACCESS_LOST)"
+                                    );
+                                    None
+                                };
+                                if let Some((nw, nh)) = applied {
+                                    displays[active_idx].width = nw;
+                                    displays[active_idx].height = nh;
+                                    let d = &displays[active_idx];
+                                    let id = d.id;
+                                    let geom = DisplayGeom {
+                                        x: d.x,
+                                        y: d.y,
+                                        width: nw,
+                                        height: nh,
+                                    };
+                                    let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
+                                    send_control_msg(
+                                        &mut write_half,
+                                        &session,
+                                        &ControlMsg::DisplayResized { id, width: nw, height: nh },
+                                        &mut tcp_tx_nonce,
+                                    )
+                                    .await?;
+                                    let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                                    tracing::info!(id, nw, nh, "virtual display takeover/resize");
+                                }
+                            }
+                            // 物理ディスプレイのキャプチャ時はホスト解像度を一切変更しない
+                            // (はみ出しはクライアント側の object-fit / レターボックスで吸収する)。
                         }
                     }
                     ControlMsg::Clipboard { text } => {
@@ -892,7 +1077,20 @@ async fn handle_client(
     //    RPC_TIMEOUT まで引きずられ、次セッションの受理と Explorer が固まるのを防ぐ。
     fs_bridge.close();
     fs_req_rx.close();
-
+    // 3) テイクオーバー中なら全トポロジ (物理の再アタッチ含む) を復元する。物理解像度は
+    //    変更しない方針なので、テイクオーバー以外の解像度復元は不要。
+    if taken_over {
+        let _ = tokio::task::spawn_blocking(crate::display::end_takeover).await;
+    }
+    // 4) VDD を再デタッチ: テイクオーバー復元後も VDD がデスクトップに残るため切り離す。
+    //    未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。
+    if let Some(vdd) = crate::virtualdisplay::detect() {
+        let vn = vdd.gdi_name;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::display::detach_vdd_if_attached(&vn);
+        })
+        .await;
+    }
     result
 }
 

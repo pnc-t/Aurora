@@ -8,6 +8,8 @@ import {
   selectDisplay,
   setVideoParams,
   setAudioMuted,
+  setResolution,
+  setClientViewport,
   uploadFileFromPath,
   formatDisplayName,
   type ClientEvent,
@@ -90,6 +92,10 @@ const toolbar = mountToolbar({
     showToast(muted ? "音声ミュート" : "音声ミュート解除");
   },
   onSetVideoParams: (fps, mbps) => void setVideoParams(fps, mbps * 1_000_000),
+  onSetResolution: (maxHeight) => {
+    void setResolution(maxHeight);
+    showToast(maxHeight === 0 ? "解像度: フル" : `解像度: ${maxHeight}p`);
+  },
 });
 
 // ファイル転送ポップオーバー。
@@ -100,6 +106,56 @@ let lastHost = "";
 let pendingEntry: HostEntry | null = null;
 // 接続中か (フルスクリーン切替後の resizable 再適用判定に使う)。
 let connected = false;
+
+// --- ホスト解像度の自動追従 (RDP 風) ---
+// クライアントの映像表示領域 (物理 px) をホストへ送り、ホストが最も近い対応モードへ
+// 解像度を変える。これによりウィンドウに合わせて黒帯が消え、マウスも 1:1 に近づく。
+let currentDisplays: DisplayDto[] = [];
+let currentDisplay: DisplayDto | null = null;
+let viewportTimer: number | null = null;
+// 直近で送った viewport。微小な変化での連投を避ける。切断でリセットする。
+let lastSentVw = 0;
+let lastSentVh = 0;
+
+/** 仮想ディスプレイに合わせる目標解像度 = クライアントのモニタ解像度 (物理 px)。
+ *  ウィンドウのサイズではなく画面全体に固定する: host の仮想ディスプレイをクライアントの
+ *  モニタ実解像度 (例 2560x1440) にし、窓をどうリサイズしても解像度は変わらない
+ *  (窓内の表示差は canvas の object-fit:contain が吸収する)。接続直後に確定できるので、
+ *  テイクオーバーの「初回 viewport 一発で確定」とも噛み合う (窓の最終サイズを待たない)。 */
+function currentViewportPx(): { w: number; h: number } {
+  const dpr = window.devicePixelRatio || 1;
+  return {
+    w: Math.max(1, Math.round(window.screen.width * dpr)),
+    h: Math.max(1, Math.round(window.screen.height * dpr)),
+  };
+}
+
+/** 現在の viewport をホストへ送る (接続中のみ)。`force` で前回値に関わらず送る。 */
+function sendViewportNow(force = false): void {
+  if (!connected) return;
+  // 解像度追従は**仮想ディスプレイのときだけ**行う (テイクオーバーした仮想をクライアント
+  // 表示領域に動的に合わせる)。物理キャプチャ時はホスト解像度を一切変えない。
+  const useVirtual = currentDisplay?.is_virtual ?? false;
+  if (!useVirtual) return;
+  const { w, h } = currentViewportPx();
+  if (!force && Math.abs(w - lastSentVw) < 8 && Math.abs(h - lastSentVh) < 8) return;
+  lastSentVw = w;
+  lastSentVh = h;
+  void setClientViewport(w, h);
+}
+
+function scheduleSendViewport(): void {
+  if (viewportTimer !== null) clearTimeout(viewportTimer);
+  viewportTimer = window.setTimeout(() => {
+    viewportTimer = null;
+    sendViewportNow();
+  }, 400);
+}
+
+// ウィンドウのリサイズに追従してホスト解像度を更新する (デバウンス)。
+window.addEventListener("resize", () => {
+  if (connected) scheduleSendViewport();
+});
 
 /** セッションを開く下回り。チャネルを張って connect_to_host を呼ぶ (再接続も共用)。 */
 // セッション世代。openSession ごとに進め、旧セッションのチャネルに残っていたイベント
@@ -149,15 +205,29 @@ const launcher = mountLauncher({
 
 launcher.show();
 
+/** ツールバーのディスプレイ切替に出す一覧。
+ *  - 仮想ディスプレイを使う (RDP) 設定が ON: 仮想のみを返す (= 物理へ切替させない)。
+ *  - OFF: 物理のみを返す (= 仮想を選ばせない。仮想は RDP 設定専用)。 */
+function toolbarDisplayList(): DisplayDto[] {
+  if (launcher.getSettings().use_virtual_display) {
+    const v = currentDisplays.find((d) => d.is_virtual);
+    return v ? [v] : [];
+  }
+  return currentDisplays.filter((d) => !d.is_virtual);
+}
+
 function switchDisplay(d: DisplayDto): void {
   // 解像度/SPS が変わるためデコーダを作り直し、入力スケールを新ディスプレイへ更新。
   void selectDisplay(d.id);
+  currentDisplay = d;
   resetDecoder();
   attachInput(canvas, { width: d.width, height: d.height }, { onCaptureChange });
   canvas.focus();
   const dn = formatDisplayName(d.name);
   toolbar.setConnLabel(`${lastHost} · ${dn} ${d.width}x${d.height}`);
   showToast(`switching to ${dn} ${d.width}x${d.height}`);
+  // 切替後の新ディスプレイもクライアント表示領域へ追従させる (前回値に関わらず送る)。
+  sendViewportNow(true);
 }
 
 // --- 自動再接続 ---
@@ -267,6 +337,13 @@ function doDisconnect(reason: string, userInitiated = false): void {
   clearStabilizeTimer();
   void disconnect();
   connected = false;
+  // viewport 追従状態をリセット (次接続/再接続で初回 viewport を必ず送る)。
+  if (viewportTimer !== null) {
+    clearTimeout(viewportTimer);
+    viewportTimer = null;
+  }
+  lastSentVw = 0;
+  lastSentVh = 0;
   detachInput(); // ポインタロックも解除される
   toolbar.setConnected(false);
   toolbar.setCaptureToggled(false);
@@ -307,17 +384,46 @@ function handleClientEvent(ev: ClientEvent, gen: number): void {
       connected = true;
       // 接続中はウィンドウのリサイズを許可 (未接続のランチャーは固定サイズ)。
       void setResizable(true);
-      toolbar.setDisplays(ev.displays, ev.displays[0]?.id);
-      const d = ev.displays[0];
-      if (d) {
-        toolbar.setConnLabel(`${lastHost} · ${formatDisplayName(d.name)} ${d.width}x${d.height}`);
-        attachInput(canvas, { width: d.width, height: d.height }, { onCaptureChange });
+      const settings = launcher.getSettings();
+      currentDisplays = ev.displays;
+      // 「仮想ディスプレイを使う」設定なら、ホストの仮想ディスプレイ (is_virtual) を既定の
+      // キャプチャ対象にする (RDP 風)。無ければ物理の先頭へフォールバックして通知する。
+      let target = ev.displays[0];
+      if (settings.use_virtual_display) {
+        const vd = ev.displays.find((dd) => dd.is_virtual);
+        if (vd) {
+          target = vd;
+        } else {
+          showToast("仮想ディスプレイが見つかりません (ホストに VDD 未導入?)", "error");
+        }
+      }
+      // [一時診断] 接続時の仮想ディスプレイ判定を可視化する (select_display が飛ばない原因の切り分け)。
+      showToast(
+        `診断 設定仮想=${settings.use_virtual_display} / 検出=${
+          ev.displays.filter((d) => d.is_virtual).map((d) => formatDisplayName(d.name)).join(",") ||
+          "なし"
+        } / 選択=${target ? formatDisplayName(target.name) : "なし"}`,
+      );
+      // currentDisplay を先に設定してから toolbarDisplayList() を呼ぶ。
+      // 仮想ディスプレイ使用時は仮想のみをツールバーに表示し (物理はデタッチされるため)
+      // 切替 UI を非表示にする。
+      currentDisplay = target ?? null;
+      toolbar.setDisplays(toolbarDisplayList(), target?.id);
+      if (target) {
+        // 既定の先頭以外 (= 仮想) を選ぶ場合はホストへキャプチャ対象切替を要求する。
+        if (target.id !== ev.displays[0]?.id) void selectDisplay(target.id);
+        toolbar.setConnLabel(
+          `${lastHost} · ${formatDisplayName(target.name)} ${target.width}x${target.height}`,
+        );
+        attachInput(canvas, { width: target.width, height: target.height }, { onCaptureChange });
         canvas.focus();
+        // 接続直後に仮想ディスプレイをクライアントのモニタ解像度へ合わせる (RDP 風)。
+        // 物理モードでは sendViewportNow が早期 return する (解像度を変えない)。
+        sendViewportNow(true);
       } else {
         toolbar.setConnLabel(`${lastHost} · (no displays?)`);
       }
       // 設定を反映: 統計 HUD / マウスキャプチャ / フルスクリーン。
-      const settings = launcher.getSettings();
       if (settings.show_stats && !statsHud.classList.contains("visible")) {
         toggleStats();
         toolbar.setStatsToggled(true);
@@ -332,7 +438,26 @@ function handleClientEvent(ev: ClientEvent, gen: number): void {
       // 映像パラメータを設定値でホストへ適用し、ツールバー表示も同期。
       toolbar.setVideoParams(settings.fps, settings.max_mbps);
       void setVideoParams(settings.fps, settings.max_mbps * 1_000_000);
+      // 解像度はフルで開始 (ホスト capture スレッドは前セッションの設定を保持しうるため明示)。
+      void setResolution(0);
       showToast("connected", "success");
+      break;
+    }
+    case "display_resized": {
+      // ホストが解像度を変更した (RDP 風の追従)。入力スケールとデコーダを新解像度へ更新する。
+      const idx = currentDisplays.findIndex((dd) => dd.id === ev.id);
+      if (idx >= 0) {
+        currentDisplays[idx] = { ...currentDisplays[idx], width: ev.width, height: ev.height };
+      }
+      if (currentDisplay && currentDisplay.id === ev.id) {
+        currentDisplay = { ...currentDisplay, width: ev.width, height: ev.height };
+      }
+      resetDecoder(); // 新 SPS (解像度/レベル変化) で作り直すため未設定に戻す
+      attachInput(canvas, { width: ev.width, height: ev.height }, { onCaptureChange });
+      canvas.focus();
+      toolbar.setDisplays(toolbarDisplayList(), ev.id);
+      const dn = currentDisplay ? formatDisplayName(currentDisplay.name) : `Display ${ev.id}`;
+      toolbar.setConnLabel(`${lastHost} · ${dn} ${ev.width}x${ev.height}`);
       break;
     }
     case "stats":
