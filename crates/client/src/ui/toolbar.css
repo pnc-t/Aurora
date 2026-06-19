@@ -4,21 +4,38 @@
  * Ctrl+Alt+Shift+B で隠す/戻すときだけ transform で帯ごとスライドする。
  * 操作はフラットなアイコンボタン (.tb-btn) を機能ごとに .tb-group へまとめ、.tb-sep で区切る。 */
 
-/* 上端の透明な帯。ピルを中央に浮かべるだけのコンテナ。背景・枠は持たない。
- * 帯の余白部分も data-tauri-drag-region でウィンドウ移動の掴みどころにする。 */
+/* 透明な帯。ピルを浮かべるだけのコンテナ。背景・枠は持たない。
+ * 帯の余白部分も data-tauri-drag-region でウィンドウ移動の掴みどころにする。
+ * 配置 (上下左右) は pos-* クラスで切り替える。left/right は .vertical で縦並びになる。 */
 #topbar {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 30;
-  display: flex; justify-content: center; align-items: flex-start;
-  padding: 8px 12px;
+  position: fixed; z-index: 30;
+  display: flex;
   background: none; border: none;
-  transform: translateY(-130%);
   transition: transform 0.2s ease;
   /* 帯 (ピル以外の余白) はクリックを素通しさせ、背後の映像 canvas (リモート操作) へ
-   * 届かせる。これが無いと全幅の帯がポインタを食い、上端でリモートを操作できず、
+   * 届かせる。これが無いと帯がポインタを食い、端でリモートを操作できず、
    * ドラッグ領域指定と相まってウィンドウ移動になってしまう。操作可なのはピルのみ。 */
   pointer-events: none;
 }
-#topbar.visible { transform: translateY(0); }
+
+/* --- 配置: 上/下 (横帯) --- */
+#topbar.pos-top, #topbar.pos-bottom {
+  left: 0; right: 0; padding: 8px 12px;
+  justify-content: center;
+}
+#topbar.pos-top { top: 0; align-items: flex-start; transform: translateY(-130%); }
+#topbar.pos-bottom { bottom: 0; align-items: flex-end; transform: translateY(130%); }
+
+/* --- 配置: 左/右 (縦サイドバー) --- */
+#topbar.pos-left, #topbar.pos-right {
+  top: 0; bottom: 0; padding: 12px 8px;
+  flex-direction: column; justify-content: center;
+}
+#topbar.pos-left { left: 0; align-items: flex-start; transform: translateX(-130%); }
+#topbar.pos-right { right: 0; align-items: flex-end; transform: translateX(130%); }
+
+/* 表示時は元位置へ (各軸でスライドイン)。 */
+#topbar.visible { transform: translate(0, 0); }
 
 /* 浮島ピル本体。角丸 + 影 + 薄い枠で映像の上にふわっと浮かせる。 */
 .tb-pill {
@@ -36,6 +53,18 @@
 /* 機能グループと区切り線 (ピル内なので短く控えめに) */
 .tb-group { display: inline-flex; align-items: center; gap: 2px; }
 .tb-sep { width: 1px; height: 18px; align-self: center; margin: 0 4px; background: var(--panel-border); opacity: 0.8; }
+
+/* --- 縦サイドバー (left/right 配置) ---
+ * ピルと内部の並び方向を縦にし、区切り線も横線へ向きを変える。 */
+#topbar.vertical .tb-pill { flex-direction: column; }
+#topbar.vertical .tb-group { flex-direction: column; }
+#topbar.vertical .tb-sep { width: 18px; height: 1px; margin: 4px 0; }
+#topbar.vertical .tb-video { flex-direction: column; gap: 6px; }
+#topbar.vertical .tb-custom { flex-direction: column; gap: 6px; }
+#topbar.vertical #display-wrap { flex-direction: column; gap: 2px; }
+/* 縦並びでは横並び前提の select 幅が広すぎるので、ピル幅に収める。 */
+#topbar.vertical select { max-width: 110px; }
+#topbar.vertical .window-controls { flex-direction: column; }
 
 /* フラットなアイコンボタン: 既定は枠なし・透明、ホバー時だけ淡い背景。 */
 .tb-btn {

@@ -123,6 +123,9 @@ export type HostEntry = {
 /// 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。
 export type ThemeId = "auto" | "dark" | "light" | "legacy";
 
+/// ツールバーの配置。left/right では縦並びのサイドバーになる。
+export type ToolbarPosition = "top" | "bottom" | "left" | "right";
+
 /// クライアント設定 (Rust 側 config::ClientSettings と対応)。
 export type ClientSettings = {
   default_fullscreen: boolean;
@@ -130,6 +133,7 @@ export type ClientSettings = {
   default_capture: boolean;
   default_port: number;
   toolbar_pinned: boolean;
+  toolbar_position: ToolbarPosition;
   accent_color: string;
   theme: ThemeId;
   fps: number;

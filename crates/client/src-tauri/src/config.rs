@@ -44,6 +44,10 @@ fn default_theme() -> String {
     "dark".to_string()
 }
 
+fn default_toolbar_position() -> String {
+    "top".to_string()
+}
+
 /// クライアント側の永続設定。接続後の挙動と UI の既定値。
 /// 各フィールドは `#[serde(default)]` で、項目を増やしても旧 settings.json を読める。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +67,10 @@ pub struct ClientSettings {
     /// 接続後、ツールバーを最初からピン留め表示する。
     #[serde(default)]
     pub toolbar_pinned: bool,
+    /// ツールバーの配置 ("top" | "bottom" | "left" | "right")。
+    /// left/right ではピルが縦並びのサイドバーになる。CSS の位置クラスへ渡す。
+    #[serde(default = "default_toolbar_position")]
+    pub toolbar_position: String,
     /// UI のアクセント色 (CSS 色)。
     #[serde(default = "default_accent")]
     pub accent_color: String,
@@ -104,6 +112,7 @@ impl Default for ClientSettings {
             default_capture: false,
             default_port: DEFAULT_PORT,
             toolbar_pinned: false,
+            toolbar_position: default_toolbar_position(),
             accent_color: default_accent(),
             theme: default_theme(),
             fps: default_fps(),

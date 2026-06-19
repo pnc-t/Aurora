@@ -378,7 +378,9 @@ function handleClientEvent(ev: ClientEvent, gen: number): void {
       launcher.hide();
       launcher.setConnState(`connected · ${lastHost}`, "connected");
       if (pendingEntry) void saveRecentHost(pendingEntry);
-      toolbar.setConnected(true);
+      // ツールバーの配置と初期ピン留めを設定から反映する (接続時に確定)。
+      toolbar.setPosition(launcher.getSettings().toolbar_position);
+      toolbar.setConnected(true, launcher.getSettings().toolbar_pinned);
       // ホストが音声対応のときだけミュートボタンを出す (毎接続でミュート解除から)。
       toolbar.setAudioAvailable(ev.audio);
       connected = true;
