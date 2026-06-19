@@ -7,7 +7,7 @@
 // 掴んでもウィンドウ移動できる。
 // 接続先情報は省スペース化のためバーの title (ホバー tooltip) に退避し、行内には常駐させない。
 
-import { formatDisplayName, type DisplayDto } from "../core/ipc";
+import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
 import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
@@ -38,7 +38,10 @@ export type ToolbarHandle = {
   setAudioAvailable: (available: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
-  setConnected: (connected: boolean) => void;
+  /** ツールバーの配置を切り替える (top/bottom = 横帯、left/right = 縦サイドバー)。 */
+  setPosition: (pos: ToolbarPosition) => void;
+  /** 接続状態を反映する。pinnedDefault でこのセッションの初期ピン留めを決める。 */
+  setConnected: (connected: boolean, pinnedDefault?: boolean) => void;
 };
 
 export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
@@ -74,6 +77,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       </span>
       <span class="tb-sep" data-tauri-drag-region></span>
       <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
+      <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / Ctrl+Alt+Shift+B で再表示">${icon("eye-off")}</button>
       <span id="tb-winctl" class="window-controls"></span>
     </div>
   `;
@@ -95,6 +99,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const captureBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-capture");
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
+  const hideBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-hide");
   const presetSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-preset");
   const resolutionSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-resolution");
   const customWrap = opts.topbar.querySelector<HTMLElement>("#tb-custom");
@@ -149,13 +154,33 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     audioBtn.title = muted ? "音声ミュート解除" : "音声ミュート";
     audioBtn.innerHTML = icon(muted ? "mute" : "volume");
   }
-  // ピン留め (常時表示)。既定は false = 自動格納し、上端ホバーで一時表示する。
+  // ピン留め (常時表示)。既定は false = 自動格納し、端ホバーで一時表示する。
   let pinned = false;
-  // 上端ホバーで一時表示中か (ピン留め時は無関係)。
+  // 端ホバーで一時表示中か (ピン留め時は無関係)。
   let revealed = false;
+  // 自動表示の無効化 (隠すボタン)。true の間は端にカーソルを合わせても出さない。
+  // 再表示はピン留め (Ctrl+Alt+Shift+B もしくは pin ボタン) のみ。
+  let autoHideLocked = false;
+  // ツールバーの配置。CSS の位置/向きクラスはこの値から付け替える。
+  let position: ToolbarPosition = "top";
+  // 既定の配置クラス (pos-top) を最初から付けておく (setPosition 前でも CSS が効くように)。
+  // 注: applyPosition は position を参照するので、必ず position 初期化後に呼ぶ
+  // (関数巻き上げに頼って宣言前に呼ぶと TDZ で ReferenceError になる)。
+  applyPosition();
 
-  function barHeight(): number {
-    // transform で隠していてもレイアウト高は取れる。未確定時は概算。
+  // 配置クラスを #topbar と body に反映する。left/right は縦並び (vertical)。
+  function applyPosition(): void {
+    const cls = `pos-${position}`;
+    opts.topbar.classList.remove("pos-top", "pos-bottom", "pos-left", "pos-right", "vertical");
+    opts.topbar.classList.add(cls);
+    if (position === "left" || position === "right") opts.topbar.classList.add("vertical");
+    document.body.classList.remove("bar-top", "bar-bottom", "bar-left", "bar-right");
+    document.body.classList.add(`bar-${position}`);
+  }
+
+  // バーの「厚み」。top/bottom は高さ、left/right は幅で端ホバー判定する。
+  function barExtent(): number {
+    if (position === "left" || position === "right") return opts.topbar.offsetWidth || 56;
     return opts.topbar.offsetHeight || 48;
   }
 
@@ -163,28 +188,57 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     const visible = connected && (pinned || revealed);
     opts.topbar.classList.toggle("visible", visible);
     if (visible) {
-      // 実測したバー高を CSS 変数へ (映像エリア/統計 HUD をこの分だけ下げる)。
+      // 実測したバー高を CSS 変数へ (統計 HUD を top 配置のときこの分だけ下げる)。
       document.documentElement.style.setProperty("--topbar-h", `${opts.topbar.offsetHeight}px`);
     }
     pinBtn?.classList.toggle("toggled", pinned);
-    // bar-open: バー表示中は常に映像エリア/統計 HUD を確保し、キャプチャに重ならないようにする
-    // (ピン留め・上端ホバー表示のどちらでも同じ挙動)。
+    hideBtn?.classList.toggle("toggled", autoHideLocked);
+    // bar-open: バー表示中は統計 HUD などをバーと重ならない位置へ寄せる
+    // (ピン留め・端ホバー表示のどちらでも同じ挙動)。
     document.body.classList.toggle("bar-open", visible);
   }
 
   function setPinned(on: boolean): void {
     pinned = on;
-    if (pinned) revealed = false;
+    if (pinned) {
+      // ピン留めするなら自動表示の無効化は解除し、その場で出す。
+      autoHideLocked = false;
+      revealed = false;
+    }
     applyVisibility();
   }
 
-  // 上端付近にマウスがある間だけ表示する (Y 座標で判定)。
+  // 「隠す」ボタン: ピン留めを外し、自動表示も無効化して即座に格納する。
+  function setAutoHideLocked(on: boolean): void {
+    autoHideLocked = on;
+    if (on) {
+      pinned = false;
+      revealed = false;
+    }
+    applyVisibility();
+  }
+
+  // 配置に応じた端付近にマウスがある間だけ表示する (座標で判定)。
   // mouseleave ではなく座標判定にすることで、バーを掴んでウィンドウをドラッグ移動する
-  // 間 (カーソルは上端に留まる) もバーが消えない。ネイティブドラッグ中は mousemove が
+  // 間 (カーソルは端に留まる) もバーが消えない。ネイティブドラッグ中は mousemove が
   // 来なくても revealed は維持される。
   window.addEventListener("mousemove", (e) => {
-    if (!connected || pinned) return;
-    const want = e.clientY <= barHeight() + 6;
+    if (!connected || pinned || autoHideLocked) return;
+    const ext = barExtent() + 6;
+    let want: boolean;
+    switch (position) {
+      case "bottom":
+        want = e.clientY >= window.innerHeight - ext;
+        break;
+      case "left":
+        want = e.clientX <= ext;
+        break;
+      case "right":
+        want = e.clientX >= window.innerWidth - ext;
+        break;
+      default:
+        want = e.clientY <= ext;
+    }
     if (want !== revealed) {
       revealed = want;
       applyVisibility();
@@ -205,6 +259,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   });
   fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
   pinBtn?.addEventListener("click", () => setPinned(!pinned));
+  hideBtn?.addEventListener("click", () => setAutoHideLocked(!autoHideLocked));
   displaySelect?.addEventListener("change", () => {
     const id = Number(displaySelect.value);
     const d = displays.find((x) => x.id === id);
@@ -256,18 +311,25 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       if (mbpsInput) mbpsInput.value = String(mbps);
       syncPreset(fps, mbps);
     },
-    /** Ctrl+Alt+Shift+B: ピン留めのトグル (常時表示 ⇔ 自動格納)。 */
+    setPosition(pos: ToolbarPosition): void {
+      position = pos;
+      applyPosition();
+      applyVisibility();
+    },
+    /** Ctrl+Alt+Shift+B: ピン留めのトグル (常時表示 ⇔ 自動格納)。
+     *  自動表示を無効化中ならまず再表示できるようにピン留めする。 */
     toggleBar(): void {
       if (!connected) return;
       setPinned(!pinned);
     },
-    setConnected(isConnected: boolean): void {
+    setConnected(isConnected: boolean, pinnedDefault = false): void {
       connected = isConnected;
       // 新規接続のたびに解像度はフルから始める (ホスト capture スレッドは
       // セッションをまたいで設定を保持するため、UI と確実に揃える)。
       if (isConnected && resolutionSelect) resolutionSelect.value = "0";
-      // 既定はピン留め (常時表示・映像とは重ならない)。ピンを外すと自動格納 (RDP の接続バー風)。
-      pinned = isConnected;
+      // 接続のたびに設定の既定ピン留めから始める (未ピンなら自動格納・端ホバーで一時表示)。
+      pinned = isConnected && pinnedDefault;
+      autoHideLocked = false;
       revealed = false;
       applyVisibility();
     },

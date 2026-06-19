@@ -11,5 +11,9 @@
   white-space: pre;
 }
 #stats-hud.visible { display: block; }
-/* ツールバー表示中はバーの下へ下げて重なりを防ぐ (--topbar-h は toolbar.ts が設定)。 */
-body.bar-open #stats-hud { top: calc(var(--topbar-h, 44px) + 8px); }
+/* ツールバーは右上に出る HUD と重なりうる。配置ごとに HUD を逃がす。
+ * 上配置 (横帯): バーの下へ下げる (--topbar-h は toolbar.ts が設定)。
+ * 右配置 (縦サイドバー): HUD を左上へ寄せてバーを避ける。
+ * 下/左配置はそもそも右上の HUD と重ならないので既定位置のまま。 */
+body.bar-open.bar-top #stats-hud { top: calc(var(--topbar-h, 44px) + 8px); }
+body.bar-open.bar-right #stats-hud { right: auto; left: 8px; }

@@ -32,6 +32,7 @@ export type IconName =
   | "pin"
   | "volume"
   | "mute"
+  | "eye-off"
   | "key";
 
 // viewBox 0 0 24 24 の path/shape 部分のみ (共通の <svg> ラッパーは icon() で付与)。
@@ -57,6 +58,7 @@ const PATHS: Record<IconName, string> = {
   pin: `<path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z"/>`,
   volume: `<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/>`,
   mute: `<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M22 9l-6 6M16 9l6 6"/>`,
+  "eye-off": `<path d="M9.9 4.2A9.1 9.1 0 0 1 12 4c5 0 9 5 9 8a11 11 0 0 1-2.3 3.3M6.6 6.6A11.2 11.2 0 0 0 3 12c0 3 4 8 9 8a9 9 0 0 0 4.3-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18"/>`,
   key: `<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2M16 7l3 3"/>`,
 };
 

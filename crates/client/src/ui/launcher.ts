@@ -20,6 +20,7 @@ import {
   type ClientSettings,
   type HostEntry,
   type ThemeId,
+  type ToolbarPosition,
 } from "../core/ipc";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
@@ -50,6 +51,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   default_capture: false,
   default_port: DEFAULT_PORT,
   toolbar_pinned: false,
+  toolbar_position: "top",
   accent_color: "#3a82f7",
   theme: "dark",
   fps: 60,
@@ -171,6 +173,26 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
             </div>
+            <div class="setting-group">ツールバー</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">配置</div>
+                <div class="s-desc">操作バーを画面のどの端に置くか。左右に置くと縦並びのサイドバーになる</div>
+              </div>
+              <select id="set-tb-position" class="select-input">
+                <option value="top">上</option>
+                <option value="bottom">下</option>
+                <option value="left">左</option>
+                <option value="right">右</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">最初からピン留め (常時表示)</div>
+                <div class="s-desc">OFF だと接続時は格納され、配置した端にカーソルを合わせると出てくる</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
+            </div>
             <div class="setting-group">外観・既定値</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -220,6 +242,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const captureToggle = $<HTMLInputElement>("#set-capture");
   const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
   const virtualToggle = $<HTMLInputElement>("#set-virtual");
+  const tbPositionSelect = $<HTMLSelectElement>("#set-tb-position");
+  const tbPinnedToggle = $<HTMLInputElement>("#set-tb-pinned");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
   const portInput = $<HTMLInputElement>("#set-port");
@@ -562,6 +586,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, use_virtual_display: virtualToggle.checked };
     persist();
   });
+  tbPositionSelect?.addEventListener("change", () => {
+    settings = { ...settings, toolbar_position: tbPositionSelect.value as ToolbarPosition };
+    persist();
+  });
+  tbPinnedToggle?.addEventListener("change", () => {
+    settings = { ...settings, toolbar_pinned: tbPinnedToggle.checked };
+    persist();
+  });
   accentInput?.addEventListener("input", () => {
     settings = { ...settings, accent_color: accentInput.value };
     applyAccent(accentInput.value);
@@ -653,6 +685,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (captureToggle) captureToggle.checked = settings.default_capture;
     if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
     if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
+    if (tbPositionSelect) tbPositionSelect.value = settings.toolbar_position;
+    if (tbPinnedToggle) tbPinnedToggle.checked = settings.toolbar_pinned;
     if (accentInput) accentInput.value = settings.accent_color;
     if (themeSelect) themeSelect.value = settings.theme;
     if (portInput) portInput.value = String(settings.default_port);
