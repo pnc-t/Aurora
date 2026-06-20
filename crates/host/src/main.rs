@@ -558,25 +558,40 @@ fn reexec_self(current_port: u16) {
 /// どのアダプタ・output index に出るか、desktop に attach されるかを実機確認する診断コマンド。
 /// VDD インストール前後で実行して差分を見る用途。
 fn list_displays_cmd() -> Result<()> {
-    println!("== DXGI adapters/outputs ==");
+    use std::fmt::Write as _;
+    // GUI サブシステムのリリースでは親コンソールへ attach するためファイルへのリダイレクトが
+    // 効かない (CONOUT$ へ張り替わる)。診断を確実に読めるよう、stdout に加えて一時ファイルにも
+    // 書き出す (`%TEMP%\aurora-list-displays.txt`)。
+    let mut out = String::new();
+    let _ = writeln!(out, "== DXGI adapters/outputs ==");
     #[cfg(target_os = "windows")]
     {
         for line in capture::debug_list_outputs()? {
-            println!("{line}");
+            let _ = writeln!(out, "{line}");
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         for d in capture::enumerate_displays()? {
-            println!(
+            let _ = writeln!(
+                out,
                 "output[{}] {}  {}x{} @ ({},{})",
                 d.id, d.name, d.width, d.height, d.x, d.y
             );
         }
     }
     match virtualdisplay::detect() {
-        Some(vdd) => println!("\nvirtual display detected: {} (MttVDD)", vdd.gdi_name),
-        None => println!("\nvirtual display: not detected"),
+        Some(vdd) => {
+            let _ = writeln!(out, "\nvirtual display detected: {} (MttVDD)", vdd.gdi_name);
+        }
+        None => {
+            let _ = writeln!(out, "\nvirtual display: not detected");
+        }
+    }
+    print!("{out}");
+    let path = std::env::temp_dir().join("aurora-list-displays.txt");
+    if std::fs::write(&path, &out).is_ok() {
+        println!("(also written to {})", path.display());
     }
     Ok(())
 }
@@ -1198,6 +1213,22 @@ fn capture_loop(
                 } else {
                     let stuck_for = first_fail.get_or_insert_with(Instant::now).elapsed();
                     tracing::warn!(error = %e, name = %cur_name, stuck_ms = stuck_for.as_millis() as u64, "capture failed; rebuilding capturer");
+                    // テイクオーバー外で対象ディスプレイ自体が消えている (例: 仮想セッション終了後の
+                    // end_takeover で DISPLAY11 がデタッチ済み) なら、消えた名前を掴んだまま固着し
+                    // ホストを丸ごと re-exec する無駄が起きる。利用可能な物理ディスプレイへ
+                    // フォールバックして固着を解消する (テイクオーバー中は物理が意図的に消えている
+                    // ので対象にしない)。
+                    if !crate::display::is_takeover_active() {
+                        if let Ok(list) = capture::enumerate_displays() {
+                            if !list.is_empty() && !list.iter().any(|d| d.name == cur_name) {
+                                if let Some(first) = list.first() {
+                                    tracing::info!(old = %cur_name, new = %first.name, "capture target vanished; falling back to available display (avoids re-exec)");
+                                    cur_name = first.name.clone();
+                                    first_fail = None;
+                                }
+                            }
+                        }
+                    }
                     // テイクオーバー中の永続固着の救済 (暗転が治らない問題の本命対策)。re-exec は
                     // 下で抑止される / クライアント切断まで net 側の end_takeover も走らないため、
                     // このまま固着すると物理を含め全画面が永久に暗転する。settle を超えて固着し続けたら
@@ -1234,6 +1265,9 @@ fn capture_loop(
                 // cur_name が stale 化して find_output_by_name が永久に失敗→映像固着することがある
                 // (リサイズで固まる症状の最有力仮説)。MTT1337 で現在の GDI 名を引き直し、変わって
                 // いれば乗り換える。cur_name と再構築を所有する capture 層で直すのが確実。
+                // テイクオーバー中の巻き戻し (物理再アタッチ) はループ先頭の能動チェックで再アサート
+                // するのでここでは扱わない。ここでは解像度変更後に Windows が仮想ディスプレイの GDI 名を
+                // 振り直し cur_name が stale 化する問題のみ救済する (MTT1337 で引き直し、変われば乗換)。
                 if crate::display::is_takeover_active() {
                     if let Some(v) = crate::virtualdisplay::detect() {
                         if v.gdi_name != cur_name {
