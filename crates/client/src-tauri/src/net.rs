@@ -2,12 +2,14 @@
 //! - TCP 制御チャネル: Noise XX-PSK initiator、ControlMsg を bincode で送受信
 //! - UDP 映像チャネル: 暗号化 VideoPacket を受信、フレーム再構成して Channel<Response> でフロントへ
 //!
-//! 単一セッションのみ保持し、`SessionState` (managed state) に置く。
+//! セッションは `session_id` をキーに `SessionState` (managed state) の HashMap で多重保持する。
+//! 1 capture ウィンドウ = 1 セッション。ウィンドウ生成 (`open_capture_window`) も Rust 側で行う。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aurora_common::clipboard::{self, ClipboardHandle};
@@ -22,6 +24,7 @@ use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use bincode::Options;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
@@ -121,6 +124,10 @@ pub struct SessionHandle {
     /// 再生スレッドへ EOF が伝わり停止する。直接読み出すことはない。
     #[allow(dead_code)]
     pub audio: Option<AudioPlayer>,
+    /// このセッションがホストの ProjFS へ投影する共有ルート。`set_share_root` で設定する。
+    /// **既定は `None` (共有無効)。** reader タスクと共有するため Arc。セッション毎に独立させ、
+    /// あるウィンドウの共有設定が別ウィンドウの接続に漏れないようにする。
+    pub share_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl SessionHandle {
@@ -136,60 +143,132 @@ impl SessionHandle {
 
 #[derive(Default)]
 pub struct SessionState {
-    pub inner: Mutex<Option<SessionHandle>>,
+    /// session_id → 稼働中セッション。1 capture ウィンドウ = 1 セッション。
+    pub inner: Mutex<HashMap<String, SessionHandle>>,
+    /// `open_capture_window` が一時的に積む接続資格情報 (session_id → password)。
+    /// `connect_to_host` が pop して使う。URL に平文パスワードを載せないための受け渡し。
+    /// 値 `None` は「保存済みパスワード (DPAPI) を使う」を意味する。
+    pub staging: Mutex<HashMap<String, Option<String>>>,
 }
 
-/// ホストの ProjFS から見えるクライアント共有ルート。`set_share_root` で設定する。
-///
-/// **既定は `None` (共有無効)。** ユーザーが明示的に共有フォルダを設定するまで、ホストからの
-/// FS 操作 (列挙・読み取り・作成・書き込み・削除・改名) は一切受け付けない。既定でホーム
-/// ディレクトリ等を開くと、接続しただけで悪意あるホストにファイルを読み書き・削除されるため、
-/// 接続パスワード保存と同様に opt-in にする。spawn したリーダタスクと共有するため Arc。
-#[derive(Clone, Default)]
-pub struct ShareRoot(pub Arc<Mutex<Option<PathBuf>>>);
+/// セッション id の発番。プロセス生存期間で一意ならよいので単調増加カウンタで足りる。
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// ホストへ投影する共有フォルダを設定する。これを呼ぶまで共有は無効。
+/// クエリ文字列値の最小 percent-encode (unreserved 以外を %XX に)。URL に host 等を
+/// 載せるとき IPv6 のコロンや空白で壊れないようにする。JS 側は URLSearchParams が復号する。
+fn q(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// capture ウィンドウを Rust 側で生成する (JS にウィンドウ生成権限を与えない)。
+/// 接続資格情報 (password) は staging マップへ積み、URL には session/host/port/save のみ
+/// 載せる (平文をウィンドウ URL に出さない)。生成した session_id を返す。
+#[tauri::command]
+pub async fn open_capture_window(
+    app: tauri::AppHandle,
+    host: String,
+    port: u16,
+    save: bool,
+    // 手入力パスワード (今回だけ/保存) は Some、保存済み即接続/再接続は None。
+    password: Option<String>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<String, String> {
+    let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    let session_id = format!("s{n}");
+    let label = format!("capture-{session_id}");
+    // パスワードを staging へ積んでから window を作る (connect_to_host が pop する)。
+    state
+        .staging
+        .lock()
+        .await
+        .insert(session_id.clone(), password);
+    let url = format!(
+        "capture.html?session={}&host={}&port={port}&save={}",
+        q(&session_id),
+        q(&host),
+        if save { 1 } else { 0 },
+    );
+    let build = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title("Aurora")
+        .inner_size(1280.0, 800.0)
+        .resizable(true)
+        .decorations(false)
+        .build();
+    if let Err(e) = build {
+        // 生成に失敗したら積んだ資格情報を残さない。
+        state.staging.lock().await.remove(&session_id);
+        return Err(format!("open capture window: {e}"));
+    }
+    Ok(session_id)
+}
+
+/// このセッションがホストへ投影する共有フォルダを設定する。これを呼ぶまで共有は無効。
 #[tauri::command]
 pub async fn set_share_root(
+    session_id: String,
     path: String,
-    state: tauri::State<'_, ShareRoot>,
+    state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     let p = PathBuf::from(&path);
     if !p.is_dir() {
         return Err(format!("not a directory: {path}"));
     }
-    *state.0.lock().await = Some(p);
-    tracing::info!(path = %path, "share root set");
+    let share = {
+        let guard = state.inner.lock().await;
+        let s = guard.get(&session_id).ok_or("unknown session")?;
+        s.share_root.clone()
+    };
+    *share.lock().await = Some(p);
+    tracing::info!(session = %session_id, path = %path, "share root set");
     Ok(())
+}
+
+/// 指定セッションの制御チャネルへ 1 メッセージ送る共通処理。未知 id は拒否する。
+async fn send_ctrl(state: &SessionState, session_id: &str, msg: ControlMsg) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.get(session_id).ok_or("unknown session")?;
+    s.ctrl_tx
+        .send(msg)
+        .map_err(|_| "ctrl channel closed".to_string())
 }
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Tauri コマンドの引数 (state/channel) 注入で増える
 pub async fn connect_to_host(
     app: tauri::AppHandle,
+    session_id: String,
     host: String,
     port: u16,
-    password: Option<String>,
     // パスワードを DPAPI ストアへ保存してよいか (接続ダイアログの「保存する」由来)。
-    // 手入力 (password = Some) かつ true のときだけ保存し、「今回だけ接続」を可能にする。
-    // 保存済み即接続/自動再接続 (password = None) では false 相当で、既存値に触れない。
+    // 手入力かつ true のときだけ保存し、「今回だけ接続」を可能にする。
+    // 保存済み即接続/自動再接続では false 相当で、既存値に触れない。
     save: bool,
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
-    share_root: tauri::State<'_, ShareRoot>,
 ) -> Result<(), String> {
-    // password 未指定 (保存済み接続) なら DPAPI ストアから復号して使う。平文は
-    // フロント (WebView) へ渡さず Rust 内で解決する。
-    let password = match password {
+    // 接続資格情報は staging マップ (open_capture_window が積む) から取り出す。平文を
+    // ウィンドウ URL に載せないための受け渡し。再接続は staging が空なので None 扱いになり、
+    // 下の分岐で保存済みパスワード (DPAPI) を使う。
+    let staged = state.staging.lock().await.remove(&session_id);
+    let password = match staged.flatten() {
         Some(p) => p,
         None => crate::secret::get(&app, &host)
             .ok_or_else(|| "保存済みパスワードがありません".to_string())?,
     };
-    // 既存セッションがあれば閉じる
+    // 同 id の既存セッションがあれば閉じる (再接続・置換)。
     {
         let mut guard = state.inner.lock().await;
-        if let Some(s) = guard.take() {
+        if let Some(s) = guard.remove(&session_id) {
             s.shutdown();
         }
     }
@@ -310,7 +389,9 @@ pub async fn connect_to_host(
     let stats_for_reader = stats.clone();
     // FS RPC 応答は制御チャネル経由で writer ループへ流す (host の同期コールバックを起こす)。
     let fs_reply_tx = ctrl_tx.clone();
-    let share_root_for_reader = share_root.0.clone();
+    // このセッション専用の共有ルート (既定 None = 共有無効)。reader と SessionHandle で共有。
+    let share_root: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+    let share_root_for_reader = share_root.clone();
     // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
@@ -427,8 +508,9 @@ pub async fn connect_to_host(
         clipboard: clip_handle,
         audio: audio_player,
         pending_downloads,
+        share_root,
     };
-    *state.inner.lock().await = Some(handle);
+    state.inner.lock().await.insert(session_id.clone(), handle);
 
     // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
     // 受けて即 selectDisplay/setClientViewport を呼んでも ctrl_tx に確実に届く。
@@ -442,9 +524,12 @@ pub async fn connect_to_host(
 }
 
 #[tauri::command]
-pub async fn disconnect(state: tauri::State<'_, SessionState>) -> Result<(), String> {
+pub async fn disconnect(
+    session_id: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
     let mut guard = state.inner.lock().await;
-    if let Some(s) = guard.take() {
+    if let Some(s) = guard.remove(&session_id) {
         // task abort だけでなくクリップボードスレッドにも shutdown を伝える
         // (connect_to_host のセッション置換経路と同じ後始末に統一)。
         s.shutdown();
@@ -454,103 +539,103 @@ pub async fn disconnect(state: tauri::State<'_, SessionState>) -> Result<(), Str
 
 #[tauri::command]
 pub async fn send_input(
+    session_id: String,
     event: InputEvent,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::Input(event))
-        .map_err(|_| "ctrl channel closed".to_string())
+    send_ctrl(&state, &session_id, ControlMsg::Input(event)).await
 }
 
 #[tauri::command]
-pub async fn request_keyframe(state: tauri::State<'_, SessionState>) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::RequestKeyframe)
-        .map_err(|_| "ctrl channel closed".to_string())
+pub async fn request_keyframe(
+    session_id: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    send_ctrl(&state, &session_id, ControlMsg::RequestKeyframe).await
 }
 
 /// キャプチャ対象ディスプレイの切替を要求する。
 #[tauri::command]
-pub async fn select_display(id: u32, state: tauri::State<'_, SessionState>) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::SelectDisplay { id })
-        .map_err(|_| "ctrl channel closed".to_string())
+pub async fn select_display(
+    session_id: String,
+    id: u32,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    send_ctrl(&state, &session_id, ControlMsg::SelectDisplay { id }).await
 }
 
 /// 映像パラメータ (fps 上限 / ビットレート上限) を実行時にホストへ送る。
 #[tauri::command]
 pub async fn set_video_params(
+    session_id: String,
     fps: u32,
     max_bitrate_bps: u32,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::SetVideoParams {
+    send_ctrl(
+        &state,
+        &session_id,
+        ControlMsg::SetVideoParams {
             fps,
             max_bitrate_bps,
-        })
-        .map_err(|_| "ctrl channel closed".to_string())
+        },
+    )
+    .await
 }
 
 /// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
 #[tauri::command]
 pub async fn set_audio_muted(
+    session_id: String,
     muted: bool,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::SetAudioMuted { muted })
-        .map_err(|_| "ctrl channel closed".to_string())
+    send_ctrl(&state, &session_id, ControlMsg::SetAudioMuted { muted }).await
 }
 
 /// 送出する映像の最大高さ (0 = キャプチャ解像度) をホストへ送る。
 #[tauri::command]
 pub async fn set_resolution(
+    session_id: String,
     max_height: u32,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::SetResolution { max_height })
-        .map_err(|_| "ctrl channel closed".to_string())
+    send_ctrl(
+        &state,
+        &session_id,
+        ControlMsg::SetResolution { max_height },
+    )
+    .await
 }
 
 /// クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
 /// 対応モードへキャプチャ対象ディスプレイの解像度を変更する (RDP 風・黒帯解消)。
 #[tauri::command]
 pub async fn set_client_viewport(
+    session_id: String,
     width: u32,
     height: u32,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
-    s.ctrl_tx
-        .send(ControlMsg::SetClientViewport { width, height })
-        .map_err(|_| "ctrl channel closed".to_string())
+    send_ctrl(
+        &state,
+        &session_id,
+        ControlMsg::SetClientViewport { width, height },
+    )
+    .await
 }
 
 /// ホスト上のファイルのダウンロードを要求する。受信は reader ループが
 /// `%USERPROFILE%\Aurora\downloads` に保存し、完了を FileResult イベントで通知する。
 #[tauri::command]
 pub async fn request_file(
+    session_id: String,
     id: u32,
     path: String,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     let guard = state.inner.lock().await;
-    let s = guard.as_ref().ok_or("not connected")?;
+    let s = guard.get(&session_id).ok_or("unknown session")?;
     // この id を「要求済み」に登録してから送る。reader はこの集合にある id の FileOffer
     // だけを受理するため、登録は送信より先に行う (オファー受信との競合を避ける)。
     if let Ok(mut pending) = s.pending_downloads.lock() {
@@ -567,6 +652,7 @@ pub async fn request_file(
 /// 完了 / 失敗は host からの FileResult イベントで通知される。
 #[tauri::command]
 pub async fn upload_file_from_path(
+    session_id: String,
     id: u32,
     path: String,
     state: tauri::State<'_, SessionState>,
@@ -575,7 +661,7 @@ pub async fn upload_file_from_path(
     // file_tx を clone してロックは send の await を跨がない。
     let file_tx = {
         let guard = state.inner.lock().await;
-        let s = guard.as_ref().ok_or("not connected")?;
+        let s = guard.get(&session_id).ok_or("unknown session")?;
         s.file_tx.clone()
     };
     let name = Path::new(&path)

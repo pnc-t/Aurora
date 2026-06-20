@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aurora</title>
+    <!-- スタイルは TS 側で import する: 共通土台は styles/base.css、各 UI は ui/<component>.css。 -->
+  </head>
+  <body>
+    <!-- 最背面: リモート映像 -->
+    <div id="screen-wrap">
+      <canvas id="screen" tabindex="0" width="1920" height="1080"></canvas>
+    </div>
+
+    <!-- 接続中のオーバーレイ UI (TS が中身を構築) -->
+    <div id="topbar"></div>
+    <div id="stats-hud"></div>
+    <div id="file-panel"></div>
+    <div id="toast-container"></div>
+
+    <!-- 接続確立前 / 切断後の状態表示 (TS が制御) -->
+    <div id="conn-status"></div>
+
+    <script type="module" src="./capture-main.ts"></script>
+  </body>
+</html>

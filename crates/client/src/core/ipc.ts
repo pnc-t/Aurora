@@ -36,18 +36,47 @@ export type InputEvent =
   | { Key: { vk: number; down: boolean } }
   | { MouseMoveRelative: { dx: number; dy: number } };
 
-/// password に null を渡すと、Rust 側が保存済みパスワード (DPAPI) を復号して使う
-/// (平文をフロントに載せない)。手入力時は文字列を渡す。`save` が true の手入力時のみ
-/// 接続成功後に Rust が DPAPI 保存する (「今回だけ接続」は save=false)。
-export async function connectToHost(
+// --- アクティブセッション id ---
+// capture ウィンドウは Phase 1 では 1 セッションのため、セッション操作系コマンド
+// (send_input / select_display / request_file …) は呼び出し側に session_id を要求せず、
+// ここで保持するアクティブ id を暗黙に付与する。decoder/input/file-transfer を無改修に保つ。
+// Phase 2 でタブ (複数セッション) を入れる際にここを差し替える。
+let activeSessionId: string | null = null;
+
+/// 現在のウィンドウが操作するセッション id を設定する (connect 時に確定)。
+export function setActiveSession(id: string | null): void {
+  activeSessionId = id;
+}
+
+/// アクティブ session_id を返す。未設定での操作はバグなので例外にする。
+function sid(): string {
+  if (activeSessionId === null) throw new Error("no active session");
+  return activeSessionId;
+}
+
+/// capture ウィンドウを Rust 側で開く (launcher から呼ぶ)。生成された session_id を返す。
+/// password は IPC 本文で Rust の staging へ渡し、ウィンドウ URL には載せない。
+export async function openCaptureWindow(
   host: string,
   port: number,
+  save: boolean,
   password: string | null,
+): Promise<string> {
+  return await invoke<string>("open_capture_window", { host, port, save, password });
+}
+
+/// capture ウィンドウが自分のセッションを開く。password はもう渡さない (Rust が staging /
+/// 保存済み DPAPI から解決する)。成功時はこの id をアクティブセッションに設定する。
+export async function connectToHost(
+  sessionId: string,
+  host: string,
+  port: number,
   save: boolean,
   eventChannel: Channel<ClientEvent>,
   videoChannel: Channel<ArrayBuffer>,
 ): Promise<void> {
-  await invoke("connect_to_host", { host, port, password, save, eventChannel, videoChannel });
+  setActiveSession(sessionId);
+  await invoke("connect_to_host", { sessionId, host, port, save, eventChannel, videoChannel });
 }
 
 /// パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。
@@ -61,56 +90,56 @@ export async function deleteHostPassword(host: string): Promise<void> {
 }
 
 export async function disconnect(): Promise<void> {
-  await invoke("disconnect");
+  await invoke("disconnect", { sessionId: sid() });
 }
 
 export async function sendInput(event: InputEvent): Promise<void> {
-  await invoke("send_input", { event });
+  await invoke("send_input", { sessionId: sid(), event });
 }
 
 export async function requestKeyframe(): Promise<void> {
-  await invoke("request_keyframe");
+  await invoke("request_keyframe", { sessionId: sid() });
 }
 
 export async function selectDisplay(id: number): Promise<void> {
-  await invoke("select_display", { id });
+  await invoke("select_display", { sessionId: sid(), id });
 }
 
 /// 映像パラメータ (fps 上限 / ビットレート上限 bps) を実行時にホストへ送る。
 export async function setVideoParams(fps: number, maxBitrateBps: number): Promise<void> {
-  await invoke("set_video_params", { fps, maxBitrateBps });
+  await invoke("set_video_params", { sessionId: sid(), fps, maxBitrateBps });
 }
 
 /// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
 export async function setAudioMuted(muted: boolean): Promise<void> {
-  await invoke("set_audio_muted", { muted });
+  await invoke("set_audio_muted", { sessionId: sid(), muted });
 }
 
 /// 送出する映像の最大高さ (px、0 = キャプチャ解像度のまま) をホストへ送る。
 /// ホストが GPU で縮小 (アスペクト比維持) してからエンコードする。
 export async function setResolution(maxHeight: number): Promise<void> {
-  await invoke("set_resolution", { maxHeight });
+  await invoke("set_resolution", { sessionId: sid(), maxHeight });
 }
 
 /// クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
 /// 対応モードへ解像度を変更する (RDP 風・黒帯解消)。
 export async function setClientViewport(width: number, height: number): Promise<void> {
-  await invoke("set_client_viewport", { width, height });
+  await invoke("set_client_viewport", { sessionId: sid(), width, height });
 }
 
 export async function requestFile(id: number, path: string): Promise<void> {
-  await invoke("request_file", { id, path });
+  await invoke("request_file", { sessionId: sid(), id, path });
 }
 
 /// ローカルのファイルパス (キャプチャ画面への D&D 由来) を host へアップロードする。
 /// Rust 側がファイルを読み、既存のアップロードプロトコルで送る。
 export async function uploadFileFromPath(id: number, path: string): Promise<void> {
-  await invoke("upload_file_from_path", { id, path });
+  await invoke("upload_file_from_path", { sessionId: sid(), id, path });
 }
 
 /// ホストの Explorer に投影する共有フォルダ (ProjFS ドライブリダイレクト) を設定する。
 export async function setShareRoot(path: string): Promise<void> {
-  await invoke("set_share_root", { path });
+  await invoke("set_share_root", { sessionId: sid(), path });
 }
 
 /// 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。

@@ -413,16 +413,20 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         okBtn.textContent = "connecting…";
       }
       if (statusEl) statusEl.textContent = `connecting to ${entry.host}…`;
-      void opts.onConnect(entry, password, save).catch((err) => {
-        if (statusEl) {
-          statusEl.textContent = `error: ${String(err)}`;
-          statusEl.classList.add("error");
-        }
-        if (okBtn) {
-          okBtn.disabled = false;
-          okBtn.textContent = "connect";
-        }
-      });
+      void opts
+        .onConnect(entry, password, save)
+        // 解決 = capture ウィンドウが開いた。ランチャーは残るのでダイアログだけ閉じる。
+        .then(() => closeDialog())
+        .catch((err) => {
+          if (statusEl) {
+            statusEl.textContent = `error: ${String(err)}`;
+            statusEl.classList.add("error");
+          }
+          if (okBtn) {
+            okBtn.disabled = false;
+            okBtn.textContent = "connect";
+          }
+        });
     });
   }
 
@@ -544,10 +548,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           const entry = hosts[idx];
           handle.setConnecting(true);
           // 保存済み即接続: password=null (Rust が DPAPI 復号)。再保存は不要なので save=false。
-          void opts.onConnect(entry, null, false).catch(() => {
-            handle.setConnState("", "idle");
-            openConnectDialog(entry);
-          });
+          void opts
+            .onConnect(entry, null, false)
+            // capture ウィンドウが開いたらランチャーの状態表示を戻す (接続進捗は別窓側)。
+            .then(() => handle.setConnState("未接続", "idle"))
+            .catch(() => {
+              handle.setConnState("", "idle");
+              openConnectDialog(entry);
+            });
         } else {
           openConnectDialog(hosts[idx]);
         }

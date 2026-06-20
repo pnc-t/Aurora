@@ -11,7 +11,8 @@ mod net;
 mod secret;
 mod stats;
 
-use net::{SessionState, ShareRoot};
+use net::SessionState;
+use tauri::Manager;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -23,10 +24,31 @@ fn main() {
 
     tauri::Builder::default()
         .manage(SessionState::default())
-        .manage(ShareRoot::default())
+        // ウィンドウ破棄時の後始末: capture ウィンドウはその session を切断、launcher
+        // (main) を閉じたらアプリ全体を終了する。
+        .on_window_event(|window, event| {
+            if !matches!(event, tauri::WindowEvent::Destroyed) {
+                return;
+            }
+            let label = window.label().to_string();
+            if label == "main" {
+                window.app_handle().exit(0);
+            } else if let Some(session_id) = label.strip_prefix("capture-") {
+                let app = window.app_handle().clone();
+                let id = session_id.to_string();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<SessionState>();
+                    let handle = state.inner.lock().await.remove(&id);
+                    if let Some(h) = handle {
+                        h.shutdown();
+                    }
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             net::connect_to_host,
             net::disconnect,
+            net::open_capture_window,
             net::send_input,
             net::request_keyframe,
             net::select_display,
