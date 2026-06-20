@@ -33,6 +33,31 @@ foreach ($f in @('MttVDD.dll','MttVDD.inf','mttvdd.cat','nefconw.exe','vdd_setti
 }
 if (-not (Test-Path (Join-Path $dst 'MttVDD.inf'))) { Log "FATAL: MttVDD.inf not staged"; exit 1 }
 
+# 1b) Pin the VDD to the host's real GPU. With gpu=default, IddCx can place the
+# virtual display on a render-only adapter whose output is NOT exposed through DXGI
+# EnumOutputs, so the host cannot Desktop-Duplicate it (capture hangs / black screen,
+# and modes degrade). Binding it to the physical GPU's model name makes the virtual
+# output enumerate on that adapter (verified: appears as adapter[0] output[N], full
+# mode list). The driver matches <friendlyname> as a substring of the DXGI adapter
+# description, so we strip the vendor prefix (AMD's DXGI desc has a double space that a
+# WMI single-spaced full name would NOT substring-match; the model portion does).
+$xmlPath = Join-Path $dst 'vdd_settings.xml'
+try {
+    $gpu = Get-CimInstance Win32_VideoController -ErrorAction Stop |
+        Where-Object { $_.Name -and $_.Name -notmatch 'Basic|Virtual|Idd|Meta|Parsec|Microsoft|Remote|VDD' } |
+        Sort-Object -Property AdapterRAM -Descending | Select-Object -First 1
+    if ($gpu -and (Test-Path $xmlPath)) {
+        $name = ($gpu.Name -replace '^(AMD|NVIDIA|Intel(\(R\))?|Advanced Micro Devices(, Inc\.)?)\s+', '').Trim()
+        if ($name) {
+            $xml = Get-Content $xmlPath -Raw
+            $xml = $xml -replace '<friendlyname>.*?</friendlyname>', "<friendlyname>$name</friendlyname>"
+            # BOM-less UTF-8: the driver/PS5.1 read this file as ANSI; a BOM would corrupt it.
+            [System.IO.File]::WriteAllText($xmlPath, $xml, (New-Object System.Text.UTF8Encoding($false)))
+            Log "pinned VDD GPU friendlyname='$name' (from '$($gpu.Name)')"
+        } else { Log "GPU name empty after strip ('$($gpu.Name)'); leaving gpu=default" }
+    } else { Log "no physical GPU found via WMI; leaving gpu=default" }
+} catch { Log "GPU pin failed: $($_.Exception.Message); leaving gpu=default" }
+
 # 2) Remove any pre-existing MttVDD nodes so we don't pile up duplicates.
 $old = @(Get-PnpDevice | Where-Object { $_.HardwareID -match 'MttVDD' -or $_.HardwareID -match 'MTT1337' })
 foreach ($d in $old) { Log "removing stale node $($d.InstanceId)"; & $pnputil /remove-device $d.InstanceId /subtree | Out-Null }
