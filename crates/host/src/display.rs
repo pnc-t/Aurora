@@ -38,7 +38,7 @@ pub fn is_takeover_active() -> bool {
 /// テイクオーバー開始: 現在の全トポロジを保存 (+ディスク) し、仮想 (`\\.\DISPLAYn`) を主 (0,0) +
 /// 表示領域 `(w,h)` に最も近い解像度にして物理を全てデタッチする。適用後の仮想解像度を返す。
 #[cfg(target_os = "windows")]
-pub fn begin_takeover(virtual_name: &str, w: u32, h: u32) -> anyhow::Result<(u32, u32)> {
+pub fn begin_takeover(virtual_name: &str, w: u32, h: u32) -> anyhow::Result<(i32, i32, u32, u32)> {
     let r = imp::begin_takeover(virtual_name, w, h);
     if r.is_ok() {
         TAKEOVER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -73,7 +73,11 @@ pub fn detach_vdd_if_attached(vdd_name: &str) {
 pub fn detach_vdd_if_attached(_vdd_name: &str) {}
 
 #[cfg(not(target_os = "windows"))]
-pub fn begin_takeover(_virtual_name: &str, _w: u32, _h: u32) -> anyhow::Result<(u32, u32)> {
+pub fn begin_takeover(
+    _virtual_name: &str,
+    _w: u32,
+    _h: u32,
+) -> anyhow::Result<(i32, i32, u32, u32)> {
     Err(anyhow::anyhow!("takeover is Windows-only"))
 }
 #[cfg(not(target_os = "windows"))]
@@ -512,8 +516,35 @@ mod imp {
         Some((paths, modes))
     }
 
+    /// 指定 GDI 名がデスクトップにアタッチ済みかを返す。
+    fn is_attached(name: &str) -> bool {
+        let mut i = 0u32;
+        loop {
+            let mut dd = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: NULL でアダプタを順に列挙。範囲外で FALSE。
+            let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), i, &mut dd, 0) };
+            if !ok.as_bool() {
+                break;
+            }
+            i += 1;
+            if wstr(&dd.DeviceName) == name {
+                return (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            }
+        }
+        false
+    }
+
     /// 保存済みトポロジへ全ディスプレイを復元する (CCD 優先、テキスト CDS フォールバック)。
     /// 復元を試みたら使用済みファイルを必ず削除する。何かを復元したら `true`。
+    ///
+    /// **安全網**: CCD 復元は `SetDisplayConfig` が成功 (Ok) を返しても、実機では物理 (特に
+    /// DISPLAY1) が detached のまま戻らないことがある (2026-06-20 実機で物理黒固着を観測)。そこで
+    /// 復元後に「テイクオーバー前にアタッチされていた保存済み物理」が実際に全て戻ったか検証し、
+    /// 欠けていれば `ChangeDisplaySettingsEx` で強制再アタッチする (= 手動復旧で成功した手順)。
+    /// これによりテイクオーバー/巻き戻しが何をしても切断時に物理黒固着を残さない。
     fn restore_all() -> bool {
         let mut ccd_ok = false;
         if let Some(path) = ccd_topology_file() {
@@ -532,20 +563,36 @@ mod imp {
             }
             let _ = std::fs::remove_file(&path);
         }
-        // テキスト (ChangeDisplaySettingsEx) フォールバック。CCD が成功していれば不要なので使わない。
-        if let Some(path) = topology_file() {
-            let text = std::fs::read_to_string(&path).ok();
-            if !ccd_ok {
-                if let Some(text) = text.as_deref() {
-                    let states = parse_topology(text);
-                    if !states.is_empty() {
-                        if let Err(e) = restore_topology(&states) {
-                            tracing::warn!(error = %e, "CDS fallback restore failed");
-                        }
-                    }
+        // テイクオーバー前のアタッチ物理一覧 (テキスト topology)。CDS フォールバック + 検証の両方に使う。
+        let states: Vec<DisplayState> = topology_file()
+            .and_then(|path| {
+                let text = std::fs::read_to_string(&path).ok();
+                let _ = std::fs::remove_file(&path);
+                text
+            })
+            .map(|t| parse_topology(&t))
+            .unwrap_or_default();
+        // CCD が失敗したときの一次フォールバック。
+        if !ccd_ok && !states.is_empty() {
+            if let Err(e) = restore_topology(&states) {
+                tracing::warn!(error = %e, "CDS fallback restore failed");
+            }
+        }
+        // ★安全網: 復元後も保存済み物理が 1 枚でも非アタッチなら強制再アタッチする。CCD restore が
+        // Ok を返しても DISPLAY1 が戻らない事例の保険 (物理黒固着を絶対に残さない)。
+        if !states.is_empty() {
+            let missing = states.iter().filter(|s| !is_attached(&s.name)).count();
+            if missing > 0 {
+                tracing::warn!(
+                    missing,
+                    "restore left physical display(s) detached; forcing reattach (safety net)"
+                );
+                if let Err(e) = restore_topology(&states) {
+                    tracing::warn!(error = %e, "forced reattach failed");
+                } else if let Some(s) = states.iter().find(|s| !is_attached(&s.name)) {
+                    tracing::error!(name = %s.name, "physical still detached after forced reattach");
                 }
             }
-            let _ = std::fs::remove_file(&path);
         }
         ccd_ok
     }
@@ -749,7 +796,23 @@ mod imp {
     /// ある (= 暗転が一瞬で戻りウィンドウが集約されない症状)。そこで (1) まず仮想を主にして
     /// 即適用し、(2) その後で非主になった物理をデタッチして commit する。各 DISP_CHANGE コードは
     /// info で残し、失敗時にどの段で落ちたか実機ログから判る (headless 検証不可のため)。
-    fn apply_takeover(virtual_name: &str, w: u32, h: u32) -> anyhow::Result<(u32, u32)> {
+    /// 指定ディスプレイ (`\\.\DISPLAYn`) の現在のジオメトリ (x,y,w,h) を読む。テイクオーバー後に
+    /// 仮想が実際にどこに何の解像度で居るかを確定するために使う (stage2 の (0,0) 移動が -1 失敗で
+    /// 右端に残ることがあり、入力座標系を実位置に合わせないとマウスがずれるため)。
+    fn current_geom(name: &str) -> Option<(i32, i32, u32, u32)> {
+        let wide = to_wide(name);
+        let dm = enum_settings(&wide, ENUM_CURRENT_SETTINGS)?;
+        // SAFETY: 表示用 DEVMODE の位置は Anonymous1.Anonymous2.dmPosition (POINTL)。
+        let pos = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
+        Some((pos.x, pos.y, dm.dmPelsWidth, dm.dmPelsHeight))
+    }
+
+    fn apply_takeover(
+        virtual_name: &str,
+        w: u32,
+        h: u32,
+        pre_topo: &[DisplayState],
+    ) -> anyhow::Result<(i32, i32, u32, u32)> {
         use anyhow::anyhow;
         let wide = to_wide(virtual_name);
 
@@ -798,8 +861,13 @@ mod imp {
         // CCD 後は仮想が唯一の表示になり GDI 名が変わることがある。MTT1337 で再検出する。
         let cur_name = detect_vdd_name().unwrap_or_else(|| virtual_name.to_string());
 
-        // 段階2: 仮想 (唯一/主) の解像度を表示領域に最も近いモードへ。唯一の表示なので
-        // ChangeDisplaySettingsEx での解像度変更は確実に通る。
+        // 段階2 (バッチ): CCD は仮想を既定モード (800x600) に戻し、レジストリには物理アタッチが残る
+        // (= 非永続のため数秒後に Windows が reconcile して物理を復活させる)。そこで **1 トランザクション
+        // (CDS_NORESET 群 + 単一 commit)** で「① 仮想を目標解像度 + (0,0)」と「② 全物理の永続デタッチ
+        // (方針 A: レジストリを"仮想のみ"へ同期し reconcile を止める)」をまとめて適用する。
+        // 別々に commit すると、① の解像度変更が直前の detach commit と競合して DISP_CHANGE_FAILED(-1)
+        // になり 800x600 に張り付く実機症状を確認したため、原子バッチにする (手動復旧で実証済みの手順)。
+        // CCD の SDC_SAVE_TO_DATABASE は使わないので過去の「特定モニタ構成で毎回全黒固着」地雷とは別経路。
         let modes = list_modes(&to_wide(&cur_name));
         let (bw, bh) = pick_nearest(&modes, w, h).unwrap_or((w.max(2), h.max(2)));
         let mut vdm = devmode_init();
@@ -808,15 +876,46 @@ mod imp {
         // 表示用 DEVMODE の位置 (union フィールド) へ書く (union への書き込みは safe)。
         vdm.Anonymous1.Anonymous2.dmPosition = POINTL { x: 0, y: 0 };
         vdm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
-        let r = change_settings(&cur_name, &vdm, CDS_UPDATEREGISTRY);
+        let vr = change_settings(&cur_name, &vdm, CDS_UPDATEREGISTRY | CDS_NORESET);
+        let mut nd = 0;
+        for s in pre_topo {
+            // 仮想 (テイクオーバー対象) と VDD アダプタは残す。is_vdd_adapter は MTT1337 モニタ ID で
+            // 判定するため CCD 後に GDI 名が変わっても確実に VDD を除外できる。
+            if s.name == cur_name || s.name == virtual_name || is_vdd_adapter(&s.name) {
+                continue;
+            }
+            let mut dm = devmode_init();
+            dm.dmPelsWidth = 0;
+            dm.dmPelsHeight = 0;
+            // union への書き込みは safe。
+            dm.Anonymous1.Anonymous2.dmPosition = POINTL { x: 0, y: 0 };
+            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
+            let r = change_settings(&s.name, &dm, CDS_UPDATEREGISTRY | CDS_NORESET);
+            tracing::info!(name = %s.name, code = r, "takeover: persist-detach physical (registry sync)");
+            nd += 1;
+        }
+        let commit = commit_changes();
         tracing::info!(
             cur_name,
             bw,
             bh,
-            code = r,
-            "takeover: set virtual resolution"
+            set_res = vr,
+            detached = nd,
+            commit,
+            "takeover: applied virtual resolution + physical persist-detach (batched)"
         );
-        Ok((bw, bh))
+        // 仮想の**実際の**位置/解像度を読み戻す。バッチが一部失敗しても入力座標系/解像度通知は
+        // 実値でなければマウス・スケールがずれるため、ENUM_CURRENT_SETTINGS の値を信頼する。
+        let (vx, vy, rw, rh) = current_geom(&cur_name).unwrap_or((0, 0, bw, bh));
+        tracing::info!(
+            cur_name,
+            vx,
+            vy,
+            rw,
+            rh,
+            "takeover: virtual actual geometry"
+        );
+        Ok((vx, vy, rw, rh))
     }
 
     /// 保存したトポロジへ全ディスプレイを復元する。
@@ -889,7 +988,11 @@ mod imp {
         }
     }
 
-    pub(super) fn begin_takeover(virtual_name: &str, w: u32, h: u32) -> anyhow::Result<(u32, u32)> {
+    pub(super) fn begin_takeover(
+        virtual_name: &str,
+        w: u32,
+        h: u32,
+    ) -> anyhow::Result<(i32, i32, u32, u32)> {
         let topo = save_topology();
         // 先にディスクへ保存する (クラッシュしても次回起動で復元できるように)。
         // CCD バイナリが本命の復元元、テキストはフォールバック。両方を書く。
@@ -901,12 +1004,14 @@ mod imp {
         if let Some(path) = topology_file() {
             let _ = std::fs::write(&path, serialize_topology(&topo));
         }
-        match apply_takeover(virtual_name, w, h) {
+        match apply_takeover(virtual_name, w, h, &topo) {
             Ok(dims) => {
                 tracing::info!(
                     virtual_name,
-                    w = dims.0,
-                    h = dims.1,
+                    x = dims.0,
+                    y = dims.1,
+                    w = dims.2,
+                    h = dims.3,
                     "display takeover applied"
                 );
                 Ok(dims)

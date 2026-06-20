@@ -823,7 +823,7 @@ async fn handle_client(
                                 vdd_gdi_name.as_deref() == Some(active_name.as_str());
                             // 「リサイズで固まる」のライブ再現用 (RUST_LOG=aurora=debug)。どの viewport が
                             // いつ来てテイクオーバー/リサイズのどちらに入ったかを追える。
-                            tracing::debug!(
+                            tracing::info!(
                                 width,
                                 height,
                                 taken_over,
@@ -840,11 +840,10 @@ async fn handle_client(
                                     })
                                     .await;
                                     match r {
-                                        Ok(Ok(dims)) => {
+                                        Ok(Ok((vx, vy, vw, vh))) => {
                                             taken_over = true;
-                                            // テイクオーバーで仮想は主 (0,0) になった。CCD で物理を
-                                            // 落とすと仮想の GDI 名が変わることがあるため MTT1337 で
-                                            // 再検出し、capture 対象 (名前ベース) と座標系を更新する。
+                                            // CCD で物理を落とすと仮想の GDI 名が変わることがあるため
+                                            // MTT1337 で再検出し、capture 対象 (名前ベース) を更新する。
                                             let new_name = tokio::task::spawn_blocking(
                                                 crate::virtualdisplay::detect,
                                             )
@@ -854,10 +853,14 @@ async fn handle_client(
                                             .map(|v| v.gdi_name)
                                             .unwrap_or_else(|| active_name.clone());
                                             displays[active_idx].name = new_name.clone();
-                                            displays[active_idx].x = 0;
-                                            displays[active_idx].y = 0;
+                                            // 仮想の**実位置**を入力座標系に使う。stage2 の (0,0) 移動が
+                                            // 失敗すると仮想は右端 (例 5120,0) に残るため、決め打ち (0,0)
+                                            // だとマウスがずれる (実機で確認)。begin_takeover が読み戻した
+                                            // 実ジオメトリ (vx,vy,vw,vh) を信頼する。
+                                            displays[active_idx].x = vx;
+                                            displays[active_idx].y = vy;
                                             let _ = cap_select_tx.send(new_name);
-                                            Some(dims)
+                                            Some((vw, vh))
                                         }
                                         Ok(Err(e)) => {
                                             tracing::warn!(error = %e, "begin_takeover failed");
