@@ -104,8 +104,66 @@ impl From<Display> for DisplayDto {
     }
 }
 
+/// 差し替え可能な表示先 (sink)。セッションの networking (TCP/UDP/各タスク) はそのままに、
+/// 映像/イベントをどの webview の `Channel` へ流すかを実行時に差し替えられるようにする。
+/// これがタブのウィンドウ間移動 (Phase 3 ドラッグ分割) の土台:
+/// 旧ウィンドウで `clear`、新ウィンドウで `set` することで、ネットワークを止めずに表示先だけ移す。
+///
+/// send は短時間で await を跨がないため同期 `std::sync::Mutex` で足りる (tokio タスクから
+/// 呼ぶが、ロック保持中に await しない)。`Channel` 自体が Arc 内部の安価な複製。
+#[derive(Clone, Default)]
+pub struct Sink {
+    event: Arc<std::sync::Mutex<Option<Channel<ClientEvent>>>>,
+    video: Arc<std::sync::Mutex<Option<Channel<InvokeResponseBody>>>>,
+}
+
+impl Sink {
+    fn new(event: Channel<ClientEvent>, video: Channel<InvokeResponseBody>) -> Self {
+        Self {
+            event: Arc::new(std::sync::Mutex::new(Some(event))),
+            video: Arc::new(std::sync::Mutex::new(Some(video))),
+        }
+    }
+    /// 現在の表示先へイベントを送る (未アタッチ = デタッチ中なら捨てる)。
+    fn send_event(&self, ev: ClientEvent) {
+        if let Ok(g) = self.event.lock() {
+            if let Some(ch) = g.as_ref() {
+                let _ = ch.send(ev);
+            }
+        }
+    }
+    /// 現在の表示先へ映像フレームを送る (未アタッチなら捨てる。次キーフレームで回復)。
+    fn send_video(&self, body: InvokeResponseBody) {
+        if let Ok(g) = self.video.lock() {
+            if let Some(ch) = g.as_ref() {
+                let _ = ch.send(body);
+            }
+        }
+    }
+    /// 表示先を差し替える (新ウィンドウのアタッチ)。
+    fn set(&self, event: Channel<ClientEvent>, video: Channel<InvokeResponseBody>) {
+        if let Ok(mut g) = self.event.lock() {
+            *g = Some(event);
+        }
+        if let Ok(mut g) = self.video.lock() {
+            *g = Some(video);
+        }
+    }
+    /// 表示先を外す (旧ウィンドウのデタッチ)。ネットワークは継続する。
+    fn clear(&self) {
+        if let Ok(mut g) = self.event.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.video.lock() {
+            *g = None;
+        }
+    }
+}
+
 /// セッションごとに保持するハンドル。
 pub struct SessionHandle {
+    /// 差し替え可能な表示先 (映像/イベント Channel)。タブのウィンドウ間移動で attach/detach する。
+    pub sink: Sink,
     /// 制御メッセージを書き込み側タスクに投げる
     pub ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
     /// ファイル転送チャンク専用の bounded チャネル。満杯時に送信が待つことで
@@ -153,6 +211,10 @@ pub struct SessionState {
     /// `connect_to_host` が pop して使う。URL に平文パスワードを載せないための受け渡し。
     /// 値 `None` は「保存済みパスワード (DPAPI) を使う」を意味する。
     pub staging: Mutex<HashMap<String, Option<String>>>,
+    /// タブのウィンドウ分割 (Phase 3) の引き継ぎデータ。`open_session_window` が移譲元の
+    /// セッション表示状態 (JSON) を session_id をキーに積み、移譲先ウィンドウの JS が
+    /// `take_handoff` で取り出して `Session` を復元する。networking は継続したまま表示先だけ移す。
+    pub adopt: Mutex<HashMap<String, String>>,
 }
 
 /// セッション id の発番。プロセス生存期間で一意ならよいので単調増加カウンタで足りる。
@@ -233,6 +295,80 @@ pub async fn stage_session(
         .await
         .insert(session_id.clone(), password);
     Ok(session_id)
+}
+
+/// 既存セッションを別ウィンドウへ移譲するための空ウィンドウを開く (Phase 3 ドラッグ分割)。
+/// networking は止めず、表示先 (sink) を即デタッチして所有ウィンドウを生成先の新ラベルへ
+/// 付け替える。これを **ウィンドウ生成より前に** 行うことで、移譲元ウィンドウが直後に
+/// (最後のタブが消えて) 閉じても、その Destroyed ハンドラが移譲中セッションを巻き込んで
+/// 停止しない (window_label が既に新ラベルになっている)。`snapshot` は移譲先で `take_handoff`
+/// が取り出す表示状態 JSON。`x`/`y` は新ウィンドウの配置 (カーソル位置、論理 px)。
+#[tauri::command]
+pub async fn open_session_window(
+    app: tauri::AppHandle,
+    session_id: String,
+    snapshot: String,
+    x: Option<f64>,
+    y: Option<f64>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    let label = format!("capture-move{n}");
+    // 所有権 (window_label) を新ラベルへ移し、表示先を外す。移譲元が閉じても巻き込まれない。
+    {
+        let mut guard = state.inner.lock().await;
+        let s = guard.get_mut(&session_id).ok_or("unknown session")?;
+        s.window_label = label.clone();
+        s.sink.clear();
+    }
+    state
+        .adopt
+        .lock()
+        .await
+        .insert(session_id.clone(), snapshot);
+    let url = format!("capture.html?adopt={}", q(&session_id));
+    let mut build = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title("Aurora")
+        .inner_size(1280.0, 800.0)
+        .resizable(true)
+        .decorations(false);
+    if let (Some(x), Some(y)) = (x, y) {
+        build = build.position(x, y);
+    }
+    if let Err(e) = build.build() {
+        // 生成失敗時は積んだ引き継ぎデータを残さない。セッションは sink デタッチ済みのまま
+        // 残る (元ウィンドウは既にタブを外している可能性があるため、ここでは停止しない)。
+        state.adopt.lock().await.remove(&session_id);
+        return Err(format!("open session window: {e}"));
+    }
+    Ok(())
+}
+
+/// 移譲先ウィンドウが引き継ぎデータ (表示状態 JSON) を取り出す。1 回限り (pop)。
+#[tauri::command]
+pub async fn take_handoff(
+    session_id: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<Option<String>, String> {
+    Ok(state.adopt.lock().await.remove(&session_id))
+}
+
+/// 既存セッションの表示先 (映像/イベント Channel) を、この呼び出し元 webview のものへ
+/// 差し替える (Phase 3 移譲先がアタッチ)。所有ウィンドウもこの webview へ付け替える。
+/// networking はそのままなので、移譲先は別途 `request_keyframe` で映像を復帰させる。
+#[tauri::command]
+pub async fn attach_session(
+    window: WebviewWindow,
+    session_id: String,
+    event_channel: Channel<ClientEvent>,
+    video_channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let mut guard = state.inner.lock().await;
+    let s = guard.get_mut(&session_id).ok_or("unknown session")?;
+    s.sink.set(event_channel, video_channel);
+    s.window_label = window.label().to_string();
+    Ok(())
 }
 
 /// このセッションがホストへ投影する共有フォルダを設定する。これを呼ぶまで共有は無効。
@@ -368,7 +504,11 @@ pub async fn connect_to_host(
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let host_info: ControlMsg = opts.deserialize(&plain).map_err(err)?;
 
-    event_channel.send(ClientEvent::Connected).ok();
+    // 映像/イベントの表示先を差し替え可能 sink にまとめる。以降タスクへはこの sink を
+    // clone して渡し、タブのウィンドウ移動 (attach/detach) で表示先だけ付け替えられるようにする。
+    let sink = Sink::new(event_channel, video_channel);
+
+    sink.send_event(ClientEvent::Connected);
     // HostInfo の中身を取り出すだけにし、フロントへの通知はセッションハンドルを管理状態へ
     // 格納した後に行う (関数末尾)。先に通知すると、フロントが host_info を受けて即
     // selectDisplay/setClientViewport を invoke した時にハンドル未格納 (再接続時は古い閉じた
@@ -401,16 +541,16 @@ pub async fn connect_to_host(
     let stats = StatsCollector::new();
     let session_start = Instant::now();
 
-    let evt_clone = event_channel.clone();
+    let sink_w = sink.clone();
     let sess_w = session.clone();
     let writer_task = tokio::spawn(async move {
         let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
-        let _ = evt_clone.send(ClientEvent::Disconnected {
+        sink_w.send_event(ClientEvent::Disconnected {
             reason: "writer closed".into(),
         });
     });
 
-    let evt_clone = event_channel.clone();
+    let sink_r = sink.clone();
     let sess_r = session.clone();
     let clip_apply_for_reader = clip_apply_tx.clone();
     let stats_for_reader = stats.clone();
@@ -426,7 +566,7 @@ pub async fn connect_to_host(
         let res = tcp_reader_loop(
             read_half,
             sess_r,
-            evt_clone.clone(),
+            sink_r.clone(),
             clip_apply_for_reader,
             stats_for_reader,
             session_start,
@@ -439,7 +579,7 @@ pub async fn connect_to_host(
             Ok(()) => "server closed".to_string(),
             Err(e) => format!("read error: {e}"),
         };
-        let _ = evt_clone.send(ClientEvent::Disconnected { reason });
+        sink_r.send_event(ClientEvent::Disconnected { reason });
     });
 
     // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。
@@ -454,18 +594,12 @@ pub async fn connect_to_host(
 
     let sess_u = session.clone();
     let stats_for_udp = stats.clone();
+    let sink_u = sink.clone();
     // ロス検出時にキーフレームを要求して映像を即時回復させるための送信口。
     let keyframe_tx = ctrl_tx.clone();
     let udp_task = tokio::spawn(async move {
-        if let Err(e) = udp_reader_loop(
-            udp,
-            sess_u,
-            video_channel,
-            audio_tx,
-            stats_for_udp,
-            keyframe_tx,
-        )
-        .await
+        if let Err(e) =
+            udp_reader_loop(udp, sess_u, sink_u, audio_tx, stats_for_udp, keyframe_tx).await
         {
             tracing::warn!(error = %e, "UDP reader ended");
         }
@@ -497,7 +631,7 @@ pub async fn connect_to_host(
 
     // 統計タスク (1 秒窓)。計測結果をホスト (適応制御用) とフロント (表示用) に送る。
     let ctrl_for_stats = ctrl_tx.clone();
-    let evt_for_stats = event_channel.clone();
+    let sink_s = sink.clone();
     let stats_for_task = stats.clone();
     let stats_task = tokio::spawn(async move {
         let mut window = StatsWindow::new(&stats_for_task);
@@ -512,7 +646,7 @@ pub async fn connect_to_host(
                 rtt_us: s.rtt_us,
                 loss_permille: s.loss_permille,
             });
-            let _ = evt_for_stats.send(ClientEvent::Stats {
+            sink_s.send_event(ClientEvent::Stats {
                 bitrate_kbps: s.bitrate_kbps,
                 fps: s.fps,
                 rtt_us: s.rtt_us,
@@ -522,6 +656,7 @@ pub async fn connect_to_host(
     });
 
     let handle = SessionHandle {
+        sink: sink.clone(),
         ctrl_tx,
         file_tx,
         tasks: vec![
@@ -542,12 +677,10 @@ pub async fn connect_to_host(
 
     // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
     // 受けて即 selectDisplay/setClientViewport を呼んでも ctrl_tx に確実に届く。
-    event_channel
-        .send(ClientEvent::HostInfo {
-            displays: host_displays.into_iter().map(Into::into).collect(),
-            audio: host_audio,
-        })
-        .ok();
+    sink.send_event(ClientEvent::HostInfo {
+        displays: host_displays.into_iter().map(Into::into).collect(),
+        audio: host_audio,
+    });
     Ok(())
 }
 
@@ -817,7 +950,7 @@ async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> 
 async fn tcp_reader_loop(
     mut read_half: OwnedReadHalf,
     session: Arc<TransportSession>,
-    event_channel: Channel<ClientEvent>,
+    sink: Sink,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     stats: Arc<StatsCollector>,
     session_start: Instant,
@@ -844,18 +977,18 @@ async fn tcp_reader_loop(
                 let now_us = session_start.elapsed().as_micros() as u64;
                 let rtt_us = now_us.saturating_sub(ts_us);
                 stats.set_rtt_us(rtt_us.min(u32::MAX as u64) as u32);
-                let _ = event_channel.send(ClientEvent::Pong {
+                sink.send_event(ClientEvent::Pong {
                     rtt_us: rtt_us as i64,
                 });
             }
             ControlMsg::HostInfo { displays, audio } => {
-                let _ = event_channel.send(ClientEvent::HostInfo {
+                sink.send_event(ClientEvent::HostInfo {
                     displays: displays.into_iter().map(Into::into).collect(),
                     audio,
                 });
             }
             ControlMsg::DisplayResized { id, width, height } => {
-                let _ = event_channel.send(ClientEvent::DisplayResized { id, width, height });
+                sink.send_event(ClientEvent::DisplayResized { id, width, height });
             }
             ControlMsg::Clipboard { text } => {
                 if clip_apply_tx.send(text).is_err() {
@@ -863,7 +996,7 @@ async fn tcp_reader_loop(
                 }
             }
             ControlMsg::FileResult { id, ok, message } => {
-                let _ = event_channel.send(ClientEvent::FileResult { id, ok, message });
+                sink.send_event(ClientEvent::FileResult { id, ok, message });
             }
             // --- ダウンロード受信 (ホスト → クライアント) ---
             // ユーザーが request_file で明示的に要求した id の FileOffer だけを受理する。
@@ -891,7 +1024,7 @@ async fn tcp_reader_loop(
                             if let Ok(mut s) = pending_downloads.lock() {
                                 s.remove(&id);
                             }
-                            let _ = event_channel.send(ClientEvent::FileResult {
+                            sink.send_event(ClientEvent::FileResult {
                                 id,
                                 ok: false,
                                 message: format!("open failed: {e}"),
@@ -920,7 +1053,7 @@ async fn tcp_reader_loop(
                         if let Ok(mut s) = pending_downloads.lock() {
                             s.remove(&id);
                         }
-                        let _ = event_channel.send(ClientEvent::FileResult {
+                        sink.send_event(ClientEvent::FileResult {
                             id,
                             ok: false,
                             message: format!(
@@ -940,7 +1073,7 @@ async fn tcp_reader_loop(
                         if let Ok(mut s) = pending_downloads.lock() {
                             s.remove(&id);
                         }
-                        let _ = event_channel.send(ClientEvent::FileResult {
+                        sink.send_event(ClientEvent::FileResult {
                             id,
                             ok: false,
                             message: "download exceeds declared size".into(),
@@ -951,7 +1084,7 @@ async fn tcp_reader_loop(
                         if let Ok(mut s) = pending_downloads.lock() {
                             s.remove(&id);
                         }
-                        let _ = event_channel.send(ClientEvent::FileResult {
+                        sink.send_event(ClientEvent::FileResult {
                             id,
                             ok: false,
                             message,
@@ -981,7 +1114,7 @@ async fn tcp_reader_loop(
                                     message: format!("flush failed: {e}"),
                                 },
                             };
-                            let _ = event_channel.send(ev);
+                            sink.send_event(ev);
                         }
                     }
                 }
@@ -1305,7 +1438,7 @@ async fn fs_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
 async fn udp_reader_loop(
     udp: Arc<UdpSocket>,
     session: Arc<TransportSession>,
-    video_channel: Channel<InvokeResponseBody>,
+    sink: Sink,
     audio_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     stats: Arc<StatsCollector>,
     keyframe_tx: mpsc::UnboundedSender<ControlMsg>,
@@ -1454,8 +1587,8 @@ async fn udp_reader_loop(
             out.push(if cur_keyframe { 1u8 } else { 0u8 });
             out.extend_from_slice(&pkt.frame_id.to_be_bytes());
             out.extend_from_slice(&cur_payload);
-            // バイナリで送信
-            let _ = video_channel.send(InvokeResponseBody::Raw(out));
+            // バイナリで現在の表示先へ送信 (デタッチ中なら捨てられ、次キーフレームで回復)
+            sink.send_video(InvokeResponseBody::Raw(out));
             stats.add_frame();
             cur_payload.clear();
             cur_frame_id = None;

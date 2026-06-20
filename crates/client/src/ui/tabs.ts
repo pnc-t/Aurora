@@ -13,6 +13,8 @@ type TabsOpts = {
   onClose: (id: string) => void;
   /** 「+」で新規接続を追加。 */
   onAdd: () => void;
+  /** タブをウィンドウ外へドラッグして離した (別ウィンドウへ分割)。座標は画面 px。 */
+  onDetach: (id: string, screenX: number, screenY: number) => void;
 };
 
 export type TabsHandle = {
@@ -58,14 +60,10 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
 
     el.append(dot, name, close);
 
-    el.addEventListener("click", (e) => {
-      // × クリックは閉じる、それ以外は選択。
-      if ((e.target as HTMLElement).closest(".tab-close")) {
-        e.stopPropagation();
-        opts.onClose(id);
-        return;
-      }
-      opts.onSelect(id);
+    // × クリックで閉じる (ドラッグ開始の pointerdown より前に拾えるよう close 自身に付ける)。
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      opts.onClose(id);
     });
     // 中クリックで閉じる (ブラウザ的)。
     el.addEventListener("auxclick", (e) => {
@@ -74,7 +72,65 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
         opts.onClose(id);
       }
     });
+    // 左ボタン: ドラッグ (ウィンドウ外で別窓へ分割)。動かなければクリック扱いで選択。
+    el.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      if ((e.target as HTMLElement).closest(".tab-close")) return; // × は閉じる
+      e.preventDefault();
+      startTabDrag(id, e, el);
+    });
     return el;
+  }
+
+  /**
+   * タブのドラッグ。動かさず離せば選択、ウィンドウ外で離せば別ウィンドウへ分割 (onDetach)。
+   * HTML5 DnD は WebView2 で不安定なため pointer イベントで自前実装する
+   * (launcher.ts:startDrag と同方針)。
+   */
+  function startTabDrag(id: string, down: PointerEvent, el: HTMLElement): void {
+    const startX = down.clientX;
+    const startY = down.clientY;
+    let dragging = false;
+    let clone: HTMLElement | null = null;
+    el.setPointerCapture(down.pointerId);
+
+    const onMove = (ev: PointerEvent): void => {
+      if (!dragging) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return;
+        dragging = true;
+        const r = el.getBoundingClientRect();
+        clone = el.cloneNode(true) as HTMLElement;
+        clone.classList.add("tab-drag-clone");
+        clone.style.width = `${r.width}px`;
+        document.body.appendChild(clone);
+        el.classList.add("tab-dragging");
+      }
+      if (clone) {
+        clone.style.left = `${ev.clientX - 24}px`;
+        clone.style.top = `${ev.clientY - 14}px`;
+      }
+    };
+    const onUp = (ev: PointerEvent): void => {
+      el.releasePointerCapture(down.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (clone) clone.remove();
+      el.classList.remove("tab-dragging");
+      if (!dragging) {
+        opts.onSelect(id); // 動いていない = クリック
+        return;
+      }
+      const outside =
+        ev.clientX < 0 ||
+        ev.clientY < 0 ||
+        ev.clientX > window.innerWidth ||
+        ev.clientY > window.innerHeight;
+      if (outside) {
+        opts.onDetach(id, window.screenX + ev.clientX, window.screenY + ev.clientY);
+      }
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
   return {

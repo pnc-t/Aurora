@@ -9,6 +9,7 @@
 
 import { Channel } from "@tauri-apps/api/core";
 import {
+  attachSession,
   connectToHost,
   disconnect,
   formatDisplayName,
@@ -37,6 +38,23 @@ export type StatsEvent = Extract<ClientEvent, { kind: "stats" }>;
 
 /** タブの接続状態 (タブのドット色に使う)。 */
 export type TabStatus = "connecting" | "connected" | "error";
+
+/**
+ * タブを別ウィンドウへ移譲する際の表示状態スナップショット (Phase 3 ドラッグ分割)。
+ * networking (Rust セッション) は継続するため、ここには接続済み前提の「表示に必要な状態」
+ * だけを入れる。移譲先はこれで `Session` を復元し、新 Channel をアタッチして表示を再開する。
+ */
+export type SessionSnapshot = {
+  entry: HostEntry;
+  save: boolean;
+  displays: DisplayDto[];
+  currentDisplayId: number | null;
+  connLabel: string;
+  audioAvailable: boolean;
+  videoFps: number;
+  videoMbps: number;
+  captured: boolean;
+};
 
 /** Session が共有 UI / orchestrator へアクセスするための窓口。 */
 export interface SessionHost {
@@ -186,6 +204,65 @@ export class Session {
     void disconnect(this.id);
   }
 
+  // ---- タブのウィンドウ間移動 (Phase 3 ドラッグ分割) ----
+
+  /** 移譲用の表示状態スナップショットを作る。接続中のみ意味を持つ。 */
+  snapshot(): SessionSnapshot {
+    return {
+      entry: this.entry,
+      save: this.save,
+      displays: this.currentDisplays,
+      currentDisplayId: this.currentDisplay?.id ?? null,
+      connLabel: this.connLabel,
+      audioAvailable: this.audioAvailable,
+      videoFps: this.videoFps,
+      videoMbps: this.videoMbps,
+      captured: this.input.isCaptured(),
+    };
+  }
+
+  /**
+   * このタブを別ウィンドウへ移譲した: networking (Rust セッション) は止めず、この窓の
+   * ローカル資源 (decoder/input/タイマー) だけ解放する。`disconnect` は呼ばない。
+   * 世代を進め、デタッチ後に旧 Channel へ遅れて届くイベント/映像を無視する。
+   */
+  detachForHandoff(): void {
+    this.disconnectHandled = true; // この窓ではもう切断イベントを扱わない
+    this.cancelReconnect();
+    if (this.viewportTimer !== null) {
+      clearTimeout(this.viewportTimer);
+      this.viewportTimer = null;
+    }
+    this.input.detach();
+    this.decoder.close();
+    this.sessionGen++;
+  }
+
+  /**
+   * 別ウィンドウから移譲されたセッションを引き受ける。再接続はせず、新しい Channel を
+   * 既存の Rust セッションへアタッチして表示状態を復元する。映像は呼び出し後の
+   * `activate()` (= setActive) が requestKeyframe で復帰させる。
+   */
+  async adoptFrom(snap: SessionSnapshot): Promise<void> {
+    this.currentDisplays = snap.displays;
+    this.currentDisplay =
+      snap.currentDisplayId !== null
+        ? (snap.displays.find((d) => d.id === snap.currentDisplayId) ?? snap.displays[0] ?? null)
+        : (snap.displays[0] ?? null);
+    this.connLabel = snap.connLabel;
+    this.audioAvailable = snap.audioAvailable;
+    this.videoFps = snap.videoFps;
+    this.videoMbps = snap.videoMbps;
+    this.connected = true;
+    this.tabStatus = "connected";
+    this.setStatus("", "hidden");
+    this.disconnectHandled = false;
+
+    const gen = ++this.sessionGen;
+    const { event, video } = this.newChannels(gen);
+    await attachSession(this.id, event, video);
+  }
+
   // ---- 共有 UI へのフック (orchestrator が呼ぶ) ----
 
   isCaptured(): boolean {
@@ -282,24 +359,33 @@ export class Session {
 
   // --- 接続 ---
 
-  private async openSession(save: boolean): Promise<void> {
-    if (this.connectInFlight) return;
-    this.connectInFlight = true;
-    const gen = ++this.sessionGen;
-    this.disconnectHandled = false;
-    this.decoder.reset();
-    const eventChannel = new Channel<ClientEvent>();
-    const videoChannel = new Channel<ArrayBuffer>();
-    eventChannel.onmessage = (ev) => this.handleClientEvent(ev, gen);
-    videoChannel.onmessage = (data) => {
+  /** 新しい event/video Channel を作り、この世代 (gen) に紐づけて配線する。 */
+  private newChannels(gen: number): {
+    event: Channel<ClientEvent>;
+    video: Channel<ArrayBuffer>;
+  } {
+    const event = new Channel<ClientEvent>();
+    const video = new Channel<ArrayBuffer>();
+    event.onmessage = (ev) => this.handleClientEvent(ev, gen);
+    video.onmessage = (data) => {
       if (gen !== this.sessionGen) return; // 旧セッションの残映像は捨てる
       if (!this.active) return; // 非アクティブタブは描画しない (host も一時停止中)
       const buf =
         data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
       this.decoder.handleChunk(buf);
     };
+    return { event, video };
+  }
+
+  private async openSession(save: boolean): Promise<void> {
+    if (this.connectInFlight) return;
+    this.connectInFlight = true;
+    const gen = ++this.sessionGen;
+    this.disconnectHandled = false;
+    this.decoder.reset();
+    const { event, video } = this.newChannels(gen);
     try {
-      await connectToHost(this.id, this.entry.host, this.entry.port, save, eventChannel, videoChannel);
+      await connectToHost(this.id, this.entry.host, this.entry.port, save, event, video);
     } finally {
       this.connectInFlight = false;
     }

@@ -9,13 +9,21 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import "./styles/base.css";
 import {
   loadSettings,
+  openSessionWindow,
   stageSession,
+  takeHandoff,
   uploadFileFromPath,
   type ClientSettings,
   type DisplayDto,
   type HostEntry,
 } from "./core/ipc";
-import { Session, type SessionHost, type StatsEvent, type StatusKind } from "./core/session";
+import {
+  Session,
+  type SessionHost,
+  type SessionSnapshot,
+  type StatsEvent,
+  type StatusKind,
+} from "./core/session";
 import { mountToolbar, type ToolbarHandle } from "./ui/toolbar";
 import { mountTabs, type TabsHandle } from "./ui/tabs";
 import { openConnectPicker } from "./ui/connect-dialog";
@@ -208,7 +216,25 @@ const tabs: TabsHandle = mountTabs(tabbar, {
   onSelect: (id) => setActive(id),
   onClose: (id) => sessions.get(id)?.closeByUser(),
   onAdd: () => openAddTab(),
+  onDetach: (id, sx, sy) => void splitTab(id, sx, sy),
 });
+
+// --- タブをウィンドウ外へドラッグ: 別ウィンドウへ分割 (networking 無停止で移譲) ---
+async function splitTab(id: string, screenX: number, screenY: number): Promise<void> {
+  const s = sessions.get(id);
+  // 接続確立済みのタブだけ移譲する (接続中/エラー中は表示状態が定まらない)。
+  if (!s || !s.isConnected) return;
+  try {
+    await openSessionWindow(id, JSON.stringify(s.snapshot()), screenX, screenY);
+  } catch (e) {
+    showToast(`分割に失敗: ${String(e)}`, "error");
+    return;
+  }
+  // 新ウィンドウ生成 = Rust 側で所有権付替え + sink デタッチ済み。この窓のローカル資源だけ解放し、
+  // タブを除去する (disconnect は呼ばない。最後の 1 枚なら removeSession が窓を閉じる)。
+  s.detachForHandoff();
+  removeSession(s);
+}
 
 // --- 「+」: 同じ窓に新しいタブ (接続) を追加 ---
 function openAddTab(): void {
@@ -308,27 +334,61 @@ void getCurrentWebview().onDragDropEvent((event) => {
   }
 });
 
-// --- 起動: 設定を読んで URL の最初のタブを開く ---
-const params = new URLSearchParams(window.location.search);
-const initialId = params.get("session") ?? "";
-const initialEntry: HostEntry = {
-  host: params.get("host") ?? "",
-  port: Number(params.get("port")) || 0,
-  label: params.get("host") ?? "",
-};
-const initialSave = params.get("save") === "1";
+// --- 別ウィンドウから移譲されたタブを引き受ける (ドラッグ分割の受け側) ---
+async function adoptInitial(id: string): Promise<void> {
+  let snap: SessionSnapshot;
+  try {
+    const json = await takeHandoff(id);
+    if (!json) throw new Error("引き継ぎデータがありません");
+    snap = JSON.parse(json) as SessionSnapshot;
+  } catch (e) {
+    renderStatusOverlay("error", `タブの引き継ぎに失敗しました: ${String(e)}`, true);
+    return;
+  }
+  const s = new Session(id, snap.entry, snap.save, host);
+  try {
+    await s.adoptFrom(snap);
+  } catch (e) {
+    renderStatusOverlay("error", `アタッチに失敗しました: ${String(e)}`, true);
+    return;
+  }
+  sessions.set(id, s);
+  tabs.add(id, s.tabLabel, "connected");
+  setActive(id); // activate(): 映像再開 (unpause) + keyframe + 入力 attach + 共有 UI 同期
+  void setResizable(true);
+  if (snap.captured) s.setCaptureMode(true);
+  if (getSettings().show_stats && !statsHud.classList.contains("visible")) {
+    toggleStats();
+    toolbar.setStatsToggled(true);
+  }
+}
 
-renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, false);
+// --- 起動: 設定を読み、URL に応じて「最初のタブを接続」or「移譲タブを引き受け」 ---
+const params = new URLSearchParams(window.location.search);
+const adoptId = params.get("adopt");
+
 void (async () => {
   try {
     settings = await loadSettings();
   } catch {
     settings = null; // getSettings() の既定にフォールバック
   }
+  if (adoptId) {
+    await adoptInitial(adoptId);
+    return;
+  }
+  const initialId = params.get("session") ?? "";
+  const initialEntry: HostEntry = {
+    host: params.get("host") ?? "",
+    port: Number(params.get("port")) || 0,
+    label: params.get("host") ?? "",
+  };
+  const initialSave = params.get("save") === "1";
   if (!initialId || !initialEntry.host || !initialEntry.port) {
     renderStatusOverlay("error", "接続情報が不正です", true);
     return;
   }
+  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, false);
   try {
     await addSession(initialId, initialEntry, initialSave, /*activate=*/ true);
     // 接続時の自動フルスクリーン (窓単位、最初のタブのみで判断)。

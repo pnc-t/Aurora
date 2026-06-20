@@ -85,6 +85,33 @@ export async function connectToHost(
   await invoke("connect_to_host", { sessionId, host, port, save, eventChannel, videoChannel });
 }
 
+/// 既存セッションを別ウィンドウへ移譲するための空ウィンドウを開く (タブのドラッグ分割)。
+/// `snapshot` は移譲先が復元に使う表示状態 JSON。`x`/`y` は新ウィンドウの配置 (カーソル位置)。
+/// networking は止まらず、Rust 側が表示先 (sink) を即デタッチして所有ウィンドウを付け替える。
+export async function openSessionWindow(
+  sessionId: string,
+  snapshot: string,
+  x: number,
+  y: number,
+): Promise<void> {
+  await invoke("open_session_window", { sessionId, snapshot, x, y });
+}
+
+/// 移譲先ウィンドウが引き継ぎデータ (表示状態 JSON) を取り出す (1 回限り)。
+export async function takeHandoff(sessionId: string): Promise<string | null> {
+  return await invoke<string | null>("take_handoff", { sessionId });
+}
+
+/// 既存セッションの表示先を、この webview の Channel へ差し替える (移譲先がアタッチ)。
+/// networking はそのままなので、別途 requestKeyframe で映像を復帰させる。
+export async function attachSession(
+  sessionId: string,
+  eventChannel: Channel<ClientEvent>,
+  videoChannel: Channel<ArrayBuffer>,
+): Promise<void> {
+  await invoke("attach_session", { sessionId, eventChannel, videoChannel });
+}
+
 /// パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。
 export async function savedPasswordHosts(): Promise<string[]> {
   return await invoke<string[]>("saved_password_hosts");

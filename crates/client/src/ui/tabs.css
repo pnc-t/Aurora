@@ -111,6 +111,18 @@
   opacity: 1;
 }
 
+/* ドラッグ中の元タブは半透明スロットに、分身 (clone) がカーソルへ追従する。 */
+.tab.tab-dragging {
+  opacity: 0.4;
+}
+.tab-drag-clone {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0.9;
+  box-shadow: 0 6px 16px var(--shadow);
+}
+
 .tab-add {
   display: flex;
   align-items: center;
