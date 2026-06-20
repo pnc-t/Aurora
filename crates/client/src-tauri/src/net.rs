@@ -24,7 +24,7 @@ use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use bincode::Options;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
@@ -128,6 +128,10 @@ pub struct SessionHandle {
     /// **既定は `None` (共有無効)。** reader タスクと共有するため Arc。セッション毎に独立させ、
     /// あるウィンドウの共有設定が別ウィンドウの接続に漏れないようにする。
     pub share_root: Arc<Mutex<Option<PathBuf>>>,
+    /// このセッションを表示している capture ウィンドウのラベル (`connect_to_host` を呼んだ
+    /// webview)。1 ウィンドウに複数タブ (セッション) がぶら下がるため、ウィンドウ破棄時に
+    /// このラベルを持つ全セッションをまとめて停止する (タブの取りこぼし防止)。
+    pub window_label: String,
 }
 
 impl SessionHandle {
@@ -211,6 +215,26 @@ pub async fn open_capture_window(
     Ok(session_id)
 }
 
+/// 既存の capture ウィンドウ内で新しいタブ (セッション) を開く準備をする。ウィンドウは
+/// 作らず、session_id を発番して接続資格情報 (password) を staging へ積むだけ。呼び出した
+/// capture ウィンドウの JS が、返った id で `connect_to_host` を呼んで実接続する。
+/// 平文パスワードを JS のウィンドウ間でやり取りしないための受け渡し (open_capture_window と対)。
+#[tauri::command]
+pub async fn stage_session(
+    // 手入力パスワード (今回だけ/保存) は Some、保存済み即接続は None。
+    password: Option<String>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<String, String> {
+    let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    let session_id = format!("s{n}");
+    state
+        .staging
+        .lock()
+        .await
+        .insert(session_id.clone(), password);
+    Ok(session_id)
+}
+
 /// このセッションがホストへ投影する共有フォルダを設定する。これを呼ぶまで共有は無効。
 #[tauri::command]
 pub async fn set_share_root(
@@ -245,6 +269,9 @@ async fn send_ctrl(state: &SessionState, session_id: &str, msg: ControlMsg) -> R
 #[allow(clippy::too_many_arguments)] // Tauri コマンドの引数 (state/channel) 注入で増える
 pub async fn connect_to_host(
     app: tauri::AppHandle,
+    // このコマンドを呼んだ capture ウィンドウ。セッションを所有ウィンドウへ紐付け、
+    // ウィンドウ破棄時にそのウィンドウの全タブをまとめて停止できるようにする。
+    window: WebviewWindow,
     session_id: String,
     host: String,
     port: u16,
@@ -509,6 +536,7 @@ pub async fn connect_to_host(
         audio: audio_player,
         pending_downloads,
         share_root,
+        window_label: window.label().to_string(),
     };
     state.inner.lock().await.insert(session_id.clone(), handle);
 
@@ -591,6 +619,17 @@ pub async fn set_audio_muted(
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     send_ctrl(&state, &session_id, ControlMsg::SetAudioMuted { muted }).await
+}
+
+/// 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
+/// 再開時は呼び出し側が別途 `request_keyframe` で映像を復帰させる。
+#[tauri::command]
+pub async fn set_video_paused(
+    session_id: String,
+    paused: bool,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    send_ctrl(&state, &session_id, ControlMsg::SetVideoPaused { paused }).await
 }
 
 /// 送出する映像の最大高さ (0 = キャプチャ解像度) をホストへ送る。

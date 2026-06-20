@@ -1,0 +1,138 @@
+/* capture ウィンドウ上部のタブストリップ。toolbar とは別の常時表示バー。 */
+
+#tabbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 4000;
+}
+
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  height: 34px;
+  padding: 4px 6px;
+  background: var(--toolbar-bg);
+  border-bottom: 1px solid var(--panel-border);
+  box-shadow: 0 1px 4px var(--shadow);
+}
+
+.tabstrip svg.icon {
+  display: block;
+}
+
+.tabstrip-list {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabstrip-list::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 200px;
+  min-width: 90px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: var(--control);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.tab:hover {
+  background: var(--control-hover);
+}
+.tab.active {
+  background: var(--raised);
+  color: var(--fg);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+.tab-dot.connecting {
+  background: var(--accent);
+  animation: tab-pulse 1.2s ease-in-out infinite;
+}
+.tab-dot.connected {
+  background: var(--ok);
+}
+.tab-dot.error {
+  background: var(--danger);
+}
+
+@keyframes tab-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.7;
+}
+.tab-close:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+  opacity: 1;
+}
+
+.tab-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+}
+.tab-add:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+
+/* 上配置のツールバー (フローティングピル) がタブストリップと重ならないよう、
+ * ピルをストリップの高さ分だけ下へずらす (id+class でセレクタ優先度を確保)。 */
+#topbar.pos-top .tb-pill {
+  margin-top: 38px;
+}
+

@@ -33,14 +33,22 @@ fn main() {
             let label = window.label().to_string();
             if label == "main" {
                 window.app_handle().exit(0);
-            } else if let Some(session_id) = label.strip_prefix("capture-") {
+            } else if label.starts_with("capture-") {
+                // 1 capture ウィンドウに複数タブ (セッション) がぶら下がるため、このウィンドウ
+                // を所有ウィンドウとする全セッションをまとめて停止する (タブの取りこぼし防止)。
                 let app = window.app_handle().clone();
-                let id = session_id.to_string();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<SessionState>();
-                    let handle = state.inner.lock().await.remove(&id);
-                    if let Some(h) = handle {
-                        h.shutdown();
+                    let mut guard = state.inner.lock().await;
+                    let ids: Vec<String> = guard
+                        .iter()
+                        .filter(|(_, h)| h.window_label == label)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in ids {
+                        if let Some(h) = guard.remove(&id) {
+                            h.shutdown();
+                        }
                     }
                 });
             }
@@ -49,11 +57,13 @@ fn main() {
             net::connect_to_host,
             net::disconnect,
             net::open_capture_window,
+            net::stage_session,
             net::send_input,
             net::request_keyframe,
             net::select_display,
             net::set_video_params,
             net::set_audio_muted,
+            net::set_video_paused,
             net::set_resolution,
             net::set_client_viewport,
             net::request_file,

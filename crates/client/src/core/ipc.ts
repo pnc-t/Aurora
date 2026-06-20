@@ -36,14 +36,14 @@ export type InputEvent =
   | { Key: { vk: number; down: boolean } }
   | { MouseMoveRelative: { dx: number; dy: number } };
 
-// --- アクティブセッション id ---
-// capture ウィンドウは Phase 1 では 1 セッションのため、セッション操作系コマンド
-// (send_input / select_display / request_file …) は呼び出し側に session_id を要求せず、
-// ここで保持するアクティブ id を暗黙に付与する。decoder/input/file-transfer を無改修に保つ。
-// Phase 2 でタブ (複数セッション) を入れる際にここを差し替える。
+// --- アクティブセッション id (共有 UI 専用) ---
+// capture ウィンドウは複数タブ (セッション) を持ちうる。映像/入力/再接続などセッション固有の
+// 操作は `Session` が**明示的に session_id を渡して**呼ぶ (下の各コマンドの第 1 引数)。
+// 一方、画面に 1 つしかない共有パネル (file-transfer / D&D アップロード) はアクティブタブを
+// 対象にするため、ここで保持するアクティブ id を暗黙に使う。タブ切替で orchestrator が更新する。
 let activeSessionId: string | null = null;
 
-/// 現在のウィンドウが操作するセッション id を設定する (connect 時に確定)。
+/// アクティブタブのセッション id を設定する (タブ切替時に orchestrator が呼ぶ)。
 export function setActiveSession(id: string | null): void {
   activeSessionId = id;
 }
@@ -65,8 +65,15 @@ export async function openCaptureWindow(
   return await invoke<string>("open_capture_window", { host, port, save, password });
 }
 
-/// capture ウィンドウが自分のセッションを開く。password はもう渡さない (Rust が staging /
-/// 保存済み DPAPI から解決する)。成功時はこの id をアクティブセッションに設定する。
+/// 既存 capture ウィンドウ内に新規タブ (セッション) を開く準備。session_id を発番し、
+/// password を Rust の staging へ積む (open_capture_window と同じ受け渡し、ただし窓は作らない)。
+/// 返った id で connectToHost を呼ぶ。
+export async function stageSession(password: string | null): Promise<string> {
+  return await invoke<string>("stage_session", { password });
+}
+
+/// セッションを開く。password はもう渡さない (Rust が staging / 保存済み DPAPI から解決する)。
+/// 所有ウィンドウの紐付けは Rust 側が呼び出し webview から取得する。
 export async function connectToHost(
   sessionId: string,
   host: string,
@@ -75,7 +82,6 @@ export async function connectToHost(
   eventChannel: Channel<ClientEvent>,
   videoChannel: Channel<ArrayBuffer>,
 ): Promise<void> {
-  setActiveSession(sessionId);
   await invoke("connect_to_host", { sessionId, host, port, save, eventChannel, videoChannel });
 }
 
@@ -89,42 +95,56 @@ export async function deleteHostPassword(host: string): Promise<void> {
   await invoke("delete_host_password", { host });
 }
 
-export async function disconnect(): Promise<void> {
-  await invoke("disconnect", { sessionId: sid() });
+export async function disconnect(sessionId: string): Promise<void> {
+  await invoke("disconnect", { sessionId });
 }
 
-export async function sendInput(event: InputEvent): Promise<void> {
-  await invoke("send_input", { sessionId: sid(), event });
+export async function sendInput(sessionId: string, event: InputEvent): Promise<void> {
+  await invoke("send_input", { sessionId, event });
 }
 
-export async function requestKeyframe(): Promise<void> {
-  await invoke("request_keyframe", { sessionId: sid() });
+export async function requestKeyframe(sessionId: string): Promise<void> {
+  await invoke("request_keyframe", { sessionId });
 }
 
-export async function selectDisplay(id: number): Promise<void> {
-  await invoke("select_display", { sessionId: sid(), id });
+export async function selectDisplay(sessionId: string, id: number): Promise<void> {
+  await invoke("select_display", { sessionId, id });
 }
 
 /// 映像パラメータ (fps 上限 / ビットレート上限 bps) を実行時にホストへ送る。
-export async function setVideoParams(fps: number, maxBitrateBps: number): Promise<void> {
-  await invoke("set_video_params", { sessionId: sid(), fps, maxBitrateBps });
+export async function setVideoParams(
+  sessionId: string,
+  fps: number,
+  maxBitrateBps: number,
+): Promise<void> {
+  await invoke("set_video_params", { sessionId, fps, maxBitrateBps });
 }
 
 /// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
-export async function setAudioMuted(muted: boolean): Promise<void> {
-  await invoke("set_audio_muted", { sessionId: sid(), muted });
+export async function setAudioMuted(sessionId: string, muted: boolean): Promise<void> {
+  await invoke("set_audio_muted", { sessionId, muted });
+}
+
+/// 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
+/// 再開時は別途 requestKeyframe で映像を復帰させる。
+export async function setVideoPaused(sessionId: string, paused: boolean): Promise<void> {
+  await invoke("set_video_paused", { sessionId, paused });
 }
 
 /// 送出する映像の最大高さ (px、0 = キャプチャ解像度のまま) をホストへ送る。
 /// ホストが GPU で縮小 (アスペクト比維持) してからエンコードする。
-export async function setResolution(maxHeight: number): Promise<void> {
-  await invoke("set_resolution", { sessionId: sid(), maxHeight });
+export async function setResolution(sessionId: string, maxHeight: number): Promise<void> {
+  await invoke("set_resolution", { sessionId, maxHeight });
 }
 
 /// クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
 /// 対応モードへ解像度を変更する (RDP 風・黒帯解消)。
-export async function setClientViewport(width: number, height: number): Promise<void> {
-  await invoke("set_client_viewport", { sessionId: sid(), width, height });
+export async function setClientViewport(
+  sessionId: string,
+  width: number,
+  height: number,
+): Promise<void> {
+  await invoke("set_client_viewport", { sessionId, width, height });
 }
 
 export async function requestFile(id: number, path: string): Promise<void> {

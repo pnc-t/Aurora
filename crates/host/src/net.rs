@@ -713,6 +713,10 @@ async fn handle_client(
     let mut held = HeldInputs::default();
     // 音声ミュート状態 (クライアントの SetAudioMuted)。true の間は音声 UDP を送らない。
     let mut audio_muted = false;
+    // 映像一時停止 (クライアントの SetVideoPaused)。true の間は映像 UDP を送らない
+    // (マルチタブで非アクティブなタブの帯域を止める)。再開時はクライアントが
+    // RequestKeyframe を送って映像を復帰させる。
+    let mut video_paused = false;
     // 現在キャプチャ中のディスプレイの index (SelectDisplay で更新)。初期は先頭 (= initial_id)。
     let mut active_idx = 0usize;
     // 仮想ディスプレイのテイクオーバー (物理オフ+仮想 primary) を実施済みか。切断時の復元判定に使う。
@@ -750,6 +754,10 @@ async fn handle_client(
                     ControlMsg::SetAudioMuted { muted } => {
                         tracing::info!(muted, "client set audio muted");
                         audio_muted = muted;
+                    }
+                    ControlMsg::SetVideoPaused { paused } => {
+                        tracing::info!(paused, "client set video paused");
+                        video_paused = paused;
                     }
                     ControlMsg::SetResolution { max_height } => {
                         tracing::info!(max_height, "client set resolution");
@@ -1012,6 +1020,11 @@ async fn handle_client(
             }
             // NAL 受信 → UDP 送信 (STREAM_VIDEO)
             Some(nal) = nal_rx.recv() => {
+                // 一時停止中はフレームをドレインするだけで送らない (非アクティブタブの帯域節約)。
+                // 送らない=その seq の nonce を消費しないだけで、再開時の RequestKeyframe で復帰する。
+                if video_paused {
+                    continue;
+                }
                 let frame_id = nal.frame_id;
                 let keyframe = nal.keyframe;
                 let mut chunks = nal.data.chunks(MAX_PAYLOAD).peekable();

@@ -12,6 +12,9 @@
       <canvas id="screen" tabindex="0" width="1920" height="1080"></canvas>
     </div>
 
+    <!-- タブストリップ (複数セッション切替。TS が中身を構築) -->
+    <div id="tabbar"></div>
+
     <!-- 接続中のオーバーレイ UI (TS が中身を構築) -->
     <div id="topbar"></div>
     <div id="stats-hud"></div>
@@ -20,6 +23,9 @@
 
     <!-- 接続確立前 / 切断後の状態表示 (TS が制御) -->
     <div id="conn-status"></div>
+
+    <!-- 「+」の接続ピッカー (モーダル。TS が制御) -->
+    <div id="picker-backdrop"></div>
 
     <script type="module" src="./capture-main.ts"></script>
   </body>
