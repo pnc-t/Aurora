@@ -27,9 +27,13 @@ export type TabsHandle = {
 };
 
 export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
+  // data-tauri-drag-region は **クリック対象そのもの** に属性が無いとドラッグ移動しない
+  // (Tauri v2 は exact target 判定)。tabstrip-list が flex:1 で空き領域を覆うため、
+  // list 自身にも付けないとタブ以外の余白でウィンドウを掴めない。タブ/ボタンは子要素
+  // (属性無し) なので掴み対象から外れる。
   container.innerHTML = `
     <div class="tabstrip" data-tauri-drag-region>
-      <div class="tabstrip-list" id="tabstrip-list"></div>
+      <div class="tabstrip-list" id="tabstrip-list" data-tauri-drag-region></div>
       <button type="button" class="tab-add" id="tab-add" title="接続を追加">${icon("add")}</button>
     </div>
   `;

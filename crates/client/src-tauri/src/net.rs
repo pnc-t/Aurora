@@ -24,7 +24,7 @@ use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use bincode::Options;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
@@ -186,6 +186,8 @@ pub struct SessionHandle {
     /// **既定は `None` (共有無効)。** reader タスクと共有するため Arc。セッション毎に独立させ、
     /// あるウィンドウの共有設定が別ウィンドウの接続に漏れないようにする。
     pub share_root: Arc<Mutex<Option<PathBuf>>>,
+    /// 接続先 host (ランチャーの接続中表示 / 切断ボタンで host 単位に扱うために保持)。
+    pub host: String,
     /// このセッションを表示している capture ウィンドウのラベル (`connect_to_host` を呼んだ
     /// webview)。1 ウィンドウに複数タブ (セッション) がぶら下がるため、ウィンドウ破棄時に
     /// このラベルを持つ全セッションをまとめて停止する (タブの取りこぼし防止)。
@@ -390,6 +392,29 @@ pub async fn set_share_root(
     *share.lock().await = Some(p);
     tracing::info!(session = %session_id, path = %path, "share root set");
     Ok(())
+}
+
+/// 接続中セッションの host を重複排除して返す。
+fn distinct_hosts(map: &HashMap<String, SessionHandle>) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for h in map.values() {
+        set.insert(h.host.clone());
+    }
+    set.into_iter().collect()
+}
+
+/// 現在接続中の host 一覧を全ウィンドウへ通知する (`aurora://connections`)。ランチャーが
+/// これを購読して接続中表示・切断ボタンの出し分け・保存バッジの再読込を行う。セッションの
+/// 追加 (connect) / 除去 (disconnect・ウィンドウ破棄) のたびに呼ぶ。
+pub(crate) async fn emit_connections(app: &tauri::AppHandle, state: &SessionState) {
+    let hosts = distinct_hosts(&*state.inner.lock().await);
+    let _ = app.emit("aurora://connections", hosts);
+}
+
+/// ランチャー初期表示用: 現在接続中の host 一覧 (重複排除)。
+#[tauri::command]
+pub async fn connected_hosts(state: tauri::State<'_, SessionState>) -> Result<Vec<String>, String> {
+    Ok(distinct_hosts(&*state.inner.lock().await))
 }
 
 /// 指定セッションの制御チャネルへ 1 メッセージ送る共通処理。未知 id は拒否する。
@@ -657,6 +682,7 @@ pub async fn connect_to_host(
 
     let handle = SessionHandle {
         sink: sink.clone(),
+        host: host.clone(),
         ctrl_tx,
         file_tx,
         tasks: vec![
@@ -681,20 +707,27 @@ pub async fn connect_to_host(
         displays: host_displays.into_iter().map(Into::into).collect(),
         audio: host_audio,
     });
+    // ランチャーへ接続中 host 一覧を通知 (接続中表示・保存バッジ更新)。
+    emit_connections(&app, &state).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn disconnect(
+    app: tauri::AppHandle,
     session_id: String,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let mut guard = state.inner.lock().await;
-    if let Some(s) = guard.remove(&session_id) {
-        // task abort だけでなくクリップボードスレッドにも shutdown を伝える
-        // (connect_to_host のセッション置換経路と同じ後始末に統一)。
-        s.shutdown();
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(s) = guard.remove(&session_id) {
+            // task abort だけでなくクリップボードスレッドにも shutdown を伝える
+            // (connect_to_host のセッション置換経路と同じ後始末に統一)。
+            s.shutdown();
+        }
     }
+    // ランチャーへ接続中 host 一覧を通知 (切断表示・接続中バッジ除去)。
+    emit_connections(&app, &state).await;
     Ok(())
 }
 

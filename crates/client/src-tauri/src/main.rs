@@ -50,6 +50,9 @@ fn main() {
                             h.shutdown();
                         }
                     }
+                    drop(guard);
+                    // ランチャーへ接続中 host 一覧を通知 (ウィンドウを閉じた分の切断を反映)。
+                    net::emit_connections(&app, &state).await;
                 });
             }
         })
@@ -61,6 +64,7 @@ fn main() {
             net::open_session_window,
             net::take_handoff,
             net::attach_session,
+            net::connected_hosts,
             net::send_input,
             net::request_keyframe,
             net::select_display,

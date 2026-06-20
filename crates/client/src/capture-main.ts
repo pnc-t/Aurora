@@ -6,6 +6,7 @@
 // は Rust 側 staging が持つためここには載らない。「+」で同じ窓に新しいタブを追加できる。
 
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
   loadSettings,
@@ -273,6 +274,16 @@ installWebviewGuard((hotkey) => {
   } else if (hotkey === "toggle-capture") {
     const s = active();
     if (s) s.setCaptureMode(!s.isCaptured());
+  }
+});
+
+// --- ランチャーからの host 単位の切断要求 ---
+// ランチャーの切断ボタンが `aurora://disconnect-host` を全ウィンドウへ emit する。
+// この窓が該当 host のタブを持っていれば閉じる (closeByUser = 切断 + タブ除去、最後なら窓終了)。
+void listen<{ host: string }>("aurora://disconnect-host", (e) => {
+  const target = e.payload.host.trim().toLowerCase();
+  for (const s of [...sessions.values()]) {
+    if (s.entry.host.trim().toLowerCase() === target) s.closeByUser();
   }
 });
 

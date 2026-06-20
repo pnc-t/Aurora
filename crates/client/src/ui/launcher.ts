@@ -9,6 +9,7 @@
 // recent_hosts.json (config.rs) には引き続き { label, host, port } のみ保持する。
 
 import {
+  connectedHosts,
   deleteRecentHost,
   deleteHostPassword,
   loadRecentHosts,
@@ -22,6 +23,7 @@ import {
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
+import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
@@ -237,6 +239,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 鍵マーク表示・即接続・「忘れる」メニューの出し分けに使う。
   let savedSet = new Set<string>();
   const hasSaved = (host: string): boolean => savedSet.has(host.trim().toLowerCase());
+  // 現在接続中の host(小文字) 集合。`aurora://connections` イベント (Rust 発) で更新し、
+  // カードの「接続中」表示・切断ボタンの出し分けに使う。
+  let connectedSet = new Set<string>();
+  const isConnected = (host: string): boolean => connectedSet.has(host.trim().toLowerCase());
   const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
@@ -512,18 +518,25 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         const saved = hasSaved(h.host)
           ? `<span class="saved-badge" title="パスワード保存済み (押すと即接続)">${icon("key")}</span>`
           : "";
+        const connected = isConnected(h.host);
+        // 接続中: 緑ピル + 切断ボタン。並べ替えグリップは編集系ボタンと同列なので残す。
+        const connPill = connected ? `<span class="conn-pill">接続中</span>` : "";
+        const tailBtn = connected
+          ? `<button class="card-btn danger" data-act="disconnect" title="切断">${icon("power")}</button>`
+          : `<span class="chevron">${icon("chevron")}</span>`;
         return `
-          <div class="host-card" data-idx="${i}">
+          <div class="host-card${connected ? " connected" : ""}" data-idx="${i}">
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
             <div class="avatar" style="background:${avatarColor(name)}">${initial}</div>
             <div class="meta">
               <div class="label">${escapeHtml(name)}</div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
             </div>
+            ${connPill}
             ${saved}
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
-            <span class="chevron">${icon("chevron")}</span>
+            ${tailBtn}
           </div>`;
       })
       .join("");
@@ -542,6 +555,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         } else if (act === "menu") {
           e.stopPropagation();
           openCardMenu(actEl as HTMLElement, hosts[idx]);
+        } else if (act === "disconnect") {
+          e.stopPropagation();
+          // 該当 host のタブを持つ capture ウィンドウへ切断を依頼する (全ウィンドウへ broadcast)。
+          void emit("aurora://disconnect-host", { host: hosts[idx].host });
         } else if (hasSaved(hosts[idx].host)) {
           // パスワード保存済み: ダイアログを出さず即接続 (平文はフロントに載らない)。
           // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
@@ -671,6 +688,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         } catch {
           savedSet = new Set();
         }
+        // 接続中表示・切断ボタンの判定用に、接続中 host 集合も更新する。
+        try {
+          connectedSet = new Set((await connectedHosts()).map((h) => h.trim().toLowerCase()));
+        } catch {
+          connectedSet = new Set();
+        }
         renderHosts(await loadRecentHosts());
       } catch {
         // 履歴は補助機能。失敗しても致命的ではない。
@@ -704,6 +727,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     applyTheme(settings.theme, settings.accent_color);
   })();
   void handle.refreshHosts();
+
+  // 接続中 host の変化 (capture ウィンドウでの接続/切断/ウィンドウ破棄) を購読し、
+  // 接続中表示・切断ボタン・保存バッジ (接続成功で新規保存された分) を更新する。
+  void listen<string[]>("aurora://connections", (e) => {
+    connectedSet = new Set(e.payload.map((h) => h.trim().toLowerCase()));
+    // 保存バッジ (新規保存) の反映も兼ねて履歴ごと再描画する。
+    void handle.refreshHosts();
+  });
 
   return handle;
 }

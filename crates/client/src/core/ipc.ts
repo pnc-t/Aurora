@@ -112,6 +112,12 @@ export async function attachSession(
   await invoke("attach_session", { sessionId, eventChannel, videoChannel });
 }
 
+/// 現在接続中の host 一覧 (重複排除)。ランチャーの接続中表示・切断ボタンの初期化に使う。
+/// 以降の更新は `aurora://connections` イベントで届く。
+export async function connectedHosts(): Promise<string[]> {
+  return await invoke<string[]>("connected_hosts");
+}
+
 /// パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。
 export async function savedPasswordHosts(): Promise<string[]> {
   return await invoke<string[]>("saved_password_hosts");
