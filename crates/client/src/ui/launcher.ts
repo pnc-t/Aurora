@@ -587,10 +587,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           // 保存済み即接続: password=null (Rust が DPAPI 復号)。再保存は不要なので save=false。
           void opts
             .onConnect(entry, null, false)
-            // capture ウィンドウが開いたらランチャーの状態表示を戻す (接続進捗は別窓側)。
-            .then(() => handle.setConnState("未接続", "idle"))
+            // capture ウィンドウが開いたら一時的な connecting 表示を解き、実際の接続中集計へ戻す
+            // (接続成立は別窓側で起き、`aurora://connections` 経由でドットが緑になる)。
+            .then(() => updateStatusDot())
             .catch(() => {
-              handle.setConnState("", "idle");
+              updateStatusDot();
               openConnectDialog(entry);
             });
         } else {
@@ -687,6 +688,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     persist();
   });
 
+  // 左下の状態ドットを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
+  // 窓側で起きるため、launcher は `aurora://connections` の集計 (connectedSet) だけを映す。
+  function updateStatusDot(): void {
+    const n = connectedSet.size;
+    statusCard.classList.remove("connecting", "connected", "error");
+    if (n > 0) {
+      statusCard.classList.add("connected");
+      statusCard.title = `接続中: ${n} 件`;
+    } else {
+      statusCard.title = "未接続";
+    }
+  }
+
   const handle: LauncherHandle = {
     show(): void {
       opts.root.classList.remove("hidden");
@@ -719,6 +733,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           connectedSet = new Set();
         }
         renderHosts(await loadRecentHosts());
+        updateStatusDot();
       } catch {
         // 履歴は補助機能。失敗しても致命的ではない。
       }
