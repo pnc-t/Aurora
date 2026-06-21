@@ -30,6 +30,11 @@ mod imp {
         }
     }
 
+    // SAFETY: 保持するのは名前付きイベントのカーネルハンドルのみ。Windows のハンドルはスレッド
+    // 非依存で、別スレッドからの CloseHandle も安全。マルチクライアント化で handle_client が
+    // tokio::spawn される (= 接続ごとに本ガードを await を跨いで保持する) ため Send が要る。
+    unsafe impl Send for ActiveGuard {}
+
     impl Drop for ActiveGuard {
         fn drop(&mut self) {
             if let Some(h) = self.handle.take() {
