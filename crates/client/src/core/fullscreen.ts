@@ -3,6 +3,7 @@
 // 権限: capabilities/default.json に core:window:allow-set-fullscreen が必要。
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { logger } from "./log";
 
 let fullscreen = false;
 
@@ -13,7 +14,7 @@ export async function toggleFullscreen(): Promise<boolean> {
   } catch (e) {
     // 失敗したら状態を戻す。
     fullscreen = !fullscreen;
-    console.warn("setFullscreen failed", e);
+    logger.warn("setFullscreen failed", e);
   }
   return fullscreen;
 }
@@ -24,7 +25,7 @@ export async function exitFullscreen(): Promise<void> {
   try {
     await getCurrentWindow().setFullscreen(false);
   } catch (e) {
-    console.warn("setFullscreen(false) failed", e);
+    logger.warn("setFullscreen(false) failed", e);
   }
 }
 

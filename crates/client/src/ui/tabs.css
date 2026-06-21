@@ -1,0 +1,249 @@
+/* capture ウィンドウ上部のタブストリップ。toolbar とは別の常時表示バー。 */
+
+#tabbar {
+  position: fixed;
+  z-index: 4000;
+  /* 既定は上配置 (pos-top が付くまでのフォールバック)。配置は pos-* で切り替える。 */
+  top: 0;
+  left: 0;
+  right: 0;
+}
+
+/* --- 配置: 上/下 (横帯) --- */
+#tabbar.pos-top {
+  top: 0; left: 0; right: 0; bottom: auto; width: auto; height: auto;
+}
+#tabbar.pos-bottom {
+  bottom: 0; left: 0; right: 0; top: auto; width: auto; height: auto;
+}
+/* --- 配置: 左/右 (縦サイドタブ) --- */
+#tabbar.pos-left {
+  left: 0; top: 0; bottom: 0; right: auto; width: var(--tabstrip-w, 160px);
+}
+#tabbar.pos-right {
+  right: 0; top: 0; bottom: 0; left: auto; width: var(--tabstrip-w, 160px);
+}
+
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  height: 34px;
+  padding: 4px 6px;
+  background: var(--toolbar-bg);
+  border-bottom: 1px solid var(--panel-border);
+  box-shadow: 0 1px 4px var(--shadow);
+}
+
+/* 縦サイドタブ (左/右) は不透明な帯が映像と重なる。フルスクリーン以外では映像エリアを
+ * その厚み分だけ内側へ寄せ、リモート画面が隠れないようにする。フルスクリーン中 (body.tab-fs)
+ * は自動格納されるため寄せず端まで映す。 */
+body.tab-left:not(.tab-fs) #screen-wrap {
+  left: var(--tabstrip-w, 160px);
+}
+body.tab-right:not(.tab-fs) #screen-wrap {
+  right: var(--tabstrip-w, 160px);
+}
+
+/* 下配置: 区切り線と影を下端側へ。 */
+#tabbar.pos-bottom .tabstrip {
+  border-bottom: none;
+  border-top: 1px solid var(--panel-border);
+  box-shadow: 0 -1px 4px var(--shadow);
+}
+
+/* 左/右配置: 縦並びのサイドタブ。ストリップ全体を縦に積み、全高を占める。 */
+#tabbar.pos-left .tabstrip,
+#tabbar.pos-right .tabstrip {
+  flex-direction: column;
+  height: 100%;
+  align-items: stretch;
+  border-bottom: none;
+}
+#tabbar.pos-left .tabstrip {
+  border-right: 1px solid var(--panel-border);
+  box-shadow: 1px 0 4px var(--shadow);
+}
+#tabbar.pos-right .tabstrip {
+  border-left: 1px solid var(--panel-border);
+  box-shadow: -1px 0 4px var(--shadow);
+}
+#tabbar.pos-left .tabstrip-list,
+#tabbar.pos-right .tabstrip-list {
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+/* 縦並びでは各タブ/「+」を全幅・最小高さで積む (横並び前提の width/min-width を打ち消す)。 */
+#tabbar.pos-left .tab,
+#tabbar.pos-right .tab {
+  max-width: none;
+  min-height: 30px;
+}
+#tabbar.pos-left .tab-add,
+#tabbar.pos-right .tab-add {
+  width: auto;
+  min-height: 30px;
+}
+
+.tabstrip svg.icon {
+  display: block;
+}
+
+.tabstrip-list {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabstrip-list::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 200px;
+  min-width: 90px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: var(--control);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.tab:hover {
+  background: var(--control-hover);
+}
+.tab.active {
+  background: var(--raised);
+  color: var(--fg);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+.tab-dot.connecting {
+  background: var(--accent);
+  animation: tab-pulse 1.2s ease-in-out infinite;
+}
+.tab-dot.connected {
+  background: var(--ok);
+}
+.tab-dot.error {
+  background: var(--danger);
+}
+
+@keyframes tab-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.7;
+}
+.tab-close:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+  opacity: 1;
+}
+
+/* ドラッグ中の元タブは半透明スロットに、分身 (clone) がカーソルへ追従する。 */
+.tab.tab-dragging {
+  opacity: 0.4;
+}
+.tab-drag-clone {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0.9;
+  box-shadow: 0 6px 16px var(--shadow);
+}
+
+.tab-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+}
+.tab-add:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+
+/* ツールバー (フローティングピル) とタブストリップが同じ端に来たとき重ならないよう、
+ * ピルをストリップの厚み分だけ内側へずらす (id+class でセレクタ優先度を確保)。
+ * 別の端どうしならずらさない (body.tab-* で同一端のときだけ効かせる)。 */
+body.tab-top #topbar.pos-top .tb-pill {
+  margin-top: 42px;
+}
+body.tab-bottom #topbar.pos-bottom .tb-pill {
+  margin-bottom: 42px;
+}
+body.tab-left #topbar.pos-left .tb-pill {
+  margin-left: var(--tabstrip-w, 160px);
+}
+body.tab-right #topbar.pos-right .tb-pill {
+  margin-right: var(--tabstrip-w, 160px);
+}
+
+/* フルスクリーン時はタブストリップを自動格納する。常時表示のままだと不透明な帯が
+ * リモート映像を覆い、画面端に黒帯が残ってしまうため。配置した端へカーソルを寄せた
+ * とき (.revealed) だけスライドで一時表示する (ツールバーピルの自動格納と同じ挙動)。 */
+#tabbar.autohide .tabstrip {
+  transition: transform 0.18s ease;
+}
+#tabbar.autohide.pos-top .tabstrip {
+  transform: translateY(-100%);
+}
+#tabbar.autohide.pos-bottom .tabstrip {
+  transform: translateY(100%);
+}
+#tabbar.autohide.pos-left .tabstrip {
+  transform: translateX(-100%);
+}
+#tabbar.autohide.pos-right .tabstrip {
+  transform: translateX(100%);
+}
+#tabbar.autohide.revealed .tabstrip {
+  transform: translate(0, 0);
+}
+

@@ -182,4 +182,11 @@ pub enum ControlMsg {
         width: u32,
         height: u32,
     },
+    /// クライアント → ホスト。映像送出の一時停止 / 再開。マルチタブで非アクティブな
+    /// タブの帯域を止めるために使う。`paused=true` の間はホストが映像 UDP を送らない
+    /// (フレームはドレインして捨てる)。再開時はクライアントが RequestKeyframe で映像を
+    /// 復帰させる。末尾に追加しタグ互換を保つ。
+    SetVideoPaused {
+        paused: bool,
+    },
 }

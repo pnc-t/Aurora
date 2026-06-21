@@ -10,6 +10,7 @@ crates/client/src-tauri/gen
 .idea/
 CLAUDE.md
 PLAN.md
+launcher.md
 # ランタイム生成ディレクトリ (ProjFS 投影 / ファイル転送の保存先)
 # 起動時 CWD 次第で任意階層に作られるためアンカーしない
 aurora-remote/
@@ -19,3 +20,4 @@ aurora-downloads/
 installer/dist/
 # VDD ドライバファイル (build.ps1 がビルド時にコピー、バイナリなので git 管理しない)
 installer/host/vdd/
+

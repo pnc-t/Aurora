@@ -206,10 +206,18 @@ fn main() -> Result<()> {
     }
 
     // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
-    // (CLI / デバッグ) は従来どおりコンソールへ出す。
-    init_tracing(
+    // (CLI / デバッグ) は従来どおりコンソールへ出す。_log_guard は非ブロッキング writer の
+    // ワーカーを生かすため main 終了まで保持する (drop すると以降のログが失われる)。
+    let _log_guard = init_tracing(
         !needs_console && !cfg!(debug_assertions),
         args.log_level.as_deref(),
+    );
+
+    // ログ冒頭にバージョン/ビルド種別を残す (どのビルドで起きた事象かを後から特定するため)。
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        debug = cfg!(debug_assertions),
+        "aurora-host starting"
     );
 
     if args.install {
@@ -337,50 +345,24 @@ fn build_log_filter(level: Option<&str>) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into())
 }
 
-/// `tracing` を初期化する。`to_file` が真なら `%LOCALAPPDATA%\Aurora\host.log` へ書き、
-/// 開けない場合や偽のときはコンソール (stdout) へ出す。フィルタの優先順位は
-/// `--log-level` 引数 > `RUST_LOG` 環境変数 > 既定 (`aurora=info`)。
-#[cfg_attr(not(windows), allow(unused_variables))]
-fn init_tracing(to_file: bool, level: Option<&str>) {
-    let filter = build_log_filter(level);
-    #[cfg(windows)]
-    if to_file {
-        if let Some(file) = open_log_file() {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-            return;
-        }
-    }
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-/// ログ出力先ファイルを追記モードで開く。一定サイズを超えていたら作り直す (簡易
-/// ローテーション)。ディレクトリや環境変数が無ければ `None`。
-#[cfg(windows)]
-fn open_log_file() -> Option<std::fs::File> {
-    /// これを超えたら次回起動時に作り直す (約 5MiB)。
-    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    let mut dir = std::path::PathBuf::from(base);
-    dir.push("Aurora");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("host.log");
-
-    let too_big = std::fs::metadata(&path)
-        .map(|m| m.len() > MAX_LOG_BYTES)
-        .unwrap_or(false);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true);
-    if too_big {
-        opts.truncate(true);
-    } else {
-        opts.append(true);
-    }
-    opts.open(&path).ok()
+/// `tracing` を初期化する。`to_file` が真なら `%LOCALAPPDATA%\Aurora\logs\host.<日付>.log`
+/// へ日次ローテ (7 世代) + 非ブロッキングで書き、デバッグビルドや CLI 実行では加えて
+/// コンソール (stdout) にも出す。ファイル出力先が用意できない場合はコンソールへフォール
+/// バックする。フィルタの優先順位は `--log-level` 引数 > `RUST_LOG` 環境変数 > 既定
+/// (`aurora=info`)。戻り値のガードは main 終了まで保持すること。
+fn init_tracing(to_file: bool, level: Option<&str>) -> aurora_common::logging::LogGuard {
+    aurora_common::logging::init(aurora_common::logging::LogOptions {
+        file_stem: "host",
+        filter: build_log_filter(level),
+        dir: if to_file {
+            aurora_common::logging::default_log_dir()
+        } else {
+            None
+        },
+        // ファイル出力する常駐サーバでは stdout は不要 (コンソール無し)。CLI / デバッグは
+        // ファイル出力しない (= to_file=false) のでフォールバックで console に出る。
+        console: false,
+    })
 }
 
 /// CLI サブコマンドのためにコンソールを用意する。端末から起動された場合は親プロセスの
@@ -856,6 +838,9 @@ fn run_server(
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            // release(GUI) は stderr が無く既定フックの出力は捨てられるため、まずログファイルへ
+            // 残す (フィールドのクラッシュを後から調べられるように)。
+            tracing::error!(panic = %info, "host panicked");
             display::recover_takeover_if_any();
             default_hook(info);
         }));

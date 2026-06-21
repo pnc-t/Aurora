@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 snow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 arboard = { workspace = true }
 bitflags = "2.6"
 argon2 = { workspace = true }

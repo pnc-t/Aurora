@@ -31,18 +31,23 @@
 .nav-item:hover { background: var(--raised-faint); color: var(--fg); }
 .nav-item.active { background: var(--raised); color: var(--fg); }
 .sidebar-spacer { flex: 1; }
-.status-card {
-  display: flex; align-items: center; justify-content: center;
-  width: 44px; height: 44px; border-radius: 10px;
-  background: var(--raised-faint); border: 1px solid var(--panel-border);
-}
-.status-card .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-.status-card.connecting .dot { background: #d6a83a; }
-.status-card.connected .dot { background: var(--ok); }
-.status-card.error .dot { background: var(--danger); }
 
-/* コンテンツ領域 */
-.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 26px 22px; overflow: hidden; }
+/* 下端ステータスバー: ウィンドウ全幅の細い帯にドット + 状態テキストを出す
+ * (未接続=グレー / 接続中=琥珀 / 接続済=緑 / エラー=赤)。VS Code 下部のような形。 */
+.statusbar {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 26px; z-index: 56;
+  display: flex; align-items: center; gap: 8px; padding: 0 14px;
+  background: var(--sidebar); border-top: 1px solid var(--panel-border);
+  font-size: 12px; color: var(--muted);
+}
+.statusbar .sb-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.statusbar.connecting .sb-dot { background: #d6a83a; }
+.statusbar.connected .sb-dot { background: var(--ok); }
+.statusbar.error .sb-dot { background: var(--danger); }
+.statusbar.connected .sb-text { color: var(--fg); }
+
+/* コンテンツ領域 (下端は status bar 分だけ余白を足し、末尾要素が隠れないようにする) */
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 26px 36px; overflow: hidden; }
 .page { display: none; flex-direction: column; min-height: 0; flex: 1; }
 .page.active { display: flex; }
 .page-head { display: flex; align-items: center; margin-bottom: 16px; }
@@ -104,6 +109,15 @@
   color: var(--accent); font-size: 14px; flex-shrink: 0; opacity: 0.85;
 }
 .host-card .chevron { display: inline-flex; align-items: center; color: var(--muted); font-size: 20px; margin-left: 2px; }
+/* 接続中: 緑ピル + 切断 (danger) ボタン。 */
+.host-card.connected { border-color: color-mix(in srgb, var(--ok) 45%, var(--panel-border)); }
+.host-card .conn-pill {
+  display: inline-flex; align-items: center; flex-shrink: 0;
+  padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  color: var(--ok); background: color-mix(in srgb, var(--ok) 18%, transparent);
+}
+.host-card .card-btn.danger { color: var(--danger); }
+.host-card .card-btn.danger:hover { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
 /* 並べ替え (grip を掴んでドラッグ) */
 .host-card .grip {
   display: inline-flex; align-items: center; color: var(--grip);
@@ -146,6 +160,14 @@
   border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px; cursor: pointer;
 }
 .select-input:focus { outline: none; border-color: var(--accent); }
+/* 診断セクションのアクションボタン群 (ログフォルダを開く / ZIP 出力) */
+.s-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.btn-secondary {
+  background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 10px;
+  font-size: 14px; cursor: pointer;
+}
+.btn-secondary:hover { background: var(--menu-hover); border-color: var(--accent); }
 /* number 入力の上下スピナーを消す (port などは text+inputmode を使うが念のため) */
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }

@@ -9,6 +9,8 @@
 // recent_hosts.json (config.rs) には引き続き { label, host, port } のみ保持する。
 
 import {
+  connectedHosts,
+  disconnectHost,
   deleteRecentHost,
   deleteHostPassword,
   loadRecentHosts,
@@ -17,11 +19,15 @@ import {
   savedPasswordHosts,
   setRecentHosts,
   saveSettings,
+  openLogsFolder,
+  exportLogsZip,
   type ClientSettings,
   type HostEntry,
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
+import { logger } from "../core/log";
+import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { icon } from "./icons";
@@ -52,6 +58,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   default_port: DEFAULT_PORT,
   toolbar_pinned: false,
   toolbar_position: "top",
+  tab_position: "top",
   accent_color: "#3a82f7",
   theme: "dark",
   fps: 60,
@@ -98,9 +105,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
         <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
         <div class="sidebar-spacer"></div>
-        <div class="status-card" id="status-card" title="未接続">
-          <span class="dot"></span>
-        </div>
       </aside>
       <main class="content">
         <section class="page active" id="page-hosts">
@@ -193,6 +197,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
             </div>
+            <div class="setting-group">タブ</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">配置</div>
+                <div class="s-desc">接続先タブを画面のどの端に置くか。左右に置くと縦並びのサイドタブになる</div>
+              </div>
+              <select id="set-tab-position" class="select-input">
+                <option value="top">上</option>
+                <option value="bottom">下</option>
+                <option value="left">左</option>
+                <option value="right">右</option>
+              </select>
+            </div>
             <div class="setting-group">外観・既定値</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -220,16 +237,32 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <input type="text" inputmode="numeric" id="set-port" class="num-input" />
             </div>
+            <div class="setting-group">診断</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">ログ</div>
+                <div class="s-desc">不具合の調査用。フォルダを開くか、まとめて ZIP に書き出して共有できる</div>
+              </div>
+              <div class="s-actions">
+                <button class="btn-secondary" id="open-logs">フォルダを開く</button>
+                <button class="btn-secondary" id="export-logs">ZIP 出力</button>
+              </div>
+            </div>
           </div>
         </section>
       </main>
+      <footer class="statusbar" id="statusbar">
+        <span class="sb-dot"></span>
+        <span class="sb-text" id="statusbar-text">未接続</span>
+      </footer>
       <div id="card-menu" class="card-menu"></div>
       <div id="dialog-backdrop"></div>
     </div>
   `;
 
   const $ = <T extends HTMLElement>(sel: string) => opts.root.querySelector<T>(sel);
-  const statusCard = $("#status-card") as HTMLElement;
+  const statusBar = $("#statusbar") as HTMLElement;
+  const statusText = $("#statusbar-text") as HTMLElement;
   const hostList = $("#host-list") as HTMLElement;
   const backdrop = $("#dialog-backdrop") as HTMLElement;
   const cardMenu = $("#card-menu") as HTMLElement;
@@ -237,12 +270,17 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 鍵マーク表示・即接続・「忘れる」メニューの出し分けに使う。
   let savedSet = new Set<string>();
   const hasSaved = (host: string): boolean => savedSet.has(host.trim().toLowerCase());
+  // 現在接続中の host(小文字) 集合。`aurora://connections` イベント (Rust 発) で更新し、
+  // カードの「接続中」表示・切断ボタンの出し分けに使う。
+  let connectedSet = new Set<string>();
+  const isConnected = (host: string): boolean => connectedSet.has(host.trim().toLowerCase());
   const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
   const statsToggle = $<HTMLInputElement>("#set-stats");
   const captureToggle = $<HTMLInputElement>("#set-capture");
   const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
   const virtualToggle = $<HTMLInputElement>("#set-virtual");
   const tbPositionSelect = $<HTMLSelectElement>("#set-tb-position");
+  const tabPositionSelect = $<HTMLSelectElement>("#set-tab-position");
   const tbPinnedToggle = $<HTMLInputElement>("#set-tb-pinned");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
@@ -254,10 +292,22 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
 
+  // 診断: ログフォルダを開く / ログを ZIP 出力。
+  $("#open-logs")?.addEventListener("click", () => {
+    void openLogsFolder().catch((e) => logger.warn("open logs folder failed", e));
+  });
+  $("#export-logs")?.addEventListener("click", () => {
+    void exportLogsZip()
+      .then((path) => {
+        statusText.textContent = `ログを出力しました: ${path}`;
+      })
+      .catch((e) => logger.warn("export logs failed", e));
+  });
+
   let settings: ClientSettings = { ...DEFAULT_SETTINGS };
 
   function persist(): void {
-    void saveSettings(settings).catch(() => {});
+    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
   }
 
   // --- ページ切替 ---
@@ -324,7 +374,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       void (async () => {
         await deleteHostPassword(entry.host);
         await handle.refreshHosts();
-      })().catch(() => {});
+      })().catch((e) => logger.warn("forget host password failed", e));
     });
     cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
       closeCardMenu();
@@ -378,7 +428,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         await saveRecentHost({ label: label || host, host, port });
         closeDialog();
         await handle.refreshHosts();
-      })().catch(() => {});
+      })().catch((e) => logger.warn("save host failed", e));
     });
   }
 
@@ -413,16 +463,20 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         okBtn.textContent = "connecting…";
       }
       if (statusEl) statusEl.textContent = `connecting to ${entry.host}…`;
-      void opts.onConnect(entry, password, save).catch((err) => {
-        if (statusEl) {
-          statusEl.textContent = `error: ${String(err)}`;
-          statusEl.classList.add("error");
-        }
-        if (okBtn) {
-          okBtn.disabled = false;
-          okBtn.textContent = "connect";
-        }
-      });
+      void opts
+        .onConnect(entry, password, save)
+        // 解決 = capture ウィンドウが開いた。ランチャーは残るのでダイアログだけ閉じる。
+        .then(() => closeDialog())
+        .catch((err) => {
+          if (statusEl) {
+            statusEl.textContent = `error: ${String(err)}`;
+            statusEl.classList.add("error");
+          }
+          if (okBtn) {
+            okBtn.disabled = false;
+            okBtn.textContent = "connect";
+          }
+        });
     });
   }
 
@@ -438,7 +492,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     arr.splice(to, 0, moved);
     currentHosts = arr;
     renderHosts(arr);
-    void setRecentHosts(arr).catch(() => {});
+    void setRecentHosts(arr).catch((e) => logger.warn("reorder hosts failed", e));
   }
 
   /**
@@ -508,18 +562,25 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         const saved = hasSaved(h.host)
           ? `<span class="saved-badge" title="パスワード保存済み (押すと即接続)">${icon("key")}</span>`
           : "";
+        const connected = isConnected(h.host);
+        // 接続中: 緑ピル + 切断ボタン。並べ替えグリップは編集系ボタンと同列なので残す。
+        const connPill = connected ? `<span class="conn-pill">接続中</span>` : "";
+        const tailBtn = connected
+          ? `<button class="card-btn danger" data-act="disconnect" title="切断">${icon("power")}</button>`
+          : `<span class="chevron">${icon("chevron")}</span>`;
         return `
-          <div class="host-card" data-idx="${i}">
+          <div class="host-card${connected ? " connected" : ""}" data-idx="${i}">
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
             <div class="avatar" style="background:${avatarColor(name)}">${initial}</div>
             <div class="meta">
               <div class="label">${escapeHtml(name)}</div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
             </div>
+            ${connPill}
             ${saved}
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
-            <span class="chevron">${icon("chevron")}</span>
+            ${tailBtn}
           </div>`;
       })
       .join("");
@@ -538,16 +599,30 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         } else if (act === "menu") {
           e.stopPropagation();
           openCardMenu(actEl as HTMLElement, hosts[idx]);
+        } else if (act === "disconnect") {
+          e.stopPropagation();
+          const host = hosts[idx].host;
+          // 該当 host のタブを持つ開いている capture ウィンドウへ切断を依頼する (UI のタブ除去)。
+          void emit("aurora://disconnect-host", { host });
+          // さらに Rust 側で host 単位に直接停止する。接続中にウィンドウを閉じた等で
+          // 残った「窓の無い孤児セッション」(emit が届かず host を占有し続ける) も確実に切る。
+          void disconnectHost(host);
         } else if (hasSaved(hosts[idx].host)) {
           // パスワード保存済み: ダイアログを出さず即接続 (平文はフロントに載らない)。
           // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
           const entry = hosts[idx];
           handle.setConnecting(true);
           // 保存済み即接続: password=null (Rust が DPAPI 復号)。再保存は不要なので save=false。
-          void opts.onConnect(entry, null, false).catch(() => {
-            handle.setConnState("", "idle");
-            openConnectDialog(entry);
-          });
+          void opts
+            .onConnect(entry, null, false)
+            // capture ウィンドウが開いたら一時的な connecting 表示を解き、実際の接続中集計へ戻す
+            // (接続成立は別窓側で起き、`aurora://connections` 経由でドットが緑になる)。
+            .then(() => updateStatusBar())
+            .catch((e) => {
+              logger.warn("open capture window failed", e);
+              updateStatusBar();
+              openConnectDialog(entry);
+            });
         } else {
           openConnectDialog(hosts[idx]);
         }
@@ -588,6 +663,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   });
   tbPositionSelect?.addEventListener("change", () => {
     settings = { ...settings, toolbar_position: tbPositionSelect.value as ToolbarPosition };
+    persist();
+  });
+  tabPositionSelect?.addEventListener("change", () => {
+    settings = { ...settings, tab_position: tabPositionSelect.value as ToolbarPosition };
     persist();
   });
   tbPinnedToggle?.addEventListener("change", () => {
@@ -638,6 +717,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     persist();
   });
 
+  // 下端ステータスバーを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
+  // 窓側で起きるため、launcher は `aurora://connections` の集計 (connectedSet) だけを映す。
+  function updateStatusBar(): void {
+    const n = connectedSet.size;
+    handle.setConnState(n > 0 ? `接続中 ${n} 件` : "未接続", n > 0 ? "connected" : "idle");
+  }
+
   const handle: LauncherHandle = {
     show(): void {
       opts.root.classList.remove("hidden");
@@ -647,13 +733,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       closeDialog();
     },
     setConnecting(connecting: boolean): void {
-      if (connecting) handle.setConnState("connecting…", "connecting");
+      if (connecting) handle.setConnState("接続中…", "connecting");
     },
     setConnState(text: string, kind: ConnState = "idle"): void {
-      // アイコンのみのサイドバーなので状態文はドットの title (ホバー) に出す。
-      statusCard.title = text;
-      statusCard.classList.remove("connecting", "connected", "error");
-      if (kind !== "idle") statusCard.classList.add(kind);
+      // 下端ステータスバーにドット色 + テキストで状態を出す。
+      statusText.textContent = text;
+      statusBar.classList.remove("connecting", "connected", "error");
+      if (kind !== "idle") statusBar.classList.add(kind);
     },
     async refreshHosts(): Promise<void> {
       try {
@@ -663,7 +749,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         } catch {
           savedSet = new Set();
         }
+        // 接続中表示・切断ボタンの判定用に、接続中 host 集合も更新する。
+        try {
+          connectedSet = new Set((await connectedHosts()).map((h) => h.trim().toLowerCase()));
+        } catch {
+          connectedSet = new Set();
+        }
         renderHosts(await loadRecentHosts());
+        updateStatusBar();
       } catch {
         // 履歴は補助機能。失敗しても致命的ではない。
       }
@@ -686,6 +779,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
     if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
     if (tbPositionSelect) tbPositionSelect.value = settings.toolbar_position;
+    if (tabPositionSelect) tabPositionSelect.value = settings.tab_position;
     if (tbPinnedToggle) tbPinnedToggle.checked = settings.toolbar_pinned;
     if (accentInput) accentInput.value = settings.accent_color;
     if (themeSelect) themeSelect.value = settings.theme;
@@ -696,6 +790,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     applyTheme(settings.theme, settings.accent_color);
   })();
   void handle.refreshHosts();
+
+  // 接続中 host の変化 (capture ウィンドウでの接続/切断/ウィンドウ破棄) を購読し、
+  // 接続中表示・切断ボタン・保存バッジ (接続成功で新規保存された分) を更新する。
+  void listen<string[]>("aurora://connections", (e) => {
+    connectedSet = new Set(e.payload.map((h) => h.trim().toLowerCase()));
+    // 保存バッジ (新規保存) の反映も兼ねて履歴ごと再描画する。
+    void handle.refreshHosts();
+  });
 
   return handle;
 }

@@ -71,6 +71,10 @@ pub struct ClientSettings {
     /// left/right ではピルが縦並びのサイドバーになる。CSS の位置クラスへ渡す。
     #[serde(default = "default_toolbar_position")]
     pub toolbar_position: String,
+    /// タブストリップの配置 ("top" | "bottom" | "left" | "right")。
+    /// left/right では縦並びのサイドタブになる。CSS の位置クラスへ渡す。
+    #[serde(default = "default_toolbar_position")]
+    pub tab_position: String,
     /// UI のアクセント色 (CSS 色)。
     #[serde(default = "default_accent")]
     pub accent_color: String,
@@ -113,6 +117,7 @@ impl Default for ClientSettings {
             default_port: DEFAULT_PORT,
             toolbar_pinned: false,
             toolbar_position: default_toolbar_position(),
+            tab_position: default_toolbar_position(),
             accent_color: default_accent(),
             theme: default_theme(),
             fps: default_fps(),

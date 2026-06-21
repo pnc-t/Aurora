@@ -4,7 +4,7 @@
 
 import "./toast.css";
 
-type ToastLevel = "info" | "success" | "error";
+export type ToastKind = "info" | "success" | "error";
 
 let container: HTMLElement | null = null;
 
@@ -12,7 +12,7 @@ export function initToast(root: HTMLElement): void {
   container = root;
 }
 
-export function showToast(message: string, level: ToastLevel = "info", durationMs = 4000): void {
+export function showToast(message: string, level: ToastKind = "info", durationMs = 4000): void {
   if (!container) return;
   const el = document.createElement("div");
   el.className = `toast ${level}`;

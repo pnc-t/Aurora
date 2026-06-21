@@ -7,20 +7,9 @@
     <!-- スタイルは TS 側で import する: 共通土台は styles/base.css、各 UI は ui/<component>.css。 -->
   </head>
   <body>
-    <!-- 最背面: リモート映像 -->
-    <div id="screen-wrap">
-      <canvas id="screen" tabindex="0" width="1920" height="1080"></canvas>
-    </div>
-
-    <!-- 接続中のオーバーレイ UI (TS が中身を構築) -->
-    <div id="topbar"></div>
-    <div id="stats-hud"></div>
-    <div id="file-panel"></div>
-    <div id="toast-container"></div>
-
-    <!-- 未接続時の中央カード (TS が中身を構築) -->
+    <!-- ランチャー (未接続) 専用ウィンドウ。接続すると別の capture ウィンドウが開く。 -->
     <div id="connect-overlay"></div>
 
-    <script type="module" src="./main.ts"></script>
+    <script type="module" src="./launcher-main.ts"></script>
   </body>
 </html>
