@@ -24,7 +24,7 @@ use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
 use bincode::Options;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{Emitter, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
@@ -699,7 +699,18 @@ pub async fn connect_to_host(
         share_root,
         window_label: window.label().to_string(),
     };
-    state.inner.lock().await.insert(session_id.clone(), handle);
+    {
+        let mut guard = state.inner.lock().await;
+        // 所有ウィンドウがハンドシェイク中に閉じられていたら、孤児セッション (どの窓からも
+        // 停止できず単一クライアントの host を占有し続け、以降の接続を全て塞ぐ) を作らず即停止
+        // する。ウィンドウ破棄ハンドラと inner ロックで直列化し取りこぼしを防ぐ。
+        if app.get_webview_window(&handle.window_label).is_none() {
+            drop(guard);
+            handle.shutdown();
+            return Err("ウィンドウが閉じられました".to_string());
+        }
+        guard.insert(session_id.clone(), handle);
+    }
 
     // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
     // 受けて即 selectDisplay/setClientViewport を呼んでも ctrl_tx に確実に届く。
@@ -727,6 +738,34 @@ pub async fn disconnect(
         }
     }
     // ランチャーへ接続中 host 一覧を通知 (切断表示・接続中バッジ除去)。
+    emit_connections(&app, &state).await;
+    Ok(())
+}
+
+/// 指定 host の全セッションを停止する (ランチャーの切断ボタン)。session_id ではなく host で
+/// 引くため、ウィンドウが既に閉じた後に残った孤児セッション (接続成立中にウィンドウを閉じる等)
+/// もここで確実に止められる。capture ウィンドウの JS 経由 (`aurora://disconnect-host`) では
+/// 窓が無い孤児に届かないため、Rust 側で直接掃く経路を用意する。
+#[tauri::command]
+pub async fn disconnect_host(
+    app: tauri::AppHandle,
+    host: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let target = host.trim().to_lowercase();
+    {
+        let mut guard = state.inner.lock().await;
+        let ids: Vec<String> = guard
+            .iter()
+            .filter(|(_, h)| h.host.trim().to_lowercase() == target)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(h) = guard.remove(&id) {
+                h.shutdown();
+            }
+        }
+    }
     emit_connections(&app, &state).await;
     Ok(())
 }

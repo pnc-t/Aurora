@@ -58,6 +58,7 @@ function getSettings(): ClientSettings {
       default_port: 7000,
       toolbar_pinned: false,
       toolbar_position: "top",
+      tab_position: "top",
       accent_color: "#3a82f7",
       theme: "dark",
       fps: 60,
@@ -188,6 +189,8 @@ function setFilePanel(visible: boolean): void {
 async function doToggleFullscreen(): Promise<void> {
   const on = await toggleFullscreen();
   toolbar.setFullscreenToggled(on);
+  // フルスクリーン中はタブストリップを自動格納する (上端の黒帯を消し、映像を端まで届かせる)。
+  tabs.setFullscreen(on);
   // フルスクリーンを抜けると Tauri がウィンドウを作成時状態へ戻すため、接続中はリサイズ可を再適用。
   if (!on && active()?.isConnected) void setResizable(true);
   showToast(on ? "fullscreen on" : "fullscreen off");
@@ -241,6 +244,18 @@ async function splitTab(id: string, screenX: number, screenY: number): Promise<v
 function openAddTab(): void {
   openConnectPicker(pickerBackdrop, {
     onConnect: async (entry: HostEntry, password: string | null, save: boolean) => {
+      // host は単一クライアントモデル。同じ host へ二重接続するとホストが先客を掴んだまま
+      // ハンドシェイクが進まず固まる (窓を閉じると孤児セッション化して host を塞ぐ)。
+      // 既に同 host のタブがあればそれへ切替えて新規接続は張らない。
+      const target = entry.host.trim().toLowerCase();
+      const existing = [...sessions.values()].find(
+        (s) => s.entry.host.trim().toLowerCase() === target,
+      );
+      if (existing) {
+        setActive(existing.id);
+        showToast(`${entry.host} は既にこのウィンドウで接続中です`);
+        return;
+      }
       // session_id 発番 + password を staging へ積む (窓は作らない)。
       const id = await stageSession(password);
       await addSession(id, entry, save, /*activate=*/ true);
@@ -384,6 +399,8 @@ void (async () => {
   } catch {
     settings = null; // getSettings() の既定にフォールバック
   }
+  // タブストリップの配置 (上下左右) を設定から適用する (窓単位・全タブ共有)。
+  tabs.setPosition(getSettings().tab_position);
   if (adoptId) {
     await adoptInitial(adoptId);
     return;

@@ -59,6 +59,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             net::connect_to_host,
             net::disconnect,
+            net::disconnect_host,
             net::open_capture_window,
             net::stage_session,
             net::open_session_window,

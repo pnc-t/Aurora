@@ -132,6 +132,12 @@ export async function disconnect(sessionId: string): Promise<void> {
   await invoke("disconnect", { sessionId });
 }
 
+/// 指定 host の全セッションを Rust 側で停止する (ランチャーの切断ボタン)。窓が閉じた後に
+/// 残った孤児セッションも host 名で確実に止められる (`aurora://disconnect-host` の補完)。
+export async function disconnectHost(host: string): Promise<void> {
+  await invoke("disconnect_host", { host });
+}
+
 export async function sendInput(sessionId: string, event: InputEvent): Promise<void> {
   await invoke("send_input", { sessionId, event });
 }
@@ -216,6 +222,7 @@ export type ClientSettings = {
   default_port: number;
   toolbar_pinned: boolean;
   toolbar_position: ToolbarPosition;
+  tab_position: ToolbarPosition;
   accent_color: string;
   theme: ThemeId;
   fps: number;

@@ -10,6 +10,7 @@
 
 import {
   connectedHosts,
+  disconnectHost,
   deleteRecentHost,
   deleteHostPassword,
   loadRecentHosts,
@@ -54,6 +55,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   default_port: DEFAULT_PORT,
   toolbar_pinned: false,
   toolbar_position: "top",
+  tab_position: "top",
   accent_color: "#3a82f7",
   theme: "dark",
   fps: 60,
@@ -195,6 +197,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
             </div>
+            <div class="setting-group">タブ</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">配置</div>
+                <div class="s-desc">接続先タブを画面のどの端に置くか。左右に置くと縦並びのサイドタブになる</div>
+              </div>
+              <select id="set-tab-position" class="select-input">
+                <option value="top">上</option>
+                <option value="bottom">下</option>
+                <option value="left">左</option>
+                <option value="right">右</option>
+              </select>
+            </div>
             <div class="setting-group">外観・既定値</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -249,6 +264,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
   const virtualToggle = $<HTMLInputElement>("#set-virtual");
   const tbPositionSelect = $<HTMLSelectElement>("#set-tb-position");
+  const tabPositionSelect = $<HTMLSelectElement>("#set-tab-position");
   const tbPinnedToggle = $<HTMLInputElement>("#set-tb-pinned");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
@@ -557,8 +573,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           openCardMenu(actEl as HTMLElement, hosts[idx]);
         } else if (act === "disconnect") {
           e.stopPropagation();
-          // 該当 host のタブを持つ capture ウィンドウへ切断を依頼する (全ウィンドウへ broadcast)。
-          void emit("aurora://disconnect-host", { host: hosts[idx].host });
+          const host = hosts[idx].host;
+          // 該当 host のタブを持つ開いている capture ウィンドウへ切断を依頼する (UI のタブ除去)。
+          void emit("aurora://disconnect-host", { host });
+          // さらに Rust 側で host 単位に直接停止する。接続中にウィンドウを閉じた等で
+          // 残った「窓の無い孤児セッション」(emit が届かず host を占有し続ける) も確実に切る。
+          void disconnectHost(host);
         } else if (hasSaved(hosts[idx].host)) {
           // パスワード保存済み: ダイアログを出さず即接続 (平文はフロントに載らない)。
           // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
@@ -613,6 +633,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   });
   tbPositionSelect?.addEventListener("change", () => {
     settings = { ...settings, toolbar_position: tbPositionSelect.value as ToolbarPosition };
+    persist();
+  });
+  tabPositionSelect?.addEventListener("change", () => {
+    settings = { ...settings, tab_position: tabPositionSelect.value as ToolbarPosition };
     persist();
   });
   tbPinnedToggle?.addEventListener("change", () => {
@@ -717,6 +741,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
     if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
     if (tbPositionSelect) tbPositionSelect.value = settings.toolbar_position;
+    if (tabPositionSelect) tabPositionSelect.value = settings.tab_position;
     if (tbPinnedToggle) tbPinnedToggle.checked = settings.toolbar_pinned;
     if (accentInput) accentInput.value = settings.accent_color;
     if (themeSelect) themeSelect.value = settings.theme;
