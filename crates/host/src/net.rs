@@ -17,7 +17,7 @@ use aurora_common::proto::{ControlMsg, Display, InputEvent, MouseButton};
 use bincode::Options;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
 
 use crate::audio::EncodedAudio;
@@ -415,111 +415,73 @@ async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_server(
-    cfg: ServerConfig,
-    mut nal_rx: mpsc::Receiver<EncodedNal>,
-    mut audio_rx: mpsc::Receiver<EncodedAudio>,
-    enc_tx: mpsc::Sender<EncoderCommand>,
-    input_tx: mpsc::Sender<InputCmd>,
-    cap_select_tx: std::sync::mpsc::Sender<String>,
-    fps_tx: std::sync::mpsc::Sender<u32>,
-    scale_tx: std::sync::mpsc::Sender<u32>,
-    clip_apply_tx: mpsc::UnboundedSender<String>,
-    mut clip_change_rx: mpsc::UnboundedReceiver<String>,
-) -> Result<()> {
-    // 認証失敗スロットル (送信元 IP 単位の指数バックオフ)。accept ループ全体で 1 つ持ち、
-    // セッションをまたいで失敗履歴を保つ。tray 表示用カウンタは cfg から共有する。
-    let throttle = AuthThrottle::new(cfg.auth_failures.clone());
+/// 同時接続できるクライアントの上限。共有 capture/encode を N 人へファンアウトするため、
+/// 帯域/CPU の暴走と接続枠 DoS を抑えるよう少数に固定する。超過接続は受理直後に丁寧に閉じる。
+const MAX_CLIENTS: usize = 4;
 
-    // 外側ループ: 現在のポートで TCP/UDP を bind する。tray でポートが変わると reload 通知で
-    // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
-    loop {
-        let port = cfg.port.load(Ordering::Relaxed);
-        let addr = SocketAddr::new(cfg.bind_ip, port);
-        let (tcp, udp) = bind_listeners(addr).await?;
-        tracing::info!(tcp = %addr, udp = %addr, "host listening");
+/// 映像 broadcast のリング容量。遅いクライアントが溢れたら Lagged で検知してキーフレーム要求で
+/// 復帰する (フレームは Arc 共有なのでバッファ自体は安価)。fan-out の drain 速度差を吸収できる
+/// 程度に取る。
+const VIDEO_RING: usize = 64;
+/// 音声 broadcast のリング容量。
+const AUDIO_RING: usize = 128;
 
-        // 内側ループ: 接続受理。reload が来たら break して外側で貼り直す。ポート変更は接続中
-        // には tray 側で拒否されるため、reload はセッション間 (idle) でのみ届く。
-        loop {
-            let (stream, peer) = tokio::select! {
-                accepted = tcp.accept() => accepted?,
-                _ = cfg.reload.notified() => {
-                    tracing::info!(new_port = cfg.port.load(Ordering::Relaxed), "port change requested; rebinding");
-                    break;
-                }
-            };
-            // 接続ごとに連番の conn_id を採番し、この接続に関する全ログへ span で付ける。
-            // クライアント側ログ (session_id) と peer/時刻で突き合わせて 1 接続を追跡できる。
-            let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
-            let span = tracing::info_span!("conn", id = conn_id, peer = %peer);
-            // 接続処理本体を span 配下で実行する (内部の handshake/session ログも id を継承)。
-            async {
-                tracing::info!("TCP client connected");
-                // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
-                // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
-                // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
-                let _active = crate::conn::ActiveGuard::new();
-                // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
-                let psk = *cfg.psk.lock().expect("psk mutex poisoned");
-                let displays = cfg.displays.clone();
-                let audio = cfg.audio;
-                let max_bitrate_bps = cfg.max_bitrate_bps;
-                let udp = udp.clone();
-                let enc_tx2 = enc_tx.clone();
-                let input_tx2 = input_tx.clone();
-                let cap_select_tx2 = cap_select_tx.clone();
-                let fps_tx2 = fps_tx.clone();
-                let scale_tx2 = scale_tx.clone();
-                let clip_apply_tx2 = clip_apply_tx.clone();
-                // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
-                // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
-                let nal_rx_ref = &mut nal_rx;
-                let audio_rx_ref = &mut audio_rx;
-                let clip_change_rx_ref = &mut clip_change_rx;
-                match handle_client(
-                    stream,
-                    peer,
-                    psk,
-                    displays,
-                    audio,
-                    udp,
-                    enc_tx2,
-                    input_tx2,
-                    cap_select_tx2,
-                    fps_tx2,
-                    scale_tx2,
-                    clip_apply_tx2,
-                    nal_rx_ref,
-                    audio_rx_ref,
-                    clip_change_rx_ref,
-                    max_bitrate_bps,
-                    &throttle,
-                    &cfg.devices,
-                )
-                .await
-                {
-                    Ok(()) => tracing::info!("client disconnected"),
-                    Err(e) => tracing::warn!(error = %e, "client session ended"),
-                }
-            }
-            .instrument(span)
-            .await;
+/// host→各クライアントへ制御メッセージを push するための登録簿。値は各 [`handle_client`] の
+/// 制御送出口 (out_tx) の clone。DisplayResized やクリップボード変化を全クライアントへ配る。
+/// std Mutex なので await を跨がず try_send で配る (映像ホットパスとは無関係)。
+type Registry = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<ControlMsg>>>>;
+
+/// 全クライアントへ制御メッセージを配信する (登録簿経由)。各クライアントの out_rx ループが
+/// 自分の Noise セッションで暗号化して TCP へ書く。満杯/切断のクライアントは取りこぼすが、
+/// 対象は低頻度の制御メッセージ (DisplayResized / Clipboard) なので許容する。
+fn broadcast_ctrl(registry: &Registry, msg: &ControlMsg) {
+    let Ok(map) = registry.lock() else { return };
+    for (id, tx) in map.iter() {
+        if let Err(e) = tx.try_send(msg.clone()) {
+            tracing::warn!(conn_id = id, error = %e, "drop control msg to client (queue full/closed)");
         }
     }
 }
 
-/// 合成した仮想ディスプレイ (デスクトップ非アタッチで DXGI に出ないもの) に付ける id。
-/// 実 DXGI 出力 index (0..) とは衝突しない番兵。テイクオーバー成立時に実 index へ差し替える。
-const VIRTUAL_SENTINEL_ID: u32 = u32::MAX;
+/// 複数クライアントで共有する制御状態 (共有ミラー)。ディスプレイ・トポロジ、単一エンコーダの
+/// ビットレート適応、各クライアントの直近 stats を 1 つにまとめ、tokio Mutex で直列化する。
+/// 制御操作 (ディスプレイ切替・解像度・stats) は低頻度なので、ロックを await を跨いで保持しても
+/// 映像/入力のホットパス (このロックを取らない) には影響しない。
+struct SharedControl {
+    /// 提示する全ディスプレイ。テイクオーバーで displays[active_idx] の name/座標/解像度が変わる。
+    displays: Vec<DisplayInfo>,
+    /// 現在キャプチャ中の displays 内 index。
+    active_idx: usize,
+    /// 仮想ディスプレイのテイクオーバー実施中か (物理オフ+仮想 primary)。最後の 1 本切断で復元する。
+    taken_over: bool,
+    /// 検出済み仮想ディスプレイの GDI 名 (テイクオーバー判定 / is_virtual 表示)。無ければ None。
+    vdd_gdi_name: Option<String>,
+    /// 単一エンコーダのビットレート適応制御。全クライアントで共有し、最悪リンクに合わせる。
+    bitrate: BitrateController,
+    /// クライアント毎の直近 stats (loss_permille, rtt_us)。最悪値集約に使う。
+    client_stats: HashMap<u64, (u16, u32)>,
+    /// ProjFS ドライブを所有する接続 (固定パスのため 1 本のみ mount 可)。None なら未所有。
+    projfs_owner: Option<u64>,
+    /// 確立済み (UDP hello 完了) のクライアント数。0 へ落ちた最後の 1 本がテイクオーバー等の
+    /// グローバルな後始末を担う。
+    active_conns: usize,
+}
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_client(
-    mut stream: TcpStream,
+impl SharedControl {
+    /// 全クライアントの最悪リンク (max loss, max rtt) を集約して返す。単一エンコーダは一番
+    /// 苦しいクライアントに合わせる必要があるため、ロス/RTT とも最大値を採る。
+    fn worst_link(&self) -> (u16, u32) {
+        self.client_stats
+            .values()
+            .fold((0u16, 0u32), |(l, r), &(cl, cr)| (l.max(cl), r.max(cr)))
+    }
+}
+
+/// 1 接続を処理する [`handle_client`] へ渡す依存一式。引数爆発を避けてまとめる。
+/// broadcast 送信元・共有制御状態・登録簿は全接続で共有 (Arc/clone)。
+struct ClientArgs {
     peer: SocketAddr,
     psk: [u8; 32],
-    mut displays: Vec<DisplayInfo>,
     audio: bool,
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
@@ -528,13 +490,231 @@ async fn handle_client(
     fps_tx: std::sync::mpsc::Sender<u32>,
     scale_tx: std::sync::mpsc::Sender<u32>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
-    nal_rx: &mut mpsc::Receiver<EncodedNal>,
-    audio_rx: &mut mpsc::Receiver<EncodedAudio>,
-    clip_change_rx: &mut mpsc::UnboundedReceiver<String>,
-    max_bitrate_bps: u32,
-    throttle: &AuthThrottle,
-    devices: &Arc<crate::devices::DeviceGuard>,
+    /// 映像/音声 broadcast の送信元。接続確立後に subscribe して自鍵で暗号化し UDP へ送る。
+    nal_btx: broadcast::Sender<Arc<EncodedNal>>,
+    audio_btx: broadcast::Sender<Arc<EncodedAudio>>,
+    throttle: Arc<AuthThrottle>,
+    devices: Arc<crate::devices::DeviceGuard>,
+    shared: Arc<tokio::sync::Mutex<SharedControl>>,
+    registry: Registry,
+    conn_id: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server(
+    cfg: ServerConfig,
+    nal_rx: mpsc::Receiver<EncodedNal>,
+    audio_rx: mpsc::Receiver<EncodedAudio>,
+    enc_tx: mpsc::Sender<EncoderCommand>,
+    input_tx: mpsc::Sender<InputCmd>,
+    cap_select_tx: std::sync::mpsc::Sender<String>,
+    fps_tx: std::sync::mpsc::Sender<u32>,
+    scale_tx: std::sync::mpsc::Sender<u32>,
+    clip_apply_tx: mpsc::UnboundedSender<String>,
+    clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
+    // 認証失敗スロットル (送信元 IP 単位の指数バックオフ)。全接続で 1 つ共有し、セッションを
+    // またいで失敗履歴を保つ。tray 表示用カウンタは cfg から共有する。
+    let throttle = Arc::new(AuthThrottle::new(cfg.auth_failures.clone()));
+
+    // --- 映像/音声ファンアウト ---
+    // 単一所有の mpsc を専用フォワーダ task が drain し、Arc で包んで broadcast へ流す。各
+    // クライアントは subscribe し、生 NAL を自分の Noise 鍵・seq で暗号化して自分の UDP へ送る
+    // (生 NAL のみ共有、暗号化はクライアント毎)。フォワーダ/共有状態は rebind をまたいで生きる
+    // ため、bind ループの外で 1 度だけ起動する。
+    let (nal_btx, _) = broadcast::channel::<Arc<EncodedNal>>(VIDEO_RING);
+    let (audio_btx, _) = broadcast::channel::<Arc<EncodedAudio>>(AUDIO_RING);
+    {
+        let nal_btx = nal_btx.clone();
+        let mut nal_rx = nal_rx;
+        tokio::spawn(async move {
+            loop {
+                // 受信者ゼロ (全員切断 = idle) の間は **drain しない**。NAL チャネルを満杯のまま
+                // 残すことで encode→capture が backpressure で停止し、待機中の CPU/GPU を抑える
+                // (常時 drain すると idle でもエンコードし続けてしまう)。クライアントが subscribe
+                // したら次の周回で drain を再開する。
+                if nal_btx.receiver_count() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                match nal_rx.recv().await {
+                    Some(nal) => {
+                        let _ = nal_btx.send(Arc::new(nal));
+                    }
+                    None => break, // encode 側終了
+                }
+            }
+        });
+    }
+    {
+        let audio_btx = audio_btx.clone();
+        let mut audio_rx = audio_rx;
+        tokio::spawn(async move {
+            loop {
+                if audio_btx.receiver_count() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                match audio_rx.recv().await {
+                    Some(au) => {
+                        let _ = audio_btx.send(Arc::new(au));
+                    }
+                    None => break,
+                }
+            }
+        });
+    }
+
+    // --- 共有制御状態 ---
+    // 仮想ディスプレイ (MttVDD) が検出されたら、未接続時はデスクトップ未アタッチで DXGI に
+    // 出ないため、合成エントリ (番兵 id) を 1 度だけ足してクライアントが選べるようにする。
+    let mut displays = cfg.displays.clone();
+    let vdd_gdi_name = crate::virtualdisplay::detect().map(|v| {
+        if !displays.iter().any(|d| d.name == v.gdi_name) {
+            displays.push(DisplayInfo {
+                id: VIRTUAL_SENTINEL_ID,
+                name: v.gdi_name.clone(),
+                width: v.width,
+                height: v.height,
+                x: 0,
+                y: 0,
+            });
+        }
+        v.gdi_name
+    });
+    tracing::info!(
+        vdd = vdd_gdi_name.as_deref().unwrap_or("(none)"),
+        names = ?displays.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        "virtual display detection (shared topology)"
+    );
+    let shared = Arc::new(tokio::sync::Mutex::new(SharedControl {
+        displays,
+        active_idx: 0,
+        taken_over: false,
+        vdd_gdi_name,
+        bitrate: BitrateController::new(cfg.max_bitrate_bps),
+        client_stats: HashMap::new(),
+        projfs_owner: None,
+        active_conns: 0,
+    }));
+
+    // host→全クライアント push 用の登録簿。
+    let registry: Registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // ローカルのクリップボード変化を全クライアントへ配信するフォワーダ。
+    {
+        let registry = registry.clone();
+        let mut clip_change_rx = clip_change_rx;
+        tokio::spawn(async move {
+            while let Some(text) = clip_change_rx.recv().await {
+                broadcast_ctrl(&registry, &ControlMsg::Clipboard { text });
+            }
+        });
+    }
+
+    // 同時接続数を MAX_CLIENTS に制限するセマフォ。permit を各 task が握り、切断で解放する。
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+
+    // 外側ループ: 現在のポートで TCP/UDP を bind する。tray でポートが変わると reload 通知で
+    // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
+    loop {
+        let port = cfg.port.load(Ordering::Relaxed);
+        let addr = SocketAddr::new(cfg.bind_ip, port);
+        let (tcp, udp) = bind_listeners(addr).await?;
+        tracing::info!(tcp = %addr, udp = %addr, max_clients = MAX_CLIENTS, "host listening");
+
+        // 内側ループ: 接続受理。reload が来たら break して外側で貼り直す。ポート変更は接続中
+        // (= 接続数 ≥ 1) には tray 側で拒否されるため、reload はセッション間 (idle) でのみ届く。
+        loop {
+            let (stream, peer) = tokio::select! {
+                accepted = tcp.accept() => accepted?,
+                _ = cfg.reload.notified() => {
+                    tracing::info!(new_port = cfg.port.load(Ordering::Relaxed), "port change requested; rebinding");
+                    break;
+                }
+            };
+            // 接続上限。超過は受理直後に丁寧に閉じる (ハンドシェイク前)。permit は task の寿命と
+            // ともに保持し、切断で解放される。
+            let permit = match sem.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(%peer, max_clients = MAX_CLIENTS, "client limit reached; rejecting connection");
+                    drop(stream);
+                    continue;
+                }
+            };
+            // 接続ごとに連番の conn_id を採番し、この接続に関する全ログへ span で付ける。
+            // クライアント側ログ (session_id) と peer/時刻で突き合わせて 1 接続を追跡できる。
+            let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+            let span = tracing::info_span!("conn", id = conn_id, peer = %peer);
+            // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
+            let psk = *cfg.psk.lock().expect("psk mutex poisoned");
+            let args = ClientArgs {
+                peer,
+                psk,
+                audio: cfg.audio,
+                udp: udp.clone(),
+                enc_tx: enc_tx.clone(),
+                input_tx: input_tx.clone(),
+                cap_select_tx: cap_select_tx.clone(),
+                fps_tx: fps_tx.clone(),
+                scale_tx: scale_tx.clone(),
+                clip_apply_tx: clip_apply_tx.clone(),
+                nal_btx: nal_btx.clone(),
+                audio_btx: audio_btx.clone(),
+                throttle: throttle.clone(),
+                devices: cfg.devices.clone(),
+                shared: shared.clone(),
+                registry: registry.clone(),
+                conn_id,
+            };
+            // 各接続を独立 task で処理する (await で占有しない = 複数クライアント同時)。
+            tokio::spawn(
+                async move {
+                    // permit を task 寿命まで保持 (drop で接続枠を解放)。
+                    let _permit = permit;
+                    tracing::info!("TCP client connected");
+                    match handle_client(stream, args).await {
+                        Ok(()) => tracing::info!("client disconnected"),
+                        Err(e) => tracing::warn!(error = %e, "client session ended"),
+                    }
+                }
+                .instrument(span),
+            );
+        }
+    }
+}
+
+/// 合成した仮想ディスプレイ (デスクトップ非アタッチで DXGI に出ないもの) に付ける id。
+/// 実 DXGI 出力 index (0..) とは衝突しない番兵。テイクオーバー成立時に実 index へ差し替える。
+const VIRTUAL_SENTINEL_ID: u32 = u32::MAX;
+
+async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
+    let ClientArgs {
+        peer,
+        psk,
+        audio,
+        udp,
+        enc_tx,
+        input_tx,
+        cap_select_tx,
+        fps_tx,
+        scale_tx,
+        clip_apply_tx,
+        nal_btx,
+        audio_btx,
+        throttle,
+        devices,
+        shared,
+        registry,
+        conn_id,
+    } = args;
+    // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
+    // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop) で
+    // 当該ハンドルが閉じる。名前付きイベントは「ハンドルが 1 つでも開いていれば生存」する
+    // ため、各接続が各々ガードを持つだけで「接続数 ≥ 1 の間 is_active=true」が成立する。
+    let _active = crate::conn::ActiveGuard::new();
+
     // Noise XX-PSK レスポンダ。host 自身の静的鍵は使い捨て (None) でよい。デバイス識別は
     // 相手 (クライアント) の永続公開鍵 = remote_static で行う。
     let mut hs = HandshakeState::new_responder(&psk, None)?;
@@ -633,57 +813,31 @@ async fn handle_client(
     let mut tcp_tx_nonce: u64 = 0;
     let mut tcp_rx_nonce: u64 = 0;
 
-    // HostInfo を即時送信 (全ディスプレイを提示)。仮想ディスプレイ (MttVDD) があれば、その
-    // GDI 名と一致する Display に is_virtual を立て、クライアントが「仮想ディスプレイを使う」
-    // 設定のとき自動選択できるようにする。
+    // HostInfo を即時送信 (このクライアントへ全ディスプレイを提示)。トポロジは共有 (SharedControl)
+    // で、capture が追従する単一の active_idx を全クライアントで共有する (共有ミラー)。
     //
     // **セキュリティゲート**: 仮想ディスプレイ (RDP 風テイクオーバー = 物理を暗転させる特権操作) は
-    // **ホストに登録済み (許可リスト) の端末だけ**に許可する。未登録端末には detect() を None 扱いに
-    // し、仮想を一切提示しない (is_virtual も立たず、SetClientViewport のテイクオーバー経路にも入れない)。
-    // 接続レベルのピン留め (devices.admit) が無効でもこのゲートは独立に効く。
+    // **ホストに登録済み (許可リスト) の端末だけ**に許可する。未登録端末には HostInfo で仮想ディス
+    // プレイ (合成エントリ) を一切見せず is_virtual も立てない (SelectDisplay/SetClientViewport の
+    // テイクオーバー経路にも入れない)。接続レベルのピン留め (devices.admit) が無効でも独立に効く。
     let client_trusted = devices.is_trusted(remote_key.as_deref());
-    let vdd = if client_trusted {
-        crate::virtualdisplay::detect()
-    } else {
-        tracing::info!(peer = %peer, "virtual display gated off (device not registered/allowlisted)");
-        None
-    };
-    let vdd_gdi_name = vdd.as_ref().map(|v| v.gdi_name.clone());
-    // 仮想ディスプレイは未接続時にデスクトップからデタッチされており (cursor 迷い込み防止)、
-    // その間は DXGI 出力に出ない = enumerate_displays に載らない。これだとクライアントが
-    // is_virtual な display を選べずテイクオーバーを起動できないため、検出済みだが未列挙の
-    // 仮想ディスプレイを番兵 id で合成エントリとして足す。選択されると SetClientViewport の
-    // begin_takeover がアタッチし、resolve_output が実 DXGI index へ差し替える。
-    if let Some(v) = vdd.as_ref() {
-        if !displays.iter().any(|d| d.name == v.gdi_name) {
-            displays.push(DisplayInfo {
-                id: VIRTUAL_SENTINEL_ID,
-                name: v.gdi_name.clone(),
-                width: v.width,
-                height: v.height,
-                x: 0,
-                y: 0,
-            });
-            tracing::info!(name = %v.gdi_name, "advertising detached virtual display");
-        }
-    }
-    // 仮想ディスプレイ検出と各ディスプレイ名を残す。クライアントの自動選択 (is_virtual)
-    // が効かない場合に「検出名 ↔ 列挙名」の不一致を実機ログから切り分けるため。
-    tracing::info!(
-        vdd = vdd_gdi_name.as_deref().unwrap_or("(none)"),
-        names = ?displays.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-        "virtual display detection"
-    );
-    let host_info = ControlMsg::HostInfo {
-        displays: displays
+    let host_info = {
+        let sc = shared.lock().await;
+        let displays = sc
+            .displays
             .iter()
-            .map(|d| {
+            .filter_map(|d| {
+                let is_virtual = sc.vdd_gdi_name.as_deref() == Some(d.name.as_str());
+                // 未登録端末には仮想ディスプレイ (合成エントリ) を提示しない。
+                if is_virtual && !client_trusted {
+                    return None;
+                }
                 let mut pd = Display::from(d);
-                pd.is_virtual = vdd_gdi_name.as_deref() == Some(d.name.as_str());
-                pd
+                pd.is_virtual = is_virtual;
+                Some(pd)
             })
-            .collect(),
-        audio,
+            .collect();
+        ControlMsg::HostInfo { displays, audio }
     };
     send_control_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
 
@@ -701,43 +855,67 @@ async fn handle_client(
     let mut seq: u32 = 0;
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
-    let mut bitrate = BitrateController::new(max_bitrate_bps);
-    // ダウンロード (ホスト → クライアント) のチャンクを select ループへ流す出口。
-    // 送信タスクがここに積み、ループが TCP へ書く (stream への書き込みは単一箇所に集約)。
+    // ダウンロード (ホスト → クライアント) のチャンクと、host→クライアントへの制御 push
+    // (DisplayResized / Clipboard 等、登録簿経由) を select ループへ流す出口。送信タスク/他接続が
+    // ここに積み、ループが自分の Noise セッションで暗号化して TCP へ書く (書き込みは単一箇所に集約)。
     let (out_tx, mut out_rx) = mpsc::channel::<ControlMsg>(64);
 
-    // ProjFS ドライブリダイレクト。コールバック (同期) → ここへ FsList/FsRead 要求が流れる。
-    // 開始失敗 (Client-ProjFS 無効など) はファイル投影を諦めてリモデス本体は継続する。
-    // bounded: 書き戻し (FsWrite) の殺到で制御チャネルとメモリを溢れさせないようにする
-    // (FsBridge が満杯時に blocking_send で ProjFS スレッドを待たせ、ディスク読みを止める)。
-    let (fs_req_tx, mut fs_req_rx) = mpsc::channel::<ControlMsg>(64);
-    let fs_bridge = Arc::new(FsBridge::new(fs_req_tx));
-    // 投影ルートは CWD 相対ではなく固定の絶対パス (`%LOCALAPPDATA%\Aurora\remote`)。
-    // セッション中だけ This PC にドライブとして現れ、切断 (Drop) で消える。
-    let remote_root = projfs::remote_root();
-    let _virt = match projfs::start(fs_bridge.clone(), &remote_root) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::warn!(error = %e, "ProjFS drive redirection disabled");
-            None
+    // 確立: 接続数を数え、登録簿へ自分の制御出口を登録する。ProjFS ドライブは固定パスのため
+    // 最初に確立した 1 本だけが所有する (複数 mount は衝突する)。
+    let is_projfs_owner = {
+        let mut sc = shared.lock().await;
+        sc.active_conns += 1;
+        if sc.projfs_owner.is_none() {
+            sc.projfs_owner = Some(conn_id);
+            true
+        } else {
+            false
         }
     };
+    registry
+        .lock()
+        .expect("registry poisoned")
+        .insert(conn_id, out_tx.clone());
+
+    // ProjFS ドライブリダイレクト。コールバック (同期) → ここへ FsList/FsRead 要求が流れる。
+    // 所有者でない接続は mount しない (要求も発生しない)。開始失敗 (Client-ProjFS 無効など) は
+    // ファイル投影を諦めてリモデス本体は継続する。bounded: 書き戻し (FsWrite) の殺到で制御
+    // チャネルとメモリを溢れさせないようにする (FsBridge が満杯時に blocking_send で ProjFS
+    // スレッドを待たせ、ディスク読みを止める)。
+    let (fs_req_tx, mut fs_req_rx) = mpsc::channel::<ControlMsg>(64);
+    let fs_bridge = Arc::new(FsBridge::new(fs_req_tx));
+    let _virt = if is_projfs_owner {
+        // 投影ルートは CWD 相対ではなく固定の絶対パス (`%LOCALAPPDATA%\Aurora\remote`)。
+        // セッション中だけ This PC にドライブとして現れ、切断 (Drop) で消える。
+        let remote_root = projfs::remote_root();
+        match projfs::start(fs_bridge.clone(), &remote_root) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "ProjFS drive redirection disabled");
+                None
+            }
+        }
+    } else {
+        tracing::info!("ProjFS drive redirection skipped (another client owns it)");
+        None
+    };
+
+    // 映像/音声 broadcast を subscribe する (確立後 = ハンドシェイク中のフレームを溜めない)。
+    let mut nal_brx = nal_btx.subscribe();
+    let mut audio_brx = audio_btx.subscribe();
 
     // セッション中に押下されたまま解放されていないキー/ボタンの追跡。切断時 (正常・異常
     // どちらでも) に解放イベントを注入し、ネットワーク断の瞬間に押していたキーがホスト側で
     // 押しっぱなしになる (stuck key) のを防ぐ。本体ループを async ブロックに包むのは、
-    // ループ内の `?` による早期 return でもこの後始末を必ず通すため。
+    // ループ内の `?` による早期 return でもこの後始末を必ず通すため。クライアント毎ローカル。
     let mut held = HeldInputs::default();
     // 音声ミュート状態 (クライアントの SetAudioMuted)。true の間は音声 UDP を送らない。
+    // クライアント毎ローカル (各自が自分の送出のみ gate し、共有エンコーダは止めない)。
     let mut audio_muted = false;
     // 映像一時停止 (クライアントの SetVideoPaused)。true の間は映像 UDP を送らない
-    // (マルチタブで非アクティブなタブの帯域を止める)。再開時はクライアントが
-    // RequestKeyframe を送って映像を復帰させる。
+    // (マルチタブで非アクティブなタブの帯域を止める)。再開時はクライアントが RequestKeyframe を
+    // 送って映像を復帰させる。これもクライアント毎ローカル。
     let mut video_paused = false;
-    // 現在キャプチャ中のディスプレイの index (SelectDisplay で更新)。初期は先頭 (= initial_id)。
-    let mut active_idx = 0usize;
-    // 仮想ディスプレイのテイクオーバー (物理オフ+仮想 primary) を実施済みか。切断時の復元判定に使う。
-    let mut taken_over = false;
     let result: Result<()> = async {
     loop {
         tokio::select! {
@@ -762,10 +940,10 @@ async fn handle_client(
                     }
                     ControlMsg::SetVideoParams { fps, max_bitrate_bps } => {
                         tracing::info!(fps, max_bitrate_bps, "client set video params");
-                        // fps 上限を capture スレッドへ。
+                        // fps 上限を capture スレッドへ (共有: last-writer-wins)。
                         let _ = fps_tx.send(fps);
-                        // ビットレート上限を更新し、新しい現在値を即エンコーダへ反映。
-                        let new_bps = bitrate.set_max(max_bitrate_bps);
+                        // 共有エンコーダのビットレート上限を更新し、新しい現在値を即反映。
+                        let new_bps = shared.lock().await.bitrate.set_max(max_bitrate_bps);
                         let _ = enc_tx.send(EncoderCommand::SetBitrate(new_bps)).await;
                     }
                     ControlMsg::SetAudioMuted { muted } => {
@@ -784,8 +962,16 @@ async fn handle_client(
                     }
                     ControlMsg::Stats { bitrate_kbps, fps, rtt_us, loss_permille } => {
                         tracing::debug!(bitrate_kbps, fps, rtt_us, loss_permille, "client stats");
-                        if let Some(new_bps) = bitrate.on_stats(loss_permille, rtt_us) {
-                            tracing::info!(new_bps, loss_permille, rtt_us, "adapt bitrate");
+                        // 共有エンコーダは全クライアントの最悪リンクに合わせる。自分の stats を記録し、
+                        // 全クライアントの max(loss)/max(rtt) を適応制御へ与える。
+                        let new = {
+                            let mut sc = shared.lock().await;
+                            sc.client_stats.insert(conn_id, (loss_permille, rtt_us));
+                            let (wl, wr) = sc.worst_link();
+                            sc.bitrate.on_stats(wl, wr)
+                        };
+                        if let Some(new_bps) = new {
+                            tracing::info!(new_bps, "adapt bitrate (worst-link)");
                             let _ = enc_tx.send(EncoderCommand::SetBitrate(new_bps)).await;
                         }
                     }
@@ -796,43 +982,51 @@ async fn handle_client(
                         }
                     }
                     ControlMsg::SelectDisplay { id } => {
-                        match displays.iter().position(|d| d.id == id) {
+                        // 共有トポロジ (全クライアント共有)。last-writer-wins で active_idx を更新。
+                        let mut sc = shared.lock().await;
+                        match sc.displays.iter().position(|d| d.id == id) {
                             Some(idx) => {
-                                // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
-                                // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
-                                // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
-                                if taken_over && id != VIRTUAL_SENTINEL_ID {
-                                    let _ =
-                                        tokio::task::spawn_blocking(crate::display::end_takeover)
-                                            .await;
-                                    taken_over = false;
-                                    tracing::info!(
-                                        "ended takeover: switching to physical display"
-                                    );
-                                }
-                                // 物理ディスプレイの解像度は変更しないので、切替時の復元は不要。
-                                active_idx = idx;
-                                let d = &displays[idx];
-                                tracing::info!(id, name = %d.name, "select display");
-                                // 合成した仮想ディスプレイ (番兵 id) はまだ DXGI 出力が無い
-                                // (デタッチ中)。ここで cap_select すると EnumOutputs が外れて
-                                // 失敗するので送らない。直後の SetClientViewport で begin_takeover
-                                // がアタッチし、resolve_output が実 index で cap_select+座標系を
-                                // 張り替える。実 index を持つ通常ディスプレイのみ即切替する。
-                                if id != VIRTUAL_SENTINEL_ID {
-                                    // capture スレッドへ切替指示 (GDI 名で。index はトポロジ変更で
-                                    // 変わるため名前で引き直す)。
-                                    let _ = cap_select_tx.send(d.name.clone());
-                                    // input スレッドの座標系を新ディスプレイへ更新。
-                                    let geom = DisplayGeom {
-                                        x: d.x,
-                                        y: d.y,
-                                        width: d.width,
-                                        height: d.height,
-                                    };
-                                    let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
-                                    // 新キャプチャの最初の出力を keyframe にしてクライアント復帰を促す。
-                                    let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                                if id == VIRTUAL_SENTINEL_ID && !client_trusted {
+                                    // 未登録端末は仮想ディスプレイ (テイクオーバー) を選べない。
+                                    tracing::warn!(id, "rejected virtual display select from untrusted client");
+                                } else {
+                                    // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
+                                    // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
+                                    // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
+                                    if sc.taken_over && id != VIRTUAL_SENTINEL_ID {
+                                        let _ = tokio::task::spawn_blocking(
+                                            crate::display::end_takeover,
+                                        )
+                                        .await;
+                                        sc.taken_over = false;
+                                        tracing::info!(
+                                            "ended takeover: switching to physical display"
+                                        );
+                                    }
+                                    // 物理ディスプレイの解像度は変更しないので、切替時の復元は不要。
+                                    sc.active_idx = idx;
+                                    let d = sc.displays[idx].clone();
+                                    tracing::info!(id, name = %d.name, "select display");
+                                    // 合成した仮想ディスプレイ (番兵 id) はまだ DXGI 出力が無い
+                                    // (デタッチ中)。ここで cap_select すると EnumOutputs が外れて
+                                    // 失敗するので送らない。直後の SetClientViewport で begin_takeover
+                                    // がアタッチし、resolve_output が実 index で cap_select+座標系を
+                                    // 張り替える。実 index を持つ通常ディスプレイのみ即切替する。
+                                    if id != VIRTUAL_SENTINEL_ID {
+                                        // capture スレッドへ切替指示 (GDI 名で。index はトポロジ変更で
+                                        // 変わるため名前で引き直す)。
+                                        let _ = cap_select_tx.send(d.name.clone());
+                                        // input スレッドの座標系を新ディスプレイへ更新。
+                                        let geom = DisplayGeom {
+                                            x: d.x,
+                                            y: d.y,
+                                            width: d.width,
+                                            height: d.height,
+                                        };
+                                        let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
+                                        // 新キャプチャの最初の出力を keyframe にしてクライアント復帰を促す。
+                                        let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                                    }
                                 }
                             }
                             None => tracing::warn!(id, "SelectDisplay for unknown display id"),
@@ -843,22 +1037,26 @@ async fn handle_client(
                         // アクティブが仮想ディスプレイなら RDP 風テイクオーバー (物理オフ+仮想 primary)、
                         // そうでなければ物理ディスプレイの解像度変更 (方式B) を行う。
                         if width > 0 && height > 0 {
-                            let active_name = displays[active_idx].name.clone();
-                            let is_virtual =
-                                vdd_gdi_name.as_deref() == Some(active_name.as_str());
+                            // 共有トポロジ (全クライアント共有)。ロックして適用する。
+                            let mut sc = shared.lock().await;
+                            let ai = sc.active_idx;
+                            let active_name = sc.displays[ai].name.clone();
+                            // 仮想ディスプレイのテイクオーバーは登録済み端末のみ (特権ゲート)。
+                            let is_virtual = client_trusted
+                                && sc.vdd_gdi_name.as_deref() == Some(active_name.as_str());
                             // 「リサイズで固まる」のライブ再現用 (RUST_LOG=aurora=debug)。どの viewport が
                             // いつ来てテイクオーバー/リサイズのどちらに入ったかを追える。
                             tracing::info!(
                                 width,
                                 height,
-                                taken_over,
+                                taken_over = sc.taken_over,
                                 is_virtual,
                                 active = %active_name,
                                 "SetClientViewport"
                             );
                             if is_virtual {
                                 // --- 仮想ディスプレイ: テイクオーバー ---
-                                let applied = if !taken_over {
+                                let applied = if !sc.taken_over {
                                     let vn = active_name.clone();
                                     let r = tokio::task::spawn_blocking(move || {
                                         crate::display::begin_takeover(&vn, width, height)
@@ -866,7 +1064,7 @@ async fn handle_client(
                                     .await;
                                     match r {
                                         Ok(Ok((vx, vy, vw, vh))) => {
-                                            taken_over = true;
+                                            sc.taken_over = true;
                                             // CCD で物理を落とすと仮想の GDI 名が変わることがあるため
                                             // MTT1337 で再検出し、capture 対象 (名前ベース) を更新する。
                                             let new_name = tokio::task::spawn_blocking(
@@ -877,13 +1075,13 @@ async fn handle_client(
                                             .flatten()
                                             .map(|v| v.gdi_name)
                                             .unwrap_or_else(|| active_name.clone());
-                                            displays[active_idx].name = new_name.clone();
+                                            sc.displays[ai].name = new_name.clone();
                                             // 仮想の**実位置**を入力座標系に使う。stage2 の (0,0) 移動が
                                             // 失敗すると仮想は右端 (例 5120,0) に残るため、決め打ち (0,0)
                                             // だとマウスがずれる (実機で確認)。begin_takeover が読み戻した
                                             // 実ジオメトリ (vx,vy,vw,vh) を信頼する。
-                                            displays[active_idx].x = vx;
-                                            displays[active_idx].y = vy;
+                                            sc.displays[ai].x = vx;
+                                            sc.displays[ai].y = vy;
                                             let _ = cap_select_tx.send(new_name);
                                             Some((vw, vh))
                                         }
@@ -912,10 +1110,9 @@ async fn handle_client(
                                     None
                                 };
                                 if let Some((nw, nh)) = applied {
-                                    displays[active_idx].width = nw;
-                                    displays[active_idx].height = nh;
-                                    let d = &displays[active_idx];
-                                    let id = d.id;
+                                    sc.displays[ai].width = nw;
+                                    sc.displays[ai].height = nh;
+                                    let d = sc.displays[ai].clone();
                                     let geom = DisplayGeom {
                                         x: d.x,
                                         y: d.y,
@@ -923,15 +1120,17 @@ async fn handle_client(
                                         height: nh,
                                     };
                                     let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
-                                    send_control_msg(
-                                        &mut write_half,
-                                        &session,
-                                        &ControlMsg::DisplayResized { id, width: nw, height: nh },
-                                        &mut tcp_tx_nonce,
-                                    )
-                                    .await?;
+                                    // 解像度追従を全クライアントへ配信する (要求元以外の canvas も合わせる)。
+                                    broadcast_ctrl(
+                                        &registry,
+                                        &ControlMsg::DisplayResized {
+                                            id: d.id,
+                                            width: nw,
+                                            height: nh,
+                                        },
+                                    );
                                     let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
-                                    tracing::info!(id, nw, nh, "virtual display takeover/resize");
+                                    tracing::info!(id = d.id, nw, nh, "virtual display takeover/resize");
                                 }
                             }
                             // 物理ディスプレイのキャプチャ時はホスト解像度を一切変更しない
@@ -1031,12 +1230,20 @@ async fn handle_client(
             Some(msg) = fs_req_rx.recv() => {
                 send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
             }
-            // ローカルクリップボード変化 → 制御チャネルで送信
-            Some(text) = clip_change_rx.recv() => {
-                send_control_msg(&mut write_half, &session, &ControlMsg::Clipboard { text }, &mut tcp_tx_nonce).await?;
-            }
-            // NAL 受信 → UDP 送信 (STREAM_VIDEO)
-            Some(nal) = nal_rx.recv() => {
+            // NAL 受信 (broadcast ファンアウト) → UDP 送信 (STREAM_VIDEO)
+            nal = nal_brx.recv() => {
+                let nal = match nal {
+                    Ok(n) => n,
+                    // 遅延でリングから溢れた: 取りこぼし数を記録し、キーフレームで復帰させる
+                    // (他クライアントには影響しない)。共有エンコーダ宛なので全員が次キーフレームを得る。
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "video broadcast lagged; requesting keyframe");
+                        let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                        continue;
+                    }
+                    // 送信元 (encode → フォワーダ) が終了 = 映像供給停止。セッションを終える。
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
                 // 一時停止中はフレームをドレインするだけで送らない (非アクティブタブの帯域節約)。
                 // 送らない=その seq の nonce を消費しないだけで、再開時の RequestKeyframe で復帰する。
                 if video_paused {
@@ -1073,8 +1280,17 @@ async fn handle_client(
                     first = false;
                 }
             }
-            // 音声フレーム受信 → UDP 送信 (STREAM_AUDIO)
-            Some(au) = audio_rx.recv() => {
+            // 音声フレーム受信 (broadcast ファンアウト) → UDP 送信 (STREAM_AUDIO)
+            au = audio_brx.recv() => {
+                let au = match au {
+                    Ok(a) => a,
+                    // 音声は欠落しても次フレームで自然回復する。取りこぼしは debug ログのみ。
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(skipped, "audio broadcast lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
                 // ミュート中はチャネルをドレインするだけで送らない (帯域節約 + 詰まり防止)。
                 // seq は送出時のみ進めればよいが、AudioPacket は au.seq をそのまま使い nonce も
                 // au.seq 由来なので、送らない=その seq の nonce を消費しないだけで一貫性は保たれる。
@@ -1094,7 +1310,7 @@ async fn handle_client(
     .await;
 
     // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
-    // 1) stuck key 防止: 押下中のキー/マウスボタンへ解放イベントを注入する。
+    // 1) stuck key 防止: 押下中のキー/マウスボタンへ解放イベントを注入する (クライアント毎)。
     let releases = held.release_events();
     if !releases.is_empty() {
         tracing::info!(
@@ -1105,24 +1321,44 @@ async fn handle_client(
             let _ = input_tx.send(InputCmd::Event(ev)).await;
         }
     }
-    // 2) ProjFS RPC を閉じる: 待機中のコールバックを即時エラーで起こし、以後の要求も
-    //    即時失敗にする。`_virt` の Drop (PrjStopVirtualizing = コールバック完了待ち) が
-    //    RPC_TIMEOUT まで引きずられ、次セッションの受理と Explorer が固まるのを防ぐ。
+    // 2) ProjFS RPC を閉じる (所有者でなければ no-op): 待機中のコールバックを即時エラーで起こし、
+    //    以後の要求も即時失敗にする。`_virt` の Drop (PrjStopVirtualizing = コールバック完了待ち)
+    //    が RPC_TIMEOUT まで引きずられ、次セッションの受理と Explorer が固まるのを防ぐ。
     fs_bridge.close();
     fs_req_rx.close();
-    // 3) テイクオーバー中なら全トポロジ (物理の再アタッチ含む) を復元する。物理解像度は
-    //    変更しない方針なので、テイクオーバー以外の解像度復元は不要。
-    if taken_over {
+    // 3) 登録解除 + 接続数減算 + ProjFS 所有解放。最後の 1 本かどうかとテイクオーバー復元の要否を
+    //    ロック下で原子的に判定する (複数同時切断でも復元は 1 回だけ走る)。
+    registry.lock().expect("registry poisoned").remove(&conn_id);
+    let (is_last, restore_takeover) = {
+        let mut sc = shared.lock().await;
+        sc.active_conns = sc.active_conns.saturating_sub(1);
+        sc.client_stats.remove(&conn_id);
+        if sc.projfs_owner == Some(conn_id) {
+            sc.projfs_owner = None;
+        }
+        let is_last = sc.active_conns == 0;
+        let restore = is_last && sc.taken_over;
+        if restore {
+            sc.taken_over = false;
+        }
+        (is_last, restore)
+    };
+    // 4) 最後の 1 本が切れたときだけグローバルな後始末を行う (他クライアントが視聴中なら維持)。
+    //    テイクオーバー中なら全トポロジ (物理の再アタッチ含む) を復元する。物理解像度は変更しない
+    //    方針なので、テイクオーバー以外の解像度復元は不要。
+    if restore_takeover {
         let _ = tokio::task::spawn_blocking(crate::display::end_takeover).await;
     }
-    // 4) VDD を再デタッチ: テイクオーバー復元後も VDD がデスクトップに残るため切り離す。
-    //    未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。
-    if let Some(vdd) = crate::virtualdisplay::detect() {
-        let vn = vdd.gdi_name;
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::display::detach_vdd_if_attached(&vn);
-        })
-        .await;
+    // 5) VDD を再デタッチ: テイクオーバー復元後も VDD がデスクトップに残るため切り離す。
+    //    未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。最後の 1 本のみ。
+    if is_last {
+        if let Some(vdd) = crate::virtualdisplay::detect() {
+            let vn = vdd.gdi_name;
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::display::detach_vdd_if_attached(&vn);
+            })
+            .await;
+        }
     }
     result
 }
