@@ -5,6 +5,11 @@
 import "./styles/base.css";
 import { mountLauncher } from "./ui/launcher";
 import { openCaptureWindow } from "./core/ipc";
+import { installWebviewGuard } from "./core/webview-guard";
+
+// ランチャーでも WebView 既定挙動 (右クリックメニュー / リロード / devtools / ズーム) を抑止する。
+// capture 用のローカルホットキーは無いのでコールバックは渡さない。
+installWebviewGuard();
 
 const overlay = document.getElementById("connect-overlay") as HTMLElement;
 
