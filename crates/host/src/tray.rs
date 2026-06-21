@@ -94,6 +94,8 @@ mod imp {
     const ID_PORT: usize = 1003;
     /// ログフォルダをエクスプローラで開くメニュー項目 ID。
     const ID_OPEN_LOGS: usize = 1007;
+    /// ログオン時自動起動の有効/無効をトグルするメニュー項目 ID。
+    const ID_AUTOSTART: usize = 1008;
     /// デバイスピン留めのメニュー項目 ID。
     const ID_PIN_TOGGLE: usize = 1004;
     const ID_PIN_PAIR: usize = 1005;
@@ -281,6 +283,7 @@ mod imp {
                         ID_CHANGE => change_password(hwnd),
                         ID_PORT => change_port(hwnd),
                         ID_OPEN_LOGS => open_logs_folder(hwnd),
+                        ID_AUTOSTART => toggle_autostart(hwnd),
                         ID_PIN_TOGGLE => toggle_pinning(hwnd),
                         ID_PIN_PAIR => toggle_pairing(hwnd),
                         ID_PIN_CLEAR => clear_devices(hwnd),
@@ -337,6 +340,24 @@ mod imp {
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_LOGS, w!("ログフォルダを開く"));
+
+            // ログオン時自動起動のトグル。現在の登録状態をチェックマークで示す。`_autostart`
+            // はラベルの UTF-16 バッファを TrackPopupMenu まで生かすための保持先 (AppendMenuW は
+            // 内部コピーするが、後続のサブメニュー構築をまたぐため明示的に束ねる)。
+            let installed = crate::autostart::is_installed();
+            let autostart_label = to_wide(if installed {
+                "ログオン時に自動起動: 有効 (クリックで無効化)"
+            } else {
+                "ログオン時に自動起動: 無効 (クリックで有効化)"
+            });
+            let autostart_flags = MF_STRING | if installed { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(
+                menu,
+                autostart_flags,
+                ID_AUTOSTART,
+                PCWSTR(autostart_label.as_ptr()),
+            );
+            let _autostart = autostart_label;
 
             // デバイスピン留め (2 要素目)。有効時のみペアリング/端末一覧を出す。
             // `_keep` は AppendMenuW へ渡す UTF-16 バッファを TrackPopupMenu まで生かすための保持先
@@ -519,6 +540,46 @@ mod imp {
                 &format!("ログフォルダ:\n{}", dir.display()),
                 "Aurora Host",
             );
+        }
+    }
+
+    /// ログオン時自動起動 (タスクスケジューラの ONLOGON タスク) の有効/無効をトグルする。
+    /// 現在登録されていれば解除し、未登録なら現プロセスの起動引数を転送して登録する。
+    /// `schtasks /Create` は `/RL HIGHEST` で登録するため管理者権限を要する場合があり、失敗時は
+    /// その旨をメッセージで案内する。接続中でも安全な操作 (映像/入力経路に影響しない) のため
+    /// 接続中ガードは設けない。
+    fn toggle_autostart(hwnd: HWND) {
+        if crate::autostart::is_installed() {
+            match crate::autostart::uninstall() {
+                Ok(()) => message_box(
+                    hwnd,
+                    "ログオン時の自動起動を無効にしました。",
+                    "Aurora Host",
+                ),
+                Err(e) => message_box(
+                    hwnd,
+                    &format!(
+                        "自動起動の解除に失敗しました: {e}\n管理者権限が必要な場合があります。"
+                    ),
+                    "Aurora Host",
+                ),
+            }
+        } else {
+            let args = crate::autostart::current_forward_args();
+            match crate::autostart::install(&args) {
+                Ok(()) => message_box(
+                    hwnd,
+                    "ログオン時に自動起動するようにしました。",
+                    "Aurora Host",
+                ),
+                Err(e) => message_box(
+                    hwnd,
+                    &format!(
+                        "自動起動の登録に失敗しました: {e}\n管理者権限が必要な場合があります。"
+                    ),
+                    "Aurora Host",
+                ),
+            }
         }
     }
 
