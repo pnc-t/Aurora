@@ -7,6 +7,7 @@
 
 mod audio;
 mod config;
+mod log;
 mod net;
 mod secret;
 mod stats;
@@ -15,12 +16,31 @@ use net::SessionState;
 use tauri::Manager;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "aurora=info".into()),
-        )
-        .init();
+    // ログを `%LOCALAPPDATA%\Aurora\logs\client.<日付>.log` へ日次ローテ (7 世代) + 非ブロッキング
+    // で残す。release は GUI サブシステム (コンソールなし) のため、ファイルに残さないと現地の
+    // 障害を後から調べられない。debug ビルドは加えて stdout にも出す。_guard は run() が返る
+    // (プロセス終了) まで保持する (drop すると以降のログが失われる)。
+    let _guard = aurora_common::logging::init(aurora_common::logging::LogOptions {
+        file_stem: "client",
+        filter: tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "aurora=info".into()),
+        dir: aurora_common::logging::default_log_dir(),
+        console: cfg!(debug_assertions),
+    });
+
+    // panic を client.log へ残す (release は WebView/コンソールが無く既定フックの stderr 出力が
+    // 捨てられるため)。既定フックも連鎖させ debug 時の挙動は維持する。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = %info, "client panicked");
+        default_hook(info);
+    }));
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        debug = cfg!(debug_assertions),
+        "aurora-client starting"
+    );
 
     tauri::Builder::default()
         .manage(SessionState::default())
@@ -85,6 +105,9 @@ fn main() {
             config::save_settings,
             secret::saved_password_hosts,
             secret::delete_host_password,
+            log::frontend_log,
+            log::open_logs_folder,
+            log::export_logs_zip,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

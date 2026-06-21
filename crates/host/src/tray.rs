@@ -92,6 +92,8 @@ mod imp {
     const ID_CHANGE: usize = 1001;
     const ID_EXIT: usize = 1002;
     const ID_PORT: usize = 1003;
+    /// ログフォルダをエクスプローラで開くメニュー項目 ID。
+    const ID_OPEN_LOGS: usize = 1007;
     /// デバイスピン留めのメニュー項目 ID。
     const ID_PIN_TOGGLE: usize = 1004;
     const ID_PIN_PAIR: usize = 1005;
@@ -278,6 +280,7 @@ mod imp {
                     match cmd {
                         ID_CHANGE => change_password(hwnd),
                         ID_PORT => change_port(hwnd),
+                        ID_OPEN_LOGS => open_logs_folder(hwnd),
                         ID_PIN_TOGGLE => toggle_pinning(hwnd),
                         ID_PIN_PAIR => toggle_pairing(hwnd),
                         ID_PIN_CLEAR => clear_devices(hwnd),
@@ -333,6 +336,7 @@ mod imp {
             }
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
+            let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_LOGS, w!("ログフォルダを開く"));
 
             // デバイスピン留め (2 要素目)。有効時のみペアリング/端末一覧を出す。
             // `_keep` は AppendMenuW へ渡す UTF-16 バッファを TrackPopupMenu まで生かすための保持先
@@ -487,6 +491,32 @@ mod imp {
             message_box(
                 hwnd,
                 &format!("待受ポートを {new_port} に変更しました。"),
+                "Aurora Host",
+            );
+        }
+    }
+
+    /// ログフォルダ (`%LOCALAPPDATA%\Aurora\logs`) をエクスプローラで開く。未作成なら作る
+    /// (起動直後でまだ書き込みが無い場合に空フォルダを開けるように)。
+    fn open_logs_folder(hwnd: HWND) {
+        let Some(dir) = aurora_common::logging::default_log_dir() else {
+            message_box(
+                hwnd,
+                "ログフォルダの場所を特定できませんでした。",
+                "Aurora Host",
+            );
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        // explorer で開く。GUI サブシステムのため標準の関連付け起動でよい。
+        if std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .is_err()
+        {
+            message_box(
+                hwnd,
+                &format!("ログフォルダ:\n{}", dir.display()),
                 "Aurora Host",
             );
         }

@@ -6,6 +6,10 @@ import "./styles/base.css";
 import { mountLauncher } from "./ui/launcher";
 import { openCaptureWindow } from "./core/ipc";
 import { installWebviewGuard } from "./core/webview-guard";
+import { installGlobalErrorLogging } from "./core/log";
+
+// 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
+installGlobalErrorLogging();
 
 // ランチャーでも WebView 既定挙動 (右クリックメニュー / リロード / devtools / ズーム) を抑止する。
 // capture 用のローカルホットキーは無いのでコールバックは渡さない。

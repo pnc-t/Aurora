@@ -146,6 +146,16 @@ export async function requestKeyframe(sessionId: string): Promise<void> {
   await invoke("request_keyframe", { sessionId });
 }
 
+/// ログフォルダ (%LOCALAPPDATA%\Aurora\logs) をエクスプローラで開く。
+export async function openLogsFolder(): Promise<void> {
+  await invoke("open_logs_folder");
+}
+
+/// ログ一式を ZIP にまとめて書き出し、生成先パスを返す。
+export async function exportLogsZip(): Promise<string> {
+  return await invoke("export_logs_zip");
+}
+
 export async function selectDisplay(sessionId: string, id: number): Promise<void> {
   await invoke("select_display", { sessionId, id });
 }

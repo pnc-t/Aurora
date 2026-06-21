@@ -34,6 +34,10 @@ import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
 import { installWebviewGuard } from "./core/webview-guard";
 import { isFullscreen, toggleFullscreen } from "./core/fullscreen";
 import { closeWindow, setResizable } from "./ui/window-controls";
+import { installGlobalErrorLogging } from "./core/log";
+
+// 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
+installGlobalErrorLogging();
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const tabbar = document.getElementById("tabbar") as HTMLElement;

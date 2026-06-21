@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
@@ -18,6 +18,7 @@ use bincode::Options;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use crate::audio::EncodedAudio;
 use crate::capture::DisplayInfo;
@@ -26,6 +27,10 @@ use crate::input::DisplayGeom;
 use crate::projfs::{self, FsBridge, FsReply};
 
 use crate::encode::{DEFAULT_BITRATE_BPS, MIN_BITRATE_BPS};
+
+/// 接続ごとの相関 ID 採番カウンタ。ログの `conn` span に載せ、クライアント側の
+/// session_id と peer/時刻で突き合わせて 1 接続を端から端まで追跡できるようにする。
+static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 制御ループ → encode スレッドへの通知。
 pub enum EncoderCommand {
@@ -445,52 +450,62 @@ pub async fn run_server(
                     break;
                 }
             };
-            tracing::info!(peer = %peer, "TCP client connected");
-            // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
-            // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
-            // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
-            let _active = crate::conn::ActiveGuard::new();
-            // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
-            let psk = *cfg.psk.lock().expect("psk mutex poisoned");
-            let displays = cfg.displays.clone();
-            let audio = cfg.audio;
-            let max_bitrate_bps = cfg.max_bitrate_bps;
-            let udp = udp.clone();
-            let enc_tx2 = enc_tx.clone();
-            let input_tx2 = input_tx.clone();
-            let cap_select_tx2 = cap_select_tx.clone();
-            let fps_tx2 = fps_tx.clone();
-            let scale_tx2 = scale_tx.clone();
-            let clip_apply_tx2 = clip_apply_tx.clone();
-            // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
-            // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
-            let nal_rx_ref = &mut nal_rx;
-            let audio_rx_ref = &mut audio_rx;
-            let clip_change_rx_ref = &mut clip_change_rx;
-            if let Err(e) = handle_client(
-                stream,
-                peer,
-                psk,
-                displays,
-                audio,
-                udp,
-                enc_tx2,
-                input_tx2,
-                cap_select_tx2,
-                fps_tx2,
-                scale_tx2,
-                clip_apply_tx2,
-                nal_rx_ref,
-                audio_rx_ref,
-                clip_change_rx_ref,
-                max_bitrate_bps,
-                &throttle,
-                &cfg.devices,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "client session ended");
+            // 接続ごとに連番の conn_id を採番し、この接続に関する全ログへ span で付ける。
+            // クライアント側ログ (session_id) と peer/時刻で突き合わせて 1 接続を追跡できる。
+            let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+            let span = tracing::info_span!("conn", id = conn_id, peer = %peer);
+            // 接続処理本体を span 配下で実行する (内部の handshake/session ログも id を継承)。
+            async {
+                tracing::info!("TCP client connected");
+                // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
+                // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop)
+                // で消える。単一クライアントモデルなのでガードは 1 つで足りる。
+                let _active = crate::conn::ActiveGuard::new();
+                // 接続ごとに現行 PSK のスナップショットを取る (tray でのパスワード変更を反映)。
+                let psk = *cfg.psk.lock().expect("psk mutex poisoned");
+                let displays = cfg.displays.clone();
+                let audio = cfg.audio;
+                let max_bitrate_bps = cfg.max_bitrate_bps;
+                let udp = udp.clone();
+                let enc_tx2 = enc_tx.clone();
+                let input_tx2 = input_tx.clone();
+                let cap_select_tx2 = cap_select_tx.clone();
+                let fps_tx2 = fps_tx.clone();
+                let scale_tx2 = scale_tx.clone();
+                let clip_apply_tx2 = clip_apply_tx.clone();
+                // nal_rx / audio_rx / clip_change_rx は単一所有のため、新規セッション開始時は既存
+                // セッションを置き換える必要がある。MVP は単一クライアントのみ受けて完了まで占有する。
+                let nal_rx_ref = &mut nal_rx;
+                let audio_rx_ref = &mut audio_rx;
+                let clip_change_rx_ref = &mut clip_change_rx;
+                match handle_client(
+                    stream,
+                    peer,
+                    psk,
+                    displays,
+                    audio,
+                    udp,
+                    enc_tx2,
+                    input_tx2,
+                    cap_select_tx2,
+                    fps_tx2,
+                    scale_tx2,
+                    clip_apply_tx2,
+                    nal_rx_ref,
+                    audio_rx_ref,
+                    clip_change_rx_ref,
+                    max_bitrate_bps,
+                    &throttle,
+                    &cfg.devices,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!("client disconnected"),
+                    Err(e) => tracing::warn!(error = %e, "client session ended"),
+                }
             }
+            .instrument(span)
+            .await;
         }
     }
 }
@@ -680,6 +695,8 @@ async fn handle_client(
     // 公開のため Tailnet 外からも到達しうる。IP 一致の要求でこの両方を遮断する。
     let peer_udp = wait_udp_hello(&udp, peer.ip()).await?;
     tracing::info!(peer_udp = %peer_udp, "UDP peer registered");
+    // ここまで来たら TCP 認証 + UDP 対向確定 = 接続確立。映像配信を開始する地点。
+    tracing::info!("client connected");
 
     let mut seq: u32 = 0;
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
