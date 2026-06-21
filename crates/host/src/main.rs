@@ -222,11 +222,7 @@ fn main() -> Result<()> {
 
     if args.install {
         // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
-        let forward: Vec<String> = std::env::args()
-            .skip(1)
-            .filter(|a| a != "--install" && a != "--uninstall")
-            .collect();
-        return autostart::install(&forward);
+        return autostart::install(&autostart::current_forward_args());
     }
     if args.uninstall {
         return autostart::uninstall();
