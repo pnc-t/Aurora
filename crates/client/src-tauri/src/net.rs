@@ -33,6 +33,7 @@ use tokio::net::{TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 const MAX_TCP_FRAME: usize = 64 * 1024;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -427,8 +428,44 @@ async fn send_ctrl(state: &SessionState, session_id: &str, msg: ControlMsg) -> R
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri コマンドの引数 (state/channel) 注入で増える
+#[allow(clippy::too_many_arguments)]
+// Tauri コマンドの引数 (state/channel) 注入で増える
+// session_id を span で全ログへ付ける。host 側 conn_id と peer/時刻で突き合わせて 1 接続を
+// 追跡できる。後段で spawn する I/O タスクにも同じ span を継承させる (Span::current)。
+// 失敗時はここで 1 度だけ warn に残す。実体 (connect_inner) は各 `?` で String を早期 return
+// するため、そのままでは接続失敗 (誤パスワード・タイムアウト等) が client.log に出ない。
+#[tracing::instrument(skip_all, fields(session = %session_id, host = %host, port = port))]
 pub async fn connect_to_host(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    session_id: String,
+    host: String,
+    port: u16,
+    save: bool,
+    event_channel: Channel<ClientEvent>,
+    video_channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let r = connect_inner(
+        app,
+        window,
+        session_id,
+        host,
+        port,
+        save,
+        event_channel,
+        video_channel,
+        state,
+    )
+    .await;
+    if let Err(e) = &r {
+        tracing::warn!(error = %e, "connect failed");
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_inner(
     app: tauri::AppHandle,
     // このコマンドを呼んだ capture ウィンドウ。セッションを所有ウィンドウへ紐付け、
     // ウィンドウ破棄時にそのウィンドウの全タブをまとめて停止できるようにする。
@@ -568,12 +605,15 @@ pub async fn connect_to_host(
 
     let sink_w = sink.clone();
     let sess_w = session.clone();
-    let writer_task = tokio::spawn(async move {
-        let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
-        sink_w.send_event(ClientEvent::Disconnected {
-            reason: "writer closed".into(),
-        });
-    });
+    let writer_task = tokio::spawn(
+        async move {
+            let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
+            sink_w.send_event(ClientEvent::Disconnected {
+                reason: "writer closed".into(),
+            });
+        }
+        .instrument(tracing::Span::current()),
+    );
 
     let sink_r = sink.clone();
     let sess_r = session.clone();
@@ -587,25 +627,29 @@ pub async fn connect_to_host(
     // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
-    let reader_task = tokio::spawn(async move {
-        let res = tcp_reader_loop(
-            read_half,
-            sess_r,
-            sink_r.clone(),
-            clip_apply_for_reader,
-            stats_for_reader,
-            session_start,
-            fs_reply_tx,
-            share_root_for_reader,
-            pending_for_reader,
-        )
-        .await;
-        let reason = match res {
-            Ok(()) => "server closed".to_string(),
-            Err(e) => format!("read error: {e}"),
-        };
-        sink_r.send_event(ClientEvent::Disconnected { reason });
-    });
+    let reader_task = tokio::spawn(
+        async move {
+            let res = tcp_reader_loop(
+                read_half,
+                sess_r,
+                sink_r.clone(),
+                clip_apply_for_reader,
+                stats_for_reader,
+                session_start,
+                fs_reply_tx,
+                share_root_for_reader,
+                pending_for_reader,
+            )
+            .await;
+            let reason = match res {
+                Ok(()) => "server closed".to_string(),
+                Err(e) => format!("read error: {e}"),
+            };
+            tracing::info!(%reason, "session closed (tcp reader)");
+            sink_r.send_event(ClientEvent::Disconnected { reason });
+        }
+        .instrument(tracing::Span::current()),
+    );
 
     // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。
     let audio_player = match audio::spawn() {
@@ -622,13 +666,16 @@ pub async fn connect_to_host(
     let sink_u = sink.clone();
     // ロス検出時にキーフレームを要求して映像を即時回復させるための送信口。
     let keyframe_tx = ctrl_tx.clone();
-    let udp_task = tokio::spawn(async move {
-        if let Err(e) =
-            udp_reader_loop(udp, sess_u, sink_u, audio_tx, stats_for_udp, keyframe_tx).await
-        {
-            tracing::warn!(error = %e, "UDP reader ended");
+    let udp_task = tokio::spawn(
+        async move {
+            if let Err(e) =
+                udp_reader_loop(udp, sess_u, sink_u, audio_tx, stats_for_udp, keyframe_tx).await
+            {
+                tracing::warn!(error = %e, "UDP reader ended");
+            }
         }
-    });
+        .instrument(tracing::Span::current()),
+    );
 
     // クリップボード変化 → ControlMsg::Clipboard 送信
     let ctrl_for_clip = ctrl_tx.clone();
@@ -720,6 +767,8 @@ pub async fn connect_to_host(
     });
     // ランチャーへ接続中 host 一覧を通知 (接続中表示・保存バッジ更新)。
     emit_connections(&app, &state).await;
+    // 接続確立完了 (host 側「client connected」と対)。span に session/host/port が乗る。
+    tracing::info!("connected");
     Ok(())
 }
 
@@ -732,6 +781,7 @@ pub async fn disconnect(
     {
         let mut guard = state.inner.lock().await;
         if let Some(s) = guard.remove(&session_id) {
+            tracing::info!(session = %session_id, host = %s.host, "disconnected (by user)");
             // task abort だけでなくクリップボードスレッドにも shutdown を伝える
             // (connect_to_host のセッション置換経路と同じ後始末に統一)。
             s.shutdown();

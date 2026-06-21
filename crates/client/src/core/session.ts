@@ -30,6 +30,7 @@ import {
 } from "./ipc";
 import { Decoder } from "./decoder";
 import { Input } from "./input";
+import { logger } from "./log";
 import type { ToolbarHandle } from "../ui/toolbar";
 import type { ToastKind } from "../ui/toast";
 
@@ -152,7 +153,7 @@ export class Session {
       requestKeyframe: () => void requestKeyframe(this.id),
     });
     this.input = new Input({
-      sendInput: (ev) => void sendInput(this.id, ev).catch((e) => console.warn("sendInput failed", e)),
+      sendInput: (ev) => void sendInput(this.id, ev).catch((e) => logger.warn("sendInput failed", e)),
     });
   }
 
@@ -587,17 +588,20 @@ export class Session {
     if (!this.reconnecting) return;
     if (this.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
       this.cancelReconnect();
+      logger.warn(`reconnect gave up after ${MAX_RECONNECT_ATTEMPTS} attempts: ${this.entry.host}`);
       this.setStatus("再接続に失敗しました", "error", true);
       this.host.toast(this, "再接続に失敗しました", "error");
       return;
     }
     this.reconnectAttempt++;
+    logger.info(`reconnect attempt ${this.reconnectAttempt}: ${this.entry.host}`);
     this.setStatus(`再接続中… (試行 ${this.reconnectAttempt})`, "connecting");
     this.host.toast(this, `再接続を試行中… (${this.reconnectAttempt})`);
     try {
       // password=null で保存済み (DPAPI) を使う。再保存不要なので save=false。
       await this.openSession(false);
-    } catch {
+    } catch (e) {
+      logger.warn(`reconnect attempt ${this.reconnectAttempt} failed`, e);
       if (!this.reconnecting) return;
       this.scheduleReconnect();
     }

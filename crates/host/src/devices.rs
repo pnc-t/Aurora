@@ -56,7 +56,9 @@ impl DeviceGuard {
     /// ピン留めの有効/無効を切り替えて永続化する。無効化時はペアリング窓も閉じる。
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
-        let _ = save_enabled(on);
+        if let Err(e) = save_enabled(on) {
+            tracing::warn!(error = %e, on, "failed to persist device pinning enabled flag");
+        }
         if !on {
             self.pairing.store(false, Ordering::Relaxed);
         }
@@ -91,7 +93,9 @@ impl DeviceGuard {
             return None;
         }
         let removed = trusted.remove(index);
-        let _ = save_trusted(&trusted);
+        if let Err(e) = save_trusted(&trusted) {
+            tracing::warn!(error = %e, "failed to persist device removal");
+        }
         Some(removed.label)
     }
 
@@ -99,7 +103,9 @@ impl DeviceGuard {
     pub fn clear(&self) {
         if let Ok(mut t) = self.trusted.lock() {
             t.clear();
-            let _ = save_trusted(&t);
+            if let Err(e) = save_trusted(&t) {
+                tracing::warn!(error = %e, "failed to persist device allowlist clear");
+            }
         }
     }
 
@@ -137,7 +143,10 @@ impl DeviceGuard {
                 label: default_label(key),
                 pubkey: key.to_vec(),
             });
-            let _ = save_trusted(&trusted);
+            if let Err(e) = save_trusted(&trusted) {
+                // 登録は成功したがディスクに残らなかった = 再起動で信頼が消える。要警告。
+                tracing::warn!(error = %e, "failed to persist newly enrolled device");
+            }
             return Admit::Enrolled;
         }
         Admit::Rejected

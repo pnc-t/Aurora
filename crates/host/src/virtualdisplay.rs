@@ -69,7 +69,19 @@ pub fn detect() -> Option<VddInfo> {
         let dev_id = wstr(&mon.DeviceID);
         let dev_str = wstr(&mon.DeviceString);
         if dev_id.contains(VDD_MONITOR_HWID) || dev_str.contains("VDD by MTT") {
-            let (width, height) = current_resolution(&aw).unwrap_or((1920, 1080));
+            let (width, height) = match current_resolution(&aw) {
+                Some(wh) => wh,
+                None => {
+                    // 解像度が読めない VDD は 1080p 仮置き。これが実クライアントと食い違うと
+                    // 「解像度が合わない」症状の元になるため warn で残す (実機切り分け用)。
+                    tracing::warn!(
+                        name = %adapter_name,
+                        "VDD resolution unreadable (CURRENT/REGISTRY both failed); using 1080p fallback"
+                    );
+                    (1920, 1080)
+                }
+            };
+            tracing::debug!(name = %adapter_name, width, height, dev = %dev_str, "VDD detected");
             return Some(VddInfo {
                 gdi_name: adapter_name,
                 width,

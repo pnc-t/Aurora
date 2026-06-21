@@ -19,11 +19,14 @@ import {
   savedPasswordHosts,
   setRecentHosts,
   saveSettings,
+  openLogsFolder,
+  exportLogsZip,
   type ClientSettings,
   type HostEntry,
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
+import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
@@ -234,6 +237,17 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <input type="text" inputmode="numeric" id="set-port" class="num-input" />
             </div>
+            <div class="setting-group">診断</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">ログ</div>
+                <div class="s-desc">不具合の調査用。フォルダを開くか、まとめて ZIP に書き出して共有できる</div>
+              </div>
+              <div class="s-actions">
+                <button class="btn-secondary" id="open-logs">フォルダを開く</button>
+                <button class="btn-secondary" id="export-logs">ZIP 出力</button>
+              </div>
+            </div>
           </div>
         </section>
       </main>
@@ -278,10 +292,22 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
 
+  // 診断: ログフォルダを開く / ログを ZIP 出力。
+  $("#open-logs")?.addEventListener("click", () => {
+    void openLogsFolder().catch((e) => logger.warn("open logs folder failed", e));
+  });
+  $("#export-logs")?.addEventListener("click", () => {
+    void exportLogsZip()
+      .then((path) => {
+        statusText.textContent = `ログを出力しました: ${path}`;
+      })
+      .catch((e) => logger.warn("export logs failed", e));
+  });
+
   let settings: ClientSettings = { ...DEFAULT_SETTINGS };
 
   function persist(): void {
-    void saveSettings(settings).catch(() => {});
+    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
   }
 
   // --- ページ切替 ---
@@ -348,7 +374,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       void (async () => {
         await deleteHostPassword(entry.host);
         await handle.refreshHosts();
-      })().catch(() => {});
+      })().catch((e) => logger.warn("forget host password failed", e));
     });
     cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
       closeCardMenu();
@@ -402,7 +428,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         await saveRecentHost({ label: label || host, host, port });
         closeDialog();
         await handle.refreshHosts();
-      })().catch(() => {});
+      })().catch((e) => logger.warn("save host failed", e));
     });
   }
 
@@ -466,7 +492,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     arr.splice(to, 0, moved);
     currentHosts = arr;
     renderHosts(arr);
-    void setRecentHosts(arr).catch(() => {});
+    void setRecentHosts(arr).catch((e) => logger.warn("reorder hosts failed", e));
   }
 
   /**
@@ -592,7 +618,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             // capture ウィンドウが開いたら一時的な connecting 表示を解き、実際の接続中集計へ戻す
             // (接続成立は別窓側で起き、`aurora://connections` 経由でドットが緑になる)。
             .then(() => updateStatusBar())
-            .catch(() => {
+            .catch((e) => {
+              logger.warn("open capture window failed", e);
               updateStatusBar();
               openConnectDialog(entry);
             });

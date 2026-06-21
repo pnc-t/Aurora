@@ -9,6 +9,8 @@
 //   [1..3] frame_id (be u16)
 //   [3..]  Annex-B H.264 (start code 00 00 00 01 区切りで複数 NALU を含む)
 
+import { logger } from "./log";
+
 type DecoderOpts = {
   /** デコード不能 (設定前のキーフレーム待ち / エラー) で復帰を促すための要求口。 */
   requestKeyframe: () => void;
@@ -18,6 +20,26 @@ export class Decoder {
   private decoder: VideoDecoder | null = null;
   private configured = false;
   private readonly ctx: CanvasRenderingContext2D | null;
+  // デコードエラーログのレート制限。壊れたストリームではエラーがフレーム毎に出て IPC 転送が
+  // 連発しうるため、最大 1 秒 1 回に間引き、その間に潰した件数を併記する。
+  private lastErrLogMs = 0;
+  private suppressedErrs = 0;
+
+  /** デコードパイプラインのエラーを 1 秒 1 回に間引いて記録する (抑制件数を併記)。 */
+  private throttledError(msg: string, ...extra: unknown[]): void {
+    const now = performance.now();
+    if (now - this.lastErrLogMs < 1000) {
+      this.suppressedErrs++;
+      return;
+    }
+    if (this.suppressedErrs > 0) {
+      logger.error(`${msg} (+${this.suppressedErrs} suppressed in last 1s)`, ...extra);
+      this.suppressedErrs = 0;
+    } else {
+      logger.error(msg, ...extra);
+    }
+    this.lastErrLogMs = now;
+  }
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -39,7 +61,7 @@ export class Decoder {
     this.decoder = new VideoDecoder({
       output: (frame) => this.onFrame(frame),
       error: (e) => {
-        console.error("VideoDecoder error", e);
+        this.throttledError("VideoDecoder error", e);
         this.configured = false;
         this.opts.requestKeyframe();
       },
@@ -115,7 +137,7 @@ export class Decoder {
         decoder.configure({ codec, optimizeForLatency: true });
         this.configured = true;
       } catch (e) {
-        console.error("configure failed", codec, e);
+        this.throttledError("configure failed", codec, e);
         return;
       }
     }
@@ -128,7 +150,7 @@ export class Decoder {
       });
       decoder.decode(chunk);
     } catch (e) {
-      console.error("decode failed", e);
+      this.throttledError("decode failed", e);
       this.configured = false;
       this.opts.requestKeyframe();
     }

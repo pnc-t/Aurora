@@ -6,13 +6,14 @@
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { icon } from "./icons";
+import { logger } from "../core/log";
 import "./window-controls.css";
 
 export async function minimizeWindow(): Promise<void> {
   try {
     await getCurrentWindow().minimize();
   } catch (e) {
-    console.warn("minimize failed", e);
+    logger.warn("minimize failed", e);
   }
 }
 
@@ -20,7 +21,7 @@ export async function closeWindow(): Promise<void> {
   try {
     await getCurrentWindow().close();
   } catch (e) {
-    console.warn("close failed", e);
+    logger.warn("close failed", e);
   }
 }
 
@@ -33,7 +34,7 @@ export async function setResizable(on: boolean): Promise<void> {
   try {
     await getCurrentWindow().setResizable(on);
   } catch (e) {
-    console.warn("setResizable failed", e);
+    logger.warn("setResizable failed", e);
   }
 }
 

@@ -160,6 +160,14 @@
   border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px; cursor: pointer;
 }
 .select-input:focus { outline: none; border-color: var(--accent); }
+/* 診断セクションのアクションボタン群 (ログフォルダを開く / ZIP 出力) */
+.s-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.btn-secondary {
+  background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 10px;
+  font-size: 14px; cursor: pointer;
+}
+.btn-secondary:hover { background: var(--menu-hover); border-color: var(--accent); }
 /* number 入力の上下スピナーを消す (port などは text+inputmode を使うが念のため) */
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
