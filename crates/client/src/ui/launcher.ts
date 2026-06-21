@@ -102,9 +102,6 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
         <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
         <div class="sidebar-spacer"></div>
-        <div class="status-card" id="status-card" title="未接続">
-          <span class="dot"></span>
-        </div>
       </aside>
       <main class="content">
         <section class="page active" id="page-hosts">
@@ -240,13 +237,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           </div>
         </section>
       </main>
+      <footer class="statusbar" id="statusbar">
+        <span class="sb-dot"></span>
+        <span class="sb-text" id="statusbar-text">未接続</span>
+      </footer>
       <div id="card-menu" class="card-menu"></div>
       <div id="dialog-backdrop"></div>
     </div>
   `;
 
   const $ = <T extends HTMLElement>(sel: string) => opts.root.querySelector<T>(sel);
-  const statusCard = $("#status-card") as HTMLElement;
+  const statusBar = $("#statusbar") as HTMLElement;
+  const statusText = $("#statusbar-text") as HTMLElement;
   const hostList = $("#host-list") as HTMLElement;
   const backdrop = $("#dialog-backdrop") as HTMLElement;
   const cardMenu = $("#card-menu") as HTMLElement;
@@ -589,9 +591,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             .onConnect(entry, null, false)
             // capture ウィンドウが開いたら一時的な connecting 表示を解き、実際の接続中集計へ戻す
             // (接続成立は別窓側で起き、`aurora://connections` 経由でドットが緑になる)。
-            .then(() => updateStatusDot())
+            .then(() => updateStatusBar())
             .catch(() => {
-              updateStatusDot();
+              updateStatusBar();
               openConnectDialog(entry);
             });
         } else {
@@ -688,17 +690,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     persist();
   });
 
-  // 左下の状態ドットを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
+  // 下端ステータスバーを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
   // 窓側で起きるため、launcher は `aurora://connections` の集計 (connectedSet) だけを映す。
-  function updateStatusDot(): void {
+  function updateStatusBar(): void {
     const n = connectedSet.size;
-    statusCard.classList.remove("connecting", "connected", "error");
-    if (n > 0) {
-      statusCard.classList.add("connected");
-      statusCard.title = `接続中: ${n} 件`;
-    } else {
-      statusCard.title = "未接続";
-    }
+    handle.setConnState(n > 0 ? `接続中 ${n} 件` : "未接続", n > 0 ? "connected" : "idle");
   }
 
   const handle: LauncherHandle = {
@@ -710,13 +706,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       closeDialog();
     },
     setConnecting(connecting: boolean): void {
-      if (connecting) handle.setConnState("connecting…", "connecting");
+      if (connecting) handle.setConnState("接続中…", "connecting");
     },
     setConnState(text: string, kind: ConnState = "idle"): void {
-      // アイコンのみのサイドバーなので状態文はドットの title (ホバー) に出す。
-      statusCard.title = text;
-      statusCard.classList.remove("connecting", "connected", "error");
-      if (kind !== "idle") statusCard.classList.add(kind);
+      // 下端ステータスバーにドット色 + テキストで状態を出す。
+      statusText.textContent = text;
+      statusBar.classList.remove("connecting", "connected", "error");
+      if (kind !== "idle") statusBar.classList.add(kind);
     },
     async refreshHosts(): Promise<void> {
       try {
@@ -733,7 +729,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           connectedSet = new Set();
         }
         renderHosts(await loadRecentHosts());
-        updateStatusDot();
+        updateStatusBar();
       } catch {
         // 履歴は補助機能。失敗しても致命的ではない。
       }
