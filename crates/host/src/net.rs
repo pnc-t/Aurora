@@ -904,6 +904,11 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     let mut nal_brx = nal_btx.subscribe();
     let mut audio_brx = audio_btx.subscribe();
 
+    // 接続直後に IDR を 1 枚要求し、最初のキーフレームを待つ黒画面時間を縮める。従来は
+    // クライアントが delta を 1 枚受けてから RequestKeyframe を送り返す往復ぶん遅れていた。
+    // 共有エンコーダだが、他クライアントには余分な keyframe が 1 枚増えるだけで無害。
+    let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+
     // セッション中に押下されたまま解放されていないキー/ボタンの追跡。切断時 (正常・異常
     // どちらでも) に解放イベントを注入し、ネットワーク断の瞬間に押していたキーがホスト側で
     // 押しっぱなしになる (stuck key) のを防ぐ。本体ループを async ブロックに包むのは、
