@@ -145,6 +145,142 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
 /// GDI 名 (`\\.\DISPLAYn`) に一致する DXGI 出力を、**毎回新しいファクトリ**で全アダプタ×出力を
 /// 走査して返す。出力名はシステム全体で一意なので名前一致で特定でき、トポロジ変更直後の
 /// 古い index に依存しない。見つからない (= デタッチ中) なら Err。
+/// 対象ディスプレイ (`\\.\DISPLAYn`) の Desktop Duplication が**実際に成功する**アダプタを選ぶ。
+///
+/// ハイブリッド GPU (NVIDIA Optimus / AMD 切替) のノートでは、内蔵パネルの描画・スキャンアウトを
+/// iGPU が担い、dGPU は同じ出力を**列挙はする**が複製しようとすると `DXGI_ERROR_UNSUPPORTED`
+/// (0x887A0004) を返す。逆に外部出力が dGPU 直結のこともある。どちらが正解かは環境依存なので
+/// 「出力を所有していそうなアダプタ」を名前一致で当てる方式 (旧 `adapter_for_output`) は外す。
+/// ここでは候補アダプタ上に試験デバイスを作って実際に `DuplicateOutput` を叩き、`UNSUPPORTED`
+/// でないものを選ぶ。これでハイブリッド GPU でも「画面真っ暗」(複製恒常失敗) を回避する。
+///
+/// 戻り値が `None` のときは候補が見つからない/全滅で、呼び出し側が既定アダプタにフォールバックする。
+pub fn select_capture_adapter(target: &str) -> Option<IDXGIAdapter> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+    // SAFETY: CreateDXGIFactory1 は OUT パラメータを初期化する。
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    // 複製が UNSUPPORTED ではなかった (= 正解の見込みがある) 最初のアダプタ。Ok が無いとき採用。
+    let mut fallback: Option<IDXGIAdapter> = None;
+    let mut ai = 0u32;
+    loop {
+        // SAFETY: EnumAdapters1 は範囲外で NOT_FOUND を返す。
+        let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(ai) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        let idx = ai;
+        ai += 1;
+        let adapter_name = unsafe { adapter.GetDesc1() }
+            .map(|d| {
+                String::from_utf16_lossy(&d.Description)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let mut oi = 0u32;
+        loop {
+            // SAFETY: EnumOutputs は範囲外で NOT_FOUND を返す。
+            let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(oi) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            oi += 1;
+            // SAFETY: output live。GetDesc は値返し。
+            let Ok(desc) = (unsafe { output.GetDesc() }) else {
+                continue;
+            };
+            let name = String::from_utf16_lossy(&desc.DeviceName)
+                .trim_end_matches('\0')
+                .to_string();
+            if name != target {
+                continue;
+            }
+            let Ok(adp) = adapter.cast::<IDXGIAdapter>() else {
+                continue;
+            };
+            match probe_duplication(&adp, &output) {
+                DuplProbe::Ok => {
+                    tracing::info!(
+                        adapter_index = idx,
+                        gpu = %adapter_name,
+                        "capture adapter selected (DuplicateOutput probe ok)"
+                    );
+                    return Some(adp);
+                }
+                DuplProbe::Unsupported => {
+                    tracing::warn!(
+                        adapter_index = idx,
+                        gpu = %adapter_name,
+                        "adapter lists display but DuplicateOutput unsupported; trying next"
+                    );
+                }
+                DuplProbe::OtherErr(e) => {
+                    // UNSUPPORTED 以外 (一過性の NOT_CURRENTLY_AVAILABLE 等) は正解アダプタの
+                    // 見込みが高い。即決はせず候補として保持し、Ok が他に無ければ採用する。
+                    tracing::info!(
+                        adapter_index = idx,
+                        gpu = %adapter_name,
+                        error = %e,
+                        "DuplicateOutput probe non-fatal; keeping adapter as fallback"
+                    );
+                    if fallback.is_none() {
+                        fallback = Some(adp);
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
+enum DuplProbe {
+    Ok,
+    Unsupported,
+    OtherErr(windows::core::Error),
+}
+
+/// `adapter` 上に試験 D3D11 デバイスを作り、`output` の Desktop Duplication を一度試す。
+/// 結果の duplication は即破棄する (本番の capturer が後で作り直す)。
+fn probe_duplication(adapter: &IDXGIAdapter, output: &IDXGIOutput) -> DuplProbe {
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED;
+
+    let feature_levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1];
+    let mut device: Option<ID3D11Device> = None;
+    // SAFETY: adapter 指定時は DriverType=UNKNOWN 必須。OUT パラメータ device を初期化する。
+    let hr = unsafe {
+        D3D11CreateDevice(
+            adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            None,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+    };
+    if let Err(e) = hr {
+        return DuplProbe::OtherErr(e);
+    }
+    let Some(device) = device else {
+        return DuplProbe::OtherErr(windows::core::Error::from(
+            windows::Win32::Foundation::E_FAIL,
+        ));
+    };
+    let output1: IDXGIOutput1 = match output.cast() {
+        Ok(o) => o,
+        Err(e) => return DuplProbe::OtherErr(e),
+    };
+    // SAFETY: device・output1 は live。成功時の duplication は即 Drop で解放される。
+    match unsafe { output1.DuplicateOutput(&device) } {
+        Ok(_dup) => DuplProbe::Ok,
+        Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED => DuplProbe::Unsupported,
+        Err(e) => DuplProbe::OtherErr(e),
+    }
+}
+
 fn find_output_by_name(target: &str) -> Result<IDXGIOutput> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
     // SAFETY: CreateDXGIFactory1 は OUT パラメータ (factory) を初期化する。

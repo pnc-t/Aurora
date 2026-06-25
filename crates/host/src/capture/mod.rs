@@ -50,12 +50,24 @@ pub type SharedDevice = std::sync::Arc<device::DeviceBundle>;
 pub type SharedDevice = ();
 
 /// 共有デバイスを 1 つ生成する。プロセス起動時に 1 回だけ呼ぶ。
+///
+/// `target_name` は初期キャプチャ対象の GDI 名 (`\\.\DISPLAYn`)。その出力を所有する
+/// アダプタ上にデバイスを作る (ハイブリッド GPU で `DuplicateOutput` が失敗するのを防ぐ)。
 #[cfg(target_os = "windows")]
-pub fn create_shared_device() -> anyhow::Result<SharedDevice> {
-    Ok(std::sync::Arc::new(device::DeviceBundle::new()?))
+pub fn create_shared_device(target_name: &str) -> anyhow::Result<SharedDevice> {
+    let adapter = windows::select_capture_adapter(target_name);
+    if adapter.is_none() {
+        tracing::warn!(
+            target = %target_name,
+            "no DXGI adapter passed the DuplicateOutput probe; using default adapter"
+        );
+    }
+    Ok(std::sync::Arc::new(device::DeviceBundle::new(
+        adapter.as_ref(),
+    )?))
 }
 #[cfg(not(target_os = "windows"))]
-pub fn create_shared_device() -> anyhow::Result<SharedDevice> {
+pub fn create_shared_device(_target_name: &str) -> anyhow::Result<SharedDevice> {
     Ok(())
 }
 
