@@ -887,6 +887,21 @@ pub async fn set_video_paused(
     send_ctrl(&state, &session_id, ControlMsg::SetVideoPaused { paused }).await
 }
 
+/// 映像へのカーソル合成 ON/OFF をホストへ送る (マウスキャプチャ中だけ ON にする)。
+#[tauri::command]
+pub async fn set_cursor_overlay(
+    session_id: String,
+    enabled: bool,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    send_ctrl(
+        &state,
+        &session_id,
+        ControlMsg::SetCursorOverlay { enabled },
+    )
+    .await
+}
+
 /// 送出する映像の最大高さ (0 = キャプチャ解像度) をホストへ送る。
 #[tauri::command]
 pub async fn set_resolution(

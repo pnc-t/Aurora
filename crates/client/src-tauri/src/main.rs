@@ -92,6 +92,7 @@ fn main() {
             net::set_video_params,
             net::set_audio_muted,
             net::set_video_paused,
+            net::set_cursor_overlay,
             net::set_resolution,
             net::set_client_viewport,
             net::request_file,
