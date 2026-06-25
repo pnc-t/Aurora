@@ -177,6 +177,7 @@ export class Session {
       void requestKeyframe(this.id);
       this.attachInputToCurrent();
     }
+    this.applyCursorVisibility();
     this.syncSharedUi();
   }
 
@@ -184,7 +185,18 @@ export class Session {
   deactivate(): void {
     this.active = false;
     this.input.detach();
+    // ローカルカーソルを元に戻す (次にアクティブになるタブが自分の状態へ付け替える)。
+    this.host.canvas.style.cursor = "";
     if (this.connected) void setVideoPaused(this.id, true);
+  }
+
+  /**
+   * 映像表示中はローカル (ブラウザ) のカーソルを消す。ホストがカーソルを映像へ焼き込む
+   * ようになったため、消さないと絶対座標モードで「ローカル + 合成」の二重カーソルになる。
+   * キャプチャ (ポインタロック) 中は元から非表示なので実質キャプチャ外で効く。
+   */
+  private applyCursorVisibility(): void {
+    this.host.canvas.style.cursor = this.active && this.connected ? "none" : "";
   }
 
   /** ユーザー操作の切断 (ツールバー切断ボタン)。恒久終了し、orchestrator がタブを除去する。 */
@@ -486,6 +498,7 @@ export class Session {
     );
 
     this.host.refreshTab(this);
+    this.applyCursorVisibility();
 
     if (this.active) {
       const tb = this.host.toolbar;
@@ -510,6 +523,7 @@ export class Session {
     this.clearStabilizeTimer();
     void disconnect(this.id);
     this.connected = false;
+    this.applyCursorVisibility();
     if (this.viewportTimer !== null) {
       clearTimeout(this.viewportTimer);
       this.viewportTimer = null;

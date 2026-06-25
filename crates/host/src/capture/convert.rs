@@ -18,11 +18,15 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CULL_NONE, D3D11_FILL_SOLID,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_VIEW_DESC,
-    D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
+    D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
+    D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_ZERO, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL,
+    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CULL_NONE, D3D11_FILL_SOLID,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAP_WRITE_DISCARD,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC,
+    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC,
+    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_USAGE_IMMUTABLE,
+    D3D11_VIEWPORT, ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
     ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11SamplerState,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
@@ -122,6 +126,51 @@ BlitOut VSBlit(uint vid : SV_VertexID) {
 float4 PSBlit(BlitOut i) : SV_Target {
     return g_src.Sample(g_samp, i.uv);
 }
+
+// --- カーソル合成 (src_copy へ alpha ブレンドで焼き込む小クアッド) ---
+// DXGI Desktop Duplication はカーソルを映像に含めないため、別途取得した形状を
+// ここで重ねる。CPU 側で全種別 (color / masked / monochrome) をストレートアルファの
+// BGRA8 へ正規化済みなので、シェーダは単純な alpha 出力に徹し OM ブレンドで合成する。
+cbuffer CursorParams : register(b1) {
+    float4 g_rect;       // クアッドの NDC 座標 (x0,y0=左上, x1,y1=右下)
+    uint   g_cur_hdr;    // 1 = HDR (scRGB linear へ変換して合成)
+    float  g_cur_scale;  // SDR white scale (scRGB 正規化係数)
+    float2 g_cur_pad;
+};
+Texture2D<float4> g_cursor : register(t1);
+SamplerState g_cursamp : register(s1);
+
+float3 srgb_decode(float3 c) {
+    return float3(
+        c.r <= 0.04045 ? c.r / 12.92 : pow((c.r + 0.055) / 1.055, 2.4),
+        c.g <= 0.04045 ? c.g / 12.92 : pow((c.g + 0.055) / 1.055, 2.4),
+        c.b <= 0.04045 ? c.b / 12.92 : pow((c.b + 0.055) / 1.055, 2.4));
+}
+
+struct CurOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+
+CurOut VSCursor(uint vid : SV_VertexID) {
+    // 2 三角形でクアッドを張る。uv(0,0)=左上 → rect.xy、uv(1,1)=右下 → rect.zw。
+    float2 corners[6] = {
+        float2(0,0), float2(1,0), float2(0,1),
+        float2(0,1), float2(1,0), float2(1,1)
+    };
+    float2 uv = corners[vid];
+    CurOut o;
+    o.uv = uv;
+    o.pos = float4(lerp(g_rect.x, g_rect.z, uv.x), lerp(g_rect.y, g_rect.w, uv.y), 0.0, 1.0);
+    return o;
+}
+
+float4 PSCursor(CurOut i) : SV_Target {
+    float4 c = g_cursor.Sample(g_cursamp, i.uv);  // straight-alpha BGRA, sRGB encoded
+    if (g_cur_hdr != 0) {
+        // SDR の sRGB カーソル色を scRGB linear (SDR white 基準) へ。SDR は素通し
+        // (src_copy も sRGB 8bit なので符号化空間のまま OM ブレンドで足し合わせる)。
+        c.rgb = srgb_decode(c.rgb) * g_cur_scale;
+    }
+    return c;
+}
 "#;
 
 #[repr(C)]
@@ -130,6 +179,21 @@ struct Params {
     inv_scale: f32,
     _pad: [f32; 2],
 }
+
+/// カーソル合成クアッドの定数 (フレーム毎に更新するため DYNAMIC バッファへ書く)。
+#[repr(C)]
+struct CursorParams {
+    /// クアッドの NDC 座標 (x0,y0 = 左上, x1,y1 = 右下)。
+    rect: [f32; 4],
+    is_hdr: u32,
+    scale: f32,
+    _pad: [f32; 2],
+}
+
+/// DXGI ポインタ形状の種別 (DXGI_OUTDUPL_POINTER_SHAPE_TYPE_*)。
+const CURSOR_TYPE_MONOCHROME: u32 = 1;
+const CURSOR_TYPE_COLOR: u32 = 2;
+const CURSOR_TYPE_MASKED_COLOR: u32 = 4;
 
 /// NV12 出力 1 枚と、その 2 プレーンへの RTV。
 struct Nv12Target {
@@ -158,9 +222,30 @@ pub struct Converter {
     cbuffer: ID3D11Buffer,
     raster: ID3D11RasterizerState,
 
+    // --- カーソル合成 ---
+    vs_cursor: ID3D11VertexShader,
+    ps_cursor: ID3D11PixelShader,
+    cursor_sampler: ID3D11SamplerState,
+    cursor_cbuffer: ID3D11Buffer,
+    blend: ID3D11BlendState,
+    /// HDR 合成のためシェーダへ渡す (is_hdr, sdr_white_scale)。
+    is_hdr: bool,
+    scale: f32,
+    /// 現在のカーソル形状テクスチャ (ストレートアルファ BGRA8)。未取得なら None。
+    cursor_tex: Option<ID3D11ShaderResourceView>,
+    cursor_w: u32,
+    cursor_h: u32,
+    cursor_hotspot_x: i32,
+    cursor_hotspot_y: i32,
+    /// カーソルの現在位置 (キャプチャ出力の左上基準・px) と可視性。
+    cursor_x: i32,
+    cursor_y: i32,
+    cursor_visible: bool,
+
     // 入力をシェーダ可読化するコピー先 (Desktop Duplication のテクスチャは SRV 不可)。
     src_copy: Option<ID3D11Texture2D>,
     src_srv: Option<ID3D11ShaderResourceView>,
+    src_rtv: Option<ID3D11RenderTargetView>,
     src_w: u32,
     src_h: u32,
     src_copy_format: DXGI_FORMAT,
@@ -186,12 +271,14 @@ impl Converter {
         let context = bundle.context.clone();
 
         // SAFETY: 各 D3DCompile / Create* は OUT パラメータを初期化する。HLSL は静的文字列。
-        let (vs, ps_y, ps_uv, vs_blit, ps_blit) = unsafe {
+        let (vs, ps_y, ps_uv, vs_blit, ps_blit, vs_cursor, ps_cursor) = unsafe {
             let vs_blob = compile_shader(s!("VSMain"), s!("vs_4_0"))?;
             let psy_blob = compile_shader(s!("PSY"), s!("ps_4_0"))?;
             let psuv_blob = compile_shader(s!("PSUV"), s!("ps_4_0"))?;
             let vsb_blob = compile_shader(s!("VSBlit"), s!("vs_4_0"))?;
             let psb_blob = compile_shader(s!("PSBlit"), s!("ps_4_0"))?;
+            let vsc_blob = compile_shader(s!("VSCursor"), s!("vs_4_0"))?;
+            let psc_blob = compile_shader(s!("PSCursor"), s!("ps_4_0"))?;
 
             let mut vs = None;
             device
@@ -213,12 +300,22 @@ impl Converter {
             device
                 .CreatePixelShader(blob_bytes(&psb_blob), None, Some(&mut ps_blit))
                 .context("CreatePixelShader(blit)")?;
+            let mut vs_cursor = None;
+            device
+                .CreateVertexShader(blob_bytes(&vsc_blob), None, Some(&mut vs_cursor))
+                .context("CreateVertexShader(cursor)")?;
+            let mut ps_cursor = None;
+            device
+                .CreatePixelShader(blob_bytes(&psc_blob), None, Some(&mut ps_cursor))
+                .context("CreatePixelShader(cursor)")?;
             (
                 vs.ok_or_else(|| anyhow!("VS null"))?,
                 ps_y.ok_or_else(|| anyhow!("PS(Y) null"))?,
                 ps_uv.ok_or_else(|| anyhow!("PS(UV) null"))?,
                 vs_blit.ok_or_else(|| anyhow!("VS(blit) null"))?,
                 ps_blit.ok_or_else(|| anyhow!("PS(blit) null"))?,
+                vs_cursor.ok_or_else(|| anyhow!("VS(cursor) null"))?,
+                ps_cursor.ok_or_else(|| anyhow!("PS(cursor) null"))?,
             )
         };
 
@@ -267,6 +364,62 @@ impl Converter {
             buf.ok_or_else(|| anyhow!("constant buffer null"))?
         };
 
+        // カーソル形状をくっきり重ねるための point サンプラ (端はクランプ)。
+        let cursor_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut s = None;
+            device
+                .CreateSamplerState(&desc, Some(&mut s))
+                .context("CreateSamplerState(cursor)")?;
+            s.ok_or_else(|| anyhow!("cursor sampler null"))?
+        };
+
+        // カーソル定数バッファ (位置はフレーム毎に変わるため DYNAMIC・CPU 書き込み)。
+        let cursor_cbuffer = unsafe {
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<CursorParams>() as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let mut buf = None;
+            device
+                .CreateBuffer(&desc, None, Some(&mut buf))
+                .context("CreateBuffer(cursor)")?;
+            buf.ok_or_else(|| anyhow!("cursor cbuffer null"))?
+        };
+
+        // ストレートアルファ合成用ブレンド (dst = src.rgb*src.a + dst*(1-src.a))。
+        let blend = unsafe {
+            let rt = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_SRC_ALPHA,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_ZERO,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let mut desc = D3D11_BLEND_DESC::default();
+            desc.RenderTarget[0] = rt;
+            let mut b = None;
+            device
+                .CreateBlendState(&desc, Some(&mut b))
+                .context("CreateBlendState(cursor)")?;
+            b.ok_or_else(|| anyhow!("blend state null"))?
+        };
+
         // フルスクリーン三角形の巻き順に依存しないよう cull を無効化。
         let raster = unsafe {
             let desc = D3D11_RASTERIZER_DESC {
@@ -292,8 +445,24 @@ impl Converter {
             sampler,
             cbuffer,
             raster,
+            vs_cursor,
+            ps_cursor,
+            cursor_sampler,
+            cursor_cbuffer,
+            blend,
+            is_hdr,
+            scale,
+            cursor_tex: None,
+            cursor_w: 0,
+            cursor_h: 0,
+            cursor_hotspot_x: 0,
+            cursor_hotspot_y: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
             src_copy: None,
             src_srv: None,
+            src_rtv: None,
             src_w: 0,
             src_h: 0,
             src_copy_format: DXGI_FORMAT_B8G8R8A8_TYPELESS,
@@ -329,6 +498,10 @@ impl Converter {
 
         // SAFETY: 同 device・互換フォーマット・同サイズ間の GPU 内コピー。
         unsafe { self.context.CopyResource(&src_copy, src_tex) };
+
+        // カーソルを src_copy へ焼き込む (縮小/NV12 変換の前 = フル解像度で重ね、以後の
+        // パスにそのまま乗る)。DXGI はカーソルを映像に含めないため別取得した形状を合成する。
+        self.composite_cursor(src_w, src_h);
 
         // 目標サイズ (アスペクト維持・偶数)。target_h==0 か src 以下なら元サイズ (= フル)。
         let (out_w, out_h) = scaled_dims(src_w, src_h, self.target_h);
@@ -398,6 +571,159 @@ impl Converter {
         }
 
         Ok(target.tex.clone())
+    }
+
+    /// カーソルの位置と可視性を更新する (キャプチャ出力の左上基準・px)。
+    /// マウス未移動フレームでは呼ばれず、直前の状態を保つ。
+    pub fn set_cursor_pos(&mut self, x: i32, y: i32, visible: bool) {
+        self.cursor_x = x;
+        self.cursor_y = y;
+        self.cursor_visible = visible;
+    }
+
+    /// 新しいカーソル形状を受け取り、ストレートアルファ BGRA8 テクスチャを作り直す。
+    /// `data` は DXGI の GetFramePointerShape が返した生バッファ。形状変化時のみ呼ばれる。
+    pub fn update_cursor_shape(
+        &mut self,
+        cur_type: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        hotspot: (i32, i32),
+        data: &[u8],
+    ) -> Result<()> {
+        let Some((w, h, bgra)) = build_cursor_rgba(cur_type, width, height, pitch, data) else {
+            // 未知種別は合成しない (形状は据え置き)。
+            return Ok(());
+        };
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr() as *const c_void,
+            SysMemPitch: w * 4,
+            SysMemSlicePitch: 0,
+        };
+        // SAFETY: device live、desc 初期化済み、init は w*4 ピッチの w*h*4 バイトを指す。
+        let tex = unsafe {
+            let mut tex = None;
+            self.device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+                .context("CreateTexture2D(cursor)")?;
+            tex.ok_or_else(|| anyhow!("cursor texture null"))?
+        };
+        let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        srv_desc.Anonymous.Texture2D.MostDetailedMip = 0;
+        srv_desc.Anonymous.Texture2D.MipLevels = 1;
+        // SAFETY: tex live、srv_desc は TEXTURE2D 用に初期化済み。
+        let srv = unsafe {
+            let mut srv = None;
+            self.device
+                .CreateShaderResourceView(&tex, Some(&srv_desc), Some(&mut srv))
+                .context("CreateShaderResourceView(cursor)")?;
+            srv.ok_or_else(|| anyhow!("cursor SRV null"))?
+        };
+
+        self.cursor_tex = Some(srv);
+        self.cursor_w = w;
+        self.cursor_h = h;
+        self.cursor_hotspot_x = hotspot.0;
+        self.cursor_hotspot_y = hotspot.1;
+        Ok(())
+    }
+
+    /// src_copy (フル解像度) へカーソルを alpha ブレンドで重ねる。可視かつ形状取得済みのときだけ。
+    fn composite_cursor(&mut self, src_w: u32, src_h: u32) {
+        if !self.cursor_visible || self.cursor_w == 0 || src_w == 0 || src_h == 0 {
+            return;
+        }
+        let Some(cursor_srv) = self.cursor_tex.clone() else {
+            return;
+        };
+        let Some(rtv) = self.src_rtv.clone() else {
+            return;
+        };
+
+        // カーソル左上 = ポインタ位置 - ホットスポット。クアッドを NDC へ写す。
+        let px = (self.cursor_x - self.cursor_hotspot_x) as f32;
+        let py = (self.cursor_y - self.cursor_hotspot_y) as f32;
+        let to_ndc_x = |x: f32| (x / src_w as f32) * 2.0 - 1.0;
+        let to_ndc_y = |y: f32| 1.0 - (y / src_h as f32) * 2.0;
+        let params = CursorParams {
+            rect: [
+                to_ndc_x(px),
+                to_ndc_y(py),
+                to_ndc_x(px + self.cursor_w as f32),
+                to_ndc_y(py + self.cursor_h as f32),
+            ],
+            is_hdr: u32::from(self.is_hdr),
+            scale: self.scale,
+            _pad: [0.0; 2],
+        };
+
+        let ctx = &self.context;
+        // SAFETY: DYNAMIC バッファを WRITE_DISCARD で写経し、live なオブジェクトで小クアッドを描く。
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if ctx
+                .Map(
+                    &self.cursor_cbuffer,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
+                .is_err()
+            {
+                return;
+            }
+            std::ptr::copy_nonoverlapping(
+                &params as *const CursorParams as *const u8,
+                mapped.pData as *mut u8,
+                std::mem::size_of::<CursorParams>(),
+            );
+            ctx.Unmap(&self.cursor_cbuffer, 0);
+
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_cursor, None);
+            ctx.VSSetConstantBuffers(1, Some(&[Some(self.cursor_cbuffer.clone())]));
+            ctx.PSSetShader(&self.ps_cursor, None);
+            ctx.PSSetConstantBuffers(1, Some(&[Some(self.cursor_cbuffer.clone())]));
+            ctx.PSSetShaderResources(1, Some(&[Some(cursor_srv)]));
+            ctx.PSSetSamplers(1, Some(&[Some(self.cursor_sampler.clone())]));
+            ctx.RSSetState(&self.raster);
+            let vp = viewport(src_w as f32, src_h as f32);
+            ctx.RSSetViewports(Some(&[vp]));
+            ctx.OMSetBlendState(Some(&self.blend), None, 0xffff_ffff);
+            ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            ctx.Draw(6, 0);
+
+            // 後続パス (縮小/Y/UV) が src_copy を SRV として読むため束縛を外し、ブレンドも戻す。
+            ctx.OMSetRenderTargets(Some(&[None]), None);
+            ctx.OMSetBlendState(None, None, 0xffff_ffff);
+            ctx.PSSetShaderResources(1, Some(&[None]));
+        }
     }
 
     /// 縮小ブリット出力テクスチャ (src と同フォーマット・指定サイズ・RT+SR) を (再)用意する。
@@ -490,7 +816,8 @@ impl Converter {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            // SR (Y/UV 入力) に加え RT も付け、カーソル合成パスで src_copy へ直接焼き込む。
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -519,8 +846,24 @@ impl Converter {
             srv.ok_or_else(|| anyhow!("SRV null"))?
         };
 
+        let mut rtv_desc = D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: srv_format,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        rtv_desc.Anonymous.Texture2D.MipSlice = 0;
+        // SAFETY: tex live、rtv_desc は TEXTURE2D 用に初期化済み (カーソル合成の描画先)。
+        let rtv = unsafe {
+            let mut rtv = None;
+            self.device
+                .CreateRenderTargetView(&tex, Some(&rtv_desc), Some(&mut rtv))
+                .context("CreateRenderTargetView(src copy)")?;
+            rtv.ok_or_else(|| anyhow!("src copy RTV null"))?
+        };
+
         self.src_copy = Some(tex);
         self.src_srv = Some(srv);
+        self.src_rtv = Some(rtv);
         self.src_w = w;
         self.src_h = h;
         self.src_copy_format = copy_format;
@@ -603,6 +946,86 @@ unsafe impl Send for Converter {}
 /// 2 の倍数へ切り下げる (NV12 は幅・高さとも偶数が必要)。
 fn even(v: u32) -> u32 {
     v & !1
+}
+
+/// DXGI ポインタ形状 (color / masked-color / monochrome) を、合成しやすいストレートアルファ
+/// BGRA8 (ピッチ = w*4) へ正規化する。戻り値 `(w, h, bgra)`。未知種別は `None`。
+///
+/// XOR / 反転 (masked-color の AND=0xFF や monochrome の and=1&xor=1) は背景を読まないと
+/// 厳密合成できないため不透明で近似する (標準の矢印は不透明な白+黒境界なので正確に出る。
+/// I ビーム等の反転カーソルは白で代替し、暗背景で視認できることを優先する)。
+fn build_cursor_rgba(
+    cur_type: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    data: &[u8],
+) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h) = (width, height);
+    match cur_type {
+        CURSOR_TYPE_COLOR => {
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h {
+                let row = (y * pitch) as usize;
+                for x in 0..w {
+                    let si = row + (x * 4) as usize;
+                    let di = ((y * w + x) * 4) as usize;
+                    if si + 4 <= data.len() {
+                        out[di..di + 4].copy_from_slice(&data[si..si + 4]); // B,G,R,A
+                    }
+                }
+            }
+            Some((w, h, out))
+        }
+        CURSOR_TYPE_MASKED_COLOR => {
+            // BGRA。A=0 は不透明な色、A=0xFF は画面との XOR (反転)。両方とも不透明で近似する。
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h {
+                let row = (y * pitch) as usize;
+                for x in 0..w {
+                    let si = row + (x * 4) as usize;
+                    let di = ((y * w + x) * 4) as usize;
+                    if si + 4 <= data.len() {
+                        out[di] = data[si];
+                        out[di + 1] = data[si + 1];
+                        out[di + 2] = data[si + 2];
+                        out[di + 3] = 255;
+                    }
+                }
+            }
+            Some((w, h, out))
+        }
+        CURSOR_TYPE_MONOCHROME => {
+            // 1bpp、高さは実寸の 2 倍 (上半分 = AND マスク、下半分 = XOR マスク)。
+            let ch = h / 2;
+            let mut out = vec![0u8; (w * ch * 4) as usize];
+            for y in 0..ch {
+                let and_row = (y * pitch) as usize;
+                let xor_row = ((y + ch) * pitch) as usize;
+                for x in 0..w {
+                    let byte = (x / 8) as usize;
+                    let bit = 7 - (x % 8);
+                    let and_b =
+                        and_row + byte < data.len() && ((data[and_row + byte] >> bit) & 1) == 1;
+                    let xor_b =
+                        xor_row + byte < data.len() && ((data[xor_row + byte] >> bit) & 1) == 1;
+                    let (b, g, r, a) = match (and_b, xor_b) {
+                        (false, false) => (0u8, 0u8, 0u8, 255u8), // 不透明な黒 (境界)
+                        (false, true) => (255, 255, 255, 255),    // 不透明な白 (塗り)
+                        (true, false) => (0, 0, 0, 0),            // 透明
+                        (true, true) => (255, 255, 255, 255),     // 反転 → 白で近似
+                    };
+                    let di = ((y * w + x) * 4) as usize;
+                    out[di] = b;
+                    out[di + 1] = g;
+                    out[di + 2] = r;
+                    out[di + 3] = a;
+                }
+            }
+            Some((w, ch, out))
+        }
+        _ => None,
+    }
 }
 
 /// アスペクト比を維持して (src_w, src_h) を高さ `max_height` 以下へ縮小したサイズ (偶数)。
