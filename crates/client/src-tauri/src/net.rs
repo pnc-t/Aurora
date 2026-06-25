@@ -1552,6 +1552,206 @@ async fn fs_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
         .map_err(|e| format!("rename: {e}"))
 }
 
+/// 並べ替え許容パケットを保持するバッファの上限 (パケット数)。実ネットワーク (Wi-Fi /
+/// Tailscale リレー) の並べ替え距離は通常数パケットなので、これより先まで埋まらない gap は
+/// 真のロスとみなす。メモリ上限も兼ねる (~64 * 1.2KB ≒ 80KB)。
+const REORDER_WINDOW: usize = 64;
+/// gap (= 欠番) が埋まるのを待つ最大時間。これを超えたら真のロスと判断して resync する。
+/// 並べ替えで遅れたパケットは通常数 ms 以内に届くため、ここを短く保てば定常遅延に影響しない
+/// 一方、真のロス時はこの時間だけ表示が止まってから次フレームへ resync する (フリーズしない)。
+const REORDER_TIMEOUT: Duration = Duration::from_millis(15);
+/// キーフレーム要求の再送間隔。ロス回復のため要求を出した後、回復 (キーフレーム到達) するまで
+/// は再要求しない。万一その要求/応答自体がロスしても止まり続けないよう、この間隔で 1 回だけ
+/// 再アームする。旧実装の「ロスのたびに 200ms 間隔で要求」を撤廃し、IDR ストームを断つ。
+const KEYFRAME_REREQUEST: Duration = Duration::from_millis(500);
+
+/// 再構成器が吐く出来事。`udp_reader_loop` 側で送信/統計/キーフレーム要求へ振り分ける。
+enum ReasmEvent {
+    /// 1 フレーム完成 (フロントへ送る Annex-B)。
+    Frame {
+        keyframe: bool,
+        frame_id: u16,
+        data: Vec<u8>,
+    },
+    /// 真のロスとして計上すべき欠番パケット数 (並べ替えは含めない)。
+    Lost(u32),
+    /// 参照フレーム破損からの回復のためキーフレームを要求する。
+    RequestKeyframe,
+}
+
+/// 並べ替え許容の映像フレーム再構成器。
+///
+/// 旧実装は `seq` が 1 つでも飛んだら即「ロス扱い・現フレーム破棄・キーフレーム要求」していた
+/// ため、(1) UDP の並べ替えをロスと誤認し、(2) ロスのたびに IDR を要求して帯域スパイク→さらに
+/// ロス、の破綻ループ (IDR ストーム) を起こしていた。これがリモート操作のカクつきの主因。
+///
+/// ここでは `seq` をキーに小さな再整列バッファ (`REORDER_WINDOW` / `REORDER_TIMEOUT`) を持ち、
+/// 並べ替えで遅れたパケットは順序を直して取り込む (フレームを落とさない)。窓も時間も尽きた gap
+/// だけを真のロスとして resync し、その時に限りキーフレームを要求する。要求は回復するまで
+/// 抑制し (`awaiting_keyframe`)、ストームを防ぐ。
+struct VideoReassembler {
+    /// 次に順序通り処理すべき seq。`None` は初回パケット待ち。`seq` は u32 巡回。
+    next_seq: Option<u32>,
+    /// 先行して届いた (順序待ち) パケット。`seq` -> (flags, frame_id, payload)。
+    buffered: HashMap<u32, OwnedPkt>,
+    /// gap が初めて生じた時刻。`REORDER_TIMEOUT` 判定に使う。埋まれば `None` に戻す。
+    gap_since: Option<Instant>,
+    // --- 現在組み立て中のフレーム ---
+    cur_frame_id: Option<u16>,
+    cur_keyframe: bool,
+    cur_payload: Vec<u8>,
+    /// 現フレームを諦めて次の FRAME_START まで読み飛ばす。
+    dropping: bool,
+    /// キーフレーム要求中 (回復待ち)。回復するまで再要求を抑制する。
+    awaiting_keyframe: bool,
+    /// 直近のキーフレーム要求時刻 (`KEYFRAME_REREQUEST` の再アーム判定)。
+    last_keyframe_req: Instant,
+}
+
+/// 順序待ちバッファに置く所有パケット。
+struct OwnedPkt {
+    flags: VideoPacketFlags,
+    frame_id: u16,
+    payload: Vec<u8>,
+}
+
+impl VideoReassembler {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_seq: None,
+            buffered: HashMap::new(),
+            gap_since: None,
+            cur_frame_id: None,
+            cur_keyframe: false,
+            cur_payload: Vec::new(),
+            dropping: false,
+            awaiting_keyframe: false,
+            // 過去側に倒し、最初のロスで即要求できるようにする。
+            last_keyframe_req: now.checked_sub(KEYFRAME_REREQUEST).unwrap_or(now),
+        }
+    }
+
+    /// パケット 1 個を取り込む。完成フレーム等の出来事を `out` へ push する。
+    fn push(&mut self, seq: u32, pkt: OwnedPkt, now: Instant, out: &mut Vec<ReasmEvent>) {
+        match self.next_seq {
+            None => {
+                // 初回。この seq から順序付けを開始する。
+                self.next_seq = Some(seq.wrapping_add(1));
+                self.ingest(pkt, out);
+                self.drain(out);
+            }
+            Some(ns) => {
+                let diff = seq.wrapping_sub(ns) as i32;
+                if diff < 0 {
+                    // 既に通過済みの seq = 並べ替えで遅れて届いた or 重複。ロスに数えず捨てる。
+                } else if diff == 0 {
+                    self.next_seq = Some(ns.wrapping_add(1));
+                    self.ingest(pkt, out);
+                    self.drain(out);
+                } else {
+                    // 先行パケット。順序待ちバッファへ積む。
+                    self.buffered.insert(seq, pkt);
+                    if self.gap_since.is_none() {
+                        self.gap_since = Some(now);
+                    }
+                    self.maybe_force_skip(now, out);
+                }
+            }
+        }
+    }
+
+    /// バッファ先頭が `next_seq` と連続する限り取り込む (並べ替えの追いつき)。
+    fn drain(&mut self, out: &mut Vec<ReasmEvent>) {
+        while let Some(ns) = self.next_seq {
+            let Some(pkt) = self.buffered.remove(&ns) else {
+                break;
+            };
+            self.next_seq = Some(ns.wrapping_add(1));
+            self.ingest(pkt, out);
+        }
+        if self.buffered.is_empty() {
+            self.gap_since = None;
+        }
+    }
+
+    /// 窓 or 時間切れの gap を真のロスとして飛ばし、最小の先行 seq へ resync する。
+    fn maybe_force_skip(&mut self, now: Instant, out: &mut Vec<ReasmEvent>) {
+        let over_window = self.buffered.len() >= REORDER_WINDOW;
+        let over_time = self
+            .gap_since
+            .is_some_and(|t| now.duration_since(t) >= REORDER_TIMEOUT);
+        if !(over_window || over_time) {
+            return;
+        }
+        let Some(ns) = self.next_seq else { return };
+        // 先行バッファの中で「最も近い (巡回前方距離が最小の)」seq まで飛ぶ。
+        let Some(target) = self
+            .buffered
+            .keys()
+            .copied()
+            .min_by_key(|&k| k.wrapping_sub(ns))
+        else {
+            return;
+        };
+        let lost = target.wrapping_sub(ns);
+        out.push(ReasmEvent::Lost(lost));
+        // 現フレームは欠落で復号不能。破棄して次の FRAME_START まで読み飛ばす。
+        self.cur_payload.clear();
+        self.cur_frame_id = None;
+        self.dropping = true;
+        // 参照フレームが壊れたので回復のためキーフレームを要求する (抑制付き)。
+        self.request_keyframe(now, out);
+        self.next_seq = Some(target);
+        self.gap_since = None;
+        self.drain(out);
+    }
+
+    /// 順序通りの 1 パケットをフレーム組み立てに反映する。
+    fn ingest(&mut self, pkt: OwnedPkt, out: &mut Vec<ReasmEvent>) {
+        if pkt.flags.contains(VideoPacketFlags::FRAME_START) {
+            self.cur_payload.clear();
+            self.cur_frame_id = Some(pkt.frame_id);
+            self.cur_keyframe = pkt.flags.contains(VideoPacketFlags::KEYFRAME);
+            self.dropping = false;
+        }
+        if self.dropping || self.cur_frame_id != Some(pkt.frame_id) {
+            // フレーム境界が合わない (読み飛ばし中 or 取りこぼした FRAME_START)。
+            return;
+        }
+        if self.cur_payload.len() + pkt.payload.len() > MAX_FRAME_BYTES {
+            tracing::warn!("frame too large, dropping");
+            self.cur_payload.clear();
+            self.cur_frame_id = None;
+            self.dropping = true;
+            return;
+        }
+        self.cur_payload.extend_from_slice(&pkt.payload);
+        if pkt.flags.contains(VideoPacketFlags::FRAME_END) {
+            let keyframe = self.cur_keyframe;
+            // キーフレームが完成 = 参照フレーム回復。以降のキーフレーム要求抑制を解除する。
+            if keyframe {
+                self.awaiting_keyframe = false;
+            }
+            out.push(ReasmEvent::Frame {
+                keyframe,
+                frame_id: self.cur_frame_id.take().unwrap_or(pkt.frame_id),
+                data: std::mem::take(&mut self.cur_payload),
+            });
+        }
+    }
+
+    /// キーフレームを要求する。回復待ち中は再アーム間隔を超えるまで抑制する (IDR ストーム防止)。
+    fn request_keyframe(&mut self, now: Instant, out: &mut Vec<ReasmEvent>) {
+        if self.awaiting_keyframe && now.duration_since(self.last_keyframe_req) < KEYFRAME_REREQUEST
+        {
+            return;
+        }
+        self.awaiting_keyframe = true;
+        self.last_keyframe_req = now;
+        out.push(ReasmEvent::RequestKeyframe);
+    }
+}
+
 /// 受信したパケットからフレームを再構成し、Channel<InvokeResponseBody> でフロントへ。
 /// フロント宛バイナリの先頭に小さなヘッダを付ける:
 ///   [0]   flags (bit0=keyframe)
@@ -1575,14 +1775,10 @@ async fn udp_reader_loop(
     let mut hello_interval = tokio::time::interval(Duration::from_millis(250));
     hello_interval.tick().await; // 初回の即時 tick を捨てる
 
-    // 映像フレーム組立状態 (STREAM_VIDEO のみで使う)
-    let mut cur_frame_id: Option<u16> = None;
-    let mut cur_keyframe = false;
-    let mut cur_payload: Vec<u8> = Vec::new();
-    let mut last_seq: Option<u32> = None;
-    let mut dropping = false;
-    // キーフレーム要求のスロットル。ロスが連続しても要求が殺到しないようにする。
-    let mut last_keyframe_req = Instant::now() - Duration::from_secs(1);
+    // 映像フレーム組立状態 (STREAM_VIDEO のみで使う)。並べ替え許容の再構成器に集約する。
+    let mut reasm = VideoReassembler::new(Instant::now());
+    // push が吐く出来事を毎パケット受ける一時バッファ (再利用してアロケーションを抑える)。
+    let mut events: Vec<ReasmEvent> = Vec::new();
 
     loop {
         // recv エラーでループを終了させない。Windows の connected UDP ソケットは
@@ -1664,56 +1860,39 @@ async fn udp_reader_loop(
         // 損失率算出のため受信した映像パケットを計上。
         stats.add_video_pkt();
 
-        // seq 連続性チェック
-        if let Some(prev) = last_seq {
-            if pkt.seq != prev.wrapping_add(1) {
-                // ロス検出: 欠落数を推定して計上し、現フレームを破棄して次の開始まで dropping
-                let missing = pkt.seq.wrapping_sub(prev).wrapping_sub(1);
-                stats.add_lost(missing as u64);
-                cur_payload.clear();
-                cur_frame_id = None;
-                dropping = true;
-                // 参照フレームが壊れたままにならないよう、キーフレームを要求して回復する。
-                // 連続ロスでの殺到を避けるため最短 200ms 間隔にスロットル。
-                if last_keyframe_req.elapsed() >= Duration::from_millis(200) {
-                    last_keyframe_req = Instant::now();
+        // 並べ替え許容の再構成器へ渡す。完成フレーム・真のロス・キーフレーム要求が出来事として返る。
+        let now = Instant::now();
+        events.clear();
+        reasm.push(
+            pkt.seq,
+            OwnedPkt {
+                flags: pkt.flags,
+                frame_id: pkt.frame_id,
+                payload: pkt.payload.to_vec(),
+            },
+            now,
+            &mut events,
+        );
+        for ev in events.drain(..) {
+            match ev {
+                ReasmEvent::Frame {
+                    keyframe,
+                    frame_id,
+                    data,
+                } => {
+                    let mut out = Vec::with_capacity(3 + data.len());
+                    out.push(if keyframe { 1u8 } else { 0u8 });
+                    out.extend_from_slice(&frame_id.to_be_bytes());
+                    out.extend_from_slice(&data);
+                    // バイナリで現在の表示先へ送信 (デタッチ中なら捨てられ、次キーフレームで回復)
+                    sink.send_video(InvokeResponseBody::Raw(out));
+                    stats.add_frame();
+                }
+                ReasmEvent::Lost(n) => stats.add_lost(n as u64),
+                ReasmEvent::RequestKeyframe => {
                     let _ = keyframe_tx.send(ControlMsg::RequestKeyframe);
                 }
             }
-        }
-        last_seq = Some(pkt.seq);
-
-        if pkt.flags.contains(VideoPacketFlags::FRAME_START) {
-            cur_payload.clear();
-            cur_frame_id = Some(pkt.frame_id);
-            cur_keyframe = pkt.flags.contains(VideoPacketFlags::KEYFRAME);
-            dropping = false;
-        }
-
-        if dropping || cur_frame_id != Some(pkt.frame_id) {
-            // フレーム境界が合わないので破棄
-            continue;
-        }
-
-        if cur_payload.len() + pkt.payload.len() > MAX_FRAME_BYTES {
-            tracing::warn!("frame too large, dropping");
-            cur_payload.clear();
-            cur_frame_id = None;
-            dropping = true;
-            continue;
-        }
-        cur_payload.extend_from_slice(pkt.payload);
-
-        if pkt.flags.contains(VideoPacketFlags::FRAME_END) {
-            let mut out = Vec::with_capacity(3 + cur_payload.len());
-            out.push(if cur_keyframe { 1u8 } else { 0u8 });
-            out.extend_from_slice(&pkt.frame_id.to_be_bytes());
-            out.extend_from_slice(&cur_payload);
-            // バイナリで現在の表示先へ送信 (デタッチ中なら捨てられ、次キーフレームで回復)
-            sink.send_video(InvokeResponseBody::Raw(out));
-            stats.add_frame();
-            cur_payload.clear();
-            cur_frame_id = None;
         }
     }
 }
@@ -1798,5 +1977,197 @@ mod tests {
         for rel in ["..", "a/../b", "a\\b", "C:/x"] {
             assert!(safe_join(root, rel).await.is_err(), "should reject {rel:?}");
         }
+    }
+
+    // ---- VideoReassembler (P1: 並べ替え/ロス耐性) ----
+
+    /// 単一パケットフレーム (START|END[|KEYFRAME]) を組み立てるテスト用ヘルパ。
+    fn single_frame_pkt(frame_id: u16, keyframe: bool) -> OwnedPkt {
+        let mut flags = VideoPacketFlags::FRAME_START | VideoPacketFlags::FRAME_END;
+        if keyframe {
+            flags |= VideoPacketFlags::KEYFRAME;
+        }
+        OwnedPkt {
+            flags,
+            frame_id,
+            payload: vec![frame_id as u8],
+        }
+    }
+
+    fn frame_ids(events: &[ReasmEvent]) -> Vec<u16> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ReasmEvent::Frame { frame_id, .. } => Some(*frame_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count_keyframe_reqs(events: &[ReasmEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ReasmEvent::RequestKeyframe))
+            .count()
+    }
+
+    fn total_lost(events: &[ReasmEvent]) -> u32 {
+        events
+            .iter()
+            .map(|e| match e {
+                ReasmEvent::Lost(n) => *n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// 順序通りに届けば各フレームが完成し、ロスもキーフレーム要求も出ない。
+    #[tokio::test]
+    async fn reasm_in_order() {
+        let now = Instant::now();
+        let mut r = VideoReassembler::new(now);
+        let mut out = Vec::new();
+        for (seq, fid) in [(0u32, 0u16), (1, 1), (2, 2)] {
+            r.push(seq, single_frame_pkt(fid, fid == 0), now, &mut out);
+        }
+        assert_eq!(frame_ids(&out), vec![0, 1, 2]);
+        assert_eq!(total_lost(&out), 0);
+        assert_eq!(count_keyframe_reqs(&out), 0);
+    }
+
+    /// 窓内の並べ替え (後続パケットが先に届く) はフレームを落とさずに吸収する。
+    #[tokio::test]
+    async fn reasm_reorder_within_window() {
+        let now = Instant::now();
+        let mut r = VideoReassembler::new(now);
+        let mut out = Vec::new();
+        // frame0: seq0 単発。frame1: seq1=START, seq2=END。seq2 を seq1 より先に届ける。
+        r.push(0, single_frame_pkt(0, true), now, &mut out);
+        r.push(
+            2,
+            OwnedPkt {
+                flags: VideoPacketFlags::FRAME_END,
+                frame_id: 1,
+                payload: vec![0xBB],
+            },
+            now,
+            &mut out,
+        );
+        r.push(
+            1,
+            OwnedPkt {
+                flags: VideoPacketFlags::FRAME_START,
+                frame_id: 1,
+                payload: vec![0xAA],
+            },
+            now,
+            &mut out,
+        );
+        assert_eq!(frame_ids(&out), vec![0, 1]);
+        assert_eq!(total_lost(&out), 0, "reorder must not count as loss");
+        assert_eq!(count_keyframe_reqs(&out), 0);
+    }
+
+    /// 遅れて届いた (通過済み seq) パケットは重複/並べ替えとして無視し、ロスに数えない。
+    #[tokio::test]
+    async fn reasm_late_packet_ignored() {
+        let now = Instant::now();
+        let mut r = VideoReassembler::new(now);
+        let mut out = Vec::new();
+        r.push(0, single_frame_pkt(0, true), now, &mut out);
+        r.push(1, single_frame_pkt(1, false), now, &mut out);
+        out.clear();
+        // 既に通過した seq0 が再度届く (重複)。
+        r.push(0, single_frame_pkt(0, true), now, &mut out);
+        assert!(out.is_empty(), "late/duplicate packet must produce nothing");
+    }
+
+    /// タイムアウトを超えても埋まらない gap は真のロスとして resync し、キーフレームを 1 回要求する。
+    #[tokio::test]
+    async fn reasm_real_loss_resyncs() {
+        let base = Instant::now();
+        let mut r = VideoReassembler::new(base);
+        let mut out = Vec::new();
+        r.push(0, single_frame_pkt(0, true), base, &mut out);
+        out.clear();
+        // seq1 がロス。seq2 が届くが gap は未タイムアウト → まだ何も出ない。
+        r.push(2, single_frame_pkt(2, false), base, &mut out);
+        assert!(out.is_empty(), "before timeout: hold, no events");
+        // タイムアウト後に次パケットが来ると force-skip して resync する。
+        let later = base + REORDER_TIMEOUT + Duration::from_millis(1);
+        r.push(3, single_frame_pkt(3, false), later, &mut out);
+        assert_eq!(
+            total_lost(&out),
+            1,
+            "exactly the missing seq1 counts as lost"
+        );
+        assert_eq!(count_keyframe_reqs(&out), 1);
+        // resync 後、バッファに溜まっていた frame2/frame3 は届く。
+        assert_eq!(frame_ids(&out), vec![2, 3]);
+    }
+
+    /// 回復前の連続ロスではキーフレーム要求を抑制し (ストーム防止)、キーフレーム完成で再アームする。
+    #[tokio::test]
+    async fn reasm_keyframe_request_suppressed_until_recovery() {
+        let mut t = Instant::now();
+        let mut r = VideoReassembler::new(t);
+        let mut out = Vec::new();
+        let after_timeout = REORDER_TIMEOUT + Duration::from_millis(1);
+
+        // 「1 個だけロスし、続く 1 フレームが届いて resync する」を起こすクロージャ。
+        // gap パケットを積み、タイムアウト後にその次の seq を届けて force-skip → 連続 drain させる。
+        // (lost_seq を欠番にし、lost_seq+1 と lost_seq+2 のフレームを届ける)
+        let clean_loss = |r: &mut VideoReassembler,
+                          t: &mut Instant,
+                          lost_seq: u32,
+                          out: &mut Vec<ReasmEvent>| {
+            r.push(
+                lost_seq + 1,
+                single_frame_pkt((lost_seq + 1) as u16, false),
+                *t,
+                out,
+            );
+            *t += after_timeout;
+            r.push(
+                lost_seq + 2,
+                single_frame_pkt((lost_seq + 2) as u16, false),
+                *t,
+                out,
+            );
+            *t += Duration::from_millis(10);
+        };
+
+        // seq0: 起点フレーム。next_seq=1 になる。
+        r.push(0, single_frame_pkt(0, true), t, &mut out);
+        t += Duration::from_millis(10);
+
+        // 1 回目のロス (seq1 欠番) → キーフレーム要求 1 回。
+        out.clear();
+        clean_loss(&mut r, &mut t, 1, &mut out);
+        assert_eq!(count_keyframe_reqs(&out), 1, "first loss requests once");
+
+        // 回復前 (まだキーフレーム未到達) の 2 回目のロス (seq4 欠番) → 抑制され要求は出ない。
+        out.clear();
+        clean_loss(&mut r, &mut t, 4, &mut out);
+        assert_eq!(
+            count_keyframe_reqs(&out),
+            0,
+            "subsequent loss before recovery is suppressed"
+        );
+
+        // キーフレーム (seq7) が順序通り完成 = 回復 → 抑制解除。
+        out.clear();
+        r.push(7, single_frame_pkt(7, true), t, &mut out);
+        t += Duration::from_millis(10);
+        assert_eq!(frame_ids(&out), vec![7], "keyframe completes in order");
+
+        // 回復後の 3 回目のロス (seq8 欠番) → 再びキーフレームを要求する。
+        out.clear();
+        clean_loss(&mut r, &mut t, 8, &mut out);
+        assert_eq!(
+            count_keyframe_reqs(&out),
+            1,
+            "after keyframe recovery, loss requests again"
+        );
     }
 }
