@@ -16,17 +16,16 @@ use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::FALSE;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
-    IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFTransform,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput, METransformNeedInput,
-    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
+    CODECAPI_AVEncCommonMeanBitRate, ICodecAPI, IMF2DBuffer, IMFActivate, IMFMediaBuffer,
+    IMFMediaEventGenerator, IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{Interface, PWSTR};
@@ -34,13 +33,10 @@ use windows::core::{Interface, PWSTR};
 use crate::capture::Frame;
 use crate::capture::SharedDevice;
 use crate::encode::mf::{
-    FRAME_DURATION_100NS, configure_rate_control, is_keyframe_annexb, make_h264_output_type,
-    make_nv12_input_type, set_vbv_buffer, variant_u32,
+    FRAME_DURATION_100NS, configure_low_latency, configure_rate_control, is_keyframe_annexb,
+    make_h264_output_type, make_nv12_input_type, set_vbv_buffer, variant_u32,
 };
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
-
-/// VARIANT 型タグ VT_BOOL。
-const VT_BOOL: u16 = 11;
 
 /// `IMFMediaEventGenerator::GetEvent` のノンブロッキング取得フラグ (MF_EVENT_FLAG_NO_WAIT)。
 /// キューが空なら待たずに `MF_E_NO_EVENTS_AVAILABLE` を返す。
@@ -169,10 +165,8 @@ impl Inner {
         // ICodecAPI は任意。低遅延モード + レート制御 (PeakConstrainedVBR + 平均/ピーク) を設定。
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
-            // SAFETY: api live。VARIANT は VT_BOOL で有効。
-            unsafe {
-                let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
-            }
+            // 低遅延モード + 大きな GOP (周期 IDR 抑制) + レート制御 (PeakConstrainedVBR)。
+            configure_low_latency(api);
             configure_rate_control(api, bitrate, max_bitrate);
         }
 
@@ -547,28 +541,4 @@ fn read_friendly_name(activate: &IMFActivate) -> Option<String> {
         CoTaskMemFree(Some(p.as_ptr() as *const std::ffi::c_void));
         s
     }
-}
-
-/// VT_BOOL の VARIANT を組み立てる (`variant_u32` と同じレイアウト手法)。
-fn variant_bool(value: bool) -> windows::core::VARIANT {
-    #[repr(C)]
-    struct RawVariant {
-        vt: u16,
-        r1: u16,
-        r2: u16,
-        r3: u16,
-        val: u64,
-        pad: u64,
-    }
-    let raw = RawVariant {
-        vt: VT_BOOL,
-        r1: 0,
-        r2: 0,
-        r3: 0,
-        // VARIANT_BOOL: true = -1 (0xFFFF), false = 0。
-        val: if value { 0xFFFF } else { 0 },
-        pad: 0,
-    };
-    // SAFETY: RawVariant は x86_64 Windows の VARIANT と同一レイアウト。VT_BOOL は非ポインタ。
-    unsafe { std::mem::transmute::<RawVariant, windows::core::VARIANT>(raw) }
 }

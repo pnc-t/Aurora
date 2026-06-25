@@ -18,14 +18,15 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, ICodecAPI,
-    IMFMediaBuffer, IMFMediaType, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaBuffer, IMFMediaType, IMFTransform,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_Base,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
@@ -47,6 +48,15 @@ pub(crate) const FRAME_DURATION_100NS: i64 = (10_000_000i64) / FPS as i64;
 /// VARIANT 型タグ VT_UI4 (unsigned long)。`windows::Win32::System::Variant` の
 /// 追加 feature を避けるため数値を直接定義する。
 const VT_UI4: u16 = 19;
+/// VARIANT 型タグ VT_BOOL。
+const VT_BOOL: u16 = 11;
+
+/// 低遅延設定として明示する GOP サイズ (フレーム数)。`FPS * 10` ≒ 10 秒。
+/// キーフレームは原則クライアントの `RequestKeyframe` 時のみ送る設計 (接続時・ロス回復時)。
+/// エンコーダ任せ (GOP 0) だと数秒ごとに周期 IDR が入り、その都度帯域スパイク→遅延の山に
+/// なるため、十分大きく取って周期 IDR を実質無効化する。10 秒の安全網は、要求が万一とりこぼ
+/// された場合の最終的な自己回復を残すための妥協値。
+const GOP_SIZE: u32 = FPS * 10;
 
 pub struct MfH264Encoder {
     /// 共有デバイス (NV12 テクスチャの staging リードバックに使う)。
@@ -151,6 +161,8 @@ impl Inner {
 
         // 実行時ビットレート変更用に ICodecAPI を取得 (MS H.264 encoder は対応)。
         let codec_api: ICodecAPI = transform.cast().context("QueryInterface ICodecAPI")?;
+        // 低遅延モード + 大きな GOP (周期 IDR 抑制)。HW 経路と揃える。
+        configure_low_latency(&codec_api);
         // レート制御を明示する (既定の緩い VBR は目標を大きく超過するため)。
         configure_rate_control(&codec_api, bitrate, max_bitrate);
 
@@ -448,6 +460,20 @@ pub(crate) fn configure_rate_control(codec_api: &ICodecAPI, mean_bps: u32, max_b
 /// その折衷 (実機で要調整余地あり)。
 const VBV_BUFFER_MS: u32 = 500;
 
+/// 低遅延向けの共通設定 (SW / HW 両エンコーダから呼ぶ)。
+/// - `AVLowLatencyMode`: B フレーム/先読みを無効化し、出力遅延を最小化する。
+/// - 大きな `GOPSize`: 周期 IDR を実質無効化し、キーフレームは原則クライアント要求時のみに
+///   する (周期的な帯域スパイク = 遅延の山を防ぐ)。
+///
+/// HW MFT はベンダによって一部 knob を無視するため best-effort (失敗は無視)。
+pub(crate) fn configure_low_latency(codec_api: &ICodecAPI) {
+    // SAFETY: codec_api 生存。VARIANT は対応する型タグで構築し SetValue が値をコピーする。
+    unsafe {
+        let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
+        let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &variant_u32(GOP_SIZE));
+    }
+}
+
 /// VBV/HRD バッファサイズ (bits) を現在のビットレートの `VBV_BUFFER_MS` 相当に設定する。
 /// ビットレート適応のたびに呼び、レートに追従して常に一定時間ぶんに保つ (低遅延を維持)。
 /// HW MFT は無視することがあるため best-effort (失敗は無視)。無制限モード (max=u32::MAX) では
@@ -485,6 +511,30 @@ pub(crate) fn variant_u32(value: u32) -> windows::core::VARIANT {
     };
     // SAFETY: RawVariant は x86_64 Windows の VARIANT と同一レイアウト (24B)。サイズ不一致なら
     // transmute がコンパイルエラーになる。VT_UI4 は非ポインタ型なので Drop (VariantClear) も安全。
+    unsafe { std::mem::transmute::<RawVariant, windows::core::VARIANT>(raw) }
+}
+
+/// VT_BOOL の VARIANT を組み立てる (`variant_u32` と同じレイアウト手法)。
+pub(crate) fn variant_bool(value: bool) -> windows::core::VARIANT {
+    #[repr(C)]
+    struct RawVariant {
+        vt: u16,
+        r1: u16,
+        r2: u16,
+        r3: u16,
+        val: u64,
+        pad: u64,
+    }
+    let raw = RawVariant {
+        vt: VT_BOOL,
+        r1: 0,
+        r2: 0,
+        r3: 0,
+        // VARIANT_BOOL: true = -1 (0xFFFF), false = 0。
+        val: if value { 0xFFFF } else { 0 },
+        pad: 0,
+    };
+    // SAFETY: RawVariant は x86_64 Windows の VARIANT と同一レイアウト。VT_BOOL は非ポインタ。
     unsafe { std::mem::transmute::<RawVariant, windows::core::VARIANT>(raw) }
 }
 
