@@ -235,12 +235,12 @@ pub struct Converter {
     cursor_tex: Option<ID3D11ShaderResourceView>,
     cursor_w: u32,
     cursor_h: u32,
-    cursor_hotspot_x: i32,
-    cursor_hotspot_y: i32,
-    /// カーソルの現在位置 (キャプチャ出力の左上基準・px) と可視性。
+    /// カーソルの現在位置 (キャプチャ出力の左上基準・ビットマップ左上 px) と可視性。
     cursor_x: i32,
     cursor_y: i32,
     cursor_visible: bool,
+    /// 合成を行うか (クライアントのマウスキャプチャ中だけ ON)。OFF の間は焼き込まない。
+    cursor_enabled: bool,
 
     // 入力をシェーダ可読化するコピー先 (Desktop Duplication のテクスチャは SRV 不可)。
     src_copy: Option<ID3D11Texture2D>,
@@ -455,11 +455,10 @@ impl Converter {
             cursor_tex: None,
             cursor_w: 0,
             cursor_h: 0,
-            cursor_hotspot_x: 0,
-            cursor_hotspot_y: 0,
             cursor_x: 0,
             cursor_y: 0,
             cursor_visible: false,
+            cursor_enabled: false,
             src_copy: None,
             src_srv: None,
             src_rtv: None,
@@ -573,8 +572,13 @@ impl Converter {
         Ok(target.tex.clone())
     }
 
-    /// カーソルの位置と可視性を更新する (キャプチャ出力の左上基準・px)。
-    /// マウス未移動フレームでは呼ばれず、直前の状態を保つ。
+    /// 映像へのカーソル合成 ON/OFF (クライアントのマウスキャプチャ中だけ ON)。
+    pub fn set_cursor_overlay(&mut self, enabled: bool) {
+        self.cursor_enabled = enabled;
+    }
+
+    /// カーソルの位置と可視性を更新する。`x`/`y` は DXGI PointerPosition (= カーソル
+    /// ビットマップの左上、キャプチャ出力基準・px)。マウス未移動フレームでは呼ばれず直前を保つ。
     pub fn set_cursor_pos(&mut self, x: i32, y: i32, visible: bool) {
         self.cursor_x = x;
         self.cursor_y = y;
@@ -589,7 +593,6 @@ impl Converter {
         width: u32,
         height: u32,
         pitch: u32,
-        hotspot: (i32, i32),
         data: &[u8],
     ) -> Result<()> {
         let Some((w, h, bgra)) = build_cursor_rgba(cur_type, width, height, pitch, data) else {
@@ -647,14 +650,18 @@ impl Converter {
         self.cursor_tex = Some(srv);
         self.cursor_w = w;
         self.cursor_h = h;
-        self.cursor_hotspot_x = hotspot.0;
-        self.cursor_hotspot_y = hotspot.1;
         Ok(())
     }
 
-    /// src_copy (フル解像度) へカーソルを alpha ブレンドで重ねる。可視かつ形状取得済みのときだけ。
+    /// src_copy (フル解像度) へカーソルを alpha ブレンドで重ねる。合成 ON かつ可視かつ
+    /// 形状取得済みのときだけ。
     fn composite_cursor(&mut self, src_w: u32, src_h: u32) {
-        if !self.cursor_visible || self.cursor_w == 0 || src_w == 0 || src_h == 0 {
+        if !self.cursor_enabled
+            || !self.cursor_visible
+            || self.cursor_w == 0
+            || src_w == 0
+            || src_h == 0
+        {
             return;
         }
         let Some(cursor_srv) = self.cursor_tex.clone() else {
@@ -664,9 +671,10 @@ impl Converter {
             return;
         };
 
-        // カーソル左上 = ポインタ位置 - ホットスポット。クアッドを NDC へ写す。
-        let px = (self.cursor_x - self.cursor_hotspot_x) as f32;
-        let py = (self.cursor_y - self.cursor_hotspot_y) as f32;
+        // DXGI PointerPosition はカーソルビットマップの左上 (ホットスポット補正済み) なので、
+        // そのまま左上として置く。クアッドを NDC へ写す。
+        let px = self.cursor_x as f32;
+        let py = self.cursor_y as f32;
         let to_ndc_x = |x: f32| (x / src_w as f32) * 2.0 - 1.0;
         let to_ndc_y = |y: f32| 1.0 - (y / src_h as f32) * 2.0;
         let params = CursorParams {

@@ -1,6 +1,6 @@
 //! TCP 制御 + UDP 映像のサーバ。単一クライアントモデル。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -460,6 +460,9 @@ struct SharedControl {
     bitrate: BitrateController,
     /// クライアント毎の直近 stats (loss_permille, rtt_us)。最悪値集約に使う。
     client_stats: HashMap<u64, (u16, u32)>,
+    /// カーソル合成を要求中のクライアント (マウスキャプチャ中)。単一エンコーダ = 共有映像なので、
+    /// 1 つでも要求があれば合成する。切断時に除く。
+    cursor_overlay: HashSet<u64>,
     /// ProjFS ドライブを所有する接続 (固定パスのため 1 本のみ mount 可)。None なら未所有。
     projfs_owner: Option<u64>,
     /// 確立済み (UDP hello 完了) のクライアント数。0 へ落ちた最後の 1 本がテイクオーバー等の
@@ -489,6 +492,7 @@ struct ClientArgs {
     cap_select_tx: std::sync::mpsc::Sender<String>,
     fps_tx: std::sync::mpsc::Sender<u32>,
     scale_tx: std::sync::mpsc::Sender<u32>,
+    cursor_tx: std::sync::mpsc::Sender<bool>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     /// 映像/音声 broadcast の送信元。接続確立後に subscribe して自鍵で暗号化し UDP へ送る。
     nal_btx: broadcast::Sender<Arc<EncodedNal>>,
@@ -510,6 +514,7 @@ pub async fn run_server(
     cap_select_tx: std::sync::mpsc::Sender<String>,
     fps_tx: std::sync::mpsc::Sender<u32>,
     scale_tx: std::sync::mpsc::Sender<u32>,
+    cursor_tx: std::sync::mpsc::Sender<bool>,
     clip_apply_tx: mpsc::UnboundedSender<String>,
     clip_change_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
@@ -594,6 +599,7 @@ pub async fn run_server(
         vdd_gdi_name,
         bitrate: BitrateController::new(cfg.max_bitrate_bps),
         client_stats: HashMap::new(),
+        cursor_overlay: HashSet::new(),
         projfs_owner: None,
         active_conns: 0,
     }));
@@ -659,6 +665,7 @@ pub async fn run_server(
                 cap_select_tx: cap_select_tx.clone(),
                 fps_tx: fps_tx.clone(),
                 scale_tx: scale_tx.clone(),
+                cursor_tx: cursor_tx.clone(),
                 clip_apply_tx: clip_apply_tx.clone(),
                 nal_btx: nal_btx.clone(),
                 audio_btx: audio_btx.clone(),
@@ -700,6 +707,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
         cap_select_tx,
         fps_tx,
         scale_tx,
+        cursor_tx,
         clip_apply_tx,
         nal_btx,
         audio_btx,
@@ -958,6 +966,20 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
                     ControlMsg::SetVideoPaused { paused } => {
                         tracing::info!(paused, "client set video paused");
                         video_paused = paused;
+                    }
+                    ControlMsg::SetCursorOverlay { enabled } => {
+                        tracing::info!(enabled, "client set cursor overlay");
+                        // 共有映像なので「1 つでも要求があれば合成」。集合を更新して capture へ。
+                        let any = {
+                            let mut sc = shared.lock().await;
+                            if enabled {
+                                sc.cursor_overlay.insert(conn_id);
+                            } else {
+                                sc.cursor_overlay.remove(&conn_id);
+                            }
+                            !sc.cursor_overlay.is_empty()
+                        };
+                        let _ = cursor_tx.send(any);
                     }
                     ControlMsg::SetResolution { max_height } => {
                         tracing::info!(max_height, "client set resolution");
@@ -1338,6 +1360,10 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
         let mut sc = shared.lock().await;
         sc.active_conns = sc.active_conns.saturating_sub(1);
         sc.client_stats.remove(&conn_id);
+        // カーソル合成要求を取り下げ、残りの要求有無を capture へ反映する (取りこぼし防止)。
+        if sc.cursor_overlay.remove(&conn_id) {
+            let _ = cursor_tx.send(!sc.cursor_overlay.is_empty());
+        }
         if sc.projfs_owner == Some(conn_id) {
             sc.projfs_owner = None;
         }
