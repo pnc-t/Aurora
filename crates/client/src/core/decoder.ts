@@ -11,6 +11,23 @@
 
 import { logger } from "./log";
 
+// --- ジッタバッファ (P2: 滑らかさ) ---
+// 旧実装はデコード完了フレームを onFrame で即 drawImage していた。WebCodecs の出力は
+// ネットワーク到着ジッタ (パケットが束で来て→疎、を繰り返す) をそのまま引き継ぐため、
+// 各フレームの表示時間が不均一になり「ヌルヌル動かずカクつく」体感の一因になっていた。
+// ここでは小さなクッション (TARGET_BUFFER_MS) を持ち、到着間隔の推定 (EMA) で**均等間隔**に
+// 提示時刻をスケジュールして requestAnimationFrame で出す。これで到着ジッタを吸収し表示が
+// 滑らかになる。リフレッシュレート非依存 (時刻ベースなので 60/120/144Hz いずれでも機能)。
+
+/// ジッタ吸収クッションの目標遅延 (ms)。到着ジッタをこの分の先読みで吸収する。操作の
+/// 体感遅延 (E2E < 50ms 目標) を圧迫しないよう小さく保つ (≒1.5 フレーム @60fps)。
+const TARGET_BUFFER_MS = 24;
+/// 提示バックログの上限 (ms)。源 fps > 表示 Hz 等で提示が追いつかないとき、これを超える
+/// 古いフレームは捨てて遅延の累積 (バッファブロート) を防ぐ。
+const MAX_BUFFER_MS = 80;
+/// フレーム間隔の初期推定 (60fps)。実際の到着間隔の EMA で源 fps 変化に追従する。
+const DEFAULT_INTERVAL_MS = 1000 / 60;
+
 type DecoderOpts = {
   /** デコード不能 (設定前のキーフレーム待ち / エラー) で復帰を促すための要求口。 */
   requestKeyframe: () => void;
@@ -24,6 +41,18 @@ export class Decoder {
   // 連発しうるため、最大 1 秒 1 回に間引き、その間に潰した件数を併記する。
   private lastErrLogMs = 0;
   private suppressedErrs = 0;
+
+  // --- ジッタバッファ状態 ---
+  // 提示待ちのデコード済みフレーム (到着順 = 提示順)。各フレームに提示予定時刻を持たせる。
+  private queue: { frame: VideoFrame; presentAt: number }[] = [];
+  // 提示ループの requestAnimationFrame ハンドル (キューが空の間は止める)。
+  private rafId: number | null = null;
+  // 到着間隔の指数移動平均 (源 fps 推定)。
+  private emaIntervalMs = DEFAULT_INTERVAL_MS;
+  // 直近フレームの到着時刻 (EMA 更新用)。0 = 未到着。
+  private lastArrivalMs = 0;
+  // 次フレームに割り当てる提示予定時刻 (均等間隔スケジューリングのアンカー)。
+  private nextPresentAt = 0;
 
   /** デコードパイプラインのエラーを 1 秒 1 回に間引いて記録する (抑制件数を併記)。 */
   private throttledError(msg: string, ...extra: unknown[]): void {
@@ -51,6 +80,7 @@ export class Decoder {
 
   /** デコーダを作り直す (接続/再接続/タブ復帰時)。次のキーフレームから再構成する。 */
   reset(): void {
+    this.flushQueue();
     if (this.decoder && this.decoder.state !== "closed") {
       try {
         this.decoder.close();
@@ -71,6 +101,7 @@ export class Decoder {
 
   /** セッション破棄時に閉じる。 */
   close(): void {
+    this.flushQueue();
     if (this.decoder && this.decoder.state !== "closed") {
       try {
         this.decoder.close();
@@ -82,7 +113,75 @@ export class Decoder {
     this.configured = false;
   }
 
+  /** WebCodecs のデコード出力。即描画せず、均等間隔の提示予定を割り当ててキューに積む。 */
   private onFrame(frame: VideoFrame): void {
+    if (!this.canvas || !this.ctx) {
+      frame.close();
+      return;
+    }
+    const now = performance.now();
+
+    // 到着間隔の EMA を更新 (源 fps 変化に追従)。大きな gap (ロス回復・再開直後) は外れ値
+    // として無視し、推定が暴れないようにする。
+    if (this.lastArrivalMs > 0) {
+      const dt = now - this.lastArrivalMs;
+      if (dt > 0 && dt < 250) {
+        this.emaIntervalMs += 0.1 * (dt - this.emaIntervalMs);
+      }
+    }
+    this.lastArrivalMs = now;
+
+    // 提示予定時刻: 前フレームの予定 + 推定間隔 = 均等間隔。クッション分だけ先に倒す。
+    // アンダーラン (キュー空) / 遅れすぎ / 先読みしすぎはクッション基準へ貼り直し、提示時刻の
+    // ドリフトを是正する。
+    const earliest = now + TARGET_BUFFER_MS;
+    let presentAt = this.nextPresentAt + this.emaIntervalMs;
+    if (this.queue.length === 0 || presentAt < now || presentAt > now + MAX_BUFFER_MS) {
+      presentAt = earliest;
+    }
+    this.nextPresentAt = presentAt;
+    this.queue.push({ frame, presentAt });
+
+    // バックログ上限 (源 fps > 表示 Hz でキューが伸びる場合): 古いフレームを捨てて遅延を抑える。
+    const maxFrames = Math.max(2, Math.ceil(MAX_BUFFER_MS / this.emaIntervalMs));
+    while (this.queue.length > maxFrames) {
+      this.queue.shift()?.frame.close();
+    }
+
+    this.ensureRafRunning();
+  }
+
+  /** 提示ループが止まっていれば起動する。 */
+  private ensureRafRunning(): void {
+    if (this.rafId === null) {
+      this.rafId = requestAnimationFrame(this.presentLoop);
+    }
+  }
+
+  /**
+   * requestAnimationFrame 駆動の提示ループ。提示予定が来たフレームを描画する。表示同期
+   * (vsync) に揃うので、到着がジッタっていても提示は均等になる。複数フレームが同時に due に
+   * なったら最新の due だけ描き、古い due は捨ててフレッシュさを優先する (追いつき)。
+   */
+  private presentLoop = (): void => {
+    // キューに何か残っていればループ継続。空なら止め、次の onFrame で再起動する。
+    this.rafId = this.queue.length > 0 ? requestAnimationFrame(this.presentLoop) : null;
+    if (this.queue.length === 0) return;
+
+    const now = performance.now();
+    let toDraw: VideoFrame | null = null;
+    while (this.queue.length > 0 && this.queue[0].presentAt <= now) {
+      const item = this.queue.shift();
+      if (!item) break;
+      // 既に保持していた古い due フレームは破棄 (追いつきのため最新の due のみ描画)。
+      if (toDraw) toDraw.close();
+      toDraw = item.frame;
+    }
+    if (toDraw) this.drawFrame(toDraw);
+  };
+
+  /** 1 フレームを canvas へ描画して閉じる。 */
+  private drawFrame(frame: VideoFrame): void {
     const canvas = this.canvas;
     const ctx = this.ctx;
     if (!canvas || !ctx) {
@@ -95,6 +194,19 @@ export class Decoder {
     }
     ctx.drawImage(frame, 0, 0);
     frame.close();
+  }
+
+  /** 提示キューを空にし (保持フレームを閉じ)、ループを止めてスケジューラ状態を初期化する。 */
+  private flushQueue(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    for (const item of this.queue) item.frame.close();
+    this.queue = [];
+    this.emaIntervalMs = DEFAULT_INTERVAL_MS;
+    this.lastArrivalMs = 0;
+    this.nextPresentAt = 0;
   }
 
   /** バイナリチャンク 1 個を受け取って decoder に渡す。 */
