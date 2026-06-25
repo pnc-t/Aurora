@@ -632,7 +632,11 @@ fn vdd_test_restore_cmd() -> Result<()> {
 }
 
 fn dump_one_bmp() -> Result<()> {
-    let device = capture::create_shared_device()?;
+    let primary = capture::enumerate_displays()
+        .ok()
+        .and_then(|d| d.into_iter().next().map(|d| d.name))
+        .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
+    let device = capture::create_shared_device(&primary)?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
     // 最初は更新がない場合があるので数回試す
     for _ in 0..30 {
@@ -647,7 +651,11 @@ fn dump_one_bmp() -> Result<()> {
 }
 
 fn dump_h264(n: usize) -> Result<()> {
-    let device = capture::create_shared_device()?;
+    let primary = capture::enumerate_displays()
+        .ok()
+        .and_then(|d| d.into_iter().next().map(|d| d.name))
+        .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
+    let device = capture::create_shared_device(&primary)?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
     let mut enc = PlatformEncoder::new(device, MAX_BITRATE_BPS)?;
     let mut out = std::fs::File::create("out.h264").context("create out.h264")?;
@@ -944,7 +952,7 @@ fn run_server(
 
     // capture・convert・encode で共有する D3D11 デバイスを 1 つだけ生成する
     // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
-    let device = capture::create_shared_device()?;
+    let device = capture::create_shared_device(&initial_name)?;
 
     let (frame_tx, frame_rx) = mpsc::channel::<Frame>(2);
     let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
@@ -1124,7 +1132,9 @@ fn capture_loop(
         match PlatformCapturer::new_for_name(device.clone(), &cur_name) {
             Ok(c) => break c,
             Err(e) => {
-                tracing::warn!(error = %e, name = %cur_name, "initial capturer create failed; retrying");
+                // `{:#}` で anyhow のコンテキスト連鎖 (下層の HRESULT 含む) を 1 行に出す。
+                // 既定の `%e` は最上位コンテキスト ("DuplicateOutput") しか出さず根因が消える。
+                tracing::warn!(error = format!("{e:#}"), name = %cur_name, "initial capturer create failed; retrying");
                 std::thread::sleep(Duration::from_millis(500));
             }
         }

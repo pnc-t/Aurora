@@ -9,13 +9,14 @@
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
-    D3D_FEATURE_LEVEL_11_1,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_1,
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
 };
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::Win32::Media::MediaFoundation::{
     IMFDXGIDeviceManager, MFCreateDXGIDeviceManager, MFSTARTUP_LITE, MFStartup,
 };
@@ -52,8 +53,20 @@ pub fn init_thread_com() -> Result<()> {
 
 impl DeviceBundle {
     /// 共有デバイスを 1 つ生成する。プロセス起動時に 1 回だけ呼ぶ。
-    pub fn new() -> Result<Self> {
+    ///
+    /// `adapter` を渡すとそのアダプタ上にデバイスを作る。ハイブリッド GPU のノートでは
+    /// キャプチャ対象ディスプレイを所有するアダプタが既定アダプタと異なることがあり、その場合
+    /// 既定アダプタのデバイスでは `DuplicateOutput` が恒常的に失敗する (画面真っ暗)。対象出力を
+    /// 所有するアダプタを明示することでこれを避ける。`None` なら既定アダプタ (単一 GPU 環境)。
+    pub fn new(adapter: Option<&IDXGIAdapter>) -> Result<Self> {
         init_thread_com()?;
+
+        // D3D11: pAdapter を渡す場合は DriverType を UNKNOWN にしなければ E_INVALIDARG。
+        let driver_type = if adapter.is_some() {
+            D3D_DRIVER_TYPE_UNKNOWN
+        } else {
+            D3D_DRIVER_TYPE_HARDWARE
+        };
 
         // SAFETY: D3D11CreateDevice は OUT パラメータを初期化する。BGRA + VIDEO_SUPPORT。
         let (device, context) = unsafe {
@@ -65,8 +78,8 @@ impl DeviceBundle {
                 D3D_FEATURE_LEVEL_10_1,
             ];
             D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                adapter,
+                driver_type,
                 None,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 Some(&feature_levels),
@@ -81,6 +94,23 @@ impl DeviceBundle {
                 context.ok_or_else(|| anyhow!("D3D11 context null"))?,
             )
         };
+
+        // 選択されたアダプタ名をログに出す (ハイブリッド GPU の取り違え診断用)。
+        // SAFETY: device は live。cast は同 COM の別 IID、GetAdapter/GetDesc は値返し。
+        if let Ok(dxgi_device) = device.cast::<IDXGIDevice>() {
+            if let Ok(adp) = unsafe { dxgi_device.GetAdapter() } {
+                if let Ok(desc) = unsafe { adp.GetDesc() } {
+                    let name = String::from_utf16_lossy(&desc.Description)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    tracing::info!(
+                        gpu = %name,
+                        explicit_adapter = adapter.is_some(),
+                        "shared D3D11 device adapter"
+                    );
+                }
+            }
+        }
 
         // capture スレッドと MFT 内部スレッドが同一デバイスを触るため必須。
         let mt: ID3D11Multithread = device.cast().context("cast ID3D11Multithread")?;
