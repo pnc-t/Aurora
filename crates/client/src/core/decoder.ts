@@ -191,6 +191,8 @@ export class Decoder {
     if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
       canvas.width = frame.displayWidth;
       canvas.height = frame.displayHeight;
+      // 解像度確定/変化時のみ (毎フレームではない)。表示サイズの追跡用に info で残す。
+      logger.info(`video size ${frame.displayWidth}x${frame.displayHeight}`);
     }
     ctx.drawImage(frame, 0, 0);
     frame.close();
@@ -248,6 +250,8 @@ export class Decoder {
       try {
         decoder.configure({ codec, optimizeForLatency: true });
         this.configured = true;
+        // 構成は 1 セッション 1 回 (キーフレーム待ち成立時) のみ。低頻度なので info で残す。
+        logger.info(`decoder configured: ${codec}`);
       } catch (e) {
         this.throttledError("configure failed", codec, e);
         return;
