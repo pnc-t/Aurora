@@ -35,7 +35,7 @@ use crate::capture::Frame;
 use crate::capture::SharedDevice;
 use crate::encode::mf::{
     FRAME_DURATION_100NS, configure_rate_control, is_keyframe_annexb, make_h264_output_type,
-    make_nv12_input_type, variant_u32,
+    make_nv12_input_type, set_vbv_buffer, variant_u32,
 };
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
@@ -409,6 +409,7 @@ impl VideoEncoder for MfHwH264Encoder {
 
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
         self.bitrate = bitrate_bps;
+        let bounded = self.max_bitrate != u32::MAX;
         if let Some(inner) = &mut self.inner {
             inner.bitrate = bitrate_bps;
             if let Some(api) = &inner.codec_api {
@@ -416,6 +417,10 @@ impl VideoEncoder for MfHwH264Encoder {
                 unsafe {
                     api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate_bps))
                         .context("ICodecAPI::SetValue(MeanBitRate)")?;
+                }
+                // VBV バッファも新レートへ追従させ低遅延を保つ (無制限モードでは触らない)。
+                if bounded {
+                    set_vbv_buffer(api, bitrate_bps);
                 }
             }
         }
