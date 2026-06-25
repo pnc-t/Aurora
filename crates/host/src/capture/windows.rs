@@ -4,6 +4,7 @@
 //! CPU での LUT トーンマップと staging リードバックは廃し、色変換は `convert::Converter`
 //! (D3D11 シェーダ) が GPU 上で行う。デバイスは `DeviceBundle` を capture・encode で共有。
 
+use std::ffi::c_void;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -20,8 +21,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIDevice, IDXGIOutput,
-    IDXGIOutput1, IDXGIOutput5, IDXGIOutput6, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutput6,
+    IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -36,6 +38,8 @@ pub struct DxgiCapturer {
     _device: SharedDevice,
     duplication: IDXGIOutputDuplication,
     converter: Converter,
+    /// GetFramePointerShape 用の再利用バッファ (形状更新フレームのみ書き込む)。
+    pointer_buf: Vec<u8>,
 }
 
 /// 現在の入力デスクトップが既定の "Default" (通常のユーザーデスクトップ) かを返す。
@@ -509,6 +513,7 @@ impl DxgiCapturer {
             _device: device,
             duplication,
             converter,
+            pointer_buf: Vec::new(),
         })
     }
 }
@@ -533,6 +538,42 @@ impl ScreenCapturer for DxgiCapturer {
             Ok(()) => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(e) => return Err(anyhow!("AcquireNextFrame: {e}")),
+        }
+
+        // カーソルを取得して converter へ渡す (DXGI はカーソルを映像に含めないため別取得)。
+        // 形状が更新されたフレームだけ取り直し、位置はマウスが動いたフレームのみ更新する。
+        if info.PointerShapeBufferSize > 0 {
+            let needed = info.PointerShapeBufferSize as usize;
+            if self.pointer_buf.len() < needed {
+                self.pointer_buf.resize(needed, 0);
+            }
+            let mut required = 0u32;
+            let mut shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            // SAFETY: pointer_buf は needed バイト確保済み。OUT パラメータを埋める。
+            // AcquireNextFrame〜ReleaseFrame の間でのみ有効 (convert より前のここで呼ぶ)。
+            let got = unsafe {
+                self.duplication.GetFramePointerShape(
+                    info.PointerShapeBufferSize,
+                    self.pointer_buf.as_mut_ptr() as *mut c_void,
+                    &mut required,
+                    &mut shape,
+                )
+            };
+            if got.is_ok() {
+                let _ = self.converter.update_cursor_shape(
+                    shape.Type,
+                    shape.Width,
+                    shape.Height,
+                    shape.Pitch,
+                    (shape.HotSpot.x, shape.HotSpot.y),
+                    &self.pointer_buf[..required as usize],
+                );
+            }
+        }
+        if info.LastMouseUpdateTime != 0 {
+            let p = info.PointerPosition;
+            self.converter
+                .set_cursor_pos(p.Position.x, p.Position.y, p.Visible.as_bool());
         }
 
         let resource =

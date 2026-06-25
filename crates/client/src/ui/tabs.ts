@@ -25,7 +25,7 @@ export type TabsHandle = {
   setActive: (id: string) => void;
   /** タブ本数 (窓を閉じる判定などに使う)。 */
   count: () => number;
-  /** フルスクリーン状態を伝える。on の間はストリップを自動格納し配置端ホバーで一時表示する。 */
+  /** フルスクリーン状態を伝える。on の間はストリップを完全に隠す (端ホバーでも出さない)。 */
   setFullscreen: (on: boolean) => void;
   /** タブストリップの配置を切り替える (top/bottom = 横帯、left/right = 縦サイドタブ)。 */
   setPosition: (pos: ToolbarPosition) => void;
@@ -50,43 +50,20 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   const tabs = new Map<string, HTMLElement>();
   let activeId: string | null = null;
 
-  // フルスクリーン時の自動格納。配置した端の付近にカーソルがある間だけストリップを出す
-  // (座標判定。ツールバーピルと同様、ドラッグ中も維持されるよう mouseleave は使わない)。
-  let fullscreen = false;
-  let revealed = false;
+  // フルスクリーン中はストリップを完全に隠す (端ホバーでも出さない)。ツールバーピルと違い、
+  // タブは没入時に不要なため一時表示もしない。
   let position: ToolbarPosition = "top";
-  window.addEventListener("mousemove", (e) => {
-    if (!fullscreen) return;
-    // 配置軸方向の「厚み」+ 余白を端判定のしきい値にする。
-    const ext =
-      (position === "left" || position === "right"
-        ? (strip?.offsetWidth ?? 150)
-        : (strip?.offsetHeight ?? 42)) + 8;
-    let want: boolean;
-    switch (position) {
-      case "bottom":
-        want = e.clientY >= window.innerHeight - ext;
-        break;
-      case "left":
-        want = e.clientX <= ext;
-        break;
-      case "right":
-        want = e.clientX >= window.innerWidth - ext;
-        break;
-      default:
-        want = e.clientY <= ext;
-    }
-    if (want !== revealed) {
-      revealed = want;
-      container.classList.toggle("revealed", revealed);
-    }
-  });
 
   function applyPosition(): void {
     container.classList.remove("pos-top", "pos-bottom", "pos-left", "pos-right");
     container.classList.add(`pos-${position}`);
     document.body.classList.remove("tab-top", "tab-bottom", "tab-left", "tab-right");
     document.body.classList.add(`tab-${position}`);
+    // 横帯 (上/下) のときだけ実測のストリップ厚を公開し、統計 HUD をその下へ逃がす
+    // (stats-overlay.css の body.tab-top 規則が参照)。
+    if ((position === "top" || position === "bottom") && strip) {
+      document.documentElement.style.setProperty("--tabstrip-h", `${strip.offsetHeight}px`);
+    }
   }
   applyPosition();
 
@@ -214,14 +191,10 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
       return tabs.size;
     },
     setFullscreen(on): void {
-      fullscreen = on;
-      container.classList.toggle("autohide", on);
+      // フルスクリーン中はタブストリップを完全に隠す (不透明な帯が映像を覆い黒帯を生むため)。
+      container.classList.toggle("hidden", on);
       // 縦サイドタブの映像寄せ (CSS) をフルスクリーン中だけ無効化するためのフラグ。
       document.body.classList.toggle("tab-fs", on);
-      if (!on) {
-        revealed = false;
-        container.classList.remove("revealed");
-      }
     },
     setPosition(pos): void {
       position = pos;
