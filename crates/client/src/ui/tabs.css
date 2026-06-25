@@ -225,25 +225,10 @@ body.tab-right #topbar.pos-right .tb-pill {
   margin-right: var(--tabstrip-w, 160px);
 }
 
-/* フルスクリーン時はタブストリップを自動格納する。常時表示のままだと不透明な帯が
- * リモート映像を覆い、画面端に黒帯が残ってしまうため。配置した端へカーソルを寄せた
- * とき (.revealed) だけスライドで一時表示する (ツールバーピルの自動格納と同じ挙動)。 */
-#tabbar.autohide .tabstrip {
-  transition: transform 0.18s ease;
-}
-#tabbar.autohide.pos-top .tabstrip {
-  transform: translateY(-100%);
-}
-#tabbar.autohide.pos-bottom .tabstrip {
-  transform: translateY(100%);
-}
-#tabbar.autohide.pos-left .tabstrip {
-  transform: translateX(-100%);
-}
-#tabbar.autohide.pos-right .tabstrip {
-  transform: translateX(100%);
-}
-#tabbar.autohide.revealed .tabstrip {
-  transform: translate(0, 0);
+/* フルスクリーン中はタブストリップを完全に隠す。常時表示のままだと不透明な帯が
+ * リモート映像を覆い画面端に黒帯が残るうえ、没入時にタブは不要なため、端ホバーでも
+ * 出さず単純に display:none にする (ツールバーピルだけが端ホバーで一時表示される)。 */
+#tabbar.hidden {
+  display: none;
 }
 
