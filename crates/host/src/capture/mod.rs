@@ -40,6 +40,10 @@ pub trait ScreenCapturer: Send {
     /// 送出する映像の最大高さを設定する (0 = キャプチャ解像度のまま)。アスペクト比は維持。
     /// 既定は no-op (縮小未対応の OS 実装はそのまま)。Windows は GPU 縮小で実装する。
     fn set_target_height(&mut self, _max_height: u32) {}
+
+    /// 映像へのカーソル合成 ON/OFF (クライアントのマウスキャプチャ中だけ ON)。
+    /// 既定は no-op。Windows は GPU で焼き込む。
+    fn set_cursor_overlay(&mut self, _enabled: bool) {}
 }
 
 /// capture・convert・encode で共有するデバイス。Windows は `Arc<DeviceBundle>`、

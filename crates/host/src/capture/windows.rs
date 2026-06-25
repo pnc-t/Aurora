@@ -523,6 +523,10 @@ impl ScreenCapturer for DxgiCapturer {
         self.converter.set_target_height(max_height);
     }
 
+    fn set_cursor_overlay(&mut self, enabled: bool) {
+        self.converter.set_cursor_overlay(enabled);
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -565,7 +569,6 @@ impl ScreenCapturer for DxgiCapturer {
                     shape.Width,
                     shape.Height,
                     shape.Pitch,
-                    (shape.HotSpot.x, shape.HotSpot.y),
                     &self.pointer_buf[..required as usize],
                 );
             }

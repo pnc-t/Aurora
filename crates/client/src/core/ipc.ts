@@ -180,6 +180,12 @@ export async function setVideoPaused(sessionId: string, paused: boolean): Promis
   await invoke("set_video_paused", { sessionId, paused });
 }
 
+/// 映像へのカーソル合成 ON/OFF をホストへ送る (マウスキャプチャ中だけ ON)。
+/// DXGI はカーソルを映像に含めないため、キャプチャ中はホストが焼き込んだカーソルを表示する。
+export async function setCursorOverlay(sessionId: string, enabled: boolean): Promise<void> {
+  await invoke("set_cursor_overlay", { sessionId, enabled });
+}
+
 /// 送出する映像の最大高さ (px、0 = キャプチャ解像度のまま) をホストへ送る。
 /// ホストが GPU で縮小 (アスペクト比維持) してからエンコードする。
 export async function setResolution(sessionId: string, maxHeight: number): Promise<void> {

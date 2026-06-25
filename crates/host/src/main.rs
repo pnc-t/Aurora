@@ -996,6 +996,8 @@ fn run_server(
     // 実行時の解像度変更 (クライアントの SetResolution) を capture スレッドへ届けるチャネル
     // (送出する映像の最大高さ。0 = キャプチャ解像度のまま)。
     let (scale_tx, scale_rx) = std::sync::mpsc::channel::<u32>();
+    // 映像へのカーソル合成 ON/OFF (クライアントのマウスキャプチャ中だけ) を capture スレッドへ。
+    let (cursor_tx, cursor_rx) = std::sync::mpsc::channel::<bool>();
     let cap_device = device.clone();
     // re-exec 時に現在の実効ポート (トレイ変更反映済み) を引き継ぐため共有して渡す。
     let cap_port = port_cell.clone();
@@ -1011,6 +1013,7 @@ fn run_server(
                 fps_cap,
                 fps_rx,
                 scale_rx,
+                cursor_rx,
                 cap_port,
             ) {
                 tracing::error!(error = %e, "capture loop ended");
@@ -1074,6 +1077,7 @@ fn run_server(
             cap_select_tx,
             fps_tx,
             scale_tx,
+            cursor_tx,
             clip_apply_tx,
             clip_change_rx,
         )
@@ -1091,6 +1095,7 @@ fn capture_loop(
     fps_cap: u32,
     fps_rx: std::sync::mpsc::Receiver<u32>,
     scale_rx: std::sync::mpsc::Receiver<u32>,
+    cursor_rx: std::sync::mpsc::Receiver<bool>,
     port: Arc<std::sync::atomic::AtomicU16>,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
@@ -1147,6 +1152,8 @@ fn capture_loop(
     let mut first_fail: Option<Instant> = None;
     // 現在の送出最大高さ (0 = キャプチャ解像度)。capturer 再構築をまたいで保持し再適用する。
     let mut cur_target_h: u32 = 0;
+    // カーソル合成の現在状態 (capturer 再構築をまたいで保持し再適用する)。
+    let mut cur_cursor_overlay = false;
     loop {
         // 実行時の fps 上限変更 (クライアント SetVideoParams) を反映する。
         while let Ok(fps) = fps_rx.try_recv() {
@@ -1158,8 +1165,14 @@ fn capture_loop(
             cur_target_h = h;
             tracing::info!(max_height = h, "target resolution updated");
         }
+        // カーソル合成の ON/OFF (クライアントのマウスキャプチャ要求) を反映する。
+        while let Ok(on) = cursor_rx.try_recv() {
+            cur_cursor_overlay = on;
+            tracing::info!(enabled = on, "cursor overlay updated");
+        }
         // 毎反復で適用する (ディスプレイ切替や ACCESS_LOST で capturer を作り直しても維持)。
         cap.set_target_height(cur_target_h);
+        cap.set_cursor_overlay(cur_cursor_overlay);
         // ディスプレイ切替要求を吸う。新規 capturer 構築に失敗したら現状維持。
         while let Ok(name) = select_rx.try_recv() {
             if name != cur_name {

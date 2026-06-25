@@ -19,6 +19,7 @@ import {
   sendInput,
   setActiveSession,
   setAudioMuted,
+  setCursorOverlay,
   setClientViewport,
   setResolution,
   setVideoParams,
@@ -177,7 +178,6 @@ export class Session {
       void requestKeyframe(this.id);
       this.attachInputToCurrent();
     }
-    this.applyCursorVisibility();
     this.syncSharedUi();
   }
 
@@ -185,18 +185,7 @@ export class Session {
   deactivate(): void {
     this.active = false;
     this.input.detach();
-    // ローカルカーソルを元に戻す (次にアクティブになるタブが自分の状態へ付け替える)。
-    this.host.canvas.style.cursor = "";
     if (this.connected) void setVideoPaused(this.id, true);
-  }
-
-  /**
-   * 映像表示中はローカル (ブラウザ) のカーソルを消す。ホストがカーソルを映像へ焼き込む
-   * ようになったため、消さないと絶対座標モードで「ローカル + 合成」の二重カーソルになる。
-   * キャプチャ (ポインタロック) 中は元から非表示なので実質キャプチャ外で効く。
-   */
-  private applyCursorVisibility(): void {
-    this.host.canvas.style.cursor = this.active && this.connected ? "none" : "";
   }
 
   /** ユーザー操作の切断 (ツールバー切断ボタン)。恒久終了し、orchestrator がタブを除去する。 */
@@ -352,6 +341,9 @@ export class Session {
 
   private onCaptureChange(captured: boolean): void {
     if (this.active) this.host.toolbar.setCaptureToggled(captured);
+    // マウスキャプチャ中だけホストにカーソルを映像へ焼き込ませる (絶対座標モードはローカル
+    // カーソルを使うので不要・二重表示防止)。ポインタロックの実状態に同期させる。
+    void setCursorOverlay(this.id, captured).catch((e) => logger.warn("setCursorOverlay failed", e));
     this.host.toast(this, captured ? "mouse captured (Esc to release)" : "mouse released");
   }
 
@@ -498,7 +490,6 @@ export class Session {
     );
 
     this.host.refreshTab(this);
-    this.applyCursorVisibility();
 
     if (this.active) {
       const tb = this.host.toolbar;
@@ -523,7 +514,6 @@ export class Session {
     this.clearStabilizeTimer();
     void disconnect(this.id);
     this.connected = false;
-    this.applyCursorVisibility();
     if (this.viewportTimer !== null) {
       clearTimeout(this.viewportTimer);
       this.viewportTimer = null;
