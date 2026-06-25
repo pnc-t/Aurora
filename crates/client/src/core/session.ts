@@ -161,6 +161,7 @@ export class Session {
 
   /** 最初の接続を開く (起動時に orchestrator が呼ぶ)。 */
   async start(): Promise<void> {
+    logger.info(`session start: ${this.entry.host}:${this.entry.port}`);
     this.setStatus(`connecting to ${this.entry.host}…`, "connecting");
     await this.openSession(this.save);
   }
@@ -188,6 +189,7 @@ export class Session {
 
   /** ユーザー操作の切断 (ツールバー切断ボタン)。恒久終了し、orchestrator がタブを除去する。 */
   closeByUser(): void {
+    logger.info(`disconnect by user: ${this.entry.host}`);
     this.teardown();
     void disconnect(this.id);
     this.host.removed(this);
@@ -440,6 +442,8 @@ export class Session {
   }
 
   private onHostInfo(ev: Extract<ClientEvent, { kind: "host_info" }>): void {
+    // markSessionEstablished は reconnecting を落とすので、再接続成立かどうかは先に拾う。
+    const wasReconnecting = this.reconnecting;
     this.markSessionEstablished();
     this.connected = true;
     this.tabStatus = "connected";
@@ -476,6 +480,11 @@ export class Session {
     // 非アクティブで接続完了したタブは即一時停止する (帯域節約)。
     if (!this.active) void setVideoPaused(this.id, true);
 
+    const disp = target ? `${formatDisplayName(target.name)} ${target.width}x${target.height}` : "none";
+    logger.info(
+      `${wasReconnecting ? "reconnected" : "connected"}: ${this.entry.host} display=${disp} audio=${ev.audio}`,
+    );
+
     this.host.refreshTab(this);
 
     if (this.active) {
@@ -497,6 +506,7 @@ export class Session {
   private doDisconnect(reason: string): void {
     if (this.disconnectHandled) return;
     this.disconnectHandled = true;
+    logger.info(`session down: ${this.entry.host} — ${reason}`);
     this.clearStabilizeTimer();
     void disconnect(this.id);
     this.connected = false;

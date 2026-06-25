@@ -34,7 +34,7 @@ import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
 import { installWebviewGuard } from "./core/webview-guard";
 import { isFullscreen, toggleFullscreen } from "./core/fullscreen";
 import { closeWindow, setResizable } from "./ui/window-controls";
-import { installGlobalErrorLogging } from "./core/log";
+import { installGlobalErrorLogging, logger } from "./core/log";
 
 // 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
 installGlobalErrorLogging();
@@ -375,6 +375,7 @@ async function adoptInitial(id: string): Promise<void> {
     renderStatusOverlay("error", `タブの引き継ぎに失敗しました: ${String(e)}`, true);
     return;
   }
+  logger.info(`adopting handed-off tab: ${id} (${snap.entry.host})`);
   const s = new Session(id, snap.entry, snap.save, host);
   try {
     await s.adoptFrom(snap);
@@ -405,6 +406,7 @@ void (async () => {
   }
   // タブストリップの配置 (上下左右) を設定から適用する (窓単位・全タブ共有)。
   tabs.setPosition(getSettings().tab_position);
+  logger.info(`capture window ready (mode=${adoptId ? "adopt" : "connect"})`);
   if (adoptId) {
     await adoptInitial(adoptId);
     return;
