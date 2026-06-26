@@ -1001,6 +1001,9 @@ fn run_server(
     let cap_device = device.clone();
     // re-exec 時に現在の実効ポート (トレイ変更反映済み) を引き継ぐため共有して渡す。
     let cap_port = port_cell.clone();
+    // 接続/キーフレーム要求時に capture スレッドへ「現在の画面を 1 枚送れ」と促す共有フラグ。
+    let force_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cap_force_frame = force_frame.clone();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
@@ -1015,6 +1018,7 @@ fn run_server(
                 scale_rx,
                 cursor_rx,
                 cap_port,
+                cap_force_frame,
             ) {
                 tracing::error!(error = %e, "capture loop ended");
             }
@@ -1067,6 +1071,7 @@ fn run_server(
             max_bitrate_bps,
             auth_failures,
             devices,
+            force_frame,
         };
         net::run_server(
             cfg,
@@ -1097,6 +1102,7 @@ fn capture_loop(
     scale_rx: std::sync::mpsc::Receiver<u32>,
     cursor_rx: std::sync::mpsc::Receiver<bool>,
     port: Arc<std::sync::atomic::AtomicU16>,
+    force_frame: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
     #[cfg(target_os = "windows")]
@@ -1118,6 +1124,11 @@ fn capture_loop(
     let mut last_sent = Instant::now()
         .checked_sub(min_interval)
         .unwrap_or_else(Instant::now);
+    // 直近にキャプチャしたフレーム (NV12 テクスチャの COM 参照のみ保持・画素コピー無し)。
+    // 画面静止中に新規接続/キーフレーム要求 (`force_frame`) が来たとき、これを再投入して
+    // 現在の画面を即送る。DXGI Desktop Duplication は変化フレームしか返さないため、これが
+    // 無いとホスト画面が動くまでクライアントが黒いままになる (実機: 2 台構成で再現)。
+    let mut last_frame: Option<Frame> = None;
 
     // 持続的なキャプチャ固着がこの時間続いたら、プロセスを再起動して回復する (re-exec)。
     // 一過性の ACCESS_LOST (UAC・解像度変更・短時間ロック) は安価な再構築で数秒以内に戻るため、
@@ -1295,6 +1306,17 @@ fn capture_loop(
                 continue;
             }
         };
+        // 新規接続/キーフレーム要求の通知。新フレームがあればそれを (鮮度優先で) 強制送出し、
+        // 画面静止で新フレームが無ければ直近フレームを再投入する。どちらも encode 側が
+        // キーフレームを生成し (net が同時に RequestKeyframe を送る)、黒画面を解消する。
+        let forced = force_frame.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if forced {
+            tracing::debug!(
+                static_screen = acquired.is_none(),
+                has_last_frame = last_frame.is_some(),
+                "force_frame: 強制送出 (静止時は直近フレーム再投入)"
+            );
+        }
         if let Some(f) = acquired {
             captured_ok = true;
             // (再)構築直後の最初のフレーム寸法を実解像度として通知する。
@@ -1302,13 +1324,20 @@ fn capture_loop(
                 let _ = res_tx.try_send((f.width, f.height));
                 reported = true;
             }
+            // 直近フレームを更新 (COM 参照のみ・安価)。ペーシングで捨てられた場合も最新を保持。
+            last_frame = Some(f.clone());
             // fps 上限ペーシング: 間隔未満のフレームは捨てる (最新フレームを送るため
-            // ここで間引く)。0 (無制限) のときは常に送る。
+            // ここで間引く)。0 (無制限) のとき・強制送出時は常に送る。
             let now = Instant::now();
-            if min_interval.is_zero() || now.duration_since(last_sent) >= min_interval {
+            if forced || min_interval.is_zero() || now.duration_since(last_sent) >= min_interval {
                 last_sent = now;
                 // try_send: バックプレッシャ。詰まったら捨てる。更新なしのときは None
                 let _ = tx.try_send(f);
+            }
+        } else if forced {
+            // 画面静止 (DXGI タイムアウト) 中の強制送出: 直近フレームを再投入する。
+            if let Some(lf) = last_frame.as_ref() {
+                let _ = tx.try_send(lf.clone());
             }
         }
     }
@@ -1344,25 +1373,48 @@ fn encode_loop(
     let mut meter = perf.then(perf::EncodeMeter::new);
     // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
     let mut nals: Vec<EncodedNal> = Vec::new();
-    loop {
-        // ノンブロックでコマンドを吸う
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                EncoderCommand::RequestKeyframe => enc.request_keyframe(),
-                EncoderCommand::SetBitrate(bps) => {
-                    if let Err(e) = enc.set_bitrate(bps) {
-                        tracing::warn!(error = %e, bps, "set_bitrate failed");
+    // 受信済みコマンドを吸い、keyframe 要求が含まれていたら true を返す。RequestKeyframe は
+    // 次の push_frame に効くフラグなので、push の直前に必ず適用する (先頭ドレインだけだと
+    // 強制送出フレームが P フレームになり、参照を持たない新規クライアントが黒画面のまま残る)。
+    let drain_cmds =
+        |enc: &mut PlatformEncoder, cmd_rx: &mut mpsc::Receiver<EncoderCommand>| -> bool {
+            let mut keyframe_requested = false;
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    EncoderCommand::RequestKeyframe => {
+                        enc.request_keyframe();
+                        keyframe_requested = true;
+                    }
+                    EncoderCommand::SetBitrate(bps) => {
+                        if let Err(e) = enc.set_bitrate(bps) {
+                            tracing::warn!(error = %e, bps, "set_bitrate failed");
+                        }
                     }
                 }
             }
-        }
-        match frame_rx.blocking_recv() {
-            Some(frame) => {
-                let t0 = std::time::Instant::now();
-                if let Err(e) = enc.push_frame(&frame) {
-                    tracing::warn!(error = %e, "push_frame failed");
-                    continue;
-                }
+            keyframe_requested
+        };
+
+    // 直近 push にキーフレーム要求が乗ったか。入力が尽きたあとのフラッシュ判断に使う。
+    // 外側ループをまたいで保持する: blocking_recv で待つ前 (先頭ドレイン) に届いた要求も
+    // 取りこぼさず、後続フレームを待たずにフラッシュへ繋ぐため (要求は別チャネルで来るので
+    // 強制送出フレームと到着順がずれうる)。フラッシュ実施時にクリアする。
+    let mut pending_keyframe = false;
+    loop {
+        pending_keyframe |= drain_cmds(&mut enc, &mut cmd_rx);
+        // 最初の 1 枚はブロッキングで待つ。
+        let mut frame = match frame_rx.blocking_recv() {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        // この外側反復で keyframe を実際に送出できたか。push 経路で出れば flush は不要。
+        let mut keyframe_sent = false;
+        loop {
+            pending_keyframe |= drain_cmds(&mut enc, &mut cmd_rx);
+            let t0 = std::time::Instant::now();
+            if let Err(e) = enc.push_frame(&frame) {
+                tracing::warn!(error = %e, "push_frame failed");
+            } else {
                 nals.clear();
                 while let Some(nal) = enc.poll_nal()? {
                     nals.push(nal);
@@ -1373,13 +1425,53 @@ fn encode_loop(
                     m.record(encode_us, nal_bytes);
                     m.maybe_flush();
                 }
+                if nals.iter().any(|n| n.keyframe) {
+                    keyframe_sent = true;
+                }
                 for nal in nals.drain(..) {
                     if nal_tx.blocking_send(nal).is_err() {
                         return Ok(());
                     }
                 }
             }
-            None => return Ok(()),
+            // 入力キューに続きがあれば再ブロックせず連続処理し、パイプライン並列性を保つ。
+            match frame_rx.try_recv() {
+                Ok(next) => frame = next,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        // 入力が尽きたが keyframe 要求が乗っていて、まだ keyframe を出せていない。非同期 HW MFT は
+        // frame N の出力に後続入力を要し (パイプライン段数は個体差あり)、静止画面では後続フレームが
+        // 無いため IDR がエンコーダ内に滞留し、ホスト画面が動く (操作する) まで黒画面が残る。直近
+        // フレームを非キーフレームで「埋め草入力」として繰り返し投入し、滞留した IDR が実際に出て
+        // くるまで押し出す (段数不明なので上限付きで自己調整・出たら即やめる)。同期 SW エンコーダの
+        // 1 フレーム遅延もこの再投入で解消され、0 遅延エンコーダは push 経路で既に出ているので入らない。
+        const MAX_FLUSH_PUSHES: u32 = 8;
+        if pending_keyframe {
+            pending_keyframe = false;
+            let mut pushes = 0u32;
+            while !keyframe_sent && pushes < MAX_FLUSH_PUSHES {
+                pushes += 1;
+                if let Err(e) = enc.push_frame(&frame) {
+                    tracing::warn!(error = %e, "keyframe flush re-push failed");
+                    break;
+                }
+                if let Err(e) = enc.flush_pending() {
+                    tracing::warn!(error = %e, "encoder flush_pending failed");
+                }
+                while let Some(nal) = enc.poll_nal()? {
+                    keyframe_sent |= nal.keyframe;
+                    if nal_tx.blocking_send(nal).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            tracing::debug!(
+                pushes,
+                keyframe_sent,
+                "keyframe flush: 埋め草入力で滞留 IDR を押し出し"
+            );
         }
     }
 }

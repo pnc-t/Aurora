@@ -283,6 +283,10 @@ pub struct ServerConfig {
     /// デバイスピン留め (クライアント静的鍵の許可リスト照合)。既定無効。tray が有効化/
     /// ペアリングを操作し、net が PSK 認証後に相手公開鍵を照合する (= 2 要素目)。
     pub devices: Arc<crate::devices::DeviceGuard>,
+    /// capture スレッドへ「現在の画面を 1 枚強制送出せよ」と促す共有フラグ。接続確立時と
+    /// クライアントの RequestKeyframe で立て、capture が直近フレームを再投入する。画面静止中に
+    /// 接続/再同期しても黒画面のまま固まらないようにするための仕組み (DXGI は変化フレームのみ返す)。
+    pub force_frame: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 送信元 IP ごとの認証失敗を追跡し、連続失敗で接続応答を指数的に遅らせるスロットル。
@@ -502,6 +506,8 @@ struct ClientArgs {
     shared: Arc<tokio::sync::Mutex<SharedControl>>,
     registry: Registry,
     conn_id: u64,
+    /// 接続/キーフレーム要求時に capture へ現在の画面の強制送出を促す共有フラグ ([`ServerConfig`])。
+    force_frame: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -674,6 +680,7 @@ pub async fn run_server(
                 shared: shared.clone(),
                 registry: registry.clone(),
                 conn_id,
+                force_frame: cfg.force_frame.clone(),
             };
             // 各接続を独立 task で処理する (await で占有しない = 複数クライアント同時)。
             tokio::spawn(
@@ -716,6 +723,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
         shared,
         registry,
         conn_id,
+        force_frame,
     } = args;
     // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
     // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop) で
@@ -915,6 +923,9 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // 接続直後に IDR を 1 枚要求し、最初のキーフレームを待つ黒画面時間を縮める。従来は
     // クライアントが delta を 1 枚受けてから RequestKeyframe を送り返す往復ぶん遅れていた。
     // 共有エンコーダだが、他クライアントには余分な keyframe が 1 枚増えるだけで無害。
+    // あわせて capture に現在の画面の強制送出を促す。画面静止中は DXGI が新フレームを返さず
+    // キーフレーム要求だけでは映像が生成されないため (接続直後ずっと黒くなる問題の本対策)。
+    force_frame.store(true, std::sync::atomic::Ordering::Release);
     let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
 
     // セッション中に押下されたまま解放されていないキー/ボタンの追跡。切断時 (正常・異常
@@ -949,6 +960,9 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
                         send_control_msg(&mut write_half, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
                     }
                     ControlMsg::RequestKeyframe => {
+                        // 画面静止中の再同期でも現在の画面を 1 枚送れるよう capture を促す
+                        // (UDP でキーフレームが欠けたまま静止すると、これが無いと回復しない)。
+                        force_frame.store(true, std::sync::atomic::Ordering::Release);
                         let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
                     }
                     ControlMsg::SetVideoParams { fps, max_bitrate_bps } => {

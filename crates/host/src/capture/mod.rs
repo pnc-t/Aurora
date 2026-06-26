@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// 1 フレーム。Windows は GPU 上の NV12 テクスチャ (ゼロコピー)、他 OS は CPU の BGRA8。
 #[cfg(not(target_os = "windows"))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -14,7 +14,10 @@ pub struct Frame {
 }
 
 /// Windows: GPU 色変換済みの NV12 テクスチャを保持する。CPU リードバックなし。
+/// `Clone` はテクスチャの COM 参照を増やすだけ (画素コピー無し)。capture_loop が
+/// 直近フレームを保持し、接続/キーフレーム要求時に再投入するのに使う。
 #[cfg(target_os = "windows")]
+#[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -28,6 +31,7 @@ pub struct Frame {
 /// このテクスチャを参照しても D3D11 が内部で直列化する。`MfH264Encoder` の
 /// `unsafe impl Send` と同じ根拠。
 #[cfg(target_os = "windows")]
+#[derive(Clone)]
 pub struct SendTexture(pub ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D);
 
 // SAFETY: 上記の根拠 (multithread-protected device) によりスレッド間 move は安全。
