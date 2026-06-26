@@ -16,16 +16,17 @@ use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::FALSE;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, ICodecAPI, IMF2DBuffer, IMFActivate, IMFMediaBuffer,
-    IMFMediaEventGenerator, IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMF2DBuffer,
+    IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFTransform,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput, METransformNeedInput,
+    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video,
+    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{Interface, PWSTR};
@@ -269,6 +270,44 @@ impl Inner {
         Ok(())
     }
 
+    /// 投入済み (`in_flight`) だが未出力のフレームを、後続フレームの `submit` を待たずに
+    /// 引き出す。非同期 HW MFT は `ProcessInput` 後しばらくして別スレッドで `HaveOutput` を
+    /// 上げるため、`submit` 末尾のノンブロッキング吸い出しでは間に合わず滞留する。静止画面で
+    /// 接続/キーフレーム要求が来たときに呼び、`in_flight` が空になるまでイベントループを
+    /// 回して keyframe NAL を即時に吐かせる (黒画面が数秒残る問題の本対策)。
+    ///
+    /// `MFT_MESSAGE_COMMAND_DRAIN` は使わない: それはストリーム終了→再 START の重い遷移で、
+    /// NeedInput トークン体系をリセットしてしまう。ここは submit と同じ `dispatch_event` 機構を
+    /// 流用し、低遅延設定 (B フレーム/先読み無効) ゆえ後続入力なしに出る `HaveOutput` を回収する
+    /// だけにとどめる。万一出力が出ないベンダ MFT でも締切で必ず抜け、従来挙動に劣化するのみ。
+    fn pump_pending_outputs(&mut self) -> Result<()> {
+        // 滞留 (in_flight) のうち最低 1 枚が出力されるまで回す。呼び出し側が直前に「後続入力」を
+        // 1 枚与えているので、滞留していた IDR がこの 1 枚で押し出される。全滅まで待つと、押し出し
+        // 用に与えた入力自身がさらに次の入力を要して締切まで空回りするため、1 枚回収で抜ける。
+        let start_len = self.in_flight.len();
+        if start_len == 0 {
+            return Ok(());
+        }
+        // 低遅延 HW では HaveOutput は数 ms 以内に出る。締切でブロックを必ず有界化する
+        // (encode スレッドを止めないため。出ないなら諦めて従来の数秒回復にフォールバック)。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        while self.in_flight.len() >= start_len && std::time::Instant::now() < deadline {
+            // SAFETY: event_gen live。NO_WAIT は空なら MF_E_NO_EVENTS_AVAILABLE を返す。
+            match unsafe {
+                self.event_gen
+                    .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(MF_EVENT_FLAG_NO_WAIT))
+            } {
+                Ok(ev) => self.dispatch_event(&ev)?,
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    // まだ出力が用意されていない。HW の完了をわずかに待って再試行する。
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(anyhow!("GetEvent(nowait, flush): {e}")),
+            }
+        }
+        Ok(())
+    }
+
     /// MFT イベントを種別ごとに処理する。NeedInput はトークンとして加算 (消費は submit 側)、
     /// HaveOutput は即ドレインする。その他は無視する。
     fn dispatch_event(
@@ -390,6 +429,18 @@ impl VideoEncoder for MfHwH264Encoder {
         let force_keyframe = self.force_keyframe;
         self.force_keyframe = false;
         let inner = self.inner.as_mut().unwrap();
+        if force_keyframe {
+            // HW MFT (特に AMD AMF) はサンプル属性 `MFSampleExtension_CleanPoint` を honor せず、
+            // IDR を GOP 周期でしか出さない個体がある (実機: 再接続後ずっと黒く、GOP 周期の
+            // FPS*10≈10〜20 秒後にようやく表示)。ICodecAPI の `AVEncVideoForceKeyFrame` が次フレームを
+            // IDR に強制する正規ルートなので、これを立ててから ProcessInput する (auto-reset)。
+            if let Some(api) = &inner.codec_api {
+                // SAFETY: api live、VARIANT は VT_UI4。SetValue は値をコピーする。
+                unsafe {
+                    let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant_u32(1));
+                }
+            }
+        }
         inner.submit(&frame.texture.0, fid, force_keyframe)
     }
 
@@ -399,6 +450,13 @@ impl VideoEncoder for MfHwH264Encoder {
 
     fn request_keyframe(&mut self) {
         self.force_keyframe = true;
+    }
+
+    fn flush_pending(&mut self) -> Result<()> {
+        match self.inner.as_mut() {
+            Some(inner) => inner.pump_pending_outputs(),
+            None => Ok(()),
+        }
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
