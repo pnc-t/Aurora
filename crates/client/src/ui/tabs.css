@@ -211,17 +211,19 @@ body.tab-right:not(.tab-fs) #screen-wrap {
 
 /* ツールバー (フローティングピル) とタブストリップが同じ端に来たとき重ならないよう、
  * ピルをストリップの厚み分だけ内側へずらす (id+class でセレクタ優先度を確保)。
- * 別の端どうしならずらさない (body.tab-* で同一端のときだけ効かせる)。 */
-body.tab-top #topbar.pos-top .tb-pill {
+ * 別の端どうしならずらさない (body.tab-* で同一端のときだけ効かせる)。
+ * フルスクリーン中 (body.tab-fs) はタブストリップが display:none になるので、寄せると
+ * ピルだけが端から内側へずれて見える。tab-fs では寄せない (#screen-wrap と同じ扱い)。 */
+body.tab-top:not(.tab-fs) #topbar.pos-top .tb-pill {
   margin-top: 42px;
 }
-body.tab-bottom #topbar.pos-bottom .tb-pill {
+body.tab-bottom:not(.tab-fs) #topbar.pos-bottom .tb-pill {
   margin-bottom: 42px;
 }
-body.tab-left #topbar.pos-left .tb-pill {
+body.tab-left:not(.tab-fs) #topbar.pos-left .tb-pill {
   margin-left: var(--tabstrip-w, 160px);
 }
-body.tab-right #topbar.pos-right .tb-pill {
+body.tab-right:not(.tab-fs) #topbar.pos-right .tb-pill {
   margin-right: var(--tabstrip-w, 160px);
 }
 
