@@ -32,7 +32,7 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
           <input id="pk-port" type="text" inputmode="numeric" placeholder="port" class="pk-port" />
         </div>
         <input id="pk-pass" type="password" placeholder="password" />
-        <label class="pk-check"><input id="pk-save" type="checkbox" /> パスワードを保存する</label>
+        <label class="pk-check"><input id="pk-save" type="checkbox" checked /> パスワードを保存する</label>
         <div class="pk-status" id="pk-status"></div>
         <div class="pk-actions">
           <button type="submit" class="pk-connect">connect</button>
