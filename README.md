@@ -10,8 +10,8 @@
   ![Platform](https://img.shields.io/badge/host-Windows-0078D6?logo=windows&logoColor=white)
   ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
-  [![CI](https://github.com/pnc-t/DDD/actions/workflows/ci.yml/badge.svg)](https://github.com/pnc-t/DDD/actions/workflows/ci.yml)
-  [![Release](https://img.shields.io/github/v/release/pnc-t/DDD?label=release&logo=github)](https://github.com/pnc-t/DDD/releases/latest)
+  [![CI](https://github.com/pnc-t/Aurora/actions/workflows/ci.yml/badge.svg)](https://github.com/pnc-t/Aurora/actions/workflows/ci.yml)
+  [![Release](https://img.shields.io/github/v/release/pnc-t/Aurora?label=release&logo=github)](https://github.com/pnc-t/Aurora/releases/latest)
 </div>
 
 出先の PC から自宅 PC に接続して操作する、自作の軽量リモートデスクトップアプリ。
@@ -43,9 +43,9 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 
 ## ダウンロード
 
-[![Download](https://img.shields.io/github/v/release/pnc-t/DDD?label=Download&logo=github)](https://github.com/pnc-t/DDD/releases/latest)
+[![Download](https://img.shields.io/github/v/release/pnc-t/Aurora?label=Download&logo=github)](https://github.com/pnc-t/Aurora/releases/latest)
 
-ビルド済みバイナリは [Releases](https://github.com/pnc-t/DDD/releases/latest) から入手できます。
+ビルド済みバイナリは [Releases](https://github.com/pnc-t/Aurora/releases/latest) から入手できます。
 
 | 成果物 | 用途 |
 |--------|------|
