@@ -212,9 +212,11 @@ export async function uploadFileFromPath(id: number, path: string): Promise<void
   await invoke("upload_file_from_path", { sessionId: sid(), id, path });
 }
 
-/// ホストの Explorer に投影する共有フォルダ (ProjFS ドライブリダイレクト) を設定する。
-export async function setShareRoot(path: string): Promise<void> {
-  await invoke("set_share_root", { sessionId: sid(), path });
+/// 指定セッションのファイル共有 (ProjFS ドライブ投影) を有効/無効にする。有効時は
+/// **このPC (client) の This PC 全体 (全ドライブ)** をホストの仮想ドライブへ公開する。
+/// 設定は接続成立時に session が自分の id で適用する (登録端末のみホストにドライブが出る)。
+export async function setFileSharing(sessionId: string, enabled: boolean): Promise<void> {
+  await invoke("set_file_sharing", { sessionId, enabled });
 }
 
 /// 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。
@@ -245,6 +247,7 @@ export type ClientSettings = {
   max_mbps: number;
   auto_reconnect: boolean;
   use_virtual_display: boolean;
+  share_files: boolean;
 };
 
 /// 接続先 host の履歴を読み込む (最新が先頭)。

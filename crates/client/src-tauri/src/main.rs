@@ -97,7 +97,7 @@ fn main() {
             net::set_client_viewport,
             net::request_file,
             net::upload_file_from_path,
-            net::set_share_root,
+            net::set_file_sharing,
             config::load_recent_hosts,
             config::save_recent_host,
             config::set_recent_hosts,

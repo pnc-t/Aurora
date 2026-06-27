@@ -69,6 +69,7 @@ function getSettings(): ClientSettings {
       max_mbps: 15,
       auto_reconnect: true,
       use_virtual_display: false,
+      share_files: false,
     }
   );
 }
