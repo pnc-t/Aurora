@@ -1,0 +1,71 @@
+name: release
+
+# main 系で安定したコミットに `v1.2.3` のようなタグを push したときだけ動く。
+# 通常の dev/main マージではビルドしない (gitflow: main = リリーススナップショット)。
+#   例) git checkout main && git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # Release 作成 + アセット添付に必要
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: crates/client/pnpm-lock.yaml
+
+      - name: Install tauri-cli (prebuilt)
+        uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y tauri-cli
+
+      - name: Install frontend deps
+        working-directory: crates/client
+        run: pnpm install --frozen-lockfile
+
+      # --- ホスト: 単独 exe ---
+      - name: Build aurora-host
+        run: cargo build --release -p aurora-host
+
+      # --- クライアント: Tauri NSIS インストーラ ---
+      # beforeBuildCommand (pnpm build) が dist を生成 → NSIS を生成する。
+      - name: Build aurora-client (Tauri NSIS)
+        working-directory: crates/client/src-tauri
+        run: cargo tauri build
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-release | Out-Null
+          Copy-Item target/release/aurora-host.exe dist-release/
+          Copy-Item target/release/bundle/nsis/*-setup.exe dist-release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 起動トリガのタグ (v1.2.3) がそのままリリース名/タグになる
+          files: |
+            dist-release/aurora-host.exe
+            dist-release/*-setup.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
