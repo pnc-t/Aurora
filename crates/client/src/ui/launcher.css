@@ -168,6 +168,13 @@
   font-size: 14px; cursor: pointer;
 }
 .btn-secondary:hover { background: var(--menu-hover); border-color: var(--accent); }
+/* ショートカット一覧のキー表記 (読み取り専用) */
+.kbd {
+  flex-shrink: 0; font-family: ui-monospace, monospace; font-size: 12px;
+  color: var(--muted); background: var(--control);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 4px 8px;
+  white-space: nowrap;
+}
 /* number 入力の上下スピナーを消す (port などは text+inputmode を使うが念のため) */
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }

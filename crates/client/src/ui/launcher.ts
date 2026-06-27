@@ -238,6 +238,30 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <input type="text" inputmode="numeric" id="set-port" class="num-input" />
             </div>
+            <div class="setting-group">ショートカット (接続中のローカル操作)</div>
+            <div class="setting-row">
+              <div class="s-meta"><div class="s-title">フルスクリーン切替</div></div>
+              <span class="kbd">F11 / Ctrl+Alt+Shift+F</span>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta"><div class="s-title">ツールバー表示 / 格納</div></div>
+              <span class="kbd">Ctrl+Alt+Shift+B</span>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta"><div class="s-title">マウスキャプチャ切替</div></div>
+              <span class="kbd">Ctrl+Alt+Shift+M</span>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta"><div class="s-title">統計 HUD 表示 / 非表示</div></div>
+              <span class="kbd">Ctrl+Alt+Shift+S</span>
+            </div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">マウスキャプチャ解除</div>
+                <div class="s-desc">キャプチャ中にポインタロックを抜ける</div>
+              </div>
+              <span class="kbd">Esc</span>
+            </div>
             <div class="setting-group">診断</div>
             <div class="setting-row">
               <div class="s-meta">
