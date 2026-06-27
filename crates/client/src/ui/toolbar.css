@@ -55,16 +55,45 @@
 .tb-sep { width: 1px; height: 18px; align-self: center; margin: 0 4px; background: var(--panel-border); opacity: 0.8; }
 
 /* --- 縦サイドバー (left/right 配置) ---
- * ピルと内部の並び方向を縦にし、区切り線も横線へ向きを変える。 */
+ * ピルと内部の並び方向を縦にし、区切り線も横線へ向きを変える。
+ * テキストを持つコントロール (画質/解像度/ディスプレイ) は縦バーを横長にするので、
+ * 縦配置ではアイコン (.tb-pop-trigger) に畳み、クリックでバー脇のポップオーバー
+ * (.tb-pop-panel) として開く (下の .tb-popgroup 規則)。 */
 #topbar.vertical .tb-pill { flex-direction: column; }
 #topbar.vertical .tb-group { flex-direction: column; }
 #topbar.vertical .tb-sep { width: 18px; height: 1px; margin: 4px 0; }
-#topbar.vertical .tb-video { flex-direction: column; gap: 6px; }
-#topbar.vertical .tb-custom { flex-direction: column; gap: 6px; }
-#topbar.vertical #display-wrap { flex-direction: column; gap: 2px; }
-/* 縦並びでは横並び前提の select 幅が広すぎるので、ピル幅に収める。 */
-#topbar.vertical select { max-width: 110px; }
 #topbar.vertical .window-controls { flex-direction: column; }
+
+/* --- ポップオーバー化するコントロール群 (画質/解像度/ディスプレイ) ---
+ * 既定 (横帯 top/bottom): トリガを隠し、パネルをそのままインライン表示する
+ * (従来の見た目を維持)。 */
+.tb-popgroup { display: inline-flex; align-items: center; position: relative; }
+.tb-pop-trigger { display: none; }
+.tb-pop-panel { display: inline-flex; align-items: center; gap: 4px; }
+
+/* 縦バー: トリガをアイコンとして出し、パネルはバー脇に開くポップオーバーにする。 */
+#topbar.vertical .tb-popgroup { width: 100%; justify-content: center; }
+#topbar.vertical .tb-pop-trigger { display: inline-flex; }
+#topbar.vertical .tb-pop-panel {
+  position: absolute; top: 0; z-index: 40;
+  display: none; /* .pop-open まで隠す */
+  align-items: center; gap: 6px;
+  padding: 8px 10px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px var(--shadow);
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+#topbar.vertical .tb-popgroup.pop-open .tb-pop-panel { display: inline-flex; }
+/* 開く向き: 左バーは右側へ、右バーは左側へ。 */
+#topbar.pos-left.vertical .tb-pop-panel { left: 100%; margin-left: 10px; }
+#topbar.pos-right.vertical .tb-pop-panel { right: 100%; margin-right: 10px; }
+/* ポップオーバー内は通常の横並び・無制限幅に戻す (狭いピル幅の制約を受けない)。 */
+#topbar.vertical .tb-pop-panel.tb-video { flex-direction: row; }
+#topbar.vertical .tb-pop-panel .tb-custom { flex-direction: row; }
+#topbar.vertical .tb-pop-panel select { max-width: none; }
 
 /* フラットなアイコンボタン: 既定は枠なし・透明、ホバー時だけ淡い背景。 */
 .tb-btn {
