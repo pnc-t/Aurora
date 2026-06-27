@@ -30,6 +30,7 @@ import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
+import { applyAriaLabels } from "../core/a11y";
 import { icon } from "./icons";
 import "./launcher.css";
 
@@ -291,6 +292,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
+
+  // ナビ (Hosts/Settings) や ＋追加 などアイコンのみボタンに aria-label を補う。
+  applyAriaLabels(opts.root);
 
   // 診断: ログフォルダを開く / ログを ZIP 出力。
   $("#open-logs")?.addEventListener("click", () => {
@@ -584,6 +588,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           </div>`;
       })
       .join("");
+    applyAriaLabels(hostList); // grip/編集/メニュー/切断 などアイコンのみボタンに付与
 
     hostList.querySelectorAll<HTMLElement>(".host-card").forEach((card) => {
       const idx = Number(card.dataset.idx);

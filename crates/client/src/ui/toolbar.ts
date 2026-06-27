@@ -10,6 +10,7 @@
 import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
 import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
+import { applyAriaLabels } from "../core/a11y";
 import { icon } from "./icons";
 import "./toolbar.css";
 
@@ -95,6 +96,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。
   const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
   if (winctl) mountWindowControls(winctl);
+
+  // アイコンのみのボタン群に aria-label を補う (SR 読み上げ用)。
+  applyAriaLabels(opts.topbar);
 
   const disconnectBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-disconnect");
   const displayWrap = opts.topbar.querySelector<HTMLElement>("#display-wrap");

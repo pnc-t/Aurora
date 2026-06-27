@@ -5,6 +5,7 @@
 //       allow-close / allow-start-dragging。
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { applyAriaLabels } from "../core/a11y";
 import { icon } from "./icons";
 import { logger } from "../core/log";
 import "./window-controls.css";
@@ -50,4 +51,5 @@ export function mountWindowControls(container: HTMLElement): void {
   `;
   container.querySelector('[data-act="min"]')?.addEventListener("click", () => void minimizeWindow());
   container.querySelector('[data-act="close"]')?.addEventListener("click", () => void closeWindow());
+  applyAriaLabels(container);
 }

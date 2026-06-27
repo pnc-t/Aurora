@@ -10,6 +10,10 @@ let container: HTMLElement | null = null;
 
 export function initToast(root: HTMLElement): void {
   container = root;
+  // 一時通知をスクリーンリーダーへ伝える (エラー等を見落とさせない)。
+  // polite: 進行中の読み上げを中断せず、合間に読み上げる。
+  root.setAttribute("role", "status");
+  root.setAttribute("aria-live", "polite");
 }
 
 export function showToast(message: string, level: ToastKind = "info", durationMs = 4000): void {

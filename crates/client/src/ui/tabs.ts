@@ -3,6 +3,7 @@
 // ラベルはホスト由来文字列を含むため textContent で描画する (XSS 注意)。
 
 import { icon } from "./icons";
+import { applyAriaLabels } from "../core/a11y";
 import type { TabStatus } from "../core/session";
 import type { ToolbarPosition } from "../core/ipc";
 import "./tabs.css";
@@ -45,6 +46,7 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   const list = container.querySelector<HTMLElement>("#tabstrip-list");
   const strip = container.querySelector<HTMLElement>(".tabstrip");
   container.querySelector<HTMLButtonElement>("#tab-add")?.addEventListener("click", () => opts.onAdd());
+  applyAriaLabels(container); // 「+」など アイコンのみボタンに aria-label を補う
 
   // id → タブ要素。
   const tabs = new Map<string, HTMLElement>();
@@ -86,6 +88,7 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     close.innerHTML = icon("close");
 
     el.append(dot, name, close);
+    applyAriaLabels(el); // × ボタン (アイコンのみ) に aria-label を補う
 
     // × クリックで閉じる (ドラッグ開始の pointerdown より前に拾えるよう close 自身に付ける)。
     close.addEventListener("click", (e) => {
