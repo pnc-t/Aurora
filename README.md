@@ -2,6 +2,16 @@
   <img src="docs/assets/aurora.png" alt="Aurora" width="160" />
 
   # Aurora
+
+  ![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white)
+  ![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri&logoColor=white)
+  ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
+  ![Tailscale](https://img.shields.io/badge/Tailscale-required-242424?logo=tailscale&logoColor=white)
+  ![Platform](https://img.shields.io/badge/host-Windows-0078D6?logo=windows&logoColor=white)
+  ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+
+  [![CI](https://github.com/pnc-t/DDD/actions/workflows/ci.yml/badge.svg)](https://github.com/pnc-t/DDD/actions/workflows/ci.yml)
+  [![Release](https://img.shields.io/github/v/release/pnc-t/DDD?label=release&logo=github)](https://github.com/pnc-t/DDD/releases/latest)
 </div>
 
 出先の PC から自宅 PC に接続して操作する、自作の軽量リモートデスクトップアプリ。
@@ -31,6 +41,26 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 
 ---
 
+## ダウンロード
+
+[![Download](https://img.shields.io/github/v/release/pnc-t/DDD?label=Download&logo=github)](https://github.com/pnc-t/DDD/releases/latest)
+
+ビルド済みバイナリは [Releases](https://github.com/pnc-t/DDD/releases/latest) から入手できます。
+
+| 成果物 | 用途 |
+|--------|------|
+| `Aurora_<ver>_x64-setup.exe` | クライアント (操作する側) の NSIS インストーラ |
+| `aurora-host.exe` | ホスト (操作される側) の単独実行ファイル |
+
+`main` に `v*` タグを push すると GitHub Actions が上記を自動ビルドして Release に添付します
+(まだ初回リリース未公開のため、公開後にリンクが有効になります)。ソースからビルドする場合は
+[docs/build.md](docs/build.md) を参照してください。
+
+> ⚠️ 配布バイナリは未署名です。SmartScreen / Defender に警告される場合があります
+> (詳細は [docs/security.md](docs/security.md))。
+
+---
+
 ## 特徴
 
 - **低遅延**: 1080p / 60fps を目標に、GPU ハードウェアエンコード + WebCodecs GPU デコードで End-to-End 体感遅延 < 50ms (Tailnet 直結時) を狙う設計
@@ -38,7 +68,7 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 - **ゼロコピー映像パイプライン**: DXGI Desktop Duplication → Media Foundation H.264 を GPU 上で完結 (CPU コピーを避ける)
 - **役割分離プロトコル**: 制御は TCP、映像/音声は UDP。遅延予算のために独自プロトコルで設計
 - **エンドツーエンド暗号化**: Noise XX-PSK ハンドシェイク。PSK はパスワードから Argon2id で導出
-- **付加機能**: マウス/キー入力注入、クリップボード同期、音声 (Opus)、ファイル転送、ProjFS によるドライブ投影、画質プリセット、自動再接続
+- **付加機能**: マウス/キー入力注入、クリップボード同期、音声 (Opus)、ファイル転送、ProjFS によるドライブ投影、画質プリセット、解像度追従 (RDP 風) と仮想ディスプレイ、マルチタブ接続、自動再接続
 
 ---
 
@@ -132,6 +162,7 @@ cargo tauri build        # crates/client/src-tauri から実行
 - 制御チャネル (TCP) と映像/音声チャネル (UDP) を分離し、ノンスドメインでクロスチャネル注入を多重防御
 - パスワードは OS の保護ストア (Windows: DPAPI) に保存し、ログには出しません
 - ホストは既定で **Tailscale インターフェースのみに bind** し、LAN/インターネットへの露出を避けます
+- 任意の 2 要素目として、クライアント静的鍵の許可リスト (デバイスピン留め、既定無効) を有効化できます
 
 脅威モデルと既知の制約の詳細は [docs/security.md](docs/security.md) を参照してください。
 
