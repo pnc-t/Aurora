@@ -68,11 +68,13 @@ const DEFAULT_SETTINGS: ClientSettings = {
   use_virtual_display: false,
 };
 
-/** ラベル/host から決定的に淡い色を作りアバター背景に使う。 */
+/** ラベル/host から決定的に色を作りアバター背景に使う。
+ *  白いイニシャル文字とのコントラストを確保するため明度は低め (38%) に固定する
+ *  (黄/緑系の hue でも白文字が読める)。 */
 function avatarColor(seed: string): string {
   let h = 0;
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) % 360;
-  return `hsl(${h}, 45%, 45%)`;
+  return `hsl(${h}, 52%, 38%)`;
 }
 
 function escapeHtml(s: string): string {

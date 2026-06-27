@@ -127,7 +127,10 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
     if (portInput && !portInput.value) portInput.value = String(defaultPort);
     if (!list) return;
     if (hosts.length === 0) {
-      list.textContent = "";
+      const empty = document.createElement("div");
+      empty.className = "pk-empty";
+      empty.textContent = "保存済みのホストはありません。下のフォームから接続できます。";
+      list.replaceChildren(empty);
       return;
     }
     for (const h of hosts) {
