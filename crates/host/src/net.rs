@@ -878,10 +878,13 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
 
     // 確立: 接続数を数え、登録簿へ自分の制御出口を登録する。ProjFS ドライブは固定パスのため
     // 最初に確立した 1 本だけが所有する (複数 mount は衝突する)。
+    // さらに **ファイル共有ドライブは「ホストに登録済みの端末」だけに許可する** (仮想ディスプレイと
+    // 同じ信頼ゲート client_trusted)。未登録端末は共有フォルダを設定していてもドライブを mount
+    // しない。登録は devices のペアリング窓経由 (接続レベルのピン留め enforcement とは独立に効く)。
     let is_projfs_owner = {
         let mut sc = shared.lock().await;
         sc.active_conns += 1;
-        if sc.projfs_owner.is_none() {
+        if client_trusted && sc.projfs_owner.is_none() {
             sc.projfs_owner = Some(conn_id);
             true
         } else {
@@ -911,6 +914,9 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
                 None
             }
         }
+    } else if !client_trusted {
+        tracing::info!("ProjFS drive redirection skipped (device not registered)");
+        None
     } else {
         tracing::info!("ProjFS drive redirection skipped (another client owns it)");
         None
