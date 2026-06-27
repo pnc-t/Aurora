@@ -5,7 +5,7 @@
 // ホスト由来文字列は textContent で描画する (XSS 注意)。
 
 import { loadRecentHosts, loadSettings, savedPasswordHosts, type HostEntry } from "../core/ipc";
-import { applyAriaLabels } from "../core/a11y";
+import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import "./connect-dialog.css";
 
@@ -51,7 +51,15 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
   const statusEl = root.querySelector<HTMLElement>("#pk-status");
   const connectBtn = root.querySelector<HTMLButtonElement>(".pk-connect");
 
+  const releaseTrap = trapFocus(root);
+  const onKeydown = (e: KeyboardEvent): void => {
+    if (e.key === "Escape") close();
+  };
+  document.addEventListener("keydown", onKeydown);
+
   function close(): void {
+    releaseTrap();
+    document.removeEventListener("keydown", onKeydown);
     root.classList.remove("visible");
     root.innerHTML = "";
   }

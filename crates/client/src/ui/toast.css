@@ -11,6 +11,8 @@
   border: 1px solid var(--panel-border); font-size: 13px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;
+  /* コンテナは素通し (pointer-events:none) だが、各トーストはクリックで消せるよう拾う。 */
+  pointer-events: auto; cursor: pointer;
 }
 .toast.show { opacity: 1; transform: translateY(0); }
 .toast.error { border-color: var(--danger); }

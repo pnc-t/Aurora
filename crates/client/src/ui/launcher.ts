@@ -30,7 +30,7 @@ import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
-import { applyAriaLabels } from "../core/a11y";
+import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import "./launcher.css";
 
@@ -326,12 +326,26 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   });
 
   // --- ダイアログ ---
+  // 開いているダイアログのフォーカストラップ解除関数 (開くたびに張り、閉じると外す)。
+  let releaseTrap: (() => void) | null = null;
+  function openBackdrop(): void {
+    backdrop.classList.add("visible");
+    applyAriaLabels(backdrop);
+    releaseTrap?.();
+    releaseTrap = trapFocus(backdrop);
+  }
   function closeDialog(): void {
+    releaseTrap?.();
+    releaseTrap = null;
     backdrop.classList.remove("visible");
     backdrop.innerHTML = "";
   }
   backdrop.addEventListener("click", (e) => {
     if (e.target === backdrop) closeDialog();
+  });
+  // Esc で開いているダイアログを閉じる (カードメニューは別途下で閉じる)。
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && backdrop.classList.contains("visible")) closeDialog();
   });
 
   /** 削除などの確認ダイアログ。OK で onConfirm を実行する。 */
@@ -346,7 +360,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
       </div>
     `;
-    backdrop.classList.add("visible");
+    openBackdrop();
     backdrop.querySelector("#c-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector("#c-ok")?.addEventListener("click", () => {
       void onConfirm().finally(closeDialog);
@@ -414,7 +428,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
       </form>
     `;
-    backdrop.classList.add("visible");
+    openBackdrop();
     backdrop.querySelector<HTMLInputElement>("#h-host")?.focus();
     backdrop.querySelector("#h-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
@@ -451,7 +465,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
       </form>
     `;
-    backdrop.classList.add("visible");
+    openBackdrop();
     const passInput = backdrop.querySelector<HTMLInputElement>("#d-pass");
     const okBtn = backdrop.querySelector<HTMLButtonElement>("#d-ok");
     const statusEl = backdrop.querySelector<HTMLElement>("#d-status");

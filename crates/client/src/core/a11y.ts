@@ -14,3 +14,36 @@ export function applyAriaLabels(root: ParentNode): void {
     el.setAttribute("aria-label", title);
   });
 }
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
+  'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * モーダル内に Tab フォーカスを閉じ込める (フォーカストラップ)。
+ * Tab / Shift+Tab が末端を超えたら反対側へ巻き戻し、背後の要素へ抜けさせない。
+ * 戻り値を呼ぶとリスナを解除する (ダイアログを閉じるときに呼ぶ)。
+ */
+export function trapFocus(container: HTMLElement): () => void {
+  function onKey(e: KeyboardEvent): void {
+    if (e.key !== "Tab") return;
+    const items = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+      (el) => el.offsetParent !== null, // 非表示要素を除く
+    );
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey) {
+      if (active === first || !container.contains(active)) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (active === last || !container.contains(active)) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+  container.addEventListener("keydown", onKey);
+  return () => container.removeEventListener("keydown", onKey);
+}
