@@ -272,6 +272,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       default:
         want = e.clientY <= ext;
     }
+    // ポップオーバー (画質/ディスプレイ) は縦バーではバーの外側に開くため、そこへ
+    // カーソルを移すと端ホバー域を外れる。開いている間は畳まない (閉じれば次の
+    // mousemove で通常判定に戻る)。これが無いとパネル操作中にバーごと格納される。
+    if (!want && popgroups.some((g) => g.classList.contains("pop-open"))) return;
     if (want !== revealed) {
       revealed = want;
       applyVisibility();
