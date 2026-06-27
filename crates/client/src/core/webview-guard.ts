@@ -4,8 +4,10 @@
 // リモートデスクトップでは、接続中のキー入力は input.ts がホストへ転送するため、
 // ここでは preventDefault のみ行い stopPropagation はしない (転送を妨げない)。
 
-/** ローカル UI 操作ホットキーの種別。 */
-export type LocalHotkey = "toggle-stats" | "toggle-bar" | "toggle-fullscreen" | "toggle-capture";
+import { matchHotkey, type LocalHotkey } from "./shortcuts";
+
+// 後方互換のため型を re-export (キー定義の正本は core/shortcuts.ts)。
+export type { LocalHotkey };
 
 export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): void {
   // 右クリックメニュー無効化。
@@ -26,7 +28,7 @@ export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): v
     (e) => {
       // Ctrl+Alt+Shift+<key> はローカル UI 操作に予約。ホストへ転送しない
       // (stopImmediatePropagation で input.ts の window ハンドラより手前で握る)。
-      const hotkey = localHotkey(e);
+      const hotkey = matchHotkey(e);
       if (hotkey) {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -37,22 +39,6 @@ export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): v
     },
     { capture: true },
   );
-}
-
-/** ローカルホットキーを判定する。Ctrl+Alt+Shift+<key> 名前空間 + F11 単独。 */
-function localHotkey(e: KeyboardEvent): LocalHotkey | null {
-  // F11 単独は標準のフルスクリーンキーとして転用。
-  if (e.key === "F11") return "toggle-fullscreen";
-
-  const mod = e.ctrlKey || e.metaKey;
-  if (!mod || !e.altKey || !e.shiftKey) return null;
-  switch (e.code) {
-    case "KeyS": return "toggle-stats";
-    case "KeyB": return "toggle-bar";
-    case "KeyF": return "toggle-fullscreen";
-    case "KeyM": return "toggle-capture";
-    default: return null;
-  }
 }
 
 /** ローカルで握りつぶすべきブラウザショートカットか判定する。 */

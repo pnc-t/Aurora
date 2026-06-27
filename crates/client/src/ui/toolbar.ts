@@ -11,6 +11,7 @@ import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../cor
 import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels } from "../core/a11y";
+import { shortcutLabel } from "../core/shortcuts";
 import { icon } from "./icons";
 import "./toolbar.css";
 
@@ -53,10 +54,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       </div>
       <span class="tb-sep" data-tauri-drag-region></span>
       <div class="tb-group" data-tauri-drag-region>
-        <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (F11 / Ctrl+Alt+Shift+F)">${icon("fullscreen")}</button>
-        <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
+        <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (${shortcutLabel("toggle-fullscreen")})">${icon("fullscreen")}</button>
+        <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (${shortcutLabel("toggle-capture")})">${icon("mouse")}</button>
         <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
-        <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
+        <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (${shortcutLabel("toggle-stats")})">${icon("stats")}</button>
         <button type="button" id="tb-audio" class="tb-btn" title="音声ミュート">${icon("volume")}</button>
       </div>
       <div id="display-wrap" class="tb-popgroup" data-pop="display" title="表示するディスプレイ" data-tauri-drag-region>
@@ -83,8 +84,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
         </span>
       </div>
       <span class="tb-sep" data-tauri-drag-region></span>
-      <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
-      <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / Ctrl+Alt+Shift+B で再表示">${icon("eye-off")}</button>
+      <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}">${icon("pin")}</button>
+      <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / ${shortcutLabel("toggle-bar")} で再表示">${icon("eye-off")}</button>
       <span id="tb-winctl" class="window-controls"></span>
     </div>
   `;

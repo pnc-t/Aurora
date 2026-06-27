@@ -31,6 +31,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
+import { SHORTCUTS } from "../core/shortcuts";
 import { icon } from "./icons";
 import "./launcher.css";
 
@@ -99,6 +100,16 @@ function applyTheme(theme: ThemeId, accent: string): void {
 }
 
 export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallback }): LauncherHandle {
+  // ショートカット一覧の行は単一定義 (core/shortcuts.ts) から生成する。
+  // label/desc は静的定数なので HTML へ直接埋め込んでよい (ホスト由来データではない)。
+  const shortcutRows = SHORTCUTS.map(
+    (s) => `
+            <div class="setting-row">
+              <div class="s-meta"><div class="s-title">${s.desc}</div></div>
+              <span class="kbd">${s.label}</span>
+            </div>`,
+  ).join("");
+
   opts.root.innerHTML = `
     <div class="launcher">
       <div class="titlebar" data-tauri-drag-region>
@@ -241,22 +252,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               <input type="text" inputmode="numeric" id="set-port" class="num-input" />
             </div>
             <div class="setting-group">ショートカット (接続中のローカル操作)</div>
-            <div class="setting-row">
-              <div class="s-meta"><div class="s-title">フルスクリーン切替</div></div>
-              <span class="kbd">F11 / Ctrl+Alt+Shift+F</span>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta"><div class="s-title">ツールバー表示 / 格納</div></div>
-              <span class="kbd">Ctrl+Alt+Shift+B</span>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta"><div class="s-title">マウスキャプチャ切替</div></div>
-              <span class="kbd">Ctrl+Alt+Shift+M</span>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta"><div class="s-title">統計 HUD 表示 / 非表示</div></div>
-              <span class="kbd">Ctrl+Alt+Shift+S</span>
-            </div>
+            ${shortcutRows}
             <div class="setting-row">
               <div class="s-meta">
                 <div class="s-title">マウスキャプチャ解除</div>
