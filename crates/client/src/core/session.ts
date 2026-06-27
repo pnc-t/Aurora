@@ -21,6 +21,7 @@ import {
   setAudioMuted,
   setCursorOverlay,
   setClientViewport,
+  setFileSharing,
   setResolution,
   setVideoParams,
   setVideoPaused,
@@ -481,6 +482,11 @@ export class Session {
     this.videoMbps = settings.max_mbps;
     void setVideoParams(this.id, settings.fps, settings.max_mbps * 1_000_000);
     void setResolution(this.id, 0);
+    // 設定でファイル共有が ON なら、この接続で This PC 全体を公開する (既定 OFF)。
+    // 各セッションが自分の id で適用し、ホスト側は所有接続かつ登録端末のときだけドライブを mount する。
+    if (settings.share_files) {
+      void setFileSharing(this.id, true).catch((e) => logger.warn("setFileSharing failed", e));
+    }
     // 非アクティブで接続完了したタブは即一時停止する (帯域節約)。
     if (!this.active) void setVideoPaused(this.id, true);
 

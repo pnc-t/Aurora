@@ -67,6 +67,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   max_mbps: 15,
   auto_reconnect: true,
   use_virtual_display: false,
+  share_files: false,
 };
 
 /** ラベル/host から決定的に色を作りアバター背景に使う。
@@ -260,6 +261,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <span class="kbd">Esc</span>
             </div>
+            <div class="setting-group">ファイル共有</div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">この PC をドライブとして共有</div>
+                <div class="s-desc">接続中、<b>この PC の This PC 全体 (全ドライブ)</b> がホスト側に仮想ドライブとして現れ、ホストの Explorer から閲覧・コピー・書き込みできる。安全のため、ホストに<b>登録済みの端末</b>のときだけドライブが出る</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="set-share-files" /><span class="slider"></span></label>
+            </div>
             <div class="setting-group">診断</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -311,6 +320,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const presetSelect = $<HTMLSelectElement>("#set-preset");
   const fpsInput = $<HTMLInputElement>("#set-fps");
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
+  const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
 
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
@@ -757,6 +767,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     syncPresetSelect();
     persist();
   });
+  shareFilesToggle?.addEventListener("change", () => {
+    settings = { ...settings, share_files: shareFilesToggle.checked };
+    persist();
+  });
 
   // 下端ステータスバーを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
   // 窓側で起きるため、launcher は `aurora://connections` の集計 (connectedSet) だけを映す。
@@ -827,6 +841,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (portInput) portInput.value = String(settings.default_port);
     if (fpsInput) fpsInput.value = String(settings.fps);
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
+    if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
     syncPresetSelect();
     applyTheme(settings.theme, settings.accent_color);
   })();

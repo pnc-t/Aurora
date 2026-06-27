@@ -3,10 +3,11 @@
 //   ここには操作ヒントだけを置く。
 // - ダウンロード (ホスト → クライアント): ホスト上のパスを指定して取得。
 //   受信ファイルはクライアント側の %USERPROFILE%\Aurora\downloads に自動保存される。
-// - 共有フォルダ (ProjFS): ホストの Explorer に投影するフォルダを設定する。
+// 共有フォルダ (ProjFS ドライブ投影) の設定は launcher の設定画面に移設した (接続のたびに
+// 自動適用されるため、転送パネルには持たない)。
 // ダウンロードの完了 / エラーは host からの FileResult (転送 id で照合) で更新する。
 
-import { requestFile, setShareRoot } from "../core/ipc";
+import { requestFile } from "../core/ipc";
 import "./file-transfer.css";
 
 let downloadProgressEl: HTMLElement | null = null;
@@ -28,40 +29,11 @@ export function mountFileTransfer(panel: HTMLElement): void {
       <span id="download-progress" class="progress"></span>
     </div>
     <div class="row"><span class="hint">受信ファイルは %USERPROFILE%\\Aurora\\downloads に保存されます</span></div>
-    <div class="section-title">share folder (ProjFS)</div>
-    <div class="row">
-      <input id="share-root" type="text" placeholder="例: C:\\Users\\name\\Shared (ホスト上のフォルダ)" />
-      <button type="button" id="share-root-btn">share</button>
-      <span id="share-root-status" class="progress"></span>
-    </div>
   `;
 
   downloadProgressEl = panel.querySelector<HTMLElement>("#download-progress");
   downloadBtn = panel.querySelector<HTMLButtonElement>("#download-file-btn");
   const pathInput = panel.querySelector<HTMLInputElement>("#download-path");
-  const shareInput = panel.querySelector<HTMLInputElement>("#share-root");
-  const shareBtn = panel.querySelector<HTMLButtonElement>("#share-root-btn");
-  const shareStatus = panel.querySelector<HTMLElement>("#share-root-status");
-
-  shareBtn?.addEventListener("click", () => {
-    const path = shareInput?.value?.trim();
-    if (!path) {
-      if (shareStatus) shareStatus.textContent = "パスを入力";
-      return;
-    }
-    shareBtn.disabled = true;
-    if (shareStatus) shareStatus.textContent = "共有中…";
-    void setShareRoot(path)
-      .then(() => {
-        if (shareStatus) shareStatus.textContent = "共有しました";
-      })
-      .catch((err) => {
-        if (shareStatus) shareStatus.textContent = `エラー: ${String(err)}`;
-      })
-      .finally(() => {
-        shareBtn.disabled = false;
-      });
-  });
 
   downloadBtn?.addEventListener("click", () => {
     const path = pathInput?.value?.trim();

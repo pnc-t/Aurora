@@ -183,10 +183,11 @@ pub struct SessionHandle {
     /// 再生スレッドへ EOF が伝わり停止する。直接読み出すことはない。
     #[allow(dead_code)]
     pub audio: Option<AudioPlayer>,
-    /// このセッションがホストの ProjFS へ投影する共有ルート。`set_share_root` で設定する。
-    /// **既定は `None` (共有無効)。** reader タスクと共有するため Arc。セッション毎に独立させ、
-    /// あるウィンドウの共有設定が別ウィンドウの接続に漏れないようにする。
-    pub share_root: Arc<Mutex<Option<PathBuf>>>,
+    /// このセッションのファイル共有スコープ。`set_file_sharing` で設定する。
+    /// **既定は `Disabled` (共有無効)。** 有効時は This PC 全体 (全ドライブ) をホストの仮想
+    /// ドライブへ投影する。reader タスクと共有するため Arc。セッション毎に独立させ、ある
+    /// ウィンドウの共有設定が別ウィンドウの接続に漏れないようにする。
+    pub share_scope: Arc<Mutex<ShareScope>>,
     /// 接続先 host (ランチャーの接続中表示 / 切断ボタンで host 単位に扱うために保持)。
     pub host: String,
     /// このセッションを表示している capture ウィンドウのラベル (`connect_to_host` を呼んだ
@@ -374,24 +375,25 @@ pub async fn attach_session(
     Ok(())
 }
 
-/// このセッションがホストへ投影する共有フォルダを設定する。これを呼ぶまで共有は無効。
+/// このセッションのファイル共有を有効/無効にする。有効時は This PC 全体 (全ドライブ) を
+/// ホストの仮想ドライブへ公開する。設定 (launcher) のトグルに対応し、接続成立時に session が呼ぶ。
 #[tauri::command]
-pub async fn set_share_root(
+pub async fn set_file_sharing(
     session_id: String,
-    path: String,
+    enabled: bool,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    if !p.is_dir() {
-        return Err(format!("not a directory: {path}"));
-    }
-    let share = {
+    let scope = {
         let guard = state.inner.lock().await;
         let s = guard.get(&session_id).ok_or("unknown session")?;
-        s.share_root.clone()
+        s.share_scope.clone()
     };
-    *share.lock().await = Some(p);
-    tracing::info!(session = %session_id, path = %path, "share root set");
+    *scope.lock().await = if enabled {
+        ShareScope::WholePc
+    } else {
+        ShareScope::Disabled
+    };
+    tracing::info!(session = %session_id, enabled, "file sharing set");
     Ok(())
 }
 
@@ -621,9 +623,9 @@ async fn connect_inner(
     let stats_for_reader = stats.clone();
     // FS RPC 応答は制御チャネル経由で writer ループへ流す (host の同期コールバックを起こす)。
     let fs_reply_tx = ctrl_tx.clone();
-    // このセッション専用の共有ルート (既定 None = 共有無効)。reader と SessionHandle で共有。
-    let share_root: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
-    let share_root_for_reader = share_root.clone();
+    // このセッションのファイル共有スコープ (既定 Disabled = 無効)。reader と SessionHandle で共有。
+    let share_scope: Arc<Mutex<ShareScope>> = Arc::new(Mutex::new(ShareScope::Disabled));
+    let share_scope_for_reader = share_scope.clone();
     // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
@@ -637,7 +639,7 @@ async fn connect_inner(
                 stats_for_reader,
                 session_start,
                 fs_reply_tx,
-                share_root_for_reader,
+                share_scope_for_reader,
                 pending_for_reader,
             )
             .await;
@@ -743,7 +745,7 @@ async fn connect_inner(
         clipboard: clip_handle,
         audio: audio_player,
         pending_downloads,
-        share_root,
+        share_scope,
         window_label: window.label().to_string(),
     };
     {
@@ -1092,7 +1094,7 @@ async fn tcp_reader_loop(
     stats: Arc<StatsCollector>,
     session_start: Instant,
     fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
-    share_root: Arc<Mutex<Option<PathBuf>>>,
+    share_scope: Arc<Mutex<ShareScope>>,
     pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
 ) -> anyhow::Result<()> {
     let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
@@ -1258,17 +1260,15 @@ async fn tcp_reader_loop(
                 _ => tracing::warn!(id, "download chunk without matching offer, ignored"),
             },
             // --- ProjFS ドライブリダイレクト: 自分のファイルをホストへ配信 ---
-            // いずれも共有ルートが設定済み (= ユーザーが明示的に共有を有効化) のときだけ処理する。
-            // 未設定なら read は error 応答、破壊系の書き戻しはログのみで無視し、無断アクセスを防ぐ。
+            // 共有スコープが Disabled なら resolve が error を返し、read は error 応答・破壊系は
+            // ログのみで無視する (無断アクセス防止)。WholePc なら This PC 全体を投影する。
             ControlMsg::FsList {
                 req_id,
                 path,
                 offset,
             } => {
-                let reply = match share_root.lock().await.clone() {
-                    Some(root) => fs_list(&root, &path, offset).await,
-                    None => ListPage::err("sharing disabled".into()),
-                };
+                let scope = share_scope.lock().await.clone();
+                let reply = fs_list(&scope, &path, offset).await;
                 let _ = fs_reply_tx.send(reply.into_msg(req_id));
             }
             ControlMsg::FsRead {
@@ -1277,10 +1277,8 @@ async fn tcp_reader_loop(
                 offset,
                 length,
             } => {
-                let (data, error) = match share_root.lock().await.clone() {
-                    Some(root) => fs_read(&root, &path, offset, length).await,
-                    None => (Vec::new(), Some("sharing disabled".to_string())),
-                };
+                let scope = share_scope.lock().await.clone();
+                let (data, error) = fs_read(&scope, &path, offset, length).await;
                 let _ = fs_reply_tx.send(ControlMsg::FsReadReply {
                     req_id,
                     data,
@@ -1288,43 +1286,44 @@ async fn tcp_reader_loop(
                 });
             }
             // --- 書き戻し (ホスト Explorer → クライアント、一方向) ---
-            ControlMsg::FsCreate { path, is_dir } => match share_root.lock().await.clone() {
-                Some(root) => {
-                    if let Err(e) = fs_create(&root, &path, is_dir).await {
-                        tracing::warn!(path = %path, error = %e, "FsCreate failed");
-                    }
+            ControlMsg::FsCreate { path, is_dir } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_create(&scope, &path, is_dir).await {
+                    tracing::warn!(path = %path, error = %e, "FsCreate failed");
                 }
-                None => tracing::warn!(path = %path, "FsCreate rejected: sharing disabled"),
-            },
-            ControlMsg::FsWrite { path, offset, data } => match share_root.lock().await.clone() {
-                Some(root) => {
-                    if let Err(e) = fs_write(&root, &path, offset, &data).await {
-                        tracing::warn!(path = %path, error = %e, "FsWrite failed");
-                    }
+            }
+            ControlMsg::FsWrite { path, offset, data } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_write(&scope, &path, offset, &data).await {
+                    tracing::warn!(path = %path, error = %e, "FsWrite failed");
                 }
-                None => tracing::warn!(path = %path, "FsWrite rejected: sharing disabled"),
-            },
-            ControlMsg::FsDelete { path } => match share_root.lock().await.clone() {
-                Some(root) => {
-                    if let Err(e) = fs_delete(&root, &path).await {
-                        tracing::warn!(path = %path, error = %e, "FsDelete failed");
-                    }
+            }
+            ControlMsg::FsDelete { path } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_delete(&scope, &path).await {
+                    tracing::warn!(path = %path, error = %e, "FsDelete failed");
                 }
-                None => tracing::warn!(path = %path, "FsDelete rejected: sharing disabled"),
-            },
-            ControlMsg::FsRename { from, to } => match share_root.lock().await.clone() {
-                Some(root) => {
-                    if let Err(e) = fs_rename(&root, &from, &to).await {
-                        tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
-                    }
+            }
+            ControlMsg::FsRename { from, to } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_rename(&scope, &from, &to).await {
+                    tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
                 }
-                None => {
-                    tracing::warn!(from = %from, to = %to, "FsRename rejected: sharing disabled")
-                }
-            },
+            }
             other => tracing::debug!(?other, "ignored control msg"),
         }
     }
+}
+
+/// このセッションのファイル共有スコープ。
+#[derive(Clone, Default)]
+pub enum ShareScope {
+    /// 共有無効 (既定)。すべての FS 要求を拒否する。
+    #[default]
+    Disabled,
+    /// This PC 全体。先頭コンポーネントをドライブ文字とみなし、全ドライブを 1 つの合成ルートに
+    /// 公開する。ホスト側は登録端末のときだけ実際にドライブを mount する (net.rs の client_trusted)。
+    WholePc,
 }
 
 /// 1 ページの一覧結果。
@@ -1359,36 +1358,104 @@ const LIST_PAGE: usize = 128;
 /// (`u16::MAX`) を超えて自己切断しないよう、オーバーヘッド分を残してクランプする。
 const MAX_READ: u32 = 60 * 1024;
 
-/// 共有ルート相対パス (`/` 区切り) を実パスへ解決する。`..` によるルート外脱出を禁止。
-async fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let mut p = root.to_path_buf();
-    for comp in rel.split('/') {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        // 書き込み側 `safe_join` と同じ字句ルールで弾く (`\`/`:` も拒否)。最終的に
-        // canonicalize で守られるが、防御を両系統で対称に揃える。
+/// 読み取り系 (一覧/読込) のパス解決。`Ok(None)` は合成ルート (= ドライブ一覧を出す) を表す。
+fn resolve_read(scope: &ShareScope, rel: &str) -> Result<Option<PathBuf>, String> {
+    match scope {
+        ShareScope::Disabled => Err("sharing disabled".into()),
+        ShareScope::WholePc => whole_pc_resolve(rel),
+    }
+}
+
+/// 書き戻し系 (作成/書込/削除/改名) のパス解決。ドライブ/合成ルート自身への作用は拒否する。
+fn resolve_write(scope: &ShareScope, rel: &str) -> Result<PathBuf, String> {
+    match scope {
+        ShareScope::Disabled => Err("sharing disabled".into()),
+        ShareScope::WholePc => whole_pc_resolve_write(rel),
+    }
+}
+
+/// 全ドライブ合成ルート: ホスト相対パス (`/` 区切り) を実パスへ写す。
+/// 先頭コンポーネント = ドライブ文字 (例 "C") → `C:\`、以降は通常の子コンポーネント。
+/// `Ok(None)` は合成ルート自身 (= ドライブ一覧)。`..` / 区切り混入などの危険成分は拒否する。
+/// This PC 全体を公開する仕様上「ルート外脱出」概念は無く、全ドライブが共有対象なので
+/// canonicalize での封じ込めは行わない (脱出先も同じく共有範囲内)。
+fn whole_pc_resolve(rel: &str) -> Result<Option<PathBuf>, String> {
+    let mut comps = rel.split('/').filter(|c| !c.is_empty() && *c != ".");
+    let Some(first) = comps.next() else {
+        return Ok(None); // 合成ルート
+    };
+    // ドライブ文字は 1 文字の英字のみ。
+    let mut chars = first.chars();
+    let letter = chars.next();
+    if first.len() != 1
+        || chars.next().is_some()
+        || !letter.is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Err(format!("invalid drive: {first}"));
+    }
+    let mut p = PathBuf::from(format!("{}:\\", letter.unwrap().to_ascii_uppercase()));
+    for comp in comps {
         if comp == ".." || comp.contains('\\') || comp.contains(':') {
             return Err(format!("unsafe path component: {comp}"));
         }
         p.push(comp);
     }
-    let canon_root = tokio::fs::canonicalize(root)
-        .await
-        .map_err(|e| format!("canonicalize root: {e}"))?;
-    let canon = tokio::fs::canonicalize(&p)
-        .await
-        .map_err(|e| format!("canonicalize: {e}"))?;
-    if !canon.starts_with(&canon_root) {
-        return Err("path escapes share root".into());
-    }
-    Ok(canon)
+    Ok(Some(p))
 }
 
-/// 共有ルート相対 `rel` のディレクトリを `offset` から最大 `LIST_PAGE` 件列挙する。
-async fn fs_list(root: &Path, rel: &str, offset: u32) -> ListPage {
-    let dir = match resolve_in_root(root, rel).await {
-        Ok(p) => p,
+/// 書き戻し用の解決。合成ルート (0 成分) とドライブのルート (1 成分) への破壊的操作を拒否する
+/// (悪意あるホストが `FsDelete{path:"C"}` 1 通でドライブごと消す/改名する事故を防ぐ)。
+fn whole_pc_resolve_write(rel: &str) -> Result<PathBuf, String> {
+    let n = rel
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .count();
+    if n < 2 {
+        return Err("refusing operation on drive or synthetic root".into());
+    }
+    whole_pc_resolve(rel)?.ok_or_else(|| "refusing operation on synthetic root".into())
+}
+
+/// 存在する論理ドライブを `FsEntry` (ディレクトリ扱い) で返す。合成ルートの一覧に使う。
+/// ドライブ名は `:` を含むとホストのファイル名として不正になるため、裸の文字 ("C") にする。
+#[cfg(windows)]
+fn list_drives() -> Vec<FsEntry> {
+    // SAFETY: GetLogicalDrives は引数を取らず、存在ドライブのビットマスクを返すだけの純粋関数。
+    let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (0..26u32)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| FsEntry {
+            name: ((b'A' + i as u8) as char).to_string(),
+            is_dir: true,
+            size: 0,
+        })
+        .collect()
+}
+#[cfg(not(windows))]
+fn list_drives() -> Vec<FsEntry> {
+    Vec::new()
+}
+
+/// `all` を名前順に整列し `offset` から 1 ページ (最大 `LIST_PAGE` 件) 切り出す。
+fn paginate(mut all: Vec<FsEntry>, offset: u32) -> ListPage {
+    // ページ境界の安定のため名前で整列 (host 側でも ProjFS 規約で再整列する)。
+    all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let total = all.len();
+    let start = (offset as usize).min(total);
+    let entries: Vec<FsEntry> = all.into_iter().skip(start).take(LIST_PAGE).collect();
+    let done = start + entries.len() >= total;
+    ListPage {
+        entries,
+        done,
+        error: None,
+    }
+}
+
+/// スコープに従いディレクトリ (または合成ルート) を `offset` から最大 `LIST_PAGE` 件列挙する。
+async fn fs_list(scope: &ShareScope, rel: &str, offset: u32) -> ListPage {
+    let dir = match resolve_read(scope, rel) {
+        Ok(Some(p)) => p,
+        Ok(None) => return paginate(list_drives(), offset), // 合成ルート = ドライブ一覧
         Err(e) => return ListPage::err(e),
     };
     let mut rd = match tokio::fs::read_dir(&dir).await {
@@ -1410,25 +1477,20 @@ async fn fs_list(root: &Path, rel: &str, offset: u32) -> ListPage {
             Err(e) => return ListPage::err(format!("read entry: {e}")),
         }
     }
-    // ページ境界の安定のため名前で整列 (host 側でも ProjFS 規約で再整列する)。
-    all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
-    let total = all.len();
-    let start = offset as usize;
-    let entries: Vec<FsEntry> = all.into_iter().skip(start).take(LIST_PAGE).collect();
-    let done = start + entries.len() >= total;
-    ListPage {
-        entries,
-        done,
-        error: None,
-    }
+    paginate(all, offset)
 }
 
-/// 共有ルート相対 `rel` のファイルを `offset` から最大 `length` バイト読む。
+/// スコープに従いファイルを `offset` から最大 `length` バイト読む。
 /// 戻り (data, error)。空 data かつ error=None は EOF。
-async fn fs_read(root: &Path, rel: &str, offset: u64, length: u32) -> (Vec<u8>, Option<String>) {
-    let path = match resolve_in_root(root, rel).await {
-        Ok(p) => p,
+async fn fs_read(
+    scope: &ShareScope,
+    rel: &str,
+    offset: u64,
+    length: u32,
+) -> (Vec<u8>, Option<String>) {
+    let path = match resolve_read(scope, rel) {
+        Ok(Some(p)) => p,
+        Ok(None) => return (Vec::new(), Some("is a directory".into())),
         Err(e) => return (Vec::new(), Some(e)),
     };
     let mut file = match tokio::fs::File::open(&path).await {
@@ -1453,61 +1515,9 @@ async fn fs_read(root: &Path, rel: &str, offset: u64, length: u32) -> (Vec<u8>, 
     (buf, None)
 }
 
-/// 書き込み系操作のパス解決。
-///
-/// 空 / `.` のみのパス (= 共有ルート自身) を拒否し、レキシカルな `..` / 絶対成分の排除に
-/// 加え、**シンボリックリンク / ジャンクション経由の
-/// ルート外脱出も防ぐ**。レキシカルチェックだけだと、共有ルート内に既存のジャンクション
-/// (例: `link` → `C:\`) があると `link/Windows/...` で OS がそれを辿り、共有外への書込・
-/// 削除を許してしまう (書込系 API はリンクを作れないが、利用者が事前に置いたリンクを
-/// 悪意あるホストが踏み台にできる)。読み取り側 `resolve_in_root` と同じく canonicalize で
-/// 実体を解決して封じ込める。対象が未存在でも使えるよう、**存在する最長の祖先**を
-/// canonicalize して root 配下か検証する (残りの未存在成分はリンクを含めないクリーンな
-/// 名前なので、その配下に作っても root 内に留まる)。
-async fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let mut p = root.to_path_buf();
-    // 空 / `.` だけのパスは共有ルート自身を指す。破壊・改名・作成系でこれを許すと、
-    // 悪意あるホストが `FsDelete{path:""}` 1 通で共有ルートごと `remove_dir_all` させられる
-    // (ユーザーが共有を許可した範囲はルート「内」のファイル操作であり、ルート本体の削除/
-    // 改名は想定外)。最低 1 つの正当なコンポーネントを要求してルートへの直接作用を弾く。
-    let mut had_component = false;
-    for comp in rel.split('/') {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        if comp == ".." || comp.contains('\\') || comp.contains(':') {
-            return Err(format!("unsafe path component: {comp}"));
-        }
-        p.push(comp);
-        had_component = true;
-    }
-    if !had_component {
-        return Err("refusing operation on share root itself".into());
-    }
-    let canon_root = tokio::fs::canonicalize(root)
-        .await
-        .map_err(|e| format!("canonicalize root: {e}"))?;
-    // 存在する最長の祖先まで遡って実体解決する。途中にジャンクション/リンクがあれば
-    // canonicalize がその実体 (root 外) を返し、starts_with で弾かれる。
-    let mut probe = p.clone();
-    let resolved = loop {
-        match tokio::fs::canonicalize(&probe).await {
-            Ok(c) => break c,
-            Err(_) => match probe.parent() {
-                Some(par) => probe = par.to_path_buf(),
-                None => return Err("path escapes share root".into()),
-            },
-        }
-    };
-    if !resolved.starts_with(&canon_root) {
-        return Err("path escapes share root".into());
-    }
-    Ok(p)
-}
-
 /// ファイル / ディレクトリを作成する (ファイルは 0 バイトに truncate)。
-async fn fs_create(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> {
-    let p = safe_join(root, rel).await?;
+async fn fs_create(scope: &ShareScope, rel: &str, is_dir: bool) -> Result<(), String> {
+    let p = resolve_write(scope, rel)?;
     if is_dir {
         tokio::fs::create_dir_all(&p)
             .await
@@ -1524,8 +1534,8 @@ async fn fs_create(root: &Path, rel: &str, is_dir: bool) -> Result<(), String> {
 }
 
 /// ファイルの `offset` 以降にバイトを書き込む (なければ作成、truncate はしない)。
-async fn fs_write(root: &Path, rel: &str, offset: u64, data: &[u8]) -> Result<(), String> {
-    let p = safe_join(root, rel).await?;
+async fn fs_write(scope: &ShareScope, rel: &str, offset: u64, data: &[u8]) -> Result<(), String> {
+    let p = resolve_write(scope, rel)?;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1542,8 +1552,8 @@ async fn fs_write(root: &Path, rel: &str, offset: u64, data: &[u8]) -> Result<()
 }
 
 /// ファイル / ディレクトリを削除する。
-async fn fs_delete(root: &Path, rel: &str) -> Result<(), String> {
-    let p = safe_join(root, rel).await?;
+async fn fs_delete(scope: &ShareScope, rel: &str) -> Result<(), String> {
+    let p = resolve_write(scope, rel)?;
     match tokio::fs::metadata(&p).await {
         Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(&p)
             .await
@@ -1556,9 +1566,9 @@ async fn fs_delete(root: &Path, rel: &str) -> Result<(), String> {
 }
 
 /// `from` を `to` にリネーム / 移動する。
-async fn fs_rename(root: &Path, from: &str, to: &str) -> Result<(), String> {
-    let src = safe_join(root, from).await?;
-    let dst = safe_join(root, to).await?;
+async fn fs_rename(scope: &ShareScope, from: &str, to: &str) -> Result<(), String> {
+    let src = resolve_write(scope, from)?;
+    let dst = resolve_write(scope, to)?;
     if let Some(parent) = dst.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -1974,24 +1984,34 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 mod tests {
     use super::*;
 
-    /// 空 / `.` / `/` のみのパスは共有ルート自身を指すため、破壊系の `safe_join` は
-    /// canonicalize に到達する前に拒否する (ルートごと remove_dir_all される回帰を防ぐ)。
-    #[tokio::test]
-    async fn safe_join_rejects_share_root_itself() {
-        let root = Path::new("nonexistent-share-root");
-        for rel in ["", ".", "/", "./", "//", "/.//."] {
-            let r = safe_join(root, rel).await;
-            assert!(r.is_err(), "expected rejection for {rel:?}, got {r:?}");
+    /// 合成ルート (0 成分) とドライブのルート (1 成分) への破壊系操作は拒否する
+    /// (ドライブごと remove_dir_all / rename される回帰を防ぐ)。
+    #[test]
+    fn whole_pc_write_rejects_drive_and_synthetic_root() {
+        for rel in ["", ".", "/", "C", "C/", "/C/.", "//"] {
+            assert!(
+                whole_pc_resolve_write(rel).is_err(),
+                "expected rejection for {rel:?}"
+            );
         }
     }
 
-    /// `..` / 区切り混入はコンポーネント単位で拒否する。
-    #[tokio::test]
-    async fn safe_join_rejects_traversal_components() {
-        let root = Path::new("nonexistent-share-root");
-        for rel in ["..", "a/../b", "a\\b", "C:/x"] {
-            assert!(safe_join(root, rel).await.is_err(), "should reject {rel:?}");
+    /// `..` / 区切り混入 / 不正なドライブ文字はコンポーネント単位で拒否する。
+    #[test]
+    fn whole_pc_resolve_rejects_traversal_and_bad_drive() {
+        for rel in ["C/..", "C/a/../b", "C/a\\b", "C/x:y", "CC/x", "1/x"] {
+            assert!(whole_pc_resolve(rel).is_err(), "should reject {rel:?}");
         }
+    }
+
+    /// 合成ルートは `None`、ドライブ配下は実パスへ写す (ドライブ文字は大文字化)。
+    #[cfg(windows)]
+    #[test]
+    fn whole_pc_resolve_maps_paths() {
+        assert!(matches!(whole_pc_resolve(""), Ok(None)));
+        assert!(matches!(whole_pc_resolve("."), Ok(None)));
+        let p = whole_pc_resolve("c/Users/name").unwrap().unwrap();
+        assert_eq!(p, std::path::PathBuf::from("C:\\Users\\name"));
     }
 
     // ---- VideoReassembler (P1: 並べ替え/ロス耐性) ----

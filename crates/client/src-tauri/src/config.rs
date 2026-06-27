@@ -94,6 +94,11 @@ pub struct ClientSettings {
     /// 既定 OFF (物理ディスプレイをキャプチャ)。ホストに仮想ディスプレイが無ければ無視される。
     #[serde(default)]
     pub use_virtual_display: bool,
+    /// 接続時にこのPC (client) の This PC 全体 (全ドライブ) をホストの仮想ドライブへ公開する。
+    /// 既定 OFF (共有しない)。ON でも、ホスト側に登録済みの端末でなければドライブは出ない
+    /// (host net.rs の client_trusted ゲート)。中身は接続中のみ要求時に読まれる。
+    #[serde(default)]
+    pub share_files: bool,
 }
 
 fn default_fps() -> u32 {
@@ -124,6 +129,7 @@ impl Default for ClientSettings {
             max_mbps: default_max_mbps(),
             auto_reconnect: true,
             use_virtual_display: false,
+            share_files: false,
         }
     }
 }
