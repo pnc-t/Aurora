@@ -11,23 +11,28 @@ crates/
 ├── common/     共有: プロトコル型 (proto)、Noise 暗号化 (noise)、
 │               UDP フレーミング (framing)、クリップボード (clipboard)
 ├── host/       操作される側 (サーバ・素のバイナリ)
-│   ├── capture/   画面キャプチャ Port + OS 別 Adapter
-│   ├── encode/    H.264 ハードウェアエンコード Port + OS 別 Adapter
+│   ├── capture/   画面キャプチャ Port + OS 別 Adapter (device/convert を含む)
+│   ├── encode/    H.264 エンコード Port + Adapter (mf=SW / mf_hw=HW / ffmpeg)
 │   ├── input/     マウス/キー入力注入 Port + OS 別 Adapter
 │   ├── audio/     ループバック音声取り込み + Opus エンコード
 │   ├── projfs/    ProjFS によるドライブ投影 (クライアント側ファイルをホストに見せる)
+│   ├── display.rs ディスプレイ解像度の動的変更 (RDP 風) / 切断時の復元
+│   ├── virtualdisplay.rs  仮想ディスプレイ (MttVDD/IddCx) 検出・テイクオーバー制御
 │   ├── net.rs     TCP 制御 + UDP 映像/音声のサーバ実装
 │   ├── conn.rs    接続状態 (単一接続ガード) のプロセス間共有
+│   ├── devices.rs デバイスピン留め (クライアント静的鍵の許可リスト)
 │   ├── secret.rs  接続パスワードの DPAPI 暗号保存
+│   ├── perf.rs    エンコード遅延・ソースビットレートの計測 (--perf)
 │   ├── settings.rs / autostart.rs / tray.rs  設定・自動起動タスク・トレイ常駐 UI
 │   └── main.rs    エントリ・CLI・スレッド配線
 └── client/     操作する側 (Tauri v2 + Vanilla TypeScript)
     ├── src-tauri/  Rust 側: ネットワーク、Webview への NALU 受け渡し、設定
     └── src/        フロント
-        ├── core/   ブリッジ・ランタイム (ipc / decoder / input /
-        │           webview-guard / fullscreen / video-presets)
-        ├── ui/     UI コンポーネント (launcher / toolbar / file-transfer /
-        │           stats-overlay / toast / window-controls / icons)
+        ├── core/   ブリッジ・ランタイム (ipc / decoder / input / session /
+        │           fullscreen / video-presets / shortcuts / a11y /
+        │           webview-guard / log)
+        ├── ui/     UI コンポーネント (launcher / tabs / toolbar / connect-dialog /
+        │           file-transfer / stats-overlay / toast / window-controls / icons)
         └── styles/ 横断スタイル (base.css)
 ```
 
@@ -78,6 +83,22 @@ crates/
 - **トレイでのパスワード/ポート変更**は `Arc<Mutex<Psk>>` / `AtomicU16` を書き換え、
   `tokio::sync::Notify` で accept ループに再 bind を促すことで、**再起動なしに反映**されます。
 - D3D11 デバイスは capture/convert/encode で**1 つだけ**生成し共有します (Windows)。
+
+## 解像度の追従 (RDP 風) と仮想ディスプレイ
+
+クライアント表示領域とホストのキャプチャ解像度が食い違うと黒帯やスケーリングが生じます。
+これを避けるため、クライアントは表示領域サイズを `SetClientViewport` で送り、ホストが
+キャプチャ対象ディスプレイを最も近い対応モードへ合わせます ([protocol.md](protocol.md))。
+
+- **物理ディスプレイ** (`display.rs`): 解像度変更は既定 **OFF** のトグル。`ChangeDisplaySettingsEx`
+  でモード変更し、切断時は記憶した元モードへ戻します。Win32 呼び出しはブロックしうるので
+  `spawn_blocking` 上で実行します。
+- **仮想ディスプレイ** (`virtualdisplay.rs`): MttVDD/IddCx 製の仮想モニタを検出し、物理画面を
+  触らずに「クライアント表示領域ぴったりの仮想ディスプレイ」をキャプチャするテイクオーバー方式。
+  物理を温存したまま 1:1 表示にできます。
+- 解像度変更は DXGI Desktop Duplication を `ACCESS_LOST` にしますが、capture スレッドが
+  capturer を作り直して新解像度で復帰します。実解像度が変わるとホストは `DisplayResized` を
+  返し、クライアントが入力スケールとデコーダを更新します。
 
 ## クライアント側
 
