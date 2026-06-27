@@ -48,9 +48,13 @@ function render(): void {
   const { fps, bitrate_kbps, rtt_us, loss_permille } = latest;
   const rttMs = (rtt_us / 1000).toFixed(1);
   const mbps = (bitrate_kbps / 1000).toFixed(1);
-  hudEl.textContent =
-    `fps   ${fps}\n` +
-    `rate  ${mbps} Mbps\n` +
-    `rtt   ${rttMs} ms\n` +
-    `loss  ${(loss_permille / 10).toFixed(1)} %`;
+  // 値の桁数が変わっても右端が揃うよう、ラベルは左詰め・値は右詰めの固定幅で組む
+  // (#stats-hud は monospace + white-space:pre)。
+  const rows: [string, string][] = [
+    ["fps", String(fps)],
+    ["rate", `${mbps} Mbps`],
+    ["rtt", `${rttMs} ms`],
+    ["loss", `${(loss_permille / 10).toFixed(1)} %`],
+  ];
+  hudEl.textContent = rows.map(([k, v]) => `${k.padEnd(5)}${v.padStart(9)}`).join("\n");
 }

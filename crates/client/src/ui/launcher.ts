@@ -30,6 +30,8 @@ import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
 import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
+import { applyAriaLabels, trapFocus } from "../core/a11y";
+import { SHORTCUTS } from "../core/shortcuts";
 import { icon } from "./icons";
 import "./launcher.css";
 
@@ -67,11 +69,13 @@ const DEFAULT_SETTINGS: ClientSettings = {
   use_virtual_display: false,
 };
 
-/** ラベル/host から決定的に淡い色を作りアバター背景に使う。 */
+/** ラベル/host から決定的に色を作りアバター背景に使う。
+ *  白いイニシャル文字とのコントラストを確保するため明度は低め (38%) に固定する
+ *  (黄/緑系の hue でも白文字が読める)。 */
 function avatarColor(seed: string): string {
   let h = 0;
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) % 360;
-  return `hsl(${h}, 45%, 45%)`;
+  return `hsl(${h}, 52%, 38%)`;
 }
 
 function escapeHtml(s: string): string {
@@ -96,6 +100,16 @@ function applyTheme(theme: ThemeId, accent: string): void {
 }
 
 export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallback }): LauncherHandle {
+  // ショートカット一覧の行は単一定義 (core/shortcuts.ts) から生成する。
+  // label/desc は静的定数なので HTML へ直接埋め込んでよい (ホスト由来データではない)。
+  const shortcutRows = SHORTCUTS.map(
+    (s) => `
+            <div class="setting-row">
+              <div class="s-meta"><div class="s-title">${s.desc}</div></div>
+              <span class="kbd">${s.label}</span>
+            </div>`,
+  ).join("");
+
   opts.root.innerHTML = `
     <div class="launcher">
       <div class="titlebar" data-tauri-drag-region>
@@ -237,6 +251,15 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <input type="text" inputmode="numeric" id="set-port" class="num-input" />
             </div>
+            <div class="setting-group">ショートカット (接続中のローカル操作)</div>
+            ${shortcutRows}
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">マウスキャプチャ解除</div>
+                <div class="s-desc">キャプチャ中にポインタロックを抜ける</div>
+              </div>
+              <span class="kbd">Esc</span>
+            </div>
             <div class="setting-group">診断</div>
             <div class="setting-row">
               <div class="s-meta">
@@ -292,6 +315,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
 
+  // ナビ (Hosts/Settings) や ＋追加 などアイコンのみボタンに aria-label を補う。
+  applyAriaLabels(opts.root);
+
   // 診断: ログフォルダを開く / ログを ZIP 出力。
   $("#open-logs")?.addEventListener("click", () => {
     void openLogsFolder().catch((e) => logger.warn("open logs folder failed", e));
@@ -322,12 +348,26 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   });
 
   // --- ダイアログ ---
+  // 開いているダイアログのフォーカストラップ解除関数 (開くたびに張り、閉じると外す)。
+  let releaseTrap: (() => void) | null = null;
+  function openBackdrop(): void {
+    backdrop.classList.add("visible");
+    applyAriaLabels(backdrop);
+    releaseTrap?.();
+    releaseTrap = trapFocus(backdrop);
+  }
   function closeDialog(): void {
+    releaseTrap?.();
+    releaseTrap = null;
     backdrop.classList.remove("visible");
     backdrop.innerHTML = "";
   }
   backdrop.addEventListener("click", (e) => {
     if (e.target === backdrop) closeDialog();
+  });
+  // Esc で開いているダイアログを閉じる (カードメニューは別途下で閉じる)。
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && backdrop.classList.contains("visible")) closeDialog();
   });
 
   /** 削除などの確認ダイアログ。OK で onConfirm を実行する。 */
@@ -342,7 +382,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
       </div>
     `;
-    backdrop.classList.add("visible");
+    openBackdrop();
     backdrop.querySelector("#c-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector("#c-ok")?.addEventListener("click", () => {
       void onConfirm().finally(closeDialog);
@@ -410,7 +450,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
       </form>
     `;
-    backdrop.classList.add("visible");
+    openBackdrop();
     backdrop.querySelector<HTMLInputElement>("#h-host")?.focus();
     backdrop.querySelector("#h-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
@@ -447,7 +487,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
       </form>
     `;
-    backdrop.classList.add("visible");
+    openBackdrop();
     const passInput = backdrop.querySelector<HTMLInputElement>("#d-pass");
     const okBtn = backdrop.querySelector<HTMLButtonElement>("#d-ok");
     const statusEl = backdrop.querySelector<HTMLElement>("#d-status");
@@ -584,6 +624,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           </div>`;
       })
       .join("");
+    applyAriaLabels(hostList); // grip/編集/メニュー/切断 などアイコンのみボタンに付与
 
     hostList.querySelectorAll<HTMLElement>(".host-card").forEach((card) => {
       const idx = Number(card.dataset.idx);

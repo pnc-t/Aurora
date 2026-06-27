@@ -10,6 +10,8 @@
 import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
 import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
+import { applyAriaLabels } from "../core/a11y";
+import { shortcutLabel } from "../core/shortcuts";
 import { icon } from "./icons";
 import "./toolbar.css";
 
@@ -52,32 +54,38 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       </div>
       <span class="tb-sep" data-tauri-drag-region></span>
       <div class="tb-group" data-tauri-drag-region>
-        <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (F11 / Ctrl+Alt+Shift+F)">${icon("fullscreen")}</button>
-        <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (Ctrl+Alt+Shift+M)">${icon("mouse")}</button>
+        <button type="button" id="tb-fullscreen" class="tb-btn" title="フルスクリーン (${shortcutLabel("toggle-fullscreen")})">${icon("fullscreen")}</button>
+        <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (${shortcutLabel("toggle-capture")})">${icon("mouse")}</button>
         <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
-        <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (Ctrl+Alt+Shift+S)">${icon("stats")}</button>
+        <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (${shortcutLabel("toggle-stats")})">${icon("stats")}</button>
         <button type="button" id="tb-audio" class="tb-btn" title="音声ミュート">${icon("volume")}</button>
       </div>
-      <span id="display-wrap" class="tb-group" title="表示するディスプレイ" data-tauri-drag-region>
-        <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
-        <select id="display-select"></select>
-      </span>
-      <span class="tb-sep" data-tauri-drag-region></span>
-      <span class="tb-video" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限" data-tauri-drag-region>
-        <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
-        <span id="tb-custom" class="tb-custom">
-          <input type="text" inputmode="numeric" id="tb-fps" />fps
-          <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
+      <div id="display-wrap" class="tb-popgroup" data-pop="display" title="表示するディスプレイ" data-tauri-drag-region>
+        <button type="button" class="tb-btn tb-pop-trigger" id="tb-display-trigger" title="ディスプレイ">${icon("display")}</button>
+        <span class="tb-pop-panel" data-tauri-drag-region>
+          <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
+          <select id="display-select"></select>
         </span>
-        <select id="tb-resolution" title="解像度 (送出する映像の高さ・アスペクト比維持)">
-          <option value="0">フル</option>
-          <option value="1080">1080p</option>
-          <option value="720">720p</option>
-        </select>
-      </span>
+      </div>
       <span class="tb-sep" data-tauri-drag-region></span>
-      <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / Ctrl+Alt+Shift+B">${icon("pin")}</button>
-      <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / Ctrl+Alt+Shift+B で再表示">${icon("eye-off")}</button>
+      <div class="tb-popgroup" data-pop="quality" data-tauri-drag-region>
+        <button type="button" class="tb-btn tb-pop-trigger" id="tb-quality-trigger" title="画質 / 解像度">${icon("tune")}</button>
+        <span class="tb-video tb-pop-panel" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限" data-tauri-drag-region>
+          <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
+          <span id="tb-custom" class="tb-custom">
+            <input type="text" inputmode="numeric" id="tb-fps" />fps
+            <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
+          </span>
+          <select id="tb-resolution" title="解像度 (送出する映像の高さ・アスペクト比維持)">
+            <option value="0">フル</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+          </select>
+        </span>
+      </div>
+      <span class="tb-sep" data-tauri-drag-region></span>
+      <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}">${icon("pin")}</button>
+      <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / ${shortcutLabel("toggle-bar")} で再表示">${icon("eye-off")}</button>
       <span id="tb-winctl" class="window-controls"></span>
     </div>
   `;
@@ -89,6 +97,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。
   const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
   if (winctl) mountWindowControls(winctl);
+
+  // アイコンのみのボタン群に aria-label を補う (SR 読み上げ用)。
+  applyAriaLabels(opts.topbar);
 
   const disconnectBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-disconnect");
   const displayWrap = opts.topbar.querySelector<HTMLElement>("#display-wrap");
@@ -105,6 +116,28 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const customWrap = opts.topbar.querySelector<HTMLElement>("#tb-custom");
   const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
   const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
+
+  // 縦バー (left/right) 時のポップオーバー。テキストを持つコントロール (画質/解像度/
+  // ディスプレイ) はバーを横長にするため、縦配置ではアイコン (.tb-pop-trigger) に畳み、
+  // クリックでバー脇にパネル (.tb-pop-panel) を開く。横帯 (top/bottom) ではトリガを隠して
+  // パネルをそのままインライン表示する (見た目は従来どおり・CSS 側で出し分け)。
+  const popgroups = Array.from(opts.topbar.querySelectorAll<HTMLElement>(".tb-popgroup"));
+  function closePopovers(except?: HTMLElement): void {
+    for (const g of popgroups) if (g !== except) g.classList.remove("pop-open");
+  }
+  for (const g of popgroups) {
+    const trigger = g.querySelector<HTMLElement>(".tb-pop-trigger");
+    trigger?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const willOpen = !g.classList.contains("pop-open");
+      closePopovers(g);
+      g.classList.toggle("pop-open", willOpen);
+    });
+  }
+  // パネル外をクリックしたら全て閉じる (パネル内の select 操作では閉じない)。
+  document.addEventListener("pointerdown", (e) => {
+    if (!(e.target as HTMLElement).closest(".tb-popgroup")) closePopovers();
+  });
 
   // fps/Mbps の手動入力欄はプリセット=カスタムのときだけ出す (常時表示は情報重複で幅を食う)。
   function applyCustomVisibility(presetId: string): void {
@@ -313,6 +346,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     },
     setPosition(pos: ToolbarPosition): void {
       position = pos;
+      // 配置が変わるとポップオーバーの開き方向 (左右) も変わるため一旦閉じる。
+      closePopovers();
       applyPosition();
       applyVisibility();
     },

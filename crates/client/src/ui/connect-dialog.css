@@ -96,6 +96,12 @@
   color: var(--accent);
   font-size: 13px;
 }
+.pk-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 2px;
+  line-height: 1.5;
+}
 
 .picker-form {
   display: flex;

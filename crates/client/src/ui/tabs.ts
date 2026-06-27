@@ -3,6 +3,7 @@
 // ラベルはホスト由来文字列を含むため textContent で描画する (XSS 注意)。
 
 import { icon } from "./icons";
+import { applyAriaLabels } from "../core/a11y";
 import type { TabStatus } from "../core/session";
 import type { ToolbarPosition } from "../core/ipc";
 import "./tabs.css";
@@ -45,6 +46,7 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   const list = container.querySelector<HTMLElement>("#tabstrip-list");
   const strip = container.querySelector<HTMLElement>(".tabstrip");
   container.querySelector<HTMLButtonElement>("#tab-add")?.addEventListener("click", () => opts.onAdd());
+  applyAriaLabels(container); // 「+」など アイコンのみボタンに aria-label を補う
 
   // id → タブ要素。
   const tabs = new Map<string, HTMLElement>();
@@ -86,6 +88,7 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     close.innerHTML = icon("close");
 
     el.append(dot, name, close);
+    applyAriaLabels(el); // × ボタン (アイコンのみ) に aria-label を補う
 
     // × クリックで閉じる (ドラッグ開始の pointerdown より前に拾えるよう close 自身に付ける)。
     close.addEventListener("click", (e) => {
@@ -117,6 +120,13 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   function startTabDrag(id: string, down: PointerEvent, el: HTMLElement): void {
     const startX = down.clientX;
     const startY = down.clientY;
+    // 掴んだ点とタブ左上の相対位置 (grab offset)。クローンをこの分だけずらして追従させると、
+    // タブの向き/形状 (横帯の小タブ・縦サイドタブの全幅タブ) に関わらず「掴んだ箇所」が
+    // カーソルに張り付く。固定オフセットだと top の横タブ基準になり、bottom/left/right で
+    // 掴み位置とクローンがズレて崩れて見える。
+    const grab = el.getBoundingClientRect();
+    const grabX = startX - grab.left;
+    const grabY = startY - grab.top;
     let dragging = false;
     let clone: HTMLElement | null = null;
     el.setPointerCapture(down.pointerId);
@@ -129,12 +139,13 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
         clone = el.cloneNode(true) as HTMLElement;
         clone.classList.add("tab-drag-clone");
         clone.style.width = `${r.width}px`;
+        clone.style.height = `${r.height}px`;
         document.body.appendChild(clone);
         el.classList.add("tab-dragging");
       }
       if (clone) {
-        clone.style.left = `${ev.clientX - 24}px`;
-        clone.style.top = `${ev.clientY - 14}px`;
+        clone.style.left = `${ev.clientX - grabX}px`;
+        clone.style.top = `${ev.clientY - grabY}px`;
       }
     };
     const onUp = (ev: PointerEvent): void => {

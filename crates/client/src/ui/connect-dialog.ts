@@ -5,6 +5,7 @@
 // ホスト由来文字列は textContent で描画する (XSS 注意)。
 
 import { loadRecentHosts, loadSettings, savedPasswordHosts, type HostEntry } from "../core/ipc";
+import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import "./connect-dialog.css";
 
@@ -31,7 +32,7 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
           <input id="pk-port" type="text" inputmode="numeric" placeholder="port" class="pk-port" />
         </div>
         <input id="pk-pass" type="password" placeholder="password" />
-        <label class="pk-check"><input id="pk-save" type="checkbox" /> パスワードを保存する</label>
+        <label class="pk-check"><input id="pk-save" type="checkbox" checked /> パスワードを保存する</label>
         <div class="pk-status" id="pk-status"></div>
         <div class="pk-actions">
           <button type="submit" class="pk-connect">connect</button>
@@ -40,6 +41,7 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
     </div>
   `;
   root.classList.add("visible");
+  applyAriaLabels(root); // 閉じる(×) などアイコンのみボタンに aria-label を補う
 
   const list = root.querySelector<HTMLElement>("#pk-list");
   const hostInput = root.querySelector<HTMLInputElement>("#pk-host");
@@ -49,7 +51,15 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
   const statusEl = root.querySelector<HTMLElement>("#pk-status");
   const connectBtn = root.querySelector<HTMLButtonElement>(".pk-connect");
 
+  const releaseTrap = trapFocus(root);
+  const onKeydown = (e: KeyboardEvent): void => {
+    if (e.key === "Escape") close();
+  };
+  document.addEventListener("keydown", onKeydown);
+
   function close(): void {
+    releaseTrap();
+    document.removeEventListener("keydown", onKeydown);
     root.classList.remove("visible");
     root.innerHTML = "";
   }
@@ -117,7 +127,10 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
     if (portInput && !portInput.value) portInput.value = String(defaultPort);
     if (!list) return;
     if (hosts.length === 0) {
-      list.textContent = "";
+      const empty = document.createElement("div");
+      empty.className = "pk-empty";
+      empty.textContent = "保存済みのホストはありません。下のフォームから接続できます。";
+      list.replaceChildren(empty);
       return;
     }
     for (const h of hosts) {

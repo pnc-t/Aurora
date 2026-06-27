@@ -146,6 +146,26 @@ html, body {
 input, textarea { user-select: text; -webkit-user-select: text; }
 button { font: inherit; }
 
+/* --- フォーカス可視化 (キーボード操作) ---
+ * 各コンポーネントは `:focus` で outline:none にしているが、キーボード操作時
+ * (:focus-visible) は今どこにいるか分かるアクセント色のリングを必ず出す。
+ * マウス操作のクリックフォーカスでは出ない (:focus-visible の仕様)。
+ * 映像 canvas はプログラムからフォーカスを当てるためリングを出さない。 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#screen:focus-visible { outline: none; }
+
+/* --- モーションを減らす設定への配慮 ---
+ * OS で「視差効果を減らす」等が有効なときはアニメ/トランジションを実質無効化する
+ * (タブのパルス、トースト/バーのスライド等で酔う・気が散るのを防ぐ)。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* --- 全面 canvas (最背面) --- */
 /* 映像エリアは常にウィンドウ全体を占める。フローティングのツールバー (ピル) は
  * 場所を予約せず映像の上端に重ねて浮かせる (自動格納される floating バー本来の挙動)。
