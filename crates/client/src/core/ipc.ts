@@ -59,10 +59,11 @@ function sid(): string {
 export async function openCaptureWindow(
   host: string,
   port: number,
+  label: string,
   save: boolean,
   password: string | null,
 ): Promise<string> {
-  return await invoke<string>("open_capture_window", { host, port, save, password });
+  return await invoke<string>("open_capture_window", { host, port, label, save, password });
 }
 
 /// 既存 capture ウィンドウ内に新規タブ (セッション) を開く準備。session_id を発番し、

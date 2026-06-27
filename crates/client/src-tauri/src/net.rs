@@ -247,6 +247,8 @@ pub async fn open_capture_window(
     app: tauri::AppHandle,
     host: String,
     port: u16,
+    // タブの表示名 (空なら capture 側で host にフォールバック)。
+    label: String,
     save: bool,
     // 手入力パスワード (今回だけ/保存) は Some、保存済み即接続/再接続は None。
     password: Option<String>,
@@ -254,7 +256,7 @@ pub async fn open_capture_window(
 ) -> Result<String, String> {
     let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("s{n}");
-    let label = format!("capture-{session_id}");
+    let win_label = format!("capture-{session_id}");
     // パスワードを staging へ積んでから window を作る (connect_to_host が pop する)。
     state
         .staging
@@ -262,12 +264,13 @@ pub async fn open_capture_window(
         .await
         .insert(session_id.clone(), password);
     let url = format!(
-        "capture.html?session={}&host={}&port={port}&save={}",
+        "capture.html?session={}&host={}&port={port}&label={}&save={}",
         q(&session_id),
         q(&host),
+        q(&label),
         if save { 1 } else { 0 },
     );
-    let build = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+    let build = WebviewWindowBuilder::new(&app, &win_label, WebviewUrl::App(url.into()))
         .title("Aurora")
         .inner_size(1280.0, 800.0)
         .resizable(true)

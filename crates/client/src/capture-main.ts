@@ -413,10 +413,12 @@ void (async () => {
     return;
   }
   const initialId = params.get("session") ?? "";
+  const initialHost = params.get("host") ?? "";
   const initialEntry: HostEntry = {
-    host: params.get("host") ?? "",
+    host: initialHost,
     port: Number(params.get("port")) || 0,
-    label: params.get("host") ?? "",
+    // 表示名 (label) が空のときだけ host にフォールバックする。
+    label: params.get("label") || initialHost,
   };
   const initialSave = params.get("save") === "1";
   if (!initialId || !initialEntry.host || !initialEntry.port) {
