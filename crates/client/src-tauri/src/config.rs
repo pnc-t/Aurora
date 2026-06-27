@@ -30,6 +30,9 @@ pub struct HostEntry {
     /// 接続ポート (host 側 --port と一致させる)。
     #[serde(default = "default_port")]
     pub port: u16,
+    /// カードのアバター画像 (data URL、空なら頭文字アバターにフォールバック)。
+    #[serde(default)]
+    pub icon: String,
 }
 
 fn default_port() -> u16 {
@@ -166,6 +169,7 @@ pub fn load_recent_hosts(app: AppHandle) -> Result<Vec<HostEntry>, String> {
             label: host.clone(),
             host,
             port: DEFAULT_PORT,
+            icon: String::new(),
         })
         .collect())
 }
@@ -182,6 +186,7 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         label: entry.label.trim().to_string(),
         host,
         port: entry.port,
+        icon: entry.icon,
     };
 
     let mut hosts = load_recent_hosts(app.clone())?;

@@ -225,6 +225,8 @@ export type HostEntry = {
   label: string;
   host: string;
   port: number;
+  /// カードのアバター画像 (data URL、空なら頭文字アバター)。任意 (古い設定/URL 由来は未設定)。
+  icon?: string;
 };
 
 /// 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。

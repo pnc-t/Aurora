@@ -79,6 +79,33 @@ function avatarColor(seed: string): string {
   return `hsl(${h}, 52%, 38%)`;
 }
 
+/** 設定 JSON に埋め込む小さなアバター。選択画像を中央クロップで 64px 正方の PNG data URL にする。
+ *  ファイルコピー/asset protocol を使わず data URL でそのまま保存・描画できるため軽い。 */
+async function imageToIconDataUrl(file: File): Promise<string> {
+  const SIZE = 64;
+  const bitmap = await createImageBitmap(file);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = SIZE;
+    canvas.height = SIZE;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("canvas 2d がありません");
+    // アスペクト比維持で正方形へ中央クロップ。
+    const side = Math.min(bitmap.width, bitmap.height);
+    const sx = (bitmap.width - side) / 2;
+    const sy = (bitmap.height - side) / 2;
+    ctx.drawImage(bitmap, sx, sy, side, side, 0, 0, SIZE, SIZE);
+    return canvas.toDataURL("image/png");
+  } finally {
+    bitmap.close();
+  }
+}
+
+/** data URL の画像アバターか判定する (描画分岐・保存値の検証に使う)。 */
+function hasImageIcon(icon: string | undefined): icon is string {
+  return !!icon && icon.startsWith("data:image/");
+}
+
 function escapeHtml(s: string): string {
   return s.replace(
     /[&<>"']/g,
@@ -451,6 +478,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
         <h3>${isAdd ? "ホストを追加" : "ホストを編集"}</h3>
+        <div class="icon-picker">
+          <div class="icon-preview" id="h-icon-preview"></div>
+          <div class="icon-picker-actions">
+            <button type="button" class="btn-secondary" id="h-icon-pick">画像を選択</button>
+            <button type="button" class="btn-ghost" id="h-icon-clear">解除</button>
+          </div>
+          <input type="file" id="h-icon-file" accept="image/*" hidden />
+        </div>
         <label>表示名 (任意)<input id="h-label" type="text" value="${escapeHtml(e.label)}" placeholder="home-pc" /></label>
         <label>host (Tailscale IP / hostname)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
         <label>port<input id="h-port" type="text" inputmode="numeric" value="${e.port}" /></label>
@@ -461,6 +496,56 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       </form>
     `;
     openBackdrop();
+
+    // --- アイコン (画像) 選択 ---
+    // 画像未設定なら label/host 由来の頭文字アバターをプレビューに出し、選択中は画像を出す。
+    let currentIcon = e.icon ?? "";
+    const labelInput = backdrop.querySelector<HTMLInputElement>("#h-label");
+    const hostInput = backdrop.querySelector<HTMLInputElement>("#h-host");
+    const preview = backdrop.querySelector<HTMLElement>("#h-icon-preview");
+    const fileInput = backdrop.querySelector<HTMLInputElement>("#h-icon-file");
+    const clearBtn = backdrop.querySelector<HTMLButtonElement>("#h-icon-clear");
+    function renderIconPreview(): void {
+      if (!preview) return;
+      if (hasImageIcon(currentIcon)) {
+        preview.style.background = "";
+        const img = document.createElement("img");
+        img.src = currentIcon; // 自前生成の data URL
+        img.alt = "";
+        img.draggable = false;
+        preview.replaceChildren(img);
+      } else {
+        const nm = labelInput?.value.trim() || hostInput?.value.trim() || "?";
+        preview.style.background = avatarColor(nm);
+        preview.textContent = (nm[0] ?? "?").toUpperCase();
+      }
+      if (clearBtn) clearBtn.style.display = currentIcon ? "" : "none";
+    }
+    renderIconPreview();
+    // 画像未設定のときは頭文字が label/host に追従するよう再描画。
+    labelInput?.addEventListener("input", () => {
+      if (!hasImageIcon(currentIcon)) renderIconPreview();
+    });
+    hostInput?.addEventListener("input", () => {
+      if (!hasImageIcon(currentIcon)) renderIconPreview();
+    });
+    backdrop.querySelector("#h-icon-pick")?.addEventListener("click", () => fileInput?.click());
+    fileInput?.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      fileInput.value = ""; // 同じファイルを選び直しても change が出るようリセット
+      if (!file) return;
+      void imageToIconDataUrl(file)
+        .then((url) => {
+          currentIcon = url;
+          renderIconPreview();
+        })
+        .catch((err) => logger.warn("icon load failed", err));
+    });
+    clearBtn?.addEventListener("click", () => {
+      currentIcon = "";
+      renderIconPreview();
+    });
+
     backdrop.querySelector<HTMLInputElement>("#h-host")?.focus();
     backdrop.querySelector("#h-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
@@ -475,7 +560,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         if (!isAdd && hostChanged) {
           await deleteRecentHost(e.host);
         }
-        await saveRecentHost({ label: label || host, host, port });
+        await saveRecentHost({ label: label || host, host, port, icon: currentIcon });
         closeDialog();
         await handle.refreshHosts();
       })().catch((e) => logger.warn("save host failed", e));
@@ -609,6 +694,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       .map((h, i) => {
         const name = h.label || h.host;
         const initial = escapeHtml((name[0] ?? "?").toUpperCase());
+        // 画像アイコンがあれば img、無ければ頭文字 + 自動生成色。data URL は自前生成
+        // (canvas.toDataURL) のみで base64 文字種なので属性を破れない。
+        const avatar = hasImageIcon(h.icon)
+          ? `<div class="avatar avatar-img"><img src="${h.icon}" alt="" draggable="false" /></div>`
+          : `<div class="avatar" style="background:${avatarColor(name)}">${initial}</div>`;
         const saved = hasSaved(h.host)
           ? `<span class="saved-badge" title="パスワード保存済み (押すと即接続)">${icon("key")}</span>`
           : "";
@@ -621,7 +711,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         return `
           <div class="host-card${connected ? " connected" : ""}" data-idx="${i}">
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
-            <div class="avatar" style="background:${avatarColor(name)}">${initial}</div>
+            ${avatar}
             <div class="meta">
               <div class="label">${escapeHtml(name)}</div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
