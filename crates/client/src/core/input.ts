@@ -223,11 +223,13 @@ export class Input {
   }
 
   private onKeyDown(e: KeyboardEvent): void {
-    if (e.repeat) return;
     const vk = vkFromKeyboardEvent(e);
     if (vk == null) return;
     e.preventDefault();
-    this.pressedKeys.add(vk);
+    // オートリピート (e.repeat) もホストへ転送する。SendInput で注入した keydown は
+    // ホスト OS のタイプマティックを誘発しないため、転送しないと押しっぱなしが 1 回で止まる。
+    // 既に登録済みなので pressedKeys への追加は初回のみでよい。
+    if (!e.repeat) this.pressedKeys.add(vk);
     this.dispatch({ Key: { vk, down: true } });
   }
 
