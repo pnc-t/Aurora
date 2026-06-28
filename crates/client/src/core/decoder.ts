@@ -40,7 +40,15 @@ const DEFAULT_JITTER_MS = 4;
 /// 自走スケジューラが実時間から先行ドリフトしてよい上限 (フレーム数)。提示予定がこの分を超えて
 /// 未来へ伸びたらアンカーを貼り直して catch-up する。**必須の安全弁**: これが無いと presentAt が
 /// 無限にドリフトし「一切提示されず画面が固着」する (2026-06-27 実機で発生)。
-const DRIFT_FRAMES = 2;
+/// 2026-06-28 の hold 内訳計測で、残遅延の sched (= ジッタバッファ滞留) が cushion 本体に加えて
+/// ceiling 方向へ駐機するドリフト余白 (~1 フレーム) を含むと判明したため、2→1 に詰めて余白を
+/// 半減させる (安全弁は 1 フレームで維持)。バースト時の再アンカー増/微小スタッターは要計測。
+const DRIFT_FRAMES = 1;
+/// 到着ジッタ EMA の非対称追従係数。RISE=上昇時は旧来どおり緩く (0.1) 追い、単発スパイクを
+/// 追いかけて cushion を膨らませない (保護は対称 0.1 と同等)。FALL=下降時 (clean 復帰) だけ
+/// 速くして (0.3) cushion=遅延を素早く回収する (2026-06-28 計測: RISE を速くする逆向きは悪化)。
+const JITTER_EMA_RISE = 0.1;
+const JITTER_EMA_FALL = 0.3;
 
 /// 値を [lo, hi] に収める。
 function clamp(x: number, lo: number, hi: number): number {
@@ -437,7 +445,10 @@ export class Decoder {
       if (dt > 0 && dt < 250) {
         const dev = Math.abs(dt - this.emaArrivalIntervalMs);
         this.emaArrivalIntervalMs += 0.1 * (dt - this.emaArrivalIntervalMs);
-        this.emaArrivalJitterMs += 0.1 * (dev - this.emaArrivalJitterMs);
+        // 非対称追従 (2b): 上昇 (RISE) は緩く追い単発スパイクで cushion を膨らませない (保護は
+        // 対称 0.1 と同等)。下降 (clean 復帰) だけ速く縮めて (FALL) cushion=遅延を素早く回収する。
+        const jAlpha = dev > this.emaArrivalJitterMs ? JITTER_EMA_RISE : JITTER_EMA_FALL;
+        this.emaArrivalJitterMs += jAlpha * (dev - this.emaArrivalJitterMs);
       }
     }
     this.lastChunkMs = arrivalNow;
