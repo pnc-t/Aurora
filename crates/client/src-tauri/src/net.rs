@@ -1785,6 +1785,65 @@ impl VideoReassembler {
 ///   [0]   flags (bit0=keyframe)
 ///   [1..3] frame_id (be u16)
 ///   [3..]  Annex-B H.264 NALU
+/// 受信側 (Rust) のフレーム完成カデンスのジッタ計測 (`AURORA_PERF` 有効時のみ)。webview の Channel
+/// へ渡す**前** (= ネット受信 + 再組立直後) の到着間隔ジッタを測る。JS 側 `vstat` の jitter_ms と
+/// 比較し、残ジッタが「ネット/再組立由来」(Rust ≈ JS) か「webview IPC/JS スケジューリング由来」
+/// (Rust ≪ JS) かを切り分ける診断用。`rstat` 行として client.log に 1 秒窓で出す。
+struct RecvJitterMeter {
+    enabled: bool,
+    last: Option<Instant>,
+    ema_interval_ms: f64,
+    ema_jitter_ms: f64,
+    window_start: Instant,
+    frames: u32,
+}
+
+impl RecvJitterMeter {
+    fn new() -> Self {
+        // ホストの --perf に対応するクライアント側スイッチ (log.rs の perf_enabled と同条件)。
+        let enabled = std::env::var("AURORA_PERF")
+            .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        Self {
+            enabled,
+            last: None,
+            ema_interval_ms: 1000.0 / 60.0,
+            ema_jitter_ms: 4.0,
+            window_start: Instant::now(),
+            frames: 0,
+        }
+    }
+
+    /// フレーム完成時刻を 1 つ記録し、1 秒窓ごとにジッタを `rstat` ログへ出す。
+    fn record(&mut self, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(last) = self.last {
+            let dt = now.duration_since(last).as_secs_f64() * 1000.0;
+            // 大きな gap (ロス回復・再開直後) は外れ値として無視 (推定を暴れさせない)。
+            if dt > 0.0 && dt < 250.0 {
+                let dev = (dt - self.ema_interval_ms).abs();
+                self.ema_interval_ms += 0.1 * (dt - self.ema_interval_ms);
+                self.ema_jitter_ms += 0.1 * (dev - self.ema_jitter_ms);
+            }
+        }
+        self.last = Some(now);
+        self.frames += 1;
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            tracing::info!(
+                target: "aurora::frontend",
+                "rstat recv_jitter_ms={:.1} recv_interval_ms={:.1} frames={}",
+                self.ema_jitter_ms,
+                self.ema_interval_ms,
+                self.frames,
+            );
+            self.window_start = now;
+            self.frames = 0;
+        }
+    }
+}
+
 async fn udp_reader_loop(
     udp: Arc<UdpSocket>,
     session: Arc<TransportSession>,
@@ -1807,6 +1866,8 @@ async fn udp_reader_loop(
     let mut reasm = VideoReassembler::new(Instant::now());
     // push が吐く出来事を毎パケット受ける一時バッファ (再利用してアロケーションを抑える)。
     let mut events: Vec<ReasmEvent> = Vec::new();
+    // 受信側ジッタ計測 (AURORA_PERF 有効時のみ)。webview へ渡す前のフレーム完成カデンスを測る。
+    let mut recv_jitter = RecvJitterMeter::new();
 
     loop {
         // recv エラーでループを終了させない。Windows の connected UDP ソケットは
@@ -1908,6 +1969,9 @@ async fn udp_reader_loop(
                     frame_id,
                     data,
                 } => {
+                    // webview へ渡す前にフレーム完成カデンスのジッタを記録 (診断)。`now` は
+                    // 完成パケット (FRAME_END) の受信時刻 ≒ フレーム完成時刻。
+                    recv_jitter.record(now);
                     let mut out = Vec::with_capacity(3 + data.len());
                     out.push(if keyframe { 1u8 } else { 0u8 });
                     out.extend_from_slice(&frame_id.to_be_bytes());
