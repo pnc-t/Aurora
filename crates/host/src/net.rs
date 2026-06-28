@@ -801,6 +801,11 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     }
     tracing::info!(peer = %peer, "noise handshake complete");
 
+    // 映像 UDP 送信を専用タスクへ分離するため session を Arc 共有する。StatelessTransportState は
+    // encrypt/decrypt とも &self なので、制御ループと映像送信タスクが同じ session を並行参照できる
+    // (nonce は呼び出し側が明示・ドメイン分離済みで衝突しない)。
+    let session = std::sync::Arc::new(session);
+
     // TCP を読み書きの 2 ハーフに分割する。読み取りは専用タスクへ隔離し、本体の select
     // ループからは外す。理由: `read_tcp_frame` は `read_exact` を 2 回行う複数段の await で
     // **キャンセル安全ではない**。これを select の枝に直接置くと、NAL 送信や FS 要求など別の
@@ -868,7 +873,6 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // ここまで来たら TCP 認証 + UDP 対向確定 = 接続確立。映像配信を開始する地点。
     tracing::info!("client connected");
 
-    let mut seq: u32 = 0;
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
     // ダウンロード (ホスト → クライアント) のチャンクと、host→クライアントへの制御 push
@@ -923,7 +927,8 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     };
 
     // 映像/音声 broadcast を subscribe する (確立後 = ハンドシェイク中のフレームを溜めない)。
-    let mut nal_brx = nal_btx.subscribe();
+    // nal_brx は下の専用映像送信タスクへ move する (そこで mut 受信)。
+    let nal_brx = nal_btx.subscribe();
     let mut audio_brx = audio_btx.subscribe();
 
     // 接続直後に IDR を 1 枚要求し、最初のキーフレームを待つ黒画面時間を縮める。従来は
@@ -944,8 +949,99 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     let mut audio_muted = false;
     // 映像一時停止 (クライアントの SetVideoPaused)。true の間は映像 UDP を送らない
     // (マルチタブで非アクティブなタブの帯域を止める)。再開時はクライアントが RequestKeyframe を
-    // 送って映像を復帰させる。これもクライアント毎ローカル。
-    let mut video_paused = false;
+    // 送って映像を復帰させる。これもクライアント毎ローカル。映像送信は専用タスクで走るため、
+    // 制御ループ (ここ) とタスクで共有する atomic にする。
+    let video_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // --- 映像 UDP 送信タスク (制御/入力から分離) ---
+    // 映像送信を制御ループの select から外し、専用タスクで回す。同じ select に置くと、ドラッグ中の
+    // 大量の mousemove (TCP 制御、フレームの ~2 倍/秒) が `nal_brx.recv` と公平に競合し、フレーム送出
+    // タイミングがジッタる (= クライアントの到着ジッタ増 → ジッタバッファ肥大 → 体感遅延)。別タスク化
+    // するとマルチスレッドランタイムで送信が入力処理と並行に走り、送出が制御トラフィックから独立する。
+    // session は &self (StatelessTransportState) なので Arc 共有で安全。seq は映像専用ローカル。
+    let video_task = {
+        let session = session.clone();
+        let udp = udp.clone();
+        let enc_tx = enc_tx.clone();
+        let video_paused = video_paused.clone();
+        let mut nal_brx = nal_brx;
+        tokio::spawn(async move {
+            let mut seq: u32 = 0;
+            loop {
+                let nal = match nal_brx.recv().await {
+                    Ok(n) => n,
+                    // 遅延でリングから溢れた: 取りこぼし、キーフレームで復帰させる (共有エンコーダ宛なので
+                    // 全クライアントが次キーフレームを得る)。
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "video broadcast lagged; requesting keyframe");
+                        let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                        continue;
+                    }
+                    // 送信元 (encode → フォワーダ) 終了 = 映像供給停止。送信タスクを畳む。
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                // 一時停止中はドレインするだけで送らない (非アクティブタブの帯域節約)。
+                if video_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let frame_id = nal.frame_id;
+                let keyframe = nal.keyframe;
+                let mut chunks = nal.data.chunks(MAX_PAYLOAD).peekable();
+                let mut first = true;
+                while let Some(chunk) = chunks.next() {
+                    let is_last = chunks.peek().is_none();
+                    let mut flags = VideoPacketFlags::empty();
+                    if first {
+                        flags |= VideoPacketFlags::FRAME_START;
+                    }
+                    if is_last {
+                        flags |= VideoPacketFlags::FRAME_END;
+                    }
+                    if keyframe {
+                        flags |= VideoPacketFlags::KEYFRAME;
+                    }
+                    let pkt = VideoPacket {
+                        seq,
+                        flags,
+                        frame_id,
+                        payload: chunk,
+                    };
+                    let mut framed = Vec::with_capacity(chunk.len() + 7);
+                    if let Err(e) = pkt.encode(&mut framed) {
+                        tracing::warn!(error = %e, "encode VideoPacket failed; ending video sender");
+                        return;
+                    }
+                    let nonce = NONCE_DOMAIN_VIDEO | seq as u64;
+                    let dgram = match encrypt_udp(&session, nonce, STREAM_VIDEO, &framed) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "encrypt video failed; ending video sender");
+                            return;
+                        }
+                    };
+                    if let Err(e) = udp.send_to(&dgram, peer_udp).await {
+                        tracing::warn!(error = %e, "video UDP send failed; ending video sender");
+                        return;
+                    }
+                    // 映像 nonce は seq (u32) を下位に使うため、一周で再利用される。ChaChaPoly は nonce
+                    // 再利用が致命的なので巻き戻る前に送信を止める (クライアント再接続で鍵が更新される)。
+                    seq = match seq.checked_add(1) {
+                        Some(s) => s,
+                        None => {
+                            tracing::error!(
+                                "video nonce space exhausted; ending video sender (reconnect to rekey)"
+                            );
+                            return;
+                        }
+                    };
+                    first = false;
+                }
+            }
+        })
+    };
+    // 本体終了 (切断・エラー) で映像送信タスクを確実に止める。
+    let _video_guard = AbortOnDrop(video_task);
+
     let result: Result<()> = async {
     loop {
         tokio::select! {
@@ -985,7 +1081,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
                     }
                     ControlMsg::SetVideoPaused { paused } => {
                         tracing::info!(paused, "client set video paused");
-                        video_paused = paused;
+                        video_paused.store(paused, std::sync::atomic::Ordering::Relaxed);
                     }
                     ControlMsg::SetCursorOverlay { enabled } => {
                         tracing::info!(enabled, "client set cursor overlay");
@@ -1277,56 +1373,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
             Some(msg) = fs_req_rx.recv() => {
                 send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
             }
-            // NAL 受信 (broadcast ファンアウト) → UDP 送信 (STREAM_VIDEO)
-            nal = nal_brx.recv() => {
-                let nal = match nal {
-                    Ok(n) => n,
-                    // 遅延でリングから溢れた: 取りこぼし数を記録し、キーフレームで復帰させる
-                    // (他クライアントには影響しない)。共有エンコーダ宛なので全員が次キーフレームを得る。
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "video broadcast lagged; requesting keyframe");
-                        let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
-                        continue;
-                    }
-                    // 送信元 (encode → フォワーダ) が終了 = 映像供給停止。セッションを終える。
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-                // 一時停止中はフレームをドレインするだけで送らない (非アクティブタブの帯域節約)。
-                // 送らない=その seq の nonce を消費しないだけで、再開時の RequestKeyframe で復帰する。
-                if video_paused {
-                    continue;
-                }
-                let frame_id = nal.frame_id;
-                let keyframe = nal.keyframe;
-                let mut chunks = nal.data.chunks(MAX_PAYLOAD).peekable();
-                let mut first = true;
-                while let Some(chunk) = chunks.next() {
-                    let is_last = chunks.peek().is_none();
-                    let mut flags = VideoPacketFlags::empty();
-                    if first { flags |= VideoPacketFlags::FRAME_START; }
-                    if is_last { flags |= VideoPacketFlags::FRAME_END; }
-                    if keyframe { flags |= VideoPacketFlags::KEYFRAME; }
-                    let pkt = VideoPacket { seq, flags, frame_id, payload: chunk };
-                    let mut framed = Vec::with_capacity(chunk.len() + 7);
-                    pkt.encode(&mut framed).context("encode VideoPacket")?;
-                    let nonce = NONCE_DOMAIN_VIDEO | seq as u64;
-                    let dgram = encrypt_udp(&session, nonce, STREAM_VIDEO, &framed)?;
-                    udp.send_to(&dgram, peer_udp).await.context("UDP send")?;
-                    // 映像 nonce は seq (u32) を下位に使うため、seq 一周で nonce が再利用される。
-                    // ChaChaPoly は nonce 再利用が機密性・完全性とも致命的なので、巻き戻る前に
-                    // セッションを終了する。クライアントが再接続すると新しいハンドシェイクで
-                    // 鍵が更新され nonce 空間がリセットされる (静かな nonce 再利用より安全)。
-                    seq = match seq.checked_add(1) {
-                        Some(s) => s,
-                        None => {
-                            return Err(anyhow!(
-                                "video nonce space exhausted; disconnecting to force rekey"
-                            ));
-                        }
-                    };
-                    first = false;
-                }
-            }
+            // (映像 UDP 送信は専用タスク (上の video_task) へ分離済み。ここでは扱わない。)
             // 音声フレーム受信 (broadcast ファンアウト) → UDP 送信 (STREAM_AUDIO)
             au = audio_brx.recv() => {
                 let au = match au {
