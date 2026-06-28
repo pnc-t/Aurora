@@ -19,6 +19,17 @@ pub fn frontend_log(level: String, message: String) {
     }
 }
 
+/// 計測ログ (`vstat` 等) を出すかどうか。環境変数 `AURORA_PERF` が空でない値で設定されて
+/// いれば有効 (`0` / `false` は無効)。ホストの `--perf` 引数に対応するクライアント側スイッチ。
+/// フロントは起動時に 1 回だけ問い合わせ、有効時のみ受信→提示の遅延集計をログへ流す。
+#[tauri::command]
+pub fn perf_enabled() -> bool {
+    match std::env::var("AURORA_PERF") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 /// ログフォルダ (`%LOCALAPPDATA%\Aurora\logs`) をエクスプローラで開く。未作成なら作る。
 #[tauri::command]
 pub fn open_logs_folder() -> Result<(), String> {

@@ -107,6 +107,7 @@ fn main() {
             secret::saved_password_hosts,
             secret::delete_host_password,
             log::frontend_log,
+            log::perf_enabled,
             log::open_logs_folder,
             log::export_logs_zip,
         ])

@@ -147,6 +147,24 @@ export async function requestKeyframe(sessionId: string): Promise<void> {
   await invoke("request_keyframe", { sessionId });
 }
 
+// --- 計測フラグ (ホスト --perf 相当) ---
+// 環境変数 AURORA_PERF で有効化されるクライアント側の計測スイッチ。起動時に 1 回 Rust へ
+// 問い合わせて保持し、decoder の vstat (受信→提示の遅延) 集計を有効化する。未取得の間は
+// false。同期 getter にして decoder のホットパスから安価に参照できるようにする。
+let perfFlag = false;
+
+export async function initPerfFlag(): Promise<void> {
+  try {
+    perfFlag = await invoke<boolean>("perf_enabled");
+  } catch {
+    perfFlag = false;
+  }
+}
+
+export function isPerfEnabled(): boolean {
+  return perfFlag;
+}
+
 /// ログフォルダ (%LOCALAPPDATA%\Aurora\logs) をエクスプローラで開く。
 export async function openLogsFolder(): Promise<void> {
   await invoke("open_logs_folder");

@@ -954,7 +954,9 @@ fn run_server(
     // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
     let device = capture::create_shared_device(&initial_name)?;
 
-    let (frame_tx, frame_rx) = mpsc::channel::<Frame>(2);
+    // フレームと一緒に capture 時刻 (Instant) を運び、encode 側で capture→encode 待ちを測る
+    // (--perf 時のみ集計)。Instant は Copy で安価。
+    let (frame_tx, frame_rx) = mpsc::channel::<(Instant, Frame)>(2);
     let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
     let (enc_cmd_tx, enc_cmd_rx) = mpsc::channel::<EncoderCommand>(8);
     let (input_tx, input_rx) = mpsc::channel::<InputCmd>(256);
@@ -1093,7 +1095,7 @@ fn run_server(
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     device: capture::SharedDevice,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<(Instant, Frame)>,
     res_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
     select_rx: std::sync::mpsc::Receiver<String>,
     initial_name: String,
@@ -1110,8 +1112,13 @@ fn capture_loop(
 
     // 送出ペーシング: 高リフレッシュレートモニタだと next_frame が毎リフレッシュ
     // (例 144Hz) でフレームを返し、全部 encode/送信するとクライアントのデコードが
-    // 追いつかずバックログが累積して遅延が増える。前回送出から min_interval 経過した
-    // フレームだけを encode 側へ流す (0 = 無制限)。
+    // 追いつかずバックログが累積して遅延が増える。fps 上限で間引いて encode 側へ流す (0 = 無制限)。
+    //
+    // **グリッド基準ペーシング**: 送出可否を「前回送出 (実時刻) からの経過」ではなく、min_interval
+    // 刻みの固定グリッド `next_send` で判定する。実時刻基準だと DXGI 到着ジッタがそのまま送出間隔に
+    // 乗り、かつ間引きの量子化 (interval 直前のフレームを落とし次を送る) で送出間隔が interval〜
+    // interval+リフレッシュ周期 で揺れる。これがクライアントの到着ジッタ (= ジッタバッファ肥大の主因)
+    // になる。グリッド基準なら誤差が累積せず、送出間隔が均等化する (2026-06-27 調査)。
     let fps_to_interval = |fps: u32| {
         if fps == 0 {
             Duration::ZERO
@@ -1120,10 +1127,8 @@ fn capture_loop(
         }
     };
     let mut min_interval = fps_to_interval(fps_cap);
-    // 初回フレームは即送出できるよう過去側に倒しておく。
-    let mut last_sent = Instant::now()
-        .checked_sub(min_interval)
-        .unwrap_or_else(Instant::now);
+    // 次に送出してよいグリッド時刻。初回は即送出。
+    let mut next_send = Instant::now();
     // 直近にキャプチャしたフレーム (NV12 テクスチャの COM 参照のみ保持・画素コピー無し)。
     // 画面静止中に新規接続/キーフレーム要求 (`force_frame`) が来たとき、これを再投入して
     // 現在の画面を即送る。DXGI Desktop Duplication は変化フレームしか返さないため、これが
@@ -1326,18 +1331,27 @@ fn capture_loop(
             }
             // 直近フレームを更新 (COM 参照のみ・安価)。ペーシングで捨てられた場合も最新を保持。
             last_frame = Some(f.clone());
-            // fps 上限ペーシング: 間隔未満のフレームは捨てる (最新フレームを送るため
-            // ここで間引く)。0 (無制限) のとき・強制送出時は常に送る。
+            // fps 上限ペーシング (グリッド基準): グリッド時刻 next_send に達したフレームを送る。
+            // 0 (無制限) のとき・強制送出時は常に送る。
             let now = Instant::now();
-            if forced || min_interval.is_zero() || now.duration_since(last_sent) >= min_interval {
-                last_sent = now;
+            let due = min_interval.is_zero() || now >= next_send;
+            if forced || due {
+                if due && !min_interval.is_zero() {
+                    // グリッドを 1 間隔進める。停止/ギャップで 1 間隔超 遅れていたら now へ再同期し、
+                    // 復帰時に溜まったぶんを一気に送る (バースト) のを防ぐ。
+                    next_send += min_interval;
+                    if next_send <= now {
+                        next_send = now + min_interval;
+                    }
+                }
                 // try_send: バックプレッシャ。詰まったら捨てる。更新なしのときは None
-                let _ = tx.try_send(f);
+                // `now` を capture 時刻として同送 (encode 側で cap→encode 待ちを測る)。
+                let _ = tx.try_send((now, f));
             }
         } else if forced {
             // 画面静止 (DXGI タイムアウト) 中の強制送出: 直近フレームを再投入する。
             if let Some(lf) = last_frame.as_ref() {
-                let _ = tx.try_send(lf.clone());
+                let _ = tx.try_send((Instant::now(), lf.clone()));
             }
         }
     }
@@ -1363,7 +1377,7 @@ fn input_loop(mut rx: mpsc::Receiver<InputCmd>, initial_geom: DisplayGeom) -> Re
 
 fn encode_loop(
     device: capture::SharedDevice,
-    mut frame_rx: mpsc::Receiver<Frame>,
+    mut frame_rx: mpsc::Receiver<(Instant, Frame)>,
     nal_tx: mpsc::Sender<EncodedNal>,
     mut cmd_rx: mpsc::Receiver<EncoderCommand>,
     perf: bool,
@@ -1412,7 +1426,9 @@ fn encode_loop(
         loop {
             pending_keyframe |= drain_cmds(&mut enc, &mut cmd_rx);
             let t0 = std::time::Instant::now();
-            if let Err(e) = enc.push_frame(&frame) {
+            // capture→encode 待ち: フレームが capture チャネルで待たされた時間 (push 直前に測る)。
+            let cap_wait_us = frame.0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            if let Err(e) = enc.push_frame(&frame.1) {
                 tracing::warn!(error = %e, "push_frame failed");
             } else {
                 nals.clear();
@@ -1422,7 +1438,7 @@ fn encode_loop(
                 if let Some(m) = meter.as_mut() {
                     let encode_us = t0.elapsed().as_micros() as u32;
                     let nal_bytes: usize = nals.iter().map(|n| n.data.len()).sum();
-                    m.record(encode_us, nal_bytes);
+                    m.record(encode_us, nal_bytes, cap_wait_us);
                     m.maybe_flush();
                 }
                 if nals.iter().any(|n| n.keyframe) {
@@ -1441,6 +1457,23 @@ fn encode_loop(
                 Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
             }
         }
+        // 入力アイドル (try_recv Empty で inner loop を抜けた) 時の低遅延フラッシュ。非同期 HW MFT は
+        // frame N の HaveOutput を次の submit まで握るため、ドラッグが断続的で入力が疎になると直前
+        // フレームの出力がエンコーダ内に滞留し、配信が遅れ・バースト化する (クライアントの到着ジッタ増
+        // → ジッタバッファ肥大の一因。2026-06-27 実測で host fps/encode の乱高下として観測)。後続入力を
+        // 待たず flush_pending で押し出し滞留分を即送出する。keyframe 要求時は下の専用フラッシュ (埋め草
+        // re-push) が担うので委ねる。高 fps では inner loop が try_recv で回り続けここに来ないため
+        // オーバーヘッドは無い (滞留が無ければ flush_pending は即返る)。
+        if !pending_keyframe {
+            if let Err(e) = enc.flush_pending() {
+                tracing::warn!(error = %e, "idle flush_pending failed");
+            }
+            while let Some(nal) = enc.poll_nal()? {
+                if nal_tx.blocking_send(nal).is_err() {
+                    return Ok(());
+                }
+            }
+        }
         // 入力が尽きたが keyframe 要求が乗っていて、まだ keyframe を出せていない。非同期 HW MFT は
         // frame N の出力に後続入力を要し (パイプライン段数は個体差あり)、静止画面では後続フレームが
         // 無いため IDR がエンコーダ内に滞留し、ホスト画面が動く (操作する) まで黒画面が残る。直近
@@ -1453,7 +1486,7 @@ fn encode_loop(
             let mut pushes = 0u32;
             while !keyframe_sent && pushes < MAX_FLUSH_PUSHES {
                 pushes += 1;
-                if let Err(e) = enc.push_frame(&frame) {
+                if let Err(e) = enc.push_frame(&frame.1) {
                     tracing::warn!(error = %e, "keyframe flush re-push failed");
                     break;
                 }

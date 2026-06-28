@@ -10,28 +10,145 @@
 //   [3..]  Annex-B H.264 (start code 00 00 00 01 区切りで複数 NALU を含む)
 
 import { logger } from "./log";
+import { isPerfEnabled } from "./ipc";
 
-// --- ジッタバッファ (P2: 滑らかさ) ---
+// --- ジッタバッファ (適応クッション) ---
 // 旧実装はデコード完了フレームを onFrame で即 drawImage していた。WebCodecs の出力は
 // ネットワーク到着ジッタ (パケットが束で来て→疎、を繰り返す) をそのまま引き継ぐため、
 // 各フレームの表示時間が不均一になり「ヌルヌル動かずカクつく」体感の一因になっていた。
-// ここでは小さなクッション (TARGET_BUFFER_MS) を持ち、到着間隔の推定 (EMA) で**均等間隔**に
-// 提示時刻をスケジュールして requestAnimationFrame で出す。これで到着ジッタを吸収し表示が
-// 滑らかになる。リフレッシュレート非依存 (時刻ベースなので 60/120/144Hz いずれでも機能)。
+// クッションを持ち、到着間隔の推定 (EMA) で**均等間隔**に提示時刻をスケジュールして
+// requestAnimationFrame で出すことで到着ジッタを吸収する。リフレッシュレート非依存。
+//
+// 旧実装の問題 (2026-06-27 計測で判明): クッションを固定 24ms にし、提示時刻を
+// `nextPresentAt + 推定間隔` で**自走**させていたため、到着がバースト気味だと presentAt が
+// 実時間より先行ドリフトし、上限 80ms に張り付いて hold が常時 ~56ms/p95 80ms まで肥大した
+// (ジッタバッファ自身のバッファブロート)。本実装は (1) クッションを実測ジッタに比例させて
+// 適応化し、(2) 提示時刻を「到着 + クッション」にアンカーしてドリフトをタイトにクランプする
+// ことで、低ジッタ回線では hold をクッション (=数 ms) 付近まで縮める。
 
-/// ジッタ吸収クッションの目標遅延 (ms)。到着ジッタをこの分の先読みで吸収する。操作の
-/// 体感遅延 (E2E < 50ms 目標) を圧迫しないよう小さく保つ (≒1.5 フレーム @60fps)。
-const TARGET_BUFFER_MS = 24;
-/// 提示バックログの上限 (ms)。源 fps > 表示 Hz 等で提示が追いつかないとき、これを超える
-/// 古いフレームは捨てて遅延の累積 (バッファブロート) を防ぐ。
-const MAX_BUFFER_MS = 80;
+/// クッション = clamp(JITTER_K × 実測ジッタ, MIN, MAX)。ジッタ (到着間隔の平均絶対偏差) の
+/// 何倍を先読みするか。大きいほど滑らかだが遅延が増える。
+const JITTER_K = 2.5;
+/// 適応クッションの下限 (ms)。低ジッタ回線 (Tailnet 直結) でもこの分は持ち、表示の取りこぼしを防ぐ。
+const MIN_CUSHION_MS = 6;
+/// 適応クッションの上限 (ms)。ジッタが大きくてもこれ以上は先読みせず、操作遅延の暴走を防ぐ。
+const MAX_CUSHION_MS = 40;
 /// フレーム間隔の初期推定 (60fps)。実際の到着間隔の EMA で源 fps 変化に追従する。
 const DEFAULT_INTERVAL_MS = 1000 / 60;
+/// ジッタ推定の初期値 (ms)。実測の平均絶対偏差 EMA で更新する。
+const DEFAULT_JITTER_MS = 4;
+/// 自走スケジューラが実時間から先行ドリフトしてよい上限 (フレーム数)。提示予定がこの分を超えて
+/// 未来へ伸びたらアンカーを貼り直して catch-up する。**必須の安全弁**: これが無いと presentAt が
+/// 無限にドリフトし「一切提示されず画面が固着」する (2026-06-27 実機で発生)。
+const DRIFT_FRAMES = 2;
+
+/// 値を [lo, hi] に収める。
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.min(Math.max(x, lo), hi);
+}
 
 type DecoderOpts = {
   /** デコード不能 (設定前のキーフレーム待ち / エラー) で復帰を促すための要求口。 */
   requestKeyframe: () => void;
 };
+
+/// ソート済み配列の p95 (切り上げ index、空なら 0)。
+function p95(sorted: number[]): number {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  const idx = Math.min(Math.max(Math.ceil(n * 0.95) - 1, 0), n - 1);
+  return sorted[idx];
+}
+
+/**
+ * 受信→提示の遅延を 1 秒窓で集計してログに出す計測器 (AURORA_PERF 有効時のみ稼働)。
+ * - decode_ms : チャンク受信 (VideoFrame.timestamp) → デコード出力 (onFrame)
+ * - hold_ms   : デコード出力 → 実提示 (drawImage)。ジッタバッファ待ち + vsync 待ち。
+ * - total_ms  : 受信 → 実提示 (= クライアント内部の合計遅延)。
+ * - sched_ms  : デコード出力 → 提示**予定**時刻 (presentAt-decodedAt)。スケジューラが意図的に
+ *               積んだジッタバッファ滞留 (= cushion/均等間隔ぶん)。
+ * - late_ms   : 提示予定 → 実提示 (now-presentAt)。予定からの遅れ = rAF/vsync 量子化ぶん。
+ *               **hold_ms = sched_ms + late_ms** に厳密分解されるので、残遅延の主因が
+ *               「バッファ待ち (sched)」か「present tick 待ち (late)」かを切り分けられる。
+ * これらと dropped/qdepth/present_fps を `vstat` 行として `client.<日付>.log` に残す。
+ */
+class VstatMeter {
+  private windowStart = performance.now();
+  private decodeMs: number[] = [];
+  private holdMs: number[] = [];
+  private totalMs: number[] = [];
+  // hold_ms の内訳 (sched + late = hold)。残遅延がバッファ待ちか present tick 待ちかの切り分け用。
+  private schedMs: number[] = [];
+  private lateMs: number[] = [];
+  private presented = 0;
+  private dropped = 0;
+  private lastQdepth = 0;
+  // 適応スケジューラの現在値 (直近値を記録)。クッションが上限に張り付いていないか等の診断用。
+  // jitter = 到着ジッタ (cushion の基準)、outputJitter = デコード出力カデンスのジッタ (比較用)。
+  private lastCushionMs = 0;
+  private lastJitterMs = 0;
+  private lastOutputJitterMs = 0;
+
+  recordDrop(n = 1): void {
+    this.dropped += n;
+  }
+
+  recordPresent(
+    decodeMs: number,
+    holdMs: number,
+    totalMs: number,
+    schedMs: number,
+    lateMs: number,
+    qdepth: number,
+    cushionMs: number,
+    jitterMs: number,
+    outputJitterMs: number,
+  ): void {
+    this.presented++;
+    this.decodeMs.push(decodeMs);
+    this.holdMs.push(holdMs);
+    this.totalMs.push(totalMs);
+    this.schedMs.push(schedMs);
+    this.lateMs.push(lateMs);
+    this.lastQdepth = qdepth;
+    this.lastCushionMs = cushionMs;
+    this.lastJitterMs = jitterMs;
+    this.lastOutputJitterMs = outputJitterMs;
+    this.maybeFlush();
+  }
+
+  /** 1 秒窓が満了したら集計を 1 行ログに出してリセットする。 */
+  maybeFlush(): void {
+    const now = performance.now();
+    const elapsed = now - this.windowStart;
+    if (elapsed < 1000 || (this.presented === 0 && this.dropped === 0)) return;
+
+    const stat = (xs: number[]): string => {
+      if (xs.length === 0) return "0.0/0.0";
+      const avg = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const sorted = [...xs].sort((a, b) => a - b);
+      return `${avg.toFixed(1)}/${p95(sorted).toFixed(1)}`;
+    };
+    const fps = Math.round((this.presented / elapsed) * 1000);
+    logger.info(
+      `vstat decode_ms=${stat(this.decodeMs)} hold_ms=${stat(this.holdMs)} ` +
+        `total_ms=${stat(this.totalMs)} sched_ms=${stat(this.schedMs)} late_ms=${stat(this.lateMs)} ` +
+        `qdepth=${this.lastQdepth} ` +
+        `present_fps=${fps} dropped=${this.dropped} ` +
+        `cushion_ms=${this.lastCushionMs.toFixed(1)} jitter_ms=${this.lastJitterMs.toFixed(1)} ` +
+        `ojitter_ms=${this.lastOutputJitterMs.toFixed(1)} (avg/p95)`,
+    );
+
+    this.windowStart = now;
+    this.decodeMs = [];
+    this.holdMs = [];
+    this.totalMs = [];
+    this.schedMs = [];
+    this.lateMs = [];
+    this.presented = 0;
+    this.dropped = 0;
+  }
+}
 
 export class Decoder {
   private decoder: VideoDecoder | null = null;
@@ -43,16 +160,31 @@ export class Decoder {
   private suppressedErrs = 0;
 
   // --- ジッタバッファ状態 ---
-  // 提示待ちのデコード済みフレーム (到着順 = 提示順)。各フレームに提示予定時刻を持たせる。
-  private queue: { frame: VideoFrame; presentAt: number }[] = [];
+  // 提示待ちのデコード済みフレーム (到着順 = 提示順)。提示予定時刻と、遅延計測用の
+  // デコード出力時刻 (decodedAt) を持たせる。
+  private queue: { frame: VideoFrame; presentAt: number; decodedAt: number }[] = [];
+  // 受信→提示の遅延計測 (AURORA_PERF 有効時のみログ出力)。フラグは起動時に確定済み。
+  private readonly perf = isPerfEnabled();
+  private readonly vstat = new VstatMeter();
   // 提示ループの requestAnimationFrame ハンドル (キューが空の間は止める)。
   private rafId: number | null = null;
-  // 到着間隔の指数移動平均 (源 fps 推定)。
+  // デコード出力間隔の指数移動平均 (提示の均等間隔スケジューリングに使う源 fps 推定)。
   private emaIntervalMs = DEFAULT_INTERVAL_MS;
-  // 直近フレームの到着時刻 (EMA 更新用)。0 = 未到着。
+  // デコード出力間隔の平均絶対偏差の EMA (出力カデンスのジッタ)。計測比較用 (cushion には使わない)。
+  private emaJitterMs = DEFAULT_JITTER_MS;
+  // 直近に算出した適応クッション (ms)。vstat への記録用 (提示時に参照する)。
+  private lastCushionMs = 0;
+  // 直近のデコード出力時刻 (出力カデンス EMA 更新用)。0 = 未到着。
   private lastArrivalMs = 0;
-  // 次フレームに割り当てる提示予定時刻 (均等間隔スケジューリングのアンカー)。
+  // 自走する提示予定アンカー (均等間隔スケジューリング)。上限 reset で実時間から乖離しない。
   private nextPresentAt = 0;
+
+  // --- 到着 (チャンク受信) カデンス: 適応クッションの基準 ---
+  // クッションは「伝送ジッタ」を吸収するためのもの。デコード出力カデンス (WebCodecs のバースト
+  // を含み過大になりがち) ではなく、チャンク**到着**の間隔ジッタを基準にする。
+  private lastChunkMs = 0;
+  private emaArrivalIntervalMs = DEFAULT_INTERVAL_MS;
+  private emaArrivalJitterMs = DEFAULT_JITTER_MS;
 
   /** デコードパイプラインのエラーを 1 秒 1 回に間引いて記録する (抑制件数を併記)。 */
   private throttledError(msg: string, ...extra: unknown[]): void {
@@ -121,31 +253,46 @@ export class Decoder {
     }
     const now = performance.now();
 
-    // 到着間隔の EMA を更新 (源 fps 変化に追従)。大きな gap (ロス回復・再開直後) は外れ値
-    // として無視し、推定が暴れないようにする。
+    // 到着間隔の EMA とジッタ (平均絶対偏差) の EMA を更新 (源 fps 変化に追従)。大きな gap
+    // (ロス回復・再開直後) は外れ値として無視し、推定が暴れないようにする。偏差は更新前の
+    // 推定間隔を基準に測る。
     if (this.lastArrivalMs > 0) {
       const dt = now - this.lastArrivalMs;
       if (dt > 0 && dt < 250) {
+        const dev = Math.abs(dt - this.emaIntervalMs);
         this.emaIntervalMs += 0.1 * (dt - this.emaIntervalMs);
+        this.emaJitterMs += 0.1 * (dev - this.emaJitterMs);
       }
     }
     this.lastArrivalMs = now;
 
-    // 提示予定時刻: 前フレームの予定 + 推定間隔 = 均等間隔。クッション分だけ先に倒す。
-    // アンダーラン (キュー空) / 遅れすぎ / 先読みしすぎはクッション基準へ貼り直し、提示時刻の
-    // ドリフトを是正する。
-    const earliest = now + TARGET_BUFFER_MS;
+    // 適応クッション: チャンク**到着**ジッタ (handleChunk で計測) に比例させる。低ジッタ回線では
+    // MIN まで縮んで低遅延、ジッタが大きければ膨らんで滑らかさを保つ。デコード出力カデンスではなく
+    // 到着カデンスを基準にするのは、クッションの役割が伝送ジッタの吸収だから。
+    const cushion = clamp(JITTER_K * this.emaArrivalJitterMs, MIN_CUSHION_MS, MAX_CUSHION_MS);
+    this.lastCushionMs = cushion;
+
+    // 提示予定時刻: 前フレームの予定 + 推定間隔で均等間隔に並べる (滑らかさ)。ただし now 基準で
+    // 上下を必ず束縛し、自走クロックが実時間から乖離するのを防ぐ:
+    //  - 下限 earliest = now + cushion       (最小バッファ。アンダーラン / 遅れすぎは貼り直す)
+    //  - 上限 ceiling  = now + cushion + DRIFT_FRAMES*間隔 (超えたら貼り直して catch-up)
+    // **上限は必須**: これが無いと presentAt が未来へ無限ドリフトし、一切提示されず画面が固着する
+    // (2026-06-27 実機で発生)。reset 値は earliest (now 基準) なので実時間に再同期される。
+    const earliest = now + cushion;
+    const ceiling = now + cushion + DRIFT_FRAMES * this.emaIntervalMs;
     let presentAt = this.nextPresentAt + this.emaIntervalMs;
-    if (this.queue.length === 0 || presentAt < now || presentAt > now + MAX_BUFFER_MS) {
+    if (this.queue.length === 0 || presentAt < now || presentAt > ceiling) {
       presentAt = earliest;
     }
     this.nextPresentAt = presentAt;
-    this.queue.push({ frame, presentAt });
+    this.queue.push({ frame, presentAt, decodedAt: now });
 
-    // バックログ上限 (源 fps > 表示 Hz でキューが伸びる場合): 古いフレームを捨てて遅延を抑える。
-    const maxFrames = Math.max(2, Math.ceil(MAX_BUFFER_MS / this.emaIntervalMs));
+    // バックログ安全弁 (二次): 上限 reset で通常は溜まらないが、バースト時の溢れを**最古**から
+    // 間引いて遅延累積を防ぐ。ceiling と整合する深さ + 1 枚の余裕、最低 2 枚は保持する。
+    const maxFrames = Math.max(2, Math.ceil(cushion / this.emaIntervalMs) + DRIFT_FRAMES + 1);
     while (this.queue.length > maxFrames) {
       this.queue.shift()?.frame.close();
+      if (this.perf) this.vstat.recordDrop();
     }
 
     this.ensureRafRunning();
@@ -169,15 +316,35 @@ export class Decoder {
     if (this.queue.length === 0) return;
 
     const now = performance.now();
-    let toDraw: VideoFrame | null = null;
+    let toDraw: { frame: VideoFrame; decodedAt: number; presentAt: number } | null = null;
     while (this.queue.length > 0 && this.queue[0].presentAt <= now) {
       const item = this.queue.shift();
       if (!item) break;
       // 既に保持していた古い due フレームは破棄 (追いつきのため最新の due のみ描画)。
-      if (toDraw) toDraw.close();
-      toDraw = item.frame;
+      if (toDraw) {
+        toDraw.frame.close();
+        if (this.perf) this.vstat.recordDrop();
+      }
+      toDraw = { frame: item.frame, decodedAt: item.decodedAt, presentAt: item.presentAt };
     }
-    if (toDraw) this.drawFrame(toDraw);
+    if (toDraw) {
+      if (this.perf) {
+        // arrival は handleChunk で chunk.timestamp(us) に刻んだ受信時刻。提示まで運ばれる。
+        const arrivalMs = toDraw.frame.timestamp / 1000;
+        this.vstat.recordPresent(
+          toDraw.decodedAt - arrivalMs, // decode_ms
+          now - toDraw.decodedAt, // hold_ms (ジッタバッファ + vsync 待ち)
+          now - arrivalMs, // total_ms (受信→提示)
+          toDraw.presentAt - toDraw.decodedAt, // sched_ms (意図したバッファ滞留)
+          now - toDraw.presentAt, // late_ms (提示予定からの遅れ = vsync 量子化)
+          this.queue.length,
+          this.lastCushionMs, // 適応クッション (診断用)
+          this.emaArrivalJitterMs, // 到着ジッタ (cushion の基準)
+          this.emaJitterMs, // デコード出力カデンスのジッタ (比較用)
+        );
+      }
+      this.drawFrame(toDraw.frame);
+    }
   };
 
   /** 1 フレームを canvas へ描画して閉じる。 */
@@ -207,8 +374,12 @@ export class Decoder {
     for (const item of this.queue) item.frame.close();
     this.queue = [];
     this.emaIntervalMs = DEFAULT_INTERVAL_MS;
+    this.emaJitterMs = DEFAULT_JITTER_MS;
     this.lastArrivalMs = 0;
     this.nextPresentAt = 0;
+    this.lastChunkMs = 0;
+    this.emaArrivalIntervalMs = DEFAULT_INTERVAL_MS;
+    this.emaArrivalJitterMs = DEFAULT_JITTER_MS;
   }
 
   /** バイナリチャンク 1 個を受け取って decoder に渡す。 */
@@ -258,10 +429,23 @@ export class Decoder {
       }
     }
 
+    // チャンク到着カデンスのジッタを更新 (適応クッションの基準)。大きな gap (ロス回復・再開
+    // 直後) は外れ値として無視する。偏差は更新前の推定間隔を基準に測る。
+    const arrivalNow = performance.now();
+    if (this.lastChunkMs > 0) {
+      const dt = arrivalNow - this.lastChunkMs;
+      if (dt > 0 && dt < 250) {
+        const dev = Math.abs(dt - this.emaArrivalIntervalMs);
+        this.emaArrivalIntervalMs += 0.1 * (dt - this.emaArrivalIntervalMs);
+        this.emaArrivalJitterMs += 0.1 * (dev - this.emaArrivalJitterMs);
+      }
+    }
+    this.lastChunkMs = arrivalNow;
+
     try {
       const chunk = new EncodedVideoChunk({
         type: keyframe ? "key" : "delta",
-        timestamp: performance.now() * 1000,
+        timestamp: arrivalNow * 1000,
         data: annexB,
       });
       decoder.decode(chunk);

@@ -9,6 +9,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
+  initPerfFlag,
   loadSettings,
   openSessionWindow,
   stageSession,
@@ -400,6 +401,8 @@ const params = new URLSearchParams(window.location.search);
 const adoptId = params.get("adopt");
 
 void (async () => {
+  // 計測フラグ (AURORA_PERF) を最初に取得しておく (decoder の vstat 集計が参照する)。
+  await initPerfFlag();
   try {
     settings = await loadSettings();
   } catch {
