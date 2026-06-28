@@ -65,6 +65,11 @@ function p95(sorted: number[]): number {
  * - decode_ms : チャンク受信 (VideoFrame.timestamp) → デコード出力 (onFrame)
  * - hold_ms   : デコード出力 → 実提示 (drawImage)。ジッタバッファ待ち + vsync 待ち。
  * - total_ms  : 受信 → 実提示 (= クライアント内部の合計遅延)。
+ * - sched_ms  : デコード出力 → 提示**予定**時刻 (presentAt-decodedAt)。スケジューラが意図的に
+ *               積んだジッタバッファ滞留 (= cushion/均等間隔ぶん)。
+ * - late_ms   : 提示予定 → 実提示 (now-presentAt)。予定からの遅れ = rAF/vsync 量子化ぶん。
+ *               **hold_ms = sched_ms + late_ms** に厳密分解されるので、残遅延の主因が
+ *               「バッファ待ち (sched)」か「present tick 待ち (late)」かを切り分けられる。
  * これらと dropped/qdepth/present_fps を `vstat` 行として `client.<日付>.log` に残す。
  */
 class VstatMeter {
@@ -72,6 +77,9 @@ class VstatMeter {
   private decodeMs: number[] = [];
   private holdMs: number[] = [];
   private totalMs: number[] = [];
+  // hold_ms の内訳 (sched + late = hold)。残遅延がバッファ待ちか present tick 待ちかの切り分け用。
+  private schedMs: number[] = [];
+  private lateMs: number[] = [];
   private presented = 0;
   private dropped = 0;
   private lastQdepth = 0;
@@ -89,6 +97,8 @@ class VstatMeter {
     decodeMs: number,
     holdMs: number,
     totalMs: number,
+    schedMs: number,
+    lateMs: number,
     qdepth: number,
     cushionMs: number,
     jitterMs: number,
@@ -98,6 +108,8 @@ class VstatMeter {
     this.decodeMs.push(decodeMs);
     this.holdMs.push(holdMs);
     this.totalMs.push(totalMs);
+    this.schedMs.push(schedMs);
+    this.lateMs.push(lateMs);
     this.lastQdepth = qdepth;
     this.lastCushionMs = cushionMs;
     this.lastJitterMs = jitterMs;
@@ -120,7 +132,8 @@ class VstatMeter {
     const fps = Math.round((this.presented / elapsed) * 1000);
     logger.info(
       `vstat decode_ms=${stat(this.decodeMs)} hold_ms=${stat(this.holdMs)} ` +
-        `total_ms=${stat(this.totalMs)} qdepth=${this.lastQdepth} ` +
+        `total_ms=${stat(this.totalMs)} sched_ms=${stat(this.schedMs)} late_ms=${stat(this.lateMs)} ` +
+        `qdepth=${this.lastQdepth} ` +
         `present_fps=${fps} dropped=${this.dropped} ` +
         `cushion_ms=${this.lastCushionMs.toFixed(1)} jitter_ms=${this.lastJitterMs.toFixed(1)} ` +
         `ojitter_ms=${this.lastOutputJitterMs.toFixed(1)} (avg/p95)`,
@@ -130,6 +143,8 @@ class VstatMeter {
     this.decodeMs = [];
     this.holdMs = [];
     this.totalMs = [];
+    this.schedMs = [];
+    this.lateMs = [];
     this.presented = 0;
     this.dropped = 0;
   }
@@ -301,7 +316,7 @@ export class Decoder {
     if (this.queue.length === 0) return;
 
     const now = performance.now();
-    let toDraw: { frame: VideoFrame; decodedAt: number } | null = null;
+    let toDraw: { frame: VideoFrame; decodedAt: number; presentAt: number } | null = null;
     while (this.queue.length > 0 && this.queue[0].presentAt <= now) {
       const item = this.queue.shift();
       if (!item) break;
@@ -310,7 +325,7 @@ export class Decoder {
         toDraw.frame.close();
         if (this.perf) this.vstat.recordDrop();
       }
-      toDraw = { frame: item.frame, decodedAt: item.decodedAt };
+      toDraw = { frame: item.frame, decodedAt: item.decodedAt, presentAt: item.presentAt };
     }
     if (toDraw) {
       if (this.perf) {
@@ -320,6 +335,8 @@ export class Decoder {
           toDraw.decodedAt - arrivalMs, // decode_ms
           now - toDraw.decodedAt, // hold_ms (ジッタバッファ + vsync 待ち)
           now - arrivalMs, // total_ms (受信→提示)
+          toDraw.presentAt - toDraw.decodedAt, // sched_ms (意図したバッファ滞留)
+          now - toDraw.presentAt, // late_ms (提示予定からの遅れ = vsync 量子化)
           this.queue.length,
           this.lastCushionMs, // 適応クッション (診断用)
           this.emaArrivalJitterMs, // 到着ジッタ (cushion の基準)
