@@ -40,6 +40,8 @@ pub struct DxgiCapturer {
     converter: Converter,
     /// GetFramePointerShape 用の再利用バッファ (形状更新フレームのみ書き込む)。
     pointer_buf: Vec<u8>,
+    /// 取得テクスチャの実フォーマットを初回 1 回だけログするための既出フラグ (診断用)。
+    logged_src_format: bool,
 }
 
 /// 現在の入力デスクトップが既定の "Default" (通常のユーザーデスクトップ) かを返す。
@@ -468,9 +470,19 @@ impl DxgiCapturer {
         // advancedColorEnabled にフォールバックする。
         let color_space_hdr = output_color_space_is_hdr(&output);
         let hdr_active = color_space_hdr.unwrap_or(adv_color_enabled);
+        // ACM-SDR: ディスプレイ HDR はオフだが Automatic Color Management (Advanced Color) が
+        // オンの状態。デスクトップは linear scRGB で合成され、legacy DuplicateOutput が渡す
+        // B8G8R8A8_UNORM 面は linear 値を保持する (sRGB 符号化ではない)。SDR 素通し経路は
+        // 「sRGB 済み」前提で sRGB デコードせずサンプルする (map_formats) ため、linear を gamma
+        // と誤解して中間調が暗く沈む。OETF を適用する経路 (is_hdr 経路) に scale=1.0 で乗せて
+        // 補正する。取得形式は FP16 化せず BGRA8 のまま (DuplicateOutput) でよい。
+        let acm_sdr = !hdr_active && adv_color_enabled;
+        let needs_oetf = hdr_active || acm_sdr;
+        let oetf_scale = if hdr_active { scale } else { 1.0 };
         tracing::info!(
             display = %gdi_name,
             hdr_active,
+            acm_sdr,
             advanced_color_enabled = adv_color_enabled,
             color_space_hdr = ?color_space_hdr,
             sdr_white_scale = scale,
@@ -507,13 +519,14 @@ impl DxgiCapturer {
             unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
         };
 
-        let converter = Converter::new(&device, hdr_active, scale)?;
+        let converter = Converter::new(&device, needs_oetf, oetf_scale)?;
 
         Ok(Self {
             _device: device,
             duplication,
             converter,
             pointer_buf: Vec::new(),
+            logged_src_format: false,
         })
     }
 }
@@ -582,6 +595,16 @@ impl ScreenCapturer for DxgiCapturer {
         let resource =
             resource.ok_or_else(|| anyhow!("AcquireNextFrame returned null resource"))?;
         let src_tex: ID3D11Texture2D = resource.cast().context("cast ID3D11Texture2D")?;
+
+        // 診断: 取得テクスチャの実フォーマットを初回 1 回だけ出す。HDR オフ時に ACM が
+        // FP16(scRGB linear) を渡すか BGRA8 を渡すかを確かめ、SDR 経路で OETF が要るか判定する。
+        if !self.logged_src_format {
+            let mut sdesc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: src_tex live。GetDesc は OUT を埋める。
+            unsafe { src_tex.GetDesc(&mut sdesc) };
+            tracing::info!(src_format = ?sdesc.Format, "capture src texture format");
+            self.logged_src_format = true;
+        }
 
         // GPU で NV12 へ変換 (HDR トーンマップ込み)。CPU リードバックなし。
         let convert_result = self.converter.convert(&src_tex);
