@@ -163,10 +163,10 @@ impl Inner {
                 .context("SetInputType(NV12)")?;
         }
 
-        // ICodecAPI は任意。低遅延モード + レート制御 (PeakConstrainedVBR + 平均/ピーク) を設定。
+        // ICodecAPI は任意。低遅延モード + レート制御 (CBR 平均一定) を設定。
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
-            // 低遅延モード + 大きな GOP (周期 IDR 抑制) + レート制御 (PeakConstrainedVBR)。
+            // 低遅延モード + 大きな GOP (周期 IDR 抑制) + レート制御 (CBR)。
             configure_low_latency(api);
             configure_rate_control(api, bitrate, max_bitrate);
         }
