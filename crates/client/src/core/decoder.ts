@@ -30,7 +30,10 @@ import { isPerfEnabled } from "./ipc";
 /// 何倍を先読みするか。大きいほど滑らかだが遅延が増える。
 const JITTER_K = 2.5;
 /// 適応クッションの下限 (ms)。低ジッタ回線 (Tailnet 直結) でもこの分は持ち、表示の取りこぼしを防ぐ。
-const MIN_CUSHION_MS = 6;
+/// 14ms ≈ 0.84 フレーム (@60Hz)。clean バーストで jitter が落ち cushion が 1 フレーム未満まで縮むと、
+/// 数 ms 遅れた到着が rAF tick を 1 枚分逃して hitch になる。1 フレーム弱の余白を常に持たせ、遅れ
+/// フレームでも提示 tick を逃さず提示尺を 1 vsync/フレームで安定させる (通常時は cushion>14 で非拘束=遅延無増)。
+const MIN_CUSHION_MS = 14;
 /// 適応クッションの上限 (ms)。ジッタが大きくてもこれ以上は先読みせず、操作遅延の暴走を防ぐ。
 const MAX_CUSHION_MS = 40;
 /// フレーム間隔の初期推定 (60fps)。実際の到着間隔の EMA で源 fps 変化に追従する。
