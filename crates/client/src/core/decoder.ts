@@ -496,6 +496,12 @@ export class Decoder {
         this.configured = true;
         // 構成は 1 セッション 1 回 (キーフレーム待ち成立時) のみ。低頻度なので info で残す。
         logger.info(`decoder configured: ${codec}`);
+        // ジッタバッファの設定値を 1 度だけ出す。実機計測で「どの変種が走っているか」を
+        // ログだけで確定できるようにする (定数を変えてビルドし忘れる事故の検出用)。
+        logger.info(
+          `jitterbuf cfg: MIN_CUSHION=${MIN_CUSHION_MS} MAX_CUSHION=${MAX_CUSHION_MS} ` +
+            `DRIFT_FRAMES=${DRIFT_FRAMES} JITTER_K=${JITTER_K} TOL=${VSYNC_TOLERANCE_FRAC}`,
+        );
       } catch (e) {
         this.throttledError("configure failed", codec, e);
         return;
