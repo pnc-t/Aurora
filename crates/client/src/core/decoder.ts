@@ -35,7 +35,10 @@ const JITTER_K = 2.5;
 /// フレームでも提示 tick を逃さず提示尺を 1 vsync/フレームで安定させる (通常時は cushion>14 で非拘束=遅延無増)。
 const MIN_CUSHION_MS = 14;
 /// 適応クッションの上限 (ms)。ジッタが大きくてもこれ以上は先読みせず、操作遅延の暴走を防ぐ。
-const MAX_CUSHION_MS = 40;
+/// 40→30: spike 時の上振れを抑え、band を [MIN,MAX]=[14,30] に圧縮して cushion の whipsaw
+/// (遅延と提示尺の揺れ) を steady にする。上振れ root は host encode p95 テールで本変更は client 側の
+/// 対症療法。30 で underrun→drop が増えるなら 34 程度へ戻す。傾き (JITTER_K/EMA 係数) は触らない。
+const MAX_CUSHION_MS = 30;
 /// フレーム間隔の初期推定 (60fps)。実際の到着間隔の EMA で源 fps 変化に追従する。
 const DEFAULT_INTERVAL_MS = 1000 / 60;
 /// ジッタ推定の初期値 (ms)。実測の平均絶対偏差 EMA で更新する。
