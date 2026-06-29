@@ -43,22 +43,22 @@ const MAX_CUSHION_MS = 30;
 const DEFAULT_INTERVAL_MS = 1000 / 60;
 /// ジッタ推定の初期値 (ms)。実測の平均絶対偏差 EMA で更新する。
 const DEFAULT_JITTER_MS = 4;
-/// 自走スケジューラが実時間から先行ドリフトしてよい上限 (フレーム数)。提示予定がこの分を超えて
-/// 未来へ伸びたらアンカーを貼り直して catch-up する。**必須の安全弁**: これが無いと presentAt が
-/// 無限にドリフトし「一切提示されず画面が固着」する (2026-06-27 実機で発生)。
-/// 2026-06-28 の hold 内訳計測で、残遅延の sched (= ジッタバッファ滞留) が cushion 本体に加えて
-/// ceiling 方向へ駐機するドリフト余白 (~1 フレーム) を含むと判明したため、2→1 に詰めて余白を
-/// 半減させる (安全弁は 1 フレームで維持)。バースト時の再アンカー増/微小スタッターは要計測。
-const DRIFT_FRAMES = 1;
+/// delay-line 提示バッファの「バースト吸収のりしろ」(フレーム数)。最大キュー深 =
+/// round(cushion/間隔) + この値。デコード出力が束で出ても、ここまでは保持して 1 tick 1 枚ずつ
+/// 提示し (落とさず後続 tick へ広げる)、これを超えた分だけ最古を間引いて遅延を有界化する。
+/// 旧 self-clock + DRIFT_FRAMES 方式は自走クロックが ceiling に駐機し平時遅延が DRIFT に比例して
+/// 増える欠点があった (2026-06-29 計測: DRIFT 1→3 で clean total 33→47ms・drop 15→7)。本方式は
+/// cushion 待ち (eligibility) と「1 tick 1 枚」だけで提示し駐機しないので、バースト吸収 (落とさない)
+/// と平時の低遅延を分離する。固着は「now が進めば必ず eligible + 上限で有界」なので構造的に無い。
+const BURST_SLACK_FRAMES = 3;
 /// 到着ジッタ EMA の非対称追従係数。RISE=上昇時は旧来どおり緩く (0.1) 追い、単発スパイクを
 /// 追いかけて cushion を膨らませない (保護は対称 0.1 と同等)。FALL=下降時 (clean 復帰) だけ
 /// 速くして (0.3) cushion=遅延を素早く回収する (2026-06-28 計測: RISE を速くする逆向きは悪化)。
 const JITTER_EMA_RISE = 0.1;
 const JITTER_EMA_FALL = 0.3;
-/// 提示判定の vsync 許容幅 (refresh の比率)。presentAt は vsync グリッドへ snap 済みだが、onFrame で
-/// snap した時点のアンカーと実 ts には微小な予測ズレが残る。グリッド点に乗ったフレームを「その tick で
-/// 出すべき」と確実に拾うため、判定時刻 ts にこの幅だけ余裕を足す。refresh 未満なので次フレームの
-/// グリッド点 (≥1 refresh 先) を誤って先取りすることはない。
+/// eligibility 判定の早取り許容 (refresh の比率)。最古フレームの eligibility 時刻 (decodedAt+cushion)
+/// が次 tick 直前に来たとき、その tick を取りこぼして 1 枚遅らせないよう、判定時刻 ts にこの幅だけ
+/// 余裕を足す。refresh 未満なので cushion 待ちを丸々 1 tick 早めることはない。
 const VSYNC_TOLERANCE_FRAC = 0.25;
 
 /// 値を [lo, hi] に収める。
@@ -84,9 +84,9 @@ function p95(sorted: number[]): number {
  * - decode_ms : チャンク受信 (VideoFrame.timestamp) → デコード出力 (onFrame)
  * - hold_ms   : デコード出力 → 実提示 (drawImage)。ジッタバッファ待ち + vsync 待ち。
  * - total_ms  : 受信 → 実提示 (= クライアント内部の合計遅延)。
- * - sched_ms  : デコード出力 → 提示**予定**時刻 (presentAt-decodedAt)。スケジューラが意図的に
- *               積んだジッタバッファ滞留 (= cushion/均等間隔ぶん)。
- * - late_ms   : 提示予定 → 実提示 (now-presentAt)。予定からの遅れ = rAF/vsync 量子化ぶん。
+ * - sched_ms  : デコード出力 → eligibility 時刻 (eligibleAt-decodedAt = cushion)。スケジューラが
+ *               意図的に積んだジッタバッファ滞留。
+ * - late_ms   : eligibility → 実提示 (now-eligibleAt)。eligibility 超過 = rAF/vsync 量子化 + backlog。
  *               **hold_ms = sched_ms + late_ms** に厳密分解されるので、残遅延の主因が
  *               「バッファ待ち (sched)」か「present tick 待ち (late)」かを切り分けられる。
  * これらと dropped/qdepth/present_fps を `vstat` 行として `client.<日付>.log` に残す。
@@ -181,7 +181,7 @@ export class Decoder {
   // --- ジッタバッファ状態 ---
   // 提示待ちのデコード済みフレーム (到着順 = 提示順)。提示予定時刻と、遅延計測用の
   // デコード出力時刻 (decodedAt) を持たせる。
-  private queue: { frame: VideoFrame; presentAt: number; decodedAt: number }[] = [];
+  private queue: { frame: VideoFrame; decodedAt: number; eligibleAt: number }[] = [];
   // 受信→提示の遅延計測 (AURORA_PERF 有効時のみログ出力)。フラグは起動時に確定済み。
   private readonly perf = isPerfEnabled();
   private readonly vstat = new VstatMeter();
@@ -195,8 +195,6 @@ export class Decoder {
   private lastCushionMs = 0;
   // 直近のデコード出力時刻 (出力カデンス EMA 更新用)。0 = 未到着。
   private lastArrivalMs = 0;
-  // 自走する提示予定アンカー (均等間隔スケジューリング)。上限 reset で実時間から乖離しない。
-  private nextPresentAt = 0;
 
   // --- 到着 (チャンク受信) カデンス: 適応クッションの基準 ---
   // クッションは「伝送ジッタ」を吸収するためのもの。デコード出力カデンス (WebCodecs のバースト
@@ -274,7 +272,7 @@ export class Decoder {
     this.configured = false;
   }
 
-  /** WebCodecs のデコード出力。即描画せず、均等間隔の提示予定を割り当ててキューに積む。 */
+  /** WebCodecs のデコード出力。即描画せず、decode 時刻と eligibility (cushion 待ち) を付けて積む。 */
   private onFrame(frame: VideoFrame): void {
     if (!this.canvas || !this.ctx) {
       frame.close();
@@ -301,28 +299,17 @@ export class Decoder {
     const cushion = clamp(JITTER_K * this.emaArrivalJitterMs, MIN_CUSHION_MS, MAX_CUSHION_MS);
     this.lastCushionMs = cushion;
 
-    // 提示予定時刻 (idealAt): 前フレームの予定 + 推定間隔で均等間隔に並べる (滑らかさ)。ただし now
-    // 基準で上下を必ず束縛し、自走クロックが実時間から乖離するのを防ぐ:
-    //  - 下限 earliest = now + cushion       (最小バッファ。アンダーラン / 遅れすぎは貼り直す)
-    //  - 上限 ceiling  = now + cushion + DRIFT_FRAMES*間隔 (超えたら貼り直して catch-up)
-    // **上限は必須**: これが無いと presentAt が未来へ無限ドリフトし、一切提示されず画面が固着する
-    // (2026-06-27 実機で発生)。reset 値は earliest (now 基準) なので実時間に再同期される。
-    // ドリフト制御は snap 前の idealAt (= nextPresentAt) で行い (源 fps カデンス/非整数比の位相を保つ)、
-    // キューに積む presentAt のみ vsync グリッドへ snap して提示の位相を表示同期へロックする (#3a)。
-    const earliest = now + cushion;
-    const ceiling = now + cushion + DRIFT_FRAMES * this.emaIntervalMs;
-    let idealAt = this.nextPresentAt + this.emaIntervalMs;
-    if (this.queue.length === 0 || idealAt < now || idealAt > ceiling) {
-      idealAt = earliest;
-    }
-    this.nextPresentAt = idealAt;
-    const presentAt = this.snapUpToVsync(idealAt);
-    this.queue.push({ frame, presentAt, decodedAt: now });
+    // delay-line 方式: 提示予定の自走クロックは持たず、frame に decode 時刻と eligibility 時刻
+    // (= decodedAt + cushion) だけを付けて到着順に積む。提示は presentLoop が 1 tick 1 枚ずつ最古を
+    // 出す。これでバースト (デコード出力の束) は後続 tick へ広がって落ちず、かつ平時は cushion 待ち
+    // だけで提示されるので駐機遅延が出ない (旧 self-clock+ceiling の DRIFT 比例遅延を解消)。
+    this.queue.push({ frame, decodedAt: now, eligibleAt: now + cushion });
 
-    // バックログ安全弁 (二次): 上限 reset で通常は溜まらないが、バースト時の溢れを**最古**から
-    // 間引いて遅延累積を防ぐ。ceiling と整合する深さ + 1 枚の余裕、最低 2 枚は保持する。
-    const maxFrames = Math.max(2, Math.ceil(cushion / this.emaIntervalMs) + DRIFT_FRAMES + 1);
-    while (this.queue.length > maxFrames) {
+    // バックログ上限: cushion 相当 (round(cushion/間隔)) + バースト吸収のりしろ。これを超えるのは
+    // 本当に追いつけない時 (源 fps > 表示 / 持続オーバラン) なので最古を間引いて遅延を有界化する。
+    const targetDepth = Math.max(1, Math.round(cushion / this.emaIntervalMs));
+    const maxDepth = targetDepth + BURST_SLACK_FRAMES;
+    while (this.queue.length > maxDepth) {
       this.queue.shift()?.frame.close();
       if (this.perf) this.vstat.recordDrop();
     }
@@ -356,64 +343,43 @@ export class Decoder {
   }
 
   /**
-   * 時刻 t を「t 以上で最も近い vsync スロット」へ snap する。アンカー (lastVsyncTs) から refreshMs
-   * 刻みのグリッドへ丸める。アンカー未取得 or 久しく rAF が止まっていた (位相不明) ときは丸めず素通し
-   * し、次の tick で lastVsyncTs が更新され次第グリッドへ乗せる (誤った位相での固着を避ける)。
-   */
-  private snapUpToVsync(t: number): number {
-    const anchor = this.lastVsyncTs;
-    if (anchor === 0 || this.refreshMs <= 0 || performance.now() - anchor > 100) return t;
-    const k = Math.ceil((t - anchor) / this.refreshMs - 1e-3);
-    return anchor + k * this.refreshMs;
-  }
-
-  /**
-   * requestAnimationFrame 駆動の提示ループ。提示予定が来たフレームを描画する。表示同期
-   * (vsync) に揃うので、到着がジッタっていても提示は均等になる。複数フレームが同時に due に
-   * なったら最新の due だけ描き、古い due は捨ててフレッシュさを優先する (追いつき)。
+   * requestAnimationFrame 駆動の提示ループ (delay-line)。各 vsync tick で、最古フレームが
+   * eligibility (decode から cushion 経過) を満たしていれば **1 枚だけ** 提示する。束で来たフレームは
+   * 後続 tick へ自然に広がり、落とさず全部出る (drop は onFrame の backlog 上限のみ=追いつけない時だけ)。
+   * tick で出すので提示は常に vsync に整列し (late≈0)、自走クロックが無いので駐機遅延も出ない。
    */
   private presentLoop = (ts: DOMHighResTimeStamp): void => {
-    // rAF の ts (= vsync/compositor フレーム時刻) からリフレッシュを実測しグリッドのアンカーを更新。
+    // rAF の ts からリフレッシュを実測 (eligibility の早取り許容に使う)。
     this.updateRefresh(ts);
     // キューに何か残っていればループ継続。空なら止め、次の onFrame で再起動する。
     this.rafId = this.queue.length > 0 ? requestAnimationFrame(this.presentLoop) : null;
     if (this.queue.length === 0) return;
 
-    // 提示判定は performance.now() でなく ts 基準 (位相ロック)。presentAt は vsync グリッドへ snap
-    // 済みなので、snap 時のアンカーと実 ts の微小な予測ズレを吸収する許容を ts へ足し、グリッド点に
-    // 乗ったフレームを取りこぼさず「この tick で出す」。許容は refresh 未満なので次フレームは先取りしない。
-    const due = ts + this.refreshMs * VSYNC_TOLERANCE_FRAC;
-    let toDraw: { frame: VideoFrame; decodedAt: number; presentAt: number } | null = null;
-    while (this.queue.length > 0 && this.queue[0].presentAt <= due) {
-      const item = this.queue.shift();
-      if (!item) break;
-      // 既に保持していた古い due フレームは破棄 (追いつきのため最新の due のみ描画)。
-      if (toDraw) {
-        toDraw.frame.close();
-        if (this.perf) this.vstat.recordDrop();
-      }
-      toDraw = { frame: item.frame, decodedAt: item.decodedAt, presentAt: item.presentAt };
+    // 最古がまだ cushion 待ち (eligibility) を満たさなければ出さない (ジッタ吸収)。eligibility 直後の
+    // tick を取りこぼさないよう、ts に refresh の一部を足して 1 tick 分だけ早取りを許容する。
+    const head = this.queue[0];
+    if (ts + this.refreshMs * VSYNC_TOLERANCE_FRAC < head.eligibleAt) return;
+
+    // eligible: この tick で最古を 1 枚だけ提示する (追いつき drop はしない=束は次 tick へ広げる)。
+    const item = this.queue.shift();
+    if (!item) return;
+    if (this.perf) {
+      // 実描画時刻は実時計で測る。arrival は handleChunk で chunk.timestamp(us) に刻んだ受信時刻。
+      const now = performance.now();
+      const arrivalMs = item.frame.timestamp / 1000;
+      this.vstat.recordPresent(
+        item.decodedAt - arrivalMs, // decode_ms
+        now - item.decodedAt, // hold_ms (eligibility 待ち + tick 待ち)
+        now - arrivalMs, // total_ms (受信→提示)
+        item.eligibleAt - item.decodedAt, // sched_ms (= cushion 意図滞留)
+        now - item.eligibleAt, // late_ms (eligibility 超過 = tick 量子化 + backlog)
+        this.queue.length,
+        this.lastCushionMs, // 適応クッション (診断用)
+        this.emaArrivalJitterMs, // 到着ジッタ (cushion の基準)
+        this.emaJitterMs, // デコード出力カデンスのジッタ (比較用)
+      );
     }
-    if (toDraw) {
-      if (this.perf) {
-        // 実描画時刻は実時計で測る (late_ms 等は実時刻基準のまま)。arrival は handleChunk で
-        // chunk.timestamp(us) に刻んだ受信時刻。提示まで運ばれる。
-        const now = performance.now();
-        const arrivalMs = toDraw.frame.timestamp / 1000;
-        this.vstat.recordPresent(
-          toDraw.decodedAt - arrivalMs, // decode_ms
-          now - toDraw.decodedAt, // hold_ms (ジッタバッファ + vsync 待ち)
-          now - arrivalMs, // total_ms (受信→提示)
-          toDraw.presentAt - toDraw.decodedAt, // sched_ms (意図したバッファ滞留)
-          now - toDraw.presentAt, // late_ms (提示予定からの遅れ = vsync 量子化)
-          this.queue.length,
-          this.lastCushionMs, // 適応クッション (診断用)
-          this.emaArrivalJitterMs, // 到着ジッタ (cushion の基準)
-          this.emaJitterMs, // デコード出力カデンスのジッタ (比較用)
-        );
-      }
-      this.drawFrame(toDraw.frame);
-    }
+    this.drawFrame(item.frame);
   };
 
   /** 1 フレームを canvas へ描画して閉じる。 */
@@ -445,7 +411,6 @@ export class Decoder {
     this.emaIntervalMs = DEFAULT_INTERVAL_MS;
     this.emaJitterMs = DEFAULT_JITTER_MS;
     this.lastArrivalMs = 0;
-    this.nextPresentAt = 0;
     this.lastChunkMs = 0;
     this.emaArrivalIntervalMs = DEFAULT_INTERVAL_MS;
     this.emaArrivalJitterMs = DEFAULT_JITTER_MS;
@@ -499,8 +464,8 @@ export class Decoder {
         // ジッタバッファの設定値を 1 度だけ出す。実機計測で「どの変種が走っているか」を
         // ログだけで確定できるようにする (定数を変えてビルドし忘れる事故の検出用)。
         logger.info(
-          `jitterbuf cfg: MIN_CUSHION=${MIN_CUSHION_MS} MAX_CUSHION=${MAX_CUSHION_MS} ` +
-            `DRIFT_FRAMES=${DRIFT_FRAMES} JITTER_K=${JITTER_K} TOL=${VSYNC_TOLERANCE_FRAC}`,
+          `jitterbuf cfg: MODE=playout MIN_CUSHION=${MIN_CUSHION_MS} MAX_CUSHION=${MAX_CUSHION_MS} ` +
+            `BURST_SLACK=${BURST_SLACK_FRAMES} JITTER_K=${JITTER_K} TOL=${VSYNC_TOLERANCE_FRAC}`,
         );
       } catch (e) {
         this.throttledError("configure failed", codec, e);
