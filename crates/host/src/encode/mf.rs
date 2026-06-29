@@ -17,8 +17,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaBuffer, IMFMediaType, IMFTransform,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
@@ -27,7 +27,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_Base,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::GUID;
@@ -418,11 +418,14 @@ impl VideoEncoder for MfH264Encoder {
     }
 }
 
-/// エンコーダのレート制御を PeakConstrainedVBR + 平均/ピーク/バッファで明示設定する。
+/// エンコーダのレート制御を **CBR (平均一定)** で明示設定する。
 /// 既定の (無指定) レート制御は緩い VBR で、動きの多い場面で目標を大きく超過する
-/// (実測で 15Mbps 目標に対し ~23Mbps)。HW MFT はベンダによって一部の knob を無視する
-/// ことがあるため各設定は best-effort (失敗は debug ログのみ) とする。
-/// SW / HW 両エンコーダから共有する。
+/// (実測で 15Mbps 目標に対し ~23Mbps)。さらに **AMD HW MFT は PeakConstrainedVBR の
+/// 平均/ピーク上限も MF_MT_AVG_BITRATE も無視**し、軽いウィンドウ (エクスプローラ/メモ帳)
+/// の高速ドラッグでも 17-21Mbps を割り当ててフレームが重くなり encode が伸びる
+/// (2026-06-29 実測)。CBR は AMF が比較的 honor するため、平均を一定目標に固定して
+/// フレームサイズを抑え encode を速くする狙い。HW MFT はベンダによって一部の knob を
+/// 無視するため各設定は best-effort (失敗は debug ログのみ)。SW / HW 両エンコーダで共有。
 pub(crate) fn configure_rate_control(codec_api: &ICodecAPI, mean_bps: u32, max_bps: u32) {
     // 無制限 (u32::MAX): レート制御モードを設定せず既定 VBR のまま、平均目標のみ与える
     // (コミット前の挙動と等価)。上限を課さないので大きなオーバーシュートを許容する。
@@ -433,25 +436,23 @@ pub(crate) fn configure_rate_control(codec_api: &ICodecAPI, mean_bps: u32, max_b
         }
         return;
     }
-    // ピークは平均以上でなければならない。
-    let max_bps = max_bps.max(mean_bps);
+    // CBR では平均のみを一定目標にする (ピーク/Max は使わない)。
+    let _ = max_bps;
     // SAFETY: codec_api 生存、VARIANT は VT_UI4。SetValue は値をコピーする。
     unsafe {
         if let Err(e) = codec_api.SetValue(
             &CODECAPI_AVEncCommonRateControlMode,
-            &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+            &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
         ) {
-            tracing::debug!(error = %e, "set RateControlMode (PeakConstrainedVBR) unsupported");
+            tracing::debug!(error = %e, "set RateControlMode (CBR) unsupported");
         }
         let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(mean_bps));
-        if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(max_bps)) {
-            tracing::debug!(error = %e, "set MaxBitRate unsupported");
-        }
         // VBV/HRD バッファは**平均 (現在) レート基準で ~0.5 秒**に絞る。旧実装は「ピークの
         // 1 秒分」と大きく、画面スクロール等のバーストが最大 1 秒ぶん回線に積み上がって体感
         // 遅延のスパイク (バッファブロート) を生んでいた。set_bitrate でも追従更新する。
         set_vbv_buffer(codec_api, mean_bps);
     }
+    tracing::info!(mode = "CBR", target_bps = mean_bps, "rate control configured");
 }
 
 /// VBV/HRD バッファの目標時間 (ms)。小さいほど瞬間レートのバーストが抑えられ、回線に
