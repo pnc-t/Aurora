@@ -52,6 +52,11 @@ const DRIFT_FRAMES = 1;
 /// 速くして (0.3) cushion=遅延を素早く回収する (2026-06-28 計測: RISE を速くする逆向きは悪化)。
 const JITTER_EMA_RISE = 0.1;
 const JITTER_EMA_FALL = 0.3;
+/// 提示判定の vsync 許容幅 (refresh の比率)。presentAt は vsync グリッドへ snap 済みだが、onFrame で
+/// snap した時点のアンカーと実 ts には微小な予測ズレが残る。グリッド点に乗ったフレームを「その tick で
+/// 出すべき」と確実に拾うため、判定時刻 ts にこの幅だけ余裕を足す。refresh 未満なので次フレームの
+/// グリッド点 (≥1 refresh 先) を誤って先取りすることはない。
+const VSYNC_TOLERANCE_FRAC = 0.25;
 
 /// 値を [lo, hi] に収める。
 function clamp(x: number, lo: number, hi: number): number {
@@ -197,6 +202,16 @@ export class Decoder {
   private emaArrivalIntervalMs = DEFAULT_INTERVAL_MS;
   private emaArrivalJitterMs = DEFAULT_JITTER_MS;
 
+  // --- vsync 位相ロック (#3a) ---
+  // rAF コールバックの ts から表示リフレッシュ間隔を実測し、提示予定を vsync グリッドへ整列させて
+  // judder (提示尺の不均一) を消す。源 fps (emaIntervalMs) とは独立に持つ。
+  // 実測リフレッシュ間隔 (ms)。連続 ts 差分の短窓 median。初期は 60Hz 仮定で実測まで暫定。
+  private refreshMs = DEFAULT_INTERVAL_MS;
+  // 直近の rAF ts (= 最後の vsync 時刻)。グリッドのアンカー兼 median の前回値。0 = 未取得。
+  private lastVsyncTs = 0;
+  // リフレッシュ実測の短窓サンプル (median 用、外れ値に強い)。
+  private refreshSamples: number[] = [];
+
   /** デコードパイプラインのエラーを 1 秒 1 回に間引いて記録する (抑制件数を併記)。 */
   private throttledError(msg: string, ...extra: unknown[]): void {
     const now = performance.now();
@@ -283,19 +298,22 @@ export class Decoder {
     const cushion = clamp(JITTER_K * this.emaArrivalJitterMs, MIN_CUSHION_MS, MAX_CUSHION_MS);
     this.lastCushionMs = cushion;
 
-    // 提示予定時刻: 前フレームの予定 + 推定間隔で均等間隔に並べる (滑らかさ)。ただし now 基準で
-    // 上下を必ず束縛し、自走クロックが実時間から乖離するのを防ぐ:
+    // 提示予定時刻 (idealAt): 前フレームの予定 + 推定間隔で均等間隔に並べる (滑らかさ)。ただし now
+    // 基準で上下を必ず束縛し、自走クロックが実時間から乖離するのを防ぐ:
     //  - 下限 earliest = now + cushion       (最小バッファ。アンダーラン / 遅れすぎは貼り直す)
     //  - 上限 ceiling  = now + cushion + DRIFT_FRAMES*間隔 (超えたら貼り直して catch-up)
     // **上限は必須**: これが無いと presentAt が未来へ無限ドリフトし、一切提示されず画面が固着する
     // (2026-06-27 実機で発生)。reset 値は earliest (now 基準) なので実時間に再同期される。
+    // ドリフト制御は snap 前の idealAt (= nextPresentAt) で行い (源 fps カデンス/非整数比の位相を保つ)、
+    // キューに積む presentAt のみ vsync グリッドへ snap して提示の位相を表示同期へロックする (#3a)。
     const earliest = now + cushion;
     const ceiling = now + cushion + DRIFT_FRAMES * this.emaIntervalMs;
-    let presentAt = this.nextPresentAt + this.emaIntervalMs;
-    if (this.queue.length === 0 || presentAt < now || presentAt > ceiling) {
-      presentAt = earliest;
+    let idealAt = this.nextPresentAt + this.emaIntervalMs;
+    if (this.queue.length === 0 || idealAt < now || idealAt > ceiling) {
+      idealAt = earliest;
     }
-    this.nextPresentAt = presentAt;
+    this.nextPresentAt = idealAt;
+    const presentAt = this.snapUpToVsync(idealAt);
     this.queue.push({ frame, presentAt, decodedAt: now });
 
     // バックログ安全弁 (二次): 上限 reset で通常は溜まらないが、バースト時の溢れを**最古**から
@@ -317,18 +335,53 @@ export class Decoder {
   }
 
   /**
+   * rAF の ts から表示リフレッシュ間隔を実測する (連続 ts 差分の短窓 median)。median は外れ値
+   * (タブ復帰直後の巨大 gap 等) に強い。lastVsyncTs はグリッドのアンカーも兼ねる。
+   */
+  private updateRefresh(ts: number): void {
+    if (this.lastVsyncTs > 0) {
+      const dt = ts - this.lastVsyncTs;
+      // 妥当な vsync 間隔のみ採用 (rAF 停止明けの巨大 gap・ゼロ/負を除外)。
+      if (dt > 1 && dt < 100) {
+        this.refreshSamples.push(dt);
+        if (this.refreshSamples.length > 31) this.refreshSamples.shift();
+        const sorted = [...this.refreshSamples].sort((a, b) => a - b);
+        this.refreshMs = sorted[sorted.length >> 1];
+      }
+    }
+    this.lastVsyncTs = ts;
+  }
+
+  /**
+   * 時刻 t を「t 以上で最も近い vsync スロット」へ snap する。アンカー (lastVsyncTs) から refreshMs
+   * 刻みのグリッドへ丸める。アンカー未取得 or 久しく rAF が止まっていた (位相不明) ときは丸めず素通し
+   * し、次の tick で lastVsyncTs が更新され次第グリッドへ乗せる (誤った位相での固着を避ける)。
+   */
+  private snapUpToVsync(t: number): number {
+    const anchor = this.lastVsyncTs;
+    if (anchor === 0 || this.refreshMs <= 0 || performance.now() - anchor > 100) return t;
+    const k = Math.ceil((t - anchor) / this.refreshMs - 1e-3);
+    return anchor + k * this.refreshMs;
+  }
+
+  /**
    * requestAnimationFrame 駆動の提示ループ。提示予定が来たフレームを描画する。表示同期
    * (vsync) に揃うので、到着がジッタっていても提示は均等になる。複数フレームが同時に due に
    * なったら最新の due だけ描き、古い due は捨ててフレッシュさを優先する (追いつき)。
    */
-  private presentLoop = (): void => {
+  private presentLoop = (ts: DOMHighResTimeStamp): void => {
+    // rAF の ts (= vsync/compositor フレーム時刻) からリフレッシュを実測しグリッドのアンカーを更新。
+    this.updateRefresh(ts);
     // キューに何か残っていればループ継続。空なら止め、次の onFrame で再起動する。
     this.rafId = this.queue.length > 0 ? requestAnimationFrame(this.presentLoop) : null;
     if (this.queue.length === 0) return;
 
-    const now = performance.now();
+    // 提示判定は performance.now() でなく ts 基準 (位相ロック)。presentAt は vsync グリッドへ snap
+    // 済みなので、snap 時のアンカーと実 ts の微小な予測ズレを吸収する許容を ts へ足し、グリッド点に
+    // 乗ったフレームを取りこぼさず「この tick で出す」。許容は refresh 未満なので次フレームは先取りしない。
+    const due = ts + this.refreshMs * VSYNC_TOLERANCE_FRAC;
     let toDraw: { frame: VideoFrame; decodedAt: number; presentAt: number } | null = null;
-    while (this.queue.length > 0 && this.queue[0].presentAt <= now) {
+    while (this.queue.length > 0 && this.queue[0].presentAt <= due) {
       const item = this.queue.shift();
       if (!item) break;
       // 既に保持していた古い due フレームは破棄 (追いつきのため最新の due のみ描画)。
@@ -340,7 +393,9 @@ export class Decoder {
     }
     if (toDraw) {
       if (this.perf) {
-        // arrival は handleChunk で chunk.timestamp(us) に刻んだ受信時刻。提示まで運ばれる。
+        // 実描画時刻は実時計で測る (late_ms 等は実時刻基準のまま)。arrival は handleChunk で
+        // chunk.timestamp(us) に刻んだ受信時刻。提示まで運ばれる。
+        const now = performance.now();
         const arrivalMs = toDraw.frame.timestamp / 1000;
         this.vstat.recordPresent(
           toDraw.decodedAt - arrivalMs, // decode_ms
@@ -391,6 +446,10 @@ export class Decoder {
     this.lastChunkMs = 0;
     this.emaArrivalIntervalMs = DEFAULT_INTERVAL_MS;
     this.emaArrivalJitterMs = DEFAULT_JITTER_MS;
+    // vsync グリッドのアンカー/サンプルはループ停止で無効になるので破棄。refreshMs は同一ディスプレイ
+    // 前提で最後の実測値を保持する (再接続直後の再計測トランジェントを避ける)。
+    this.lastVsyncTs = 0;
+    this.refreshSamples = [];
   }
 
   /** バイナリチャンク 1 個を受け取って decoder に渡す。 */
