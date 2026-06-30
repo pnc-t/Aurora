@@ -5,6 +5,8 @@
 //! (`--set-password` 等) を端末から実行したときだけ親コンソールへ接続して入出力する。
 //! デバッグビルドはログ確認のためコンソールサブシステムのまま。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// 新たに追加する unsafe ブロックには直上に `// SAFETY:` を必須化する (規約の機械強制)。
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{Context, Result, anyhow};
 use aurora_common::noise::psk_from_password;

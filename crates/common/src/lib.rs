@@ -1,5 +1,8 @@
 //! 共有プロトコル・暗号化・フレーミング層。
 
+// 新たに追加する unsafe ブロックには直上に `// SAFETY:` を必須化する (規約の機械強制)。
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod clipboard;
 pub mod framing;
 pub mod fsname;

@@ -4,6 +4,8 @@
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
 )]
+// 新たに追加する unsafe ブロックには直上に `// SAFETY:` を必須化する (規約の機械強制)。
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 mod audio;
 mod config;
