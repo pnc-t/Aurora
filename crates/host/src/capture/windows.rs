@@ -160,13 +160,19 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
 /// ここでは候補アダプタ上に試験デバイスを作って実際に `DuplicateOutput` を叩き、`UNSUPPORTED`
 /// でないものを選ぶ。これでハイブリッド GPU でも「画面真っ暗」(複製恒常失敗) を回避する。
 ///
-/// 戻り値が `None` のときは候補が見つからない/全滅で、呼び出し側が既定アダプタにフォールバックする。
-pub fn select_capture_adapter(target: &str) -> Option<IDXGIAdapter> {
+/// 戻り値の意味は [`CaptureAdapter`] を参照。`AllUnsupported` はハイブリッド GPU (muxless) で
+/// dGPU からデスクトップを複製できない徴候で、呼び出し側 (main) が iGPU フォールバックの判断に使う。
+pub fn select_capture_adapter(target: &str) -> CaptureAdapter {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
     // SAFETY: CreateDXGIFactory1 は OUT パラメータを初期化する。
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(f) => f,
+        Err(_) => return CaptureAdapter::NotFound,
+    };
     // 複製が UNSUPPORTED ではなかった (= 正解の見込みがある) 最初のアダプタ。Ok が無いとき採用。
     let mut fallback: Option<IDXGIAdapter> = None;
+    // 対象出力をいずれかのアダプタで列挙できたか (全 UNSUPPORTED と「出力なし」を区別する)。
+    let mut found_target = false;
     let mut ai = 0u32;
     loop {
         // SAFETY: EnumAdapters1 は範囲外で NOT_FOUND を返す。
@@ -201,6 +207,7 @@ pub fn select_capture_adapter(target: &str) -> Option<IDXGIAdapter> {
             if name != target {
                 continue;
             }
+            found_target = true;
             let Ok(adp) = adapter.cast::<IDXGIAdapter>() else {
                 continue;
             };
@@ -211,7 +218,7 @@ pub fn select_capture_adapter(target: &str) -> Option<IDXGIAdapter> {
                         gpu = %adapter_name,
                         "capture adapter selected (DuplicateOutput probe ok)"
                     );
-                    return Some(adp);
+                    return CaptureAdapter::Adapter(adp);
                 }
                 DuplProbe::Unsupported => {
                     tracing::warn!(
@@ -236,7 +243,26 @@ pub fn select_capture_adapter(target: &str) -> Option<IDXGIAdapter> {
             }
         }
     }
-    fallback
+    match fallback {
+        Some(adp) => CaptureAdapter::Adapter(adp),
+        // 対象出力は在るが全アダプタで UNSUPPORTED = muxless ハイブリッドの徴候。
+        None if found_target => CaptureAdapter::AllUnsupported,
+        // 対象出力がどのアダプタにも無い (デタッチ中など)。
+        None => CaptureAdapter::NotFound,
+    }
+}
+
+/// [`select_capture_adapter`] の結果。`create_shared_device` のアダプタ選択と、main の
+/// iGPU フォールバック判定 ([`super::capture_all_adapters_unsupported`]) の両方で使う。
+pub enum CaptureAdapter {
+    /// 複製プローブが成功 (Ok)、または UNSUPPORTED 以外の一過性エラーで保持した候補。
+    /// このアダプタ上に共有デバイスを作る。
+    Adapter(IDXGIAdapter),
+    /// 対象出力は見つかったが全アダプタで `DuplicateOutput` が UNSUPPORTED。
+    /// ハイブリッド GPU (muxless) で dGPU からデスクトップを複製できない徴候。
+    AllUnsupported,
+    /// 対象出力がどのアダプタにも無い (デタッチ中など)。
+    NotFound,
 }
 
 enum DuplProbe {

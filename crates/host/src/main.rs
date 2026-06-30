@@ -502,6 +502,114 @@ fn reexec_self(current_port: u16) {
     }
 }
 
+/// iGPU フォールバック適用後の子プロセスである印 (多重 re-exec 防止)。
+#[cfg(windows)]
+const IGPU_FALLBACK_ENV: &str = "AURORA_IGPU_FALLBACK";
+
+/// ハイブリッド GPU (muxless Optimus) のノートでは内蔵パネルのデスクトップ合成を iGPU が担うため、
+/// dGPU プロセスからは `DuplicateOutput` が全アダプタで UNSUPPORTED になり画面が出ない。Windows の
+/// per-app GPU プリファレンス (`UserGpuPreferences` レジストリ) を **iGPU(省電力)** にして re-exec すると、
+/// DXGI の出力列挙が iGPU 側へ反転し複製できる (実機確認済)。レジストリは永続化するので次回起動からは
+/// 直接 iGPU で立ち上がり本フォールバックは発火しない。dGPU がデスクトップを所有する通常機 (デスクトップ
+/// 等) はプローブが成功しここは何もしないため dGPU/NVENC のまま。env で 1 回限りに制限し、それでも
+/// 直らなければ通常のリトライ経路に委ねる (無限 re-exec 防止)。
+#[cfg(windows)]
+fn maybe_reexec_for_igpu_capture(target_name: &str) {
+    // 既にフォールバック適用後の子なら、再度の re-exec はしない。
+    if std::env::var_os(IGPU_FALLBACK_ENV).is_some() {
+        return;
+    }
+    // dGPU で複製可能 (通常機) / 対象出力なし → フォールバック不要。
+    if !capture::capture_all_adapters_unsupported(target_name) {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "igpu fallback: current_exe failed; continuing on default GPU");
+            return;
+        }
+    };
+    let exe_str = exe.to_string_lossy().to_string();
+    if let Err(e) = set_powersaving_gpu_preference(&exe_str) {
+        tracing::error!(error = %e, "igpu fallback: failed to set GPU preference; continuing on default GPU");
+        return;
+    }
+    tracing::warn!(
+        exe = %exe_str,
+        "hybrid GPU: desktop not duplicable on current GPU; set iGPU (power-saving) preference and re-exec"
+    );
+    // 起動引数はそのまま引き継ぐ (startup 時点なので tray のポート変更は未発生=書換え不要)。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(&exe)
+        .args(&args)
+        .env(IGPU_FALLBACK_ENV, "1")
+        .spawn()
+    {
+        Ok(mut child) => {
+            // spawn 成功 = 回復成功ではない。子が即死したら旧プロセスを残す (reexec_self と同じ流儀)。
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::error!(%status, "igpu fallback: child died immediately; keeping old process");
+                }
+                _ => std::process::exit(0),
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "igpu fallback: spawn failed; continuing on default GPU");
+        }
+    }
+}
+
+/// 自プロセス実行ファイルの GPU プリファレンスを iGPU(省電力) に設定する。
+/// `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` に `<exeパス> = "GpuPreference=1;"` を書く
+/// (1=省電力/iGPU, 2=高パフォーマンス/dGPU)。Windows「設定→システム→ディスプレイ→グラフィック」と同実体。
+#[cfg(windows)]
+fn set_powersaving_gpu_preference(exe_path: &str) -> Result<()> {
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
+    };
+    use windows::core::PCWSTR;
+
+    let subkey: Vec<u16> = "Software\\Microsoft\\DirectX\\UserGpuPreferences"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let value_data: Vec<u16> = "GpuPreference=1;"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: Reg* は標準 Win32。subkey/value_name は NUL 終端の有効な UTF-16、hkey は OUT。
+    // value_data を NUL 終端込みのバイト列として REG_SZ に渡す。hkey は成否に関わらず close する。
+    unsafe {
+        let mut hkey = HKEY::default();
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            0,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        )
+        .ok()
+        .context("RegCreateKeyExW(UserGpuPreferences)")?;
+
+        let bytes =
+            std::slice::from_raw_parts(value_data.as_ptr() as *const u8, value_data.len() * 2);
+        let set = RegSetValueExW(hkey, PCWSTR(value_name.as_ptr()), 0, REG_SZ, Some(bytes));
+        let _ = RegCloseKey(hkey);
+        set.ok().context("RegSetValueExW(GpuPreference)")?;
+    }
+    Ok(())
+}
+
 /// 全 DXGI アダプタ × 出力を列挙して表示する (`--list-displays`)。仮想ディスプレイ (VDD/IDD) が
 /// どのアダプタ・output index に出るか、desktop に attach されるかを実機確認する診断コマンド。
 /// VDD インストール前後で実行して差分を見る用途。
@@ -919,6 +1027,13 @@ fn run_server(
     }
     // 初期キャプチャ対象 (先頭 = primary)。
     let initial_name = displays[0].name.clone();
+
+    // ハイブリッド GPU (muxless Optimus) のノートで dGPU プロセスからは内蔵パネルを複製できない
+    // (DuplicateOutput が全アダプタで UNSUPPORTED) 環境は、自プロセスの GPU プリファレンスを
+    // iGPU(省電力) にして re-exec する。フォールバック発火時はここから戻らず子へ置き換わる。
+    // dGPU がデスクトップを所有する通常機 (デスクトップ等) では何もしない (dGPU/NVENC のまま)。
+    #[cfg(windows)]
+    maybe_reexec_for_igpu_capture(&initial_name);
 
     // capture・convert・encode で共有する D3D11 デバイスを 1 つだけ生成する
     // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
