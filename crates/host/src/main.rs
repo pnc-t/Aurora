@@ -993,6 +993,9 @@ fn run_server(
     // デバイスピン留め (クライアント静的鍵の許可リスト) の実行時状態。既定無効。永続化済みの
     // 有効フラグ・許可リストを読み込む。net (照合) と tray (操作) で共有する。
     let devices = Arc::new(devices::DeviceGuard::load());
+    // net→tray の実行時ステータス/通知バス。net (接続受理) が接続/切断/登録を記録し、tray が
+    // ポーリングしてツールチップ更新とバルーン通知へ反映する (接続状態の可視化)。
+    let tray_bus = tray::TrayBus::new();
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
     tray::spawn(
@@ -1002,6 +1005,7 @@ fn run_server(
         reload.clone(),
         auth_failures.clone(),
         devices.clone(),
+        tray_bus.clone(),
         !have_stored,
     );
 
@@ -1162,6 +1166,7 @@ fn run_server(
             auth_failures,
             devices,
             force_frame,
+            tray_bus,
         };
         net::run_server(
             cfg,
