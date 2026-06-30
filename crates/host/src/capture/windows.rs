@@ -115,6 +115,7 @@ fn create_enum_device() -> Result<ID3D11Device> {
 pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
     let device = create_enum_device()?;
     let dxgi_device: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
+    // SAFETY: dxgi_device は live。GetAdapter は所有権付き COM を返す。
     let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
 
     let mut displays = Vec::new();
@@ -182,6 +183,7 @@ pub fn select_capture_adapter(target: &str) -> CaptureAdapter {
         };
         let idx = ai;
         ai += 1;
+        // SAFETY: adapter は live。GetDesc1 は OUT 構造体を値で返す。
         let adapter_name = unsafe { adapter.GetDesc1() }
             .map(|d| {
                 String::from_utf16_lossy(&d.Description)
@@ -461,7 +463,9 @@ impl DxgiCapturer {
         let d3d = &device.device;
         // SAFETY: device は live。cast は同 COM オブジェクトの別 IID。
         let dxgi_device: IDXGIDevice = d3d.cast().context("cast IDXGIDevice")?;
+        // SAFETY: dxgi_device は live。GetAdapter は所有権付き COM を返す。
         let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }.context("GetAdapter")?;
+        // SAFETY: adapter は live。EnumOutputs は範囲外で NOT_FOUND を返し ? で扱う。
         let output: IDXGIOutput = unsafe { adapter.EnumOutputs(output_index) }
             .with_context(|| format!("EnumOutputs({output_index}) -- no such display?"))?;
         Self::from_output(device, output)
@@ -525,6 +529,7 @@ impl DxgiCapturer {
                 let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             }
             match output.cast::<IDXGIOutput5>() {
+                // SAFETY: output5/d3d は live。DuplicateOutput1 は OUT に複製を返し ? で扱う。
                 Ok(output5) => match unsafe {
                     output5.DuplicateOutput1(d3d, 0, &[DXGI_FORMAT_R16G16B16A16_FLOAT])
                 } {
@@ -532,16 +537,19 @@ impl DxgiCapturer {
                     Err(e) => {
                         tracing::warn!(error = %e, "DuplicateOutput1(FP16) failed, falling back");
                         let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
+                        // SAFETY: output1/d3d は live。DuplicateOutput は OUT に複製を返し ? で扱う。
                         unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
                     }
                 },
                 Err(_) => {
                     let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
+                    // SAFETY: output1/d3d は live。DuplicateOutput は OUT に複製を返し ? で扱う。
                     unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
                 }
             }
         } else {
             let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
+            // SAFETY: output1/d3d は live。DuplicateOutput は OUT に複製を返し ? で扱う。
             unsafe { output1.DuplicateOutput(d3d) }.context("DuplicateOutput")?
         };
 

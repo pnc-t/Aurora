@@ -262,6 +262,7 @@ impl Inner {
         loop {
             // MFT は自前で sample を作るパターン (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) と
             // 呼び出し側が作るパターンがある。H264 encoder は呼び出し側提供。
+            // SAFETY: stream_info.cbSize は MFT 申告サイズ。MFCreate* は OUT を返し ? で確認する。
             let sample = unsafe {
                 let buffer = MFCreateMemoryBuffer(stream_info.cbSize.max(1024 * 1024))
                     .context("MFCreateMemoryBuffer (out)")?;
@@ -283,9 +284,11 @@ impl Inner {
             let r = unsafe { self.transform.ProcessOutput(0, &mut outs, &mut status) };
             match r {
                 Ok(()) => {
+                    // SAFETY: ProcessOutput 成功時 pSample は live。take で所有権を取り出す。
                     let sample = unsafe { std::mem::ManuallyDrop::take(&mut outs[0].pSample) }
                         .ok_or_else(|| anyhow!("ProcessOutput returned no sample"))?;
                     // sample → contiguous buffer → bytes
+                    // SAFETY: sample は live。ConvertToContiguousBuffer は OUT を返し ? で確認。
                     let buf: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer()? };
                     let mut ptr: *mut u8 = std::ptr::null_mut();
                     let mut max_len = 0u32;
@@ -296,6 +299,7 @@ impl Inner {
                             .context("MFMediaBuffer::Lock")?;
                     }
                     let mut data = vec![0u8; cur_len as usize];
+                    // SAFETY: ptr/cur_len は直前の Lock が返した有効域。コピー後に Unlock する。
                     unsafe {
                         std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), cur_len as usize);
                         let _ = buf.Unlock();
@@ -314,12 +318,16 @@ impl Inner {
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
                     // pSample をクリーンアップ (ManuallyDrop)
+                    // SAFETY: NEED_MORE_INPUT では出力が無いので pSample を手動 drop して解放する。
                     unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
+                    // SAFETY: pEvents も同様に手動 drop して解放する。
                     unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                     return Ok(());
                 }
                 Err(e) => {
+                    // SAFETY: エラー時も出力サンプルは無い。pSample を手動 drop して解放する。
                     unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
+                    // SAFETY: pEvents も同様に手動 drop して解放する。
                     unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                     return Err(anyhow!("ProcessOutput: {e}"));
                 }
@@ -351,6 +359,7 @@ impl VideoEncoder for MfH264Encoder {
         };
 
         // バッファに NV12 を書き込み
+        // SAFETY: buffer は直前に作成。Lock の ptr へ nv12_buf を len 分コピーし Unlock する。
         unsafe {
             let mut ptr: *mut u8 = std::ptr::null_mut();
             buffer
@@ -582,6 +591,7 @@ pub(crate) fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Re
 }
 
 pub(crate) fn make_nv12_input_type(width: u32, height: u32) -> Result<IMFMediaType> {
+    // SAFETY: MF API。MFCreateMediaType は OUT を返し、以降の Set* は ? で確認する。
     unsafe {
         let t = MFCreateMediaType().context("MFCreateMediaType (in)")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;

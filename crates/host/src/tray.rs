@@ -165,6 +165,7 @@ mod imp {
         devices: SharedDevices,
         prompt_now: bool,
     ) -> windows::core::Result<()> {
+        // SAFETY: トレイ用隠しウィンドウ生成一式。各 Win32 呼び出しの結果は ? で確認する。
         unsafe {
             let hmod = GetModuleHandleW(None)?;
             let hinstance = HINSTANCE(hmod.0);
@@ -259,6 +260,7 @@ mod imp {
 
     /// 隠しウィンドウのウィンドウプロシージャ。
     extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // SAFETY: メッセージ処理中の Win32 呼び出し。hwnd は OS から渡る有効なウィンドウ。
         unsafe {
             match msg {
                 WM_CREATE => {
@@ -310,6 +312,7 @@ mod imp {
 
     /// 隠しウィンドウに紐づけた共有状態 (PSK + 設定済みフラグ) への参照を取り出す。
     unsafe fn wnd_state(hwnd: HWND) -> Option<&'static WndState> {
+        // SAFETY: hwnd は有効なウィンドウ。GWLP_USERDATA は run でセットしたポインタ値を返す。
         let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WndState;
         if ptr.is_null() {
             None
@@ -321,6 +324,7 @@ mod imp {
 
     /// トレイの右クリックメニューを表示する。
     unsafe fn show_menu(hwnd: HWND) {
+        // SAFETY: メニュー構築一式の Win32 呼び出し。hwnd は有効で各 API の結果は確認する。
         unsafe {
             let menu = match CreatePopupMenu() {
                 Ok(m) => m,
@@ -436,6 +440,7 @@ mod imp {
 
     /// パスワード変更ダイアログを表示し、入力されたら DPAPI 保存 + 共有 PSK を更新する。
     fn change_password(hwnd: HWND) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
@@ -475,6 +480,7 @@ mod imp {
     /// ポート変更ダイアログを表示し、入力されたら保存 + 共有ポートを更新して reload を通知する
     /// (net の accept ループが TCP/UDP を貼り直して再起動なしに反映)。
     fn change_port(hwnd: HWND) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
@@ -587,6 +593,7 @@ mod imp {
     /// 入力注入でトレイを操作してピン留めを外す (= 2 要素目の無効化) のを防ぐ (パスワード/
     /// ポート変更と同じ方針)。有効化は保護を強める方向なので接続中でも許可する。
     fn toggle_pinning(hwnd: HWND) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
@@ -613,6 +620,7 @@ mod imp {
     /// 保護を弱めないので接続中でも許可)。窓は開いたままだと「次の認証成功端末を登録」状態が
     /// 続くため、誤って開けたままにしたときに閉じられるよう取消を用意する。
     fn toggle_pairing(hwnd: HWND) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
@@ -643,6 +651,7 @@ mod imp {
 
     /// 登録端末リストの `index` 番目を削除する (確認付き)。**接続中拒否** + 破壊的操作のため確認。
     fn remove_device(hwnd: HWND, index: usize) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
@@ -693,6 +702,7 @@ mod imp {
 
     /// 登録済み信頼端末をすべて削除する (確認付き)。**接続中拒否** + 破壊的操作のため確認。
     fn clear_devices(hwnd: HWND) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
@@ -752,6 +762,7 @@ mod imp {
     fn message_box(owner: HWND, text: &str, caption: &str) {
         let t = to_wide(text);
         let c = to_wide(caption);
+        // SAFETY: t/c は NUL 終端 UTF-16 で呼び出し中は生存。owner は有効なウィンドウ。
         unsafe {
             MessageBoxW(
                 owner,
@@ -776,6 +787,7 @@ mod imp {
     /// パスワード」欄を追加し、入力が現行 PSK と一致しないと OK を受け付けない。
     fn prompt_password(owner: HWND, expect_current: Option<[u8; 32]>) -> Option<String> {
         let require_current = expect_current.is_some();
+        // SAFETY: パスワードダイアログ生成一式。各 Win32 呼び出しの結果は ? で確認する。
         unsafe {
             let hmod = GetModuleHandleW(None).ok()?;
             let hinstance = HINSTANCE(hmod.0);
@@ -944,6 +956,7 @@ mod imp {
 
     /// ダイアログのウィンドウプロシージャ。
     extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // SAFETY: メッセージ処理中の Win32 呼び出し。hwnd は OS から渡る有効なウィンドウ。
         unsafe {
             match msg {
                 WM_CREATE => {
@@ -974,6 +987,7 @@ mod imp {
     /// OK 押下: (現在パスワードが要求されていれば照合し) 新旧 2 欄を検証して、問題なければ
     /// 結果へ格納しダイアログを閉じる。検証に失敗したときはダイアログを開いたままにする。
     unsafe fn on_ok(hwnd: HWND) {
+        // SAFETY: hwnd は有効なダイアログ。GWLP_USERDATA は WM_CREATE で置いた DlgResult ポインタ。
         unsafe {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgResult;
             let expect_current = if ptr.is_null() {
@@ -1041,6 +1055,7 @@ mod imp {
 
     /// EDIT コントロールの現在テキストを取得する。
     unsafe fn get_text(edit: HWND) -> String {
+        // SAFETY: edit は有効な EDIT コントロール。テキスト長で確保した buf に書き込む。
         unsafe {
             let len = GetWindowTextLengthW(edit);
             if len <= 0 {
@@ -1062,6 +1077,7 @@ mod imp {
     /// 待受ポート変更ダイアログを表示する。`current` を初期値に 1 欄だけ出し、1..=65535 を
     /// 検証する。OK で有効値なら `Some(port)` を返す。
     fn prompt_port(owner: HWND, current: u16) -> Option<u16> {
+        // SAFETY: ポートダイアログ生成一式。各 Win32 呼び出しの結果は ? で確認する。
         unsafe {
             let hmod = GetModuleHandleW(None).ok()?;
             let hinstance = HINSTANCE(hmod.0);
@@ -1205,6 +1221,7 @@ mod imp {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // SAFETY: メッセージ処理中の Win32 呼び出し。hwnd は OS から渡る有効なウィンドウ。
         unsafe {
             match msg {
                 WM_CREATE => {
@@ -1235,6 +1252,7 @@ mod imp {
     /// OK 押下: 入力を 1..=65535 で検証し、問題なければ結果へ格納して閉じる。不正値は
     /// ダイアログを開いたままにする。
     unsafe fn on_port_ok(hwnd: HWND) {
+        // SAFETY: hwnd は有効なダイアログ。GetDlgItem/get_text で入力欄のテキストを読む。
         unsafe {
             let text = match GetDlgItem(hwnd, ID_EDIT_PORT) {
                 Ok(h) => get_text(h),

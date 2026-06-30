@@ -314,6 +314,7 @@ impl Inner {
         &mut self,
         event: &windows::Win32::Media::MediaFoundation::IMFMediaEvent,
     ) -> Result<()> {
+        // SAFETY: event は live。GetType は値を返す。
         let et = unsafe { event.GetType() }.context("event GetType")?;
         if et == METransformNeedInput.0 as u32 {
             self.pending_need_input += 1;
@@ -355,11 +356,14 @@ impl Inner {
         let r = unsafe { self.transform.ProcessOutput(0, &mut outs, &mut status) };
         match r {
             Ok(()) => {
+                // SAFETY: ProcessOutput 成功時 pSample は live。take で所有権を取り出す。
                 let sample = unsafe { std::mem::ManuallyDrop::take(&mut outs[0].pSample) }
                     .ok_or_else(|| anyhow!("ProcessOutput returned no sample"))?;
+                // SAFETY: pEvents は使わないので手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
 
                 // sample → contiguous buffer → bytes
+                // SAFETY: sample は live。ConvertToContiguousBuffer は OUT を返し ? で確認。
                 let buf: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer()? };
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 let mut cur_len = 0u32;
@@ -394,7 +398,9 @@ impl Inner {
                 Ok(())
             }
             Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                // SAFETY: ストリーム変更時も出力サンプルは無い。pSample を手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
+                // SAFETY: pEvents も同様に手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                 // 出力ストリーム変更要求: H.264 出力タイプを再設定して次回出力を待つ。
                 let out_type = make_h264_output_type(self.width, self.height, self.bitrate)?;
@@ -407,12 +413,16 @@ impl Inner {
                 Ok(())
             }
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                // SAFETY: 出力が無いので pSample を手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
+                // SAFETY: pEvents も同様に手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                 Ok(())
             }
             Err(e) => {
+                // SAFETY: エラー時も出力サンプルは無い。pSample を手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
+                // SAFETY: pEvents も同様に手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                 Err(anyhow!("ProcessOutput: {e}"))
             }
@@ -598,6 +608,7 @@ unsafe fn mft_enum_ex_call(
     count: *mut u32,
 ) -> Result<()> {
     use windows::Win32::Media::MediaFoundation::MFTEnumEx;
+    // SAFETY: activates/count は呼び出し側が渡す有効な OUT ポインタ。MFTEnumEx が結果を確保する。
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,

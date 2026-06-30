@@ -38,6 +38,7 @@ pub struct DeviceBundle {
 // capture / encode スレッド間で本構造体を共有しても安全。既存の
 // `unsafe impl Send for MfH264Encoder` と同じ流儀。
 unsafe impl Send for DeviceBundle {}
+// SAFETY: Send と同根拠。device は multithread-protected で並行アクセスは D3D11 が直列化する。
 unsafe impl Sync for DeviceBundle {}
 
 /// このスレッドで COM(MTA) + Media Foundation を初期化する (冪等)。各ワーカースレッド
@@ -96,9 +97,10 @@ impl DeviceBundle {
         };
 
         // 選択されたアダプタ名をログに出す (ハイブリッド GPU の取り違え診断用)。
-        // SAFETY: device は live。cast は同 COM の別 IID、GetAdapter/GetDesc は値返し。
         if let Ok(dxgi_device) = device.cast::<IDXGIDevice>() {
+            // SAFETY: dxgi_device は live。GetAdapter は所有権付き COM を返す。
             if let Ok(adp) = unsafe { dxgi_device.GetAdapter() } {
+                // SAFETY: adp は live。GetDesc は値 (OUT 構造体) を返す。
                 if let Ok(desc) = unsafe { adp.GetDesc() } {
                     let name = String::from_utf16_lossy(&desc.Description)
                         .trim_end_matches('\0')

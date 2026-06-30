@@ -871,6 +871,7 @@ fn read_secret_line() -> Result<String> {
     // (パイプ等) では GetConsoleMode が失敗するので、その場合は素通しで読み取る。
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.context("GetStdHandle")?;
     let mut orig = CONSOLE_MODE(0);
+    // SAFETY: handle は直上で取得した有効値。GetConsoleMode は OUT の orig に現在モードを書く。
     let have_mode = unsafe { GetConsoleMode(handle, &mut orig) }.is_ok();
     if have_mode {
         // SAFETY: 直前に取得したハンドル/モードに対しエコーのみ無効化する。
