@@ -26,42 +26,54 @@ import { isPerfEnabled } from "./ipc";
 // 適応化し、(2) 提示時刻を「到着 + クッション」にアンカーしてドリフトをタイトにクランプする
 // ことで、低ジッタ回線では hold をクッション (=数 ms) 付近まで縮める。
 
-/// クッション = clamp(JITTER_K × 実測ジッタ, MIN, MAX)。ジッタ (到着間隔の平均絶対偏差) の
-/// 何倍を先読みするか。大きいほど滑らかだが遅延が増える。
+/**
+ * クッション = clamp(JITTER_K × 実測ジッタ, MIN, MAX)。ジッタ (到着間隔の平均絶対偏差) の
+ * 何倍を先読みするか。大きいほど滑らかだが遅延が増える。
+ */
 const JITTER_K = 2.5;
-/// 適応クッションの下限 (ms)。低ジッタ回線 (Tailnet 直結) でもこの分は持ち、表示の取りこぼしを防ぐ。
-/// 14ms ≈ 0.84 フレーム (@60Hz)。clean バーストで jitter が落ち cushion が 1 フレーム未満まで縮むと、
-/// 数 ms 遅れた到着が rAF tick を 1 枚分逃して hitch になる。1 フレーム弱の余白を常に持たせ、遅れ
-/// フレームでも提示 tick を逃さず提示尺を 1 vsync/フレームで安定させる (通常時は cushion>14 で非拘束=遅延無増)。
+/**
+ * 適応クッションの下限 (ms)。低ジッタ回線 (Tailnet 直結) でもこの分は持ち、表示の取りこぼしを防ぐ。
+ * 14ms ≈ 0.84 フレーム (@60Hz)。clean バーストで jitter が落ち cushion が 1 フレーム未満まで縮むと、
+ * 数 ms 遅れた到着が rAF tick を 1 枚分逃して hitch になる。1 フレーム弱の余白を常に持たせ、遅れ
+ * フレームでも提示 tick を逃さず提示尺を 1 vsync/フレームで安定させる (通常時は cushion>14 で非拘束=遅延無増)。
+ */
 const MIN_CUSHION_MS = 14;
-/// 適応クッションの上限 (ms)。ジッタが大きくてもこれ以上は先読みせず、操作遅延の暴走を防ぐ。
-/// 40→30: spike 時の上振れを抑え、band を [MIN,MAX]=[14,30] に圧縮して cushion の whipsaw
-/// (遅延と提示尺の揺れ) を steady にする。上振れ root は host encode p95 テールで本変更は client 側の
-/// 対症療法。30 で underrun→drop が増えるなら 34 程度へ戻す。傾き (JITTER_K/EMA 係数) は触らない。
+/**
+ * 適応クッションの上限 (ms)。ジッタが大きくてもこれ以上は先読みせず、操作遅延の暴走を防ぐ。
+ * 40→30: spike 時の上振れを抑え、band を [MIN,MAX]=[14,30] に圧縮して cushion の whipsaw
+ * (遅延と提示尺の揺れ) を steady にする。上振れ root は host encode p95 テールで本変更は client 側の
+ * 対症療法。30 で underrun→drop が増えるなら 34 程度へ戻す。傾き (JITTER_K/EMA 係数) は触らない。
+ */
 const MAX_CUSHION_MS = 30;
-/// フレーム間隔の初期推定 (60fps)。実際の到着間隔の EMA で源 fps 変化に追従する。
+/** フレーム間隔の初期推定 (60fps)。実際の到着間隔の EMA で源 fps 変化に追従する。 */
 const DEFAULT_INTERVAL_MS = 1000 / 60;
-/// ジッタ推定の初期値 (ms)。実測の平均絶対偏差 EMA で更新する。
+/** ジッタ推定の初期値 (ms)。実測の平均絶対偏差 EMA で更新する。 */
 const DEFAULT_JITTER_MS = 4;
-/// delay-line 提示バッファの「バースト吸収のりしろ」(フレーム数)。最大キュー深 =
-/// round(cushion/間隔) + この値。デコード出力が束で出ても、ここまでは保持して 1 tick 1 枚ずつ
-/// 提示し (落とさず後続 tick へ広げる)、これを超えた分だけ最古を間引いて遅延を有界化する。
-/// 旧 self-clock + DRIFT_FRAMES 方式は自走クロックが ceiling に駐機し平時遅延が DRIFT に比例して
-/// 増える欠点があった (2026-06-29 計測: DRIFT 1→3 で clean total 33→47ms・drop 15→7)。本方式は
-/// cushion 待ち (eligibility) と「1 tick 1 枚」だけで提示し駐機しないので、バースト吸収 (落とさない)
-/// と平時の低遅延を分離する。固着は「now が進めば必ず eligible + 上限で有界」なので構造的に無い。
+/**
+ * delay-line 提示バッファの「バースト吸収のりしろ」(フレーム数)。最大キュー深 =
+ * round(cushion/間隔) + この値。デコード出力が束で出ても、ここまでは保持して 1 tick 1 枚ずつ
+ * 提示し (落とさず後続 tick へ広げる)、これを超えた分だけ最古を間引いて遅延を有界化する。
+ * 旧 self-clock + DRIFT_FRAMES 方式は自走クロックが ceiling に駐機し平時遅延が DRIFT に比例して
+ * 増える欠点があった (2026-06-29 計測: DRIFT 1→3 で clean total 33→47ms・drop 15→7)。本方式は
+ * cushion 待ち (eligibility) と「1 tick 1 枚」だけで提示し駐機しないので、バースト吸収 (落とさない)
+ * と平時の低遅延を分離する。固着は「now が進めば必ず eligible + 上限で有界」なので構造的に無い。
+ */
 const BURST_SLACK_FRAMES = 3;
-/// 到着ジッタ EMA の非対称追従係数。RISE=上昇時は旧来どおり緩く (0.1) 追い、単発スパイクを
-/// 追いかけて cushion を膨らませない (保護は対称 0.1 と同等)。FALL=下降時 (clean 復帰) だけ
-/// 速くして (0.3) cushion=遅延を素早く回収する (2026-06-28 計測: RISE を速くする逆向きは悪化)。
+/**
+ * 到着ジッタ EMA の非対称追従係数。RISE=上昇時は旧来どおり緩く (0.1) 追い、単発スパイクを
+ * 追いかけて cushion を膨らませない (保護は対称 0.1 と同等)。FALL=下降時 (clean 復帰) だけ
+ * 速くして (0.3) cushion=遅延を素早く回収する (2026-06-28 計測: RISE を速くする逆向きは悪化)。
+ */
 const JITTER_EMA_RISE = 0.1;
 const JITTER_EMA_FALL = 0.3;
-/// eligibility 判定の早取り許容 (refresh の比率)。最古フレームの eligibility 時刻 (decodedAt+cushion)
-/// が次 tick 直前に来たとき、その tick を取りこぼして 1 枚遅らせないよう、判定時刻 ts にこの幅だけ
-/// 余裕を足す。refresh 未満なので cushion 待ちを丸々 1 tick 早めることはない。
+/**
+ * eligibility 判定の早取り許容 (refresh の比率)。最古フレームの eligibility 時刻 (decodedAt+cushion)
+ * が次 tick 直前に来たとき、その tick を取りこぼして 1 枚遅らせないよう、判定時刻 ts にこの幅だけ
+ * 余裕を足す。refresh 未満なので cushion 待ちを丸々 1 tick 早めることはない。
+ */
 const VSYNC_TOLERANCE_FRAC = 0.25;
 
-/// 値を [lo, hi] に収める。
+/** 値を [lo, hi] に収める。 */
 function clamp(x: number, lo: number, hi: number): number {
   return Math.min(Math.max(x, lo), hi);
 }
@@ -71,7 +83,7 @@ type DecoderOpts = {
   requestKeyframe: () => void;
 };
 
-/// ソート済み配列の p95 (切り上げ index、空なら 0)。
+/** ソート済み配列の p95 (切り上げ index、空なら 0)。 */
 function p95(sorted: number[]): number {
   const n = sorted.length;
   if (n === 0) return 0;

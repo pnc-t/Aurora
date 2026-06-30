@@ -53,8 +53,10 @@ export function mountFileTransfer(panel: HTMLElement): void {
   });
 }
 
-/// host からの FileResult を反映する (ダウンロード)。アップロード (D&D) は main.ts が
-/// トーストで通知するため、ここではダウンロードのみ照合する。
+/**
+ * host からの FileResult を反映する (ダウンロード)。アップロード (D&D) は main.ts が
+ * トーストで通知するため、ここではダウンロードのみ照合する。
+ */
 export function handleFileResult(id: number, ok: boolean, message: string): void {
   if (id === activeDownloadId) {
     setDownloadProgress(ok ? `保存: ${message}` : `失敗: ${message}`);
