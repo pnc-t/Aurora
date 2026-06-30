@@ -340,12 +340,26 @@ export class Session {
     this.host.renderStatus(this);
   }
 
+  /** 脱出方法ヒントを表示済みか (全 Session 共有)。初回キャプチャ時だけ案内する。 */
+  private static breakoutHintShown = false;
+
   private onCaptureChange(captured: boolean): void {
     if (this.active) this.host.toolbar.setCaptureToggled(captured);
     // マウスキャプチャ中だけホストにカーソルを映像へ焼き込ませる (絶対座標モードはローカル
     // カーソルを使うので不要・二重表示防止)。ポインタロックの実状態に同期させる。
     void setCursorOverlay(this.id, captured).catch((e) => logger.warn("setCursorOverlay failed", e));
-    this.host.toast(this, captured ? "mouse captured (Esc to release)" : "mouse released");
+    if (!captured) {
+      this.host.toast(this, "マウスキャプチャ OFF");
+      return;
+    }
+    // 初回キャプチャ時だけ脱出方法を案内する。フルスクリーン中は単押し Esc がホストへ流れて
+    // 抜けられないため、Esc 2 連打で戻れることを知らせる (以降は短い通知のみ)。
+    if (Session.breakoutHintShown) {
+      this.host.toast(this, "マウスキャプチャ ON");
+    } else {
+      Session.breakoutHintShown = true;
+      this.host.toast(this, "マウスキャプチャ ON — Esc を素早く2回でマウス解放・全画面解除");
+    }
   }
 
   private toolbarDisplayList(): DisplayDto[] {

@@ -11,16 +11,28 @@
   white-space: pre;
 }
 #stats-hud.visible { display: block; }
-/* 常時表示のタブストリップ (z-index 4000・不透明) は右上の HUD を覆い隠す。タブが上配置の
- * ときはストリップの厚みぶん HUD を下げ、右配置のときは左上へ逃がす (フルスクリーン中は
- * タブが隠れるので tab-fs では適用しない)。 */
-body.tab-top:not(.tab-fs) #stats-hud { top: calc(var(--tabstrip-h, 43px) + 8px); }
-body.tab-right:not(.tab-fs) #stats-hud { right: auto; left: 8px; }
 
-/* ツールバーは右上に出る HUD と重なりうる。配置ごとに HUD を逃がす。
- * 上配置 (横帯): バーの下へ下げる (--topbar-h は toolbar.ts が設定。タブ上配置時は
- *   ピルがタブ下に押し下げられ #topbar の実測高に含まれるため、タブ厚も自然に加味される)。
- * 右配置 (縦サイドバー): HUD を左上へ寄せてバーを避ける。
- * 下/左配置はそもそも右上の HUD と重ならないので既定位置のまま。 */
+/* HUD は既定で右上。常時表示のタブストリップ (不透明・z-index 4000) とツールバー (半透明ピル) に
+ * 潜って見えなくなるのを防ぐため、占有された端から逃がす。縦バー (左右配置) は「空いている側」へ、
+ * 横バー (上配置) は「その厚みぶん下」へ寄せる。フルスクリーン中 (tab-fs) はタブが隠れるので
+ * tab 系は適用しない。
+ *
+ * 旧実装は「右にバーがあれば左へ」だけで、タブが左・ツールバーが右のように左右が別々に塞がる
+ * 組み合わせを考慮せず、逃げた先の不透明タブに HUD が潜って見えなくなっていた。左右双方の占有を
+ * 見て配置する。 */
+
+/* 横バー (上配置) の厚みぶん下へ下げる。--topbar-h は toolbar.ts が設定。タブ上配置時はピルが
+ * タブ下に押し下げられ #topbar の実測高に含まれるため、タブ厚も自然に加味される。 */
+body.tab-top:not(.tab-fs) #stats-hud { top: calc(var(--tabstrip-h, 43px) + 8px); }
 body.bar-open.bar-top #stats-hud { top: calc(var(--topbar-h, 44px) + 8px); }
+
+/* ツールバー (ピル) が左右にあれば反対側へ逃がす。下のタブ規則と特異度が同じなので、
+ * ソース順で後に来るタブ規則が優先される (タブ回避が勝つ)。 */
 body.bar-open.bar-right #stats-hud { right: auto; left: 8px; }
+body.bar-open.bar-left #stats-hud { left: auto; right: 8px; }
+
+/* タブストリップ (不透明・最前面) 回避を最優先する: HUD を必ずタブの反対側へ置き、左右どちらに
+ * タブがあっても潜らせない。タブとツールバーが逆側のときは HUD がツールバーピル側に来るが、
+ * ピルは半透明なので実害は小さい (タブの不透明帯に隠れるよりよい)。 */
+body.tab-right:not(.tab-fs) #stats-hud { right: auto; left: 8px; }
+body.tab-left:not(.tab-fs) #stats-hud { left: auto; right: 8px; }
