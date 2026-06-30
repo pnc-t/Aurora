@@ -124,7 +124,12 @@ impl DeviceGuard {
 
     /// クライアント公開鍵 (ハンドシェイクの `remote_static`) を判定する。ペアリング窓が開いて
     /// いれば未知鍵をここで登録して消費する (1 回限り)。`Admit` で結果を返す。
-    pub fn admit(&self, key: Option<&[u8]>) -> Admit {
+    ///
+    /// `name` はクライアントが申告した端末名 (PC 名)。登録時の表示ラベルに使い、トレイの一覧で
+    /// 「どの PC を登録したか」を判別できるようにする。クライアント任意の値なのでサニタイズ・
+    /// 長さ制限する (机上のラベル用途のみ。認証は公開鍵で行い名前は信頼しない)。空/無効なら
+    /// 従来の `device-xxxx` (公開鍵 hex) にフォールバックする。
+    pub fn admit(&self, key: Option<&[u8]>, name: Option<&str>) -> Admit {
         if !self.enabled.load(Ordering::Relaxed) {
             return Admit::Disabled;
         }
@@ -139,8 +144,11 @@ impl DeviceGuard {
         }
         // ペアリング窓が開いていれば、この未知端末を 1 台だけ登録して窓を閉じる。
         if self.pairing.swap(false, Ordering::Relaxed) {
+            let label = name
+                .and_then(sanitize_label)
+                .unwrap_or_else(|| default_label(key));
             trusted.push(TrustedDevice {
-                label: default_label(key),
+                label,
                 pubkey: key.to_vec(),
             });
             if let Err(e) = save_trusted(&trusted) {
@@ -150,6 +158,26 @@ impl DeviceGuard {
             return Admit::Enrolled;
         }
         Admit::Rejected
+    }
+}
+
+/// クライアント申告の端末名を表示ラベルへ整える。クライアント任意の値なので、
+/// (1) 制御文字を除去 (改行は `trusted_devices.txt` の `<hex> <label>` 行を壊すため特に重要、
+/// トレイメニュー表示の崩れも防ぐ)、(2) 前後空白を除去、(3) 64 文字に制限する。
+/// 結果が空なら `None` を返し、呼び出し側が既定ラベルへフォールバックする。
+fn sanitize_label(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
     }
 }
 
@@ -311,14 +339,49 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_label_cleans_and_caps() {
+        // 通常の PC 名はそのまま (空白・ハイフンは保持)。
+        assert_eq!(
+            sanitize_label("DESKTOP-ABC 1").as_deref(),
+            Some("DESKTOP-ABC 1")
+        );
+        // 制御文字 (改行など) を除去し前後空白を trim する。
+        assert_eq!(sanitize_label("  pc\nname\t ").as_deref(), Some("pcname"));
+        // 空 / 制御文字のみ → None (既定ラベルへフォールバックさせる)。
+        assert_eq!(sanitize_label(""), None);
+        assert_eq!(sanitize_label("\r\n\t"), None);
+        // 64 文字に制限する。
+        assert_eq!(
+            sanitize_label(&"x".repeat(100)).unwrap().chars().count(),
+            64
+        );
+    }
+
+    #[test]
+    fn enroll_with_empty_name_falls_back_to_default_label() {
+        let g = DeviceGuard {
+            enabled: AtomicBool::new(true),
+            pairing: AtomicBool::new(false),
+            trusted: Mutex::new(Vec::new()),
+        };
+        g.arm_pairing();
+        // 旧クライアント (端末名なし) は既定ラベル device-xxxx に落ちる。
+        assert!(matches!(
+            g.admit(Some(&[0xab, 0xcd, 0xef, 0x01]), Some("")),
+            Admit::Enrolled
+        ));
+        assert_eq!(g.labels(), vec!["device-abcdef01".to_string()]);
+    }
+
+    #[test]
     fn admit_disabled_passes_through() {
         let g = DeviceGuard {
             enabled: AtomicBool::new(false),
             pairing: AtomicBool::new(false),
             trusted: Mutex::new(Vec::new()),
         };
-        assert!(matches!(g.admit(Some(&[1, 2, 3])), Admit::Disabled));
-        assert!(matches!(g.admit(None), Admit::Disabled));
+        assert!(matches!(g.admit(Some(&[1, 2, 3]), None), Admit::Disabled));
+        assert!(matches!(g.admit(None, None), Admit::Disabled));
     }
 
     #[test]
@@ -329,17 +392,25 @@ mod tests {
             trusted: Mutex::new(Vec::new()),
         };
         // 有効・未登録・ペアリング窓なし → 拒否。鍵なしも拒否。
-        assert!(matches!(g.admit(Some(&[9, 9, 9, 9])), Admit::Rejected));
-        assert!(matches!(g.admit(None), Admit::Rejected));
+        assert!(matches!(
+            g.admit(Some(&[9, 9, 9, 9]), None),
+            Admit::Rejected
+        ));
+        assert!(matches!(g.admit(None, None), Admit::Rejected));
 
         // ペアリング窓を開くと次の 1 台を登録して許可。窓は消費される。
+        // 申告された端末名がラベルになる (どの PC かを判別できる)。
         g.arm_pairing();
-        assert!(matches!(g.admit(Some(&[9, 9, 9, 9])), Admit::Enrolled));
-        assert!(matches!(g.admit(Some(&[9, 9, 9, 9])), Admit::Trusted));
+        assert!(matches!(
+            g.admit(Some(&[9, 9, 9, 9]), Some("My-Laptop")),
+            Admit::Enrolled
+        ));
+        assert!(matches!(g.admit(Some(&[9, 9, 9, 9]), None), Admit::Trusted));
         assert!(!g.pairing_armed());
+        assert_eq!(g.labels(), vec!["My-Laptop".to_string()]);
 
         // 別の未知端末は窓が閉じているので拒否。
-        assert!(matches!(g.admit(Some(&[7, 7])), Admit::Rejected));
+        assert!(matches!(g.admit(Some(&[7, 7]), None), Admit::Rejected));
         assert_eq!(g.labels().len(), 1);
 
         // disarm でペアリング窓を閉じられる。

@@ -745,7 +745,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // ハンドシェイク 3 メッセージ + transport 確立を 1 ブロックにまとめ、失敗時に遅延を挟む。
     // 相手 (クライアント) の静的公開鍵は transport 確立で hs が消費される前に控える
     // (デバイスピン留めの許可リスト照合に使う)。
-    let (session, remote_key) = match async {
+    let (session, remote_key, device_name) = match async {
         // <- e
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
             .await
@@ -763,14 +763,19 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
             .context("handshake timed out (s,se,psk)")??;
         hs.read_msg(&buf, &mut tmp)?;
         let remote_key = hs.remote_static();
+        // 最終メッセージの (暗号化済み) payload にクライアントが載せた端末名。デバイスピン留めの
+        // 登録ラベルに使い「どの PC を登録したか」を判別できるようにする (空 = 旧クライアントは
+        // host 側で既定ラベル device-xxxx にフォールバック)。値はクライアント任意なので devices で
+        // サニタイズ・長さ制限する。机上のラベル用途のみで認証には使わない。
+        let device_name = String::from_utf8_lossy(&tmp).into_owned();
         // snow の StatelessTransportState は encrypt/decrypt とも &self なので Arc<Mutex> は
         // 不要 (映像 UDP のパケット毎ロックを排除)。
         let session = hs.into_transport().map_err(anyhow::Error::from)?;
-        Ok::<_, anyhow::Error>((session, remote_key))
+        Ok::<_, anyhow::Error>((session, remote_key, device_name))
     }
     .await
     {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) => {
             // 認証/ハンドシェイク失敗。snow は PSK 不一致を最終メッセージの復号失敗として
             // 返すため、ここに来る = パスワード誤りかプロトコル不正。送信元 IP 単位の指数
@@ -786,7 +791,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // デバイスピン留め (有効時のみ): PSK は正しくても、登録済み端末以外を拒否する 2 要素目。
     // PSK 漏洩でも「登録した端末の秘密鍵」を持たない相手を弾く。判定は record_success の前に
     // 行い、拒否はバックオフを伸ばす (= 履歴を消さない) ことで未許可端末の連投も減速させる。
-    let admit = devices.admit(remote_key.as_deref());
+    let admit = devices.admit(remote_key.as_deref(), Some(device_name.as_str()));
     if let crate::devices::Admit::Rejected = &admit {
         let delay = throttle.record_failure(peer.ip());
         tracing::warn!(peer = %peer, delay_ms = delay.as_millis() as u64, "device not in allowlist; rejecting (device pinning)");
@@ -797,7 +802,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
     if let crate::devices::Admit::Enrolled = &admit {
-        tracing::info!(peer = %peer, "device pinning: enrolled this device via pairing window");
+        tracing::info!(peer = %peer, name = %device_name, "device pinning: enrolled this device via pairing window");
     }
     tracing::info!(peer = %peer, "noise handshake complete");
 
