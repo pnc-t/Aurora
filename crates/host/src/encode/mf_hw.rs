@@ -523,7 +523,14 @@ fn hw_h264_encoder_present() -> Result<bool> {
     Ok(count > 0)
 }
 
-/// HW H.264 エンコーダ MFT を `MFTEnumEx` で 1 つ選び、(transform, friendly name) を返す。
+/// HW H.264 エンコーダ MFT を `MFTEnumEx` で列挙し、**実際に `ActivateObject` できた最初の 1 つ**を
+/// (transform, friendly name) で返す。
+///
+/// ハイブリッド GPU (Optimus) のノートでは複数ベンダの HW MFT が列挙される。プロセスの GPU
+/// プリファレンスを iGPU(Intel) に固定していると、列挙先頭に来がちな dGPU(NVENC) の MFT は
+/// `ActivateObject` が失敗する (プロセスから dGPU を掴めない)。先頭だけを試すと QSV にたどり着けず
+/// 毎フレーム失敗するため、列挙順に総当たりして最初に起動できた MFT を採る (= キャプチャ共有デバイスと
+/// 同じ iGPU 上の QSV に自然に落ちる)。`MFTEnumEx` は LUID フィルタ非対応なのでこの方式で吸収する。
 fn enum_hw_encoder() -> Result<(IMFTransform, String)> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
@@ -541,25 +548,43 @@ fn enum_hw_encoder() -> Result<(IMFTransform, String)> {
         return Err(anyhow!("no hardware H.264 encoder MFT found"));
     }
 
-    // SAFETY: activates は count 要素の Option<IMFActivate> 配列。先頭を取り出し、残りを解放する。
-    let (activate, transform) = unsafe {
+    // 列挙結果を Vec へ移し、配列メモリは即解放する。以後は Vec 上で総当たりする。
+    // SAFETY: activates は count 要素の Option<IMFActivate> 配列。各要素を take して所有権を移す。
+    let candidates: Vec<IMFActivate> = unsafe {
         let slice = std::slice::from_raw_parts_mut(activates, count as usize);
-        let activate = slice[0]
-            .take()
-            .ok_or_else(|| anyhow!("first IMFActivate null"))?;
-        for slot in slice.iter_mut().skip(1) {
-            let _ = slot.take(); // drop = Release
-        }
+        let v: Vec<IMFActivate> = slice.iter_mut().filter_map(|s| s.take()).collect();
         CoTaskMemFree(Some(activates as *const _ as *const std::ffi::c_void));
-
-        let transform: IMFTransform = activate
-            .ActivateObject()
-            .context("IMFActivate::ActivateObject")?;
-        (activate, transform)
+        v
     };
 
-    let friendly = read_friendly_name(&activate).unwrap_or_else(|| "unknown HW MFT".to_string());
-    Ok((transform, friendly))
+    let mut skipped: Vec<String> = Vec::new();
+    for activate in &candidates {
+        let friendly = read_friendly_name(activate).unwrap_or_else(|| "unknown HW MFT".to_string());
+        // SAFETY: activate は live。ActivateObject は MFT を 1 つ生成するか失敗を返す。
+        match unsafe { activate.ActivateObject::<IMFTransform>() } {
+            Ok(transform) => {
+                if !skipped.is_empty() {
+                    tracing::warn!(
+                        selected = %friendly,
+                        skipped = ?skipped,
+                        "HW H.264 MFT: earlier candidate(s) failed to activate; using next"
+                    );
+                }
+                return Ok((transform, friendly));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    encoder = %friendly,
+                    error = %e,
+                    "HW H.264 MFT ActivateObject failed; trying next candidate"
+                );
+                skipped.push(friendly);
+            }
+        }
+    }
+    Err(anyhow!(
+        "no activatable hardware H.264 encoder MFT (tried: {skipped:?})"
+    ))
 }
 
 /// `MFTEnumEx` の薄いラッパー (unsafe 呼び出しを 1 箇所に閉じる)。

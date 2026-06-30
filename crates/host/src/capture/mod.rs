@@ -63,13 +63,23 @@ pub type SharedDevice = ();
 /// アダプタ上にデバイスを作る (ハイブリッド GPU で `DuplicateOutput` が失敗するのを防ぐ)。
 #[cfg(target_os = "windows")]
 pub fn create_shared_device(target_name: &str) -> anyhow::Result<SharedDevice> {
-    let adapter = windows::select_capture_adapter(target_name);
-    if adapter.is_none() {
-        tracing::warn!(
-            target = %target_name,
-            "no DXGI adapter passed the DuplicateOutput probe; using default adapter"
-        );
-    }
+    let adapter = match windows::select_capture_adapter(target_name) {
+        windows::CaptureAdapter::Adapter(a) => Some(a),
+        windows::CaptureAdapter::AllUnsupported => {
+            tracing::warn!(
+                target = %target_name,
+                "no DXGI adapter could DuplicateOutput (hybrid muxless?); using default adapter"
+            );
+            None
+        }
+        windows::CaptureAdapter::NotFound => {
+            tracing::warn!(
+                target = %target_name,
+                "target output not found on any adapter; using default adapter"
+            );
+            None
+        }
+    };
     Ok(std::sync::Arc::new(device::DeviceBundle::new(
         adapter.as_ref(),
     )?))
@@ -77,6 +87,21 @@ pub fn create_shared_device(target_name: &str) -> anyhow::Result<SharedDevice> {
 #[cfg(not(target_os = "windows"))]
 pub fn create_shared_device(_target_name: &str) -> anyhow::Result<SharedDevice> {
     Ok(())
+}
+
+/// dGPU プロセスでは内蔵パネルの Desktop Duplication が全アダプタで UNSUPPORTED になる
+/// ハイブリッド GPU (muxless Optimus) を検出する。main がこのとき GPU プリファレンスを
+/// iGPU(省電力) にして re-exec する判断に使う。Windows 以外は常に false。
+#[cfg(target_os = "windows")]
+pub fn capture_all_adapters_unsupported(target_name: &str) -> bool {
+    matches!(
+        windows::select_capture_adapter(target_name),
+        windows::CaptureAdapter::AllUnsupported
+    )
+}
+#[cfg(not(target_os = "windows"))]
+pub fn capture_all_adapters_unsupported(_target_name: &str) -> bool {
+    false
 }
 
 /// 接続クライアントへ提示する 1 ディスプレイの情報。
