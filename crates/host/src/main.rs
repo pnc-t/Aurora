@@ -35,7 +35,7 @@ use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
 use encode::{EncodedNal, MAX_BITRATE_BPS, PlatformEncoder, VideoEncoder};
 use input::{DisplayGeom, InputInjector, PlatformInjector};
-use net::{EncoderCommand, InputCmd, ServerConfig};
+use net::{BindSpec, EncoderCommand, InputCmd, ServerConfig};
 
 /// 既定の送出フレームレート上限 (PLAN.md の 60fps 目標)。
 const DEFAULT_FPS_CAP: u32 = 60;
@@ -265,62 +265,32 @@ fn main() -> Result<()> {
     } else {
         settings::load_port().unwrap_or(args.port)
     };
-    let bind_ip = resolve_bind_ip(args.bind.as_deref());
-    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port, bind_ip)
+    let bind = resolve_bind_spec(args.bind.as_deref());
+    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port, bind)
 }
 
-/// 待受アドレスを解決する。
+/// 待受アドレスの解決方法 ([`BindSpec`]) を決める。
 ///
-/// 優先順位: `--bind` 明示 > Tailscale IP 自動検出 > `127.0.0.1` (loopback)。本プロジェクトは
-/// Tailnet 前提のため、既定では tailnet インターフェースのみに公開して LAN/インターネットへの
-/// 露出を避ける。
+/// `--bind` 明示なら `Fixed`、未指定なら `Auto`。本プロジェクトは Tailnet 前提のため、既定
+/// (`Auto`) では tailnet インターフェースのみに公開して LAN/インターネットへの露出を避ける。
 ///
-/// Tailscale 未導入 (CLI 不在 / IP 取得失敗) のときは **loopback に fail-closed する**。
-/// 以前は `0.0.0.0` (全 NIC) へフォールバックしていたが、これは設計が前提にした「tailnet 限定
-/// 公開」という境界を、最も無防備な環境 (Tailscale が無い PC) で逆向き (全公開) に倒す
-/// fail-open だった。loopback なら localhost での動作確認フローは保てる一方、LAN/インター
-/// ネットへは到達不能になる。LAN テストや意図的な公開は `--bind <ip>` の明示オプトイン
-/// (露出は設定ミスではなく意識的な選択にする)。`--bind 0.0.0.0` で従来挙動も選べる。
-fn resolve_bind_ip(explicit: Option<&str>) -> std::net::IpAddr {
-    use std::net::{IpAddr, Ipv4Addr};
-    if let Some(s) = explicit {
-        return s.parse().unwrap_or_else(|_| {
-            eprintln!("error: --bind expects an IP address (got '{s}')");
-            std::process::exit(2);
-        });
-    }
-    match tailscale_ip() {
-        Some(ip) => {
-            tracing::info!(%ip, "binding to Tailscale interface (default; override with --bind)");
-            ip
+/// **Tailscale IP の実解決は bind 時に行う** (`net::resolve_bind_ip`)。ホストは ONLOGON タスクで
+/// `tailscaled` より先に起動しうるため、起動時点では IP が未確定なことがある。ここで一度きりに
+/// 解決すると loopback へ落ちて以後固着するので、解決を bind ループへ遅延させ、そこで待つ。
+/// Tailscale 未導入 (取得失敗) が続けば最終的に `127.0.0.1` に fail-close する (localhost の
+/// 動作確認フローは保つ一方、LAN/インターネットへは到達不能)。LAN テストや意図的な公開は
+/// `--bind <ip>` の明示オプトイン (`--bind 0.0.0.0` で全 NIC 公開も選べる)。
+fn resolve_bind_spec(explicit: Option<&str>) -> BindSpec {
+    match explicit {
+        Some(s) => {
+            let ip = s.parse().unwrap_or_else(|_| {
+                eprintln!("error: --bind expects an IP address (got '{s}')");
+                std::process::exit(2);
+            });
+            BindSpec::Fixed(ip)
         }
-        None => {
-            tracing::warn!(
-                "Tailscale IP not found; binding to 127.0.0.1 (loopback only). \
-                 LAN/internet are NOT reachable. Install Tailscale, or pass \
-                 --bind <ip> (e.g. a LAN IP, or 0.0.0.0 for all interfaces) to expose."
-            );
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        }
+        None => BindSpec::Auto,
     }
-}
-
-/// `tailscale ip -4` を実行して tailnet IPv4 を取得する。CLI 不在・非ゼロ終了・パース失敗は
-/// `None`。CGNAT 範囲 (100.64/10) のインターフェース誤検出を避けるため、権威ある CLI に問う。
-fn tailscale_ip() -> Option<std::net::IpAddr> {
-    let out = std::process::Command::new("tailscale")
-        .args(["ip", "-4"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    // 複数アドレスが返りうる (1 行 1 つ)。先頭の有効な IPv4 を採る。
-    text.lines()
-        .map(str::trim)
-        .find_map(|l| l.parse::<std::net::Ipv4Addr>().ok())
-        .map(std::net::IpAddr::V4)
 }
 
 /// ログフィルタを構築する。`--log-level` 引数が最優先。素のレベル (`debug`) は `aurora=`
@@ -825,7 +795,7 @@ fn run_server(
     fps_cap: u32,
     max_bitrate_bps: u32,
     port: u16,
-    bind_ip: std::net::IpAddr,
+    bind: BindSpec,
 ) -> Result<()> {
     // DPAPI で保存済みのパスワードがあればそれを使う (再起動しても固定・無人起動で読める)。
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
@@ -894,7 +864,7 @@ fn run_server(
             generated
         }
     };
-    println!("TCP/UDP: {bind_ip}:{port}");
+    println!("TCP/UDP: {bind} (port {port})");
 
     // PSK は tray (UI スレッド) と net (接続受理) で共有する。tray でパスワードを変更すると
     // ここを書き換え、net が次の接続受理時に読むことで再起動なしに反映される。
@@ -1064,7 +1034,7 @@ fn run_server(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let cfg = ServerConfig {
-            bind_ip,
+            bind,
             port: port_cell,
             reload,
             psk,

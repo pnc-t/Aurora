@@ -261,10 +261,33 @@ async fn stream_file_to_client(id: u32, path: &str, out_tx: mpsc::Sender<Control
     tracing::info!(id, size, "file download streamed");
 }
 
+/// 待受アドレスの解決方法。`--bind` 明示なら `Fixed`、未指定なら `Auto`。
+///
+/// ホストは ONLOGON タスクで自動起動するため、`tailscaled` の Tailscale IP 割り当てより先に
+/// 立ち上がるレースが常態化する。`Auto` を **bind 時に** 解決 (遅延解決) することで、起動直後に
+/// IP が未確定でも bind ループ内で待ってから貼れる ([`resolve_bind_ip`])。`Fixed` は即値。
+#[derive(Clone, Copy)]
+pub enum BindSpec {
+    /// Tailscale IP を bind ごとに解決する (起動が Tailscale より先でも待つ)。
+    Auto,
+    /// `--bind <ip>` で明示指定された固定アドレス。
+    Fixed(std::net::IpAddr),
+}
+
+impl std::fmt::Display for BindSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BindSpec::Auto => write!(f, "auto(Tailscale)"),
+            BindSpec::Fixed(ip) => write!(f, "{ip}"),
+        }
+    }
+}
+
 pub struct ServerConfig {
-    /// 待受アドレス。既定は Tailscale IP (tailnet 限定公開)、`--bind` で上書き可能。
+    /// 待受アドレスの解決方法。既定 (`--bind` 未指定) は `Auto` = Tailscale IP を **bind 時に**
+    /// 解決する (起動が Tailscale より先でも待てるよう遅延解決)。`--bind <ip>` で `Fixed`。
     /// Tailnet 外 (LAN/インターネット) への露出を絞り、総当たり・接続枠 DoS の面を減らす。
-    pub bind_ip: std::net::IpAddr,
+    pub bind: BindSpec,
     /// 待受ポート (TCP 制御 / UDP 映像で共用)。tray UI からのポート変更で書き換えられ、
     /// `reload` 通知で accept ループが TCP/UDP を貼り直す (再起動なしに反映)。
     pub port: std::sync::Arc<std::sync::atomic::AtomicU16>,
@@ -393,6 +416,78 @@ fn disable_udp_conn_reset(udp: &UdpSocket) {
 #[cfg(not(windows))]
 fn disable_udp_conn_reset(_udp: &UdpSocket) {}
 
+/// `tailscale ip -4` を実行して tailnet IPv4 を取得する。CLI 不在・非ゼロ終了・パース失敗は
+/// `None`。CGNAT 範囲 (100.64/10) のインターフェース誤検出を避けるため、権威ある CLI に問う。
+/// bind ループ (async) から呼ぶため `tokio::process` で非同期に起動する (ランタイムを塞がない)。
+async fn tailscale_ip() -> Option<std::net::IpAddr> {
+    // GUI サブシステム (リリース) のトレイ常駐から console アプリを起動すると窓が点滅する。
+    // Auto は起動レース中これを毎周回す可能性があるため CREATE_NO_WINDOW で抑止する
+    // (autostart の schtasks 呼び出しと同じ理由)。
+    let mut cmd = std::process::Command::new("tailscale");
+    cmd.args(["ip", "-4"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = tokio::process::Command::from(cmd).output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    // 複数アドレスが返りうる (1 行 1 つ)。先頭の有効な IPv4 を採る。
+    text.lines()
+        .map(str::trim)
+        .find_map(|l| l.parse::<std::net::Ipv4Addr>().ok())
+        .map(std::net::IpAddr::V4)
+}
+
+/// bind 時に実効待受 IP を解決する。`Fixed` は即値、`Auto` は Tailscale IP を待つ。
+///
+/// ホストは ONLOGON で `tailscaled` より先に起動しうるため、`Auto` は `tailscale ip -4` を
+/// ポーリングで待ってから返す (一度きりの解決だと未確定時に loopback へ落ちて以後固着する)。
+/// `TIMEOUT` まで取れなければ `127.0.0.1` に fail-close する (Tailscale 未導入の dev 用に
+/// localhost 動作確認フローを残す。LAN/インターネットへは到達不能のまま)。bind ループは
+/// ポート変更でここへ戻るため、loopback に倒れた後でも次の (再)bind で Tailscale を再探索する。
+async fn resolve_bind_ip(spec: BindSpec) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv4Addr};
+    /// Tailscale IP 待ちのポーリング間隔。
+    const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Tailscale IP 待ちの上限。これを超えたら loopback に倒す (= Tailscale 未導入とみなす)。
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    // Fixed は即値で返す。Auto だけ Tailscale IP を待つ (以降のポーリングループ)。
+    let start = match spec {
+        BindSpec::Fixed(ip) => return ip,
+        BindSpec::Auto => Instant::now(),
+    };
+    let mut waited = false;
+    loop {
+        if let Some(ip) = tailscale_ip().await {
+            tracing::info!(%ip, waited, "binding to Tailscale interface (auto; override with --bind)");
+            return ip;
+        }
+        if start.elapsed() >= TIMEOUT {
+            tracing::warn!(
+                timeout_s = TIMEOUT.as_secs(),
+                "Tailscale IP not found; binding to 127.0.0.1 (loopback only). \
+                 LAN/internet are NOT reachable. Install Tailscale, or pass \
+                 --bind <ip> (e.g. a LAN IP, or 0.0.0.0 for all interfaces) to expose."
+            );
+            return IpAddr::V4(Ipv4Addr::LOCALHOST);
+        }
+        // 起動直後の Tailscale 待ちを 1 度だけ告知する (毎周ログを膨らませない)。
+        if !waited {
+            tracing::info!(
+                "Tailscale IP not ready yet; waiting before bind (host started before tailscaled)"
+            );
+            waited = true;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>)> {
     const ATTEMPTS: u32 = 25; // 25 × 200ms ≒ 5 秒
     let mut attempt = 0u32;
@@ -412,7 +507,16 @@ async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>
             Err(e) => ("TCP", e),
         };
         attempt += 1;
-        if e.kind() != std::io::ErrorKind::AddrInUse || attempt >= ATTEMPTS {
+        // AddrInUse: re-exec 直後に旧プロセスがまだポートを保持しているケース。
+        // AddrNotAvailable: `tailscale ip -4` が IP を返した直後でも OS のインターフェース整備が
+        // 間に合わず bind が WSAEADDRNOTAVAIL (10049) で落ちるケース (起動レースの第二段)。どちらも
+        // 数秒で解消するため短くリトライする。--bind の IP がマシンに無い設定ミスもここに来るが、
+        // その場合は ATTEMPTS 回 (≒5 秒) 試して諦め、明示エラーで失敗させる。
+        let retryable = matches!(
+            e.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
+        );
+        if !retryable || attempt >= ATTEMPTS {
             return Err(anyhow::Error::new(e).context(format!("bind {what} {addr}")));
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -629,9 +733,13 @@ pub async fn run_server(
 
     // 外側ループ: 現在のポートで TCP/UDP を bind する。tray でポートが変わると reload 通知で
     // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
+    // 待受 IP は bind ごとに解決する: `Auto` は Tailscale IP を待つため、ホストが tailscaled より
+    // 先に起動しても (起動レース) ここで待ってから貼れる。tray は既にこのループ前に起動済みなので、
+    // 待っても tray の表示・操作は阻害しない。
     loop {
         let port = cfg.port.load(Ordering::Relaxed);
-        let addr = SocketAddr::new(cfg.bind_ip, port);
+        let bind_ip = resolve_bind_ip(cfg.bind).await;
+        let addr = SocketAddr::new(bind_ip, port);
         let (tcp, udp) = bind_listeners(addr).await?;
         tracing::info!(tcp = %addr, udp = %addr, max_clients = MAX_CLIENTS, "host listening");
 

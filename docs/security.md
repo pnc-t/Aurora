@@ -10,8 +10,12 @@ Aurora は自宅 PC の画面・入力をネットワーク越しに開放する
 
 - **Tailscale (Tailnet) 直結が前提**。NAT 越え・シグナリング・中継サーバは実装しません。
   通信は Tailnet 内 (`100.x.x.x`) に閉じ、外側からは Tailscale の認証・ACL で守られます。
-- ホストは既定で **Tailscale インターフェースのみに bind** します (`main.rs` の `resolve_bind_ip`)。
-  優先順位は `--bind` 明示 > Tailscale IP 自動検出 > `127.0.0.1` (loopback)。Tailscale 未導入の
+- ホストは既定で **Tailscale インターフェースのみに bind** します (`--bind` 未指定なら
+  `main.rs` の `resolve_bind_spec` が `Auto` を選び、実 IP は bind 時に `net.rs` の
+  `resolve_bind_ip` が解決)。優先順位は `--bind` 明示 > Tailscale IP 自動検出 > `127.0.0.1`
+  (loopback)。**Tailscale IP の解決は bind ループ内で行い、起動が `tailscaled` より先でも
+  IP が出るまで待ってから bind します** (ホストは ONLOGON で自動起動するため起動レースが常態。
+  一度きりの解決だと loopback へ落ちて固着するのを防ぐ)。一定時間 (既定 120 秒) 待っても取れない
   ときは **loopback に fail-closed** します (localhost での動作確認は可能、LAN/インターネットへは
   到達不能)。以前は `0.0.0.0` (全 NIC) へフォールバックしていましたが、これは Tailscale が無い
   最も無防備な環境で境界を全公開側へ倒す fail-open だったため改めました。LAN テストや意図的な
@@ -155,7 +159,7 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 | PSK 導出 (Argon2id) | `crates/common/src/noise.rs` (`psk_from_password`) |
 | パスワードの DPAPI 保存 | `crates/host/src/secret.rs` |
 | 単一接続ガード | `crates/host/src/conn.rs` |
-| bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_ip`) |
+| bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_spec`) → `crates/host/src/net.rs` (`resolve_bind_ip`, bind 時に Tailscale IP を待つ) |
 | パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray.rs` |
 | パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net.rs` |
 | デバイスピン留め (静的鍵許可リスト) | `crates/host/src/devices.rs` / `crates/host/src/net.rs` / `crates/host/src/tray.rs` |
