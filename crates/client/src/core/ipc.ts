@@ -43,19 +43,21 @@ export type InputEvent =
 // 対象にするため、ここで保持するアクティブ id を暗黙に使う。タブ切替で orchestrator が更新する。
 let activeSessionId: string | null = null;
 
-/// アクティブタブのセッション id を設定する (タブ切替時に orchestrator が呼ぶ)。
+/** アクティブタブのセッション id を設定する (タブ切替時に orchestrator が呼ぶ)。 */
 export function setActiveSession(id: string | null): void {
   activeSessionId = id;
 }
 
-/// アクティブ session_id を返す。未設定での操作はバグなので例外にする。
+/** アクティブ session_id を返す。未設定での操作はバグなので例外にする。 */
 function sid(): string {
   if (activeSessionId === null) throw new Error("no active session");
   return activeSessionId;
 }
 
-/// capture ウィンドウを Rust 側で開く (launcher から呼ぶ)。生成された session_id を返す。
-/// password は IPC 本文で Rust の staging へ渡し、ウィンドウ URL には載せない。
+/**
+ * capture ウィンドウを Rust 側で開く (launcher から呼ぶ)。生成された session_id を返す。
+ * password は IPC 本文で Rust の staging へ渡し、ウィンドウ URL には載せない。
+ */
 export async function openCaptureWindow(
   host: string,
   port: number,
@@ -66,15 +68,19 @@ export async function openCaptureWindow(
   return await invoke<string>("open_capture_window", { host, port, label, save, password });
 }
 
-/// 既存 capture ウィンドウ内に新規タブ (セッション) を開く準備。session_id を発番し、
-/// password を Rust の staging へ積む (open_capture_window と同じ受け渡し、ただし窓は作らない)。
-/// 返った id で connectToHost を呼ぶ。
+/**
+ * 既存 capture ウィンドウ内に新規タブ (セッション) を開く準備。session_id を発番し、
+ * password を Rust の staging へ積む (open_capture_window と同じ受け渡し、ただし窓は作らない)。
+ * 返った id で connectToHost を呼ぶ。
+ */
 export async function stageSession(password: string | null): Promise<string> {
   return await invoke<string>("stage_session", { password });
 }
 
-/// セッションを開く。password はもう渡さない (Rust が staging / 保存済み DPAPI から解決する)。
-/// 所有ウィンドウの紐付けは Rust 側が呼び出し webview から取得する。
+/**
+ * セッションを開く。password はもう渡さない (Rust が staging / 保存済み DPAPI から解決する)。
+ * 所有ウィンドウの紐付けは Rust 側が呼び出し webview から取得する。
+ */
 export async function connectToHost(
   sessionId: string,
   host: string,
@@ -86,9 +92,11 @@ export async function connectToHost(
   await invoke("connect_to_host", { sessionId, host, port, save, eventChannel, videoChannel });
 }
 
-/// 既存セッションを別ウィンドウへ移譲するための空ウィンドウを開く (タブのドラッグ分割)。
-/// `snapshot` は移譲先が復元に使う表示状態 JSON。`x`/`y` は新ウィンドウの配置 (カーソル位置)。
-/// networking は止まらず、Rust 側が表示先 (sink) を即デタッチして所有ウィンドウを付け替える。
+/**
+ * 既存セッションを別ウィンドウへ移譲するための空ウィンドウを開く (タブのドラッグ分割)。
+ * `snapshot` は移譲先が復元に使う表示状態 JSON。`x`/`y` は新ウィンドウの配置 (カーソル位置)。
+ * networking は止まらず、Rust 側が表示先 (sink) を即デタッチして所有ウィンドウを付け替える。
+ */
 export async function openSessionWindow(
   sessionId: string,
   snapshot: string,
@@ -98,13 +106,15 @@ export async function openSessionWindow(
   await invoke("open_session_window", { sessionId, snapshot, x, y });
 }
 
-/// 移譲先ウィンドウが引き継ぎデータ (表示状態 JSON) を取り出す (1 回限り)。
+/** 移譲先ウィンドウが引き継ぎデータ (表示状態 JSON) を取り出す (1 回限り)。 */
 export async function takeHandoff(sessionId: string): Promise<string | null> {
   return await invoke<string | null>("take_handoff", { sessionId });
 }
 
-/// 既存セッションの表示先を、この webview の Channel へ差し替える (移譲先がアタッチ)。
-/// networking はそのままなので、別途 requestKeyframe で映像を復帰させる。
+/**
+ * 既存セッションの表示先を、この webview の Channel へ差し替える (移譲先がアタッチ)。
+ * networking はそのままなので、別途 requestKeyframe で映像を復帰させる。
+ */
 export async function attachSession(
   sessionId: string,
   eventChannel: Channel<ClientEvent>,
@@ -113,18 +123,20 @@ export async function attachSession(
   await invoke("attach_session", { sessionId, eventChannel, videoChannel });
 }
 
-/// 現在接続中の host 一覧 (重複排除)。ランチャーの接続中表示・切断ボタンの初期化に使う。
-/// 以降の更新は `aurora://connections` イベントで届く。
+/**
+ * 現在接続中の host 一覧 (重複排除)。ランチャーの接続中表示・切断ボタンの初期化に使う。
+ * 以降の更新は `aurora://connections` イベントで届く。
+ */
 export async function connectedHosts(): Promise<string[]> {
   return await invoke<string[]>("connected_hosts");
 }
 
-/// パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。
+/** パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。 */
 export async function savedPasswordHosts(): Promise<string[]> {
   return await invoke<string[]>("saved_password_hosts");
 }
 
-/// 指定 host の保存済みパスワードを削除する (「忘れる」)。
+/** 指定 host の保存済みパスワードを削除する (「忘れる」)。 */
 export async function deleteHostPassword(host: string): Promise<void> {
   await invoke("delete_host_password", { host });
 }
@@ -133,8 +145,10 @@ export async function disconnect(sessionId: string): Promise<void> {
   await invoke("disconnect", { sessionId });
 }
 
-/// 指定 host の全セッションを Rust 側で停止する (ランチャーの切断ボタン)。窓が閉じた後に
-/// 残った孤児セッションも host 名で確実に止められる (`aurora://disconnect-host` の補完)。
+/**
+ * 指定 host の全セッションを Rust 側で停止する (ランチャーの切断ボタン)。窓が閉じた後に
+ * 残った孤児セッションも host 名で確実に止められる (`aurora://disconnect-host` の補完)。
+ */
 export async function disconnectHost(host: string): Promise<void> {
   await invoke("disconnect_host", { host });
 }
@@ -165,12 +179,12 @@ export function isPerfEnabled(): boolean {
   return perfFlag;
 }
 
-/// ログフォルダ (%LOCALAPPDATA%\Aurora\logs) をエクスプローラで開く。
+/** ログフォルダ (%LOCALAPPDATA%\Aurora\logs) をエクスプローラで開く。 */
 export async function openLogsFolder(): Promise<void> {
   await invoke("open_logs_folder");
 }
 
-/// ログ一式を ZIP にまとめて書き出し、生成先パスを返す。
+/** ログ一式を ZIP にまとめて書き出し、生成先パスを返す。 */
 export async function exportLogsZip(): Promise<string> {
   return await invoke("export_logs_zip");
 }
@@ -179,7 +193,7 @@ export async function selectDisplay(sessionId: string, id: number): Promise<void
   await invoke("select_display", { sessionId, id });
 }
 
-/// 映像パラメータ (fps 上限 / ビットレート上限 bps) を実行時にホストへ送る。
+/** 映像パラメータ (fps 上限 / ビットレート上限 bps) を実行時にホストへ送る。 */
 export async function setVideoParams(
   sessionId: string,
   fps: number,
@@ -188,31 +202,39 @@ export async function setVideoParams(
   await invoke("set_video_params", { sessionId, fps, maxBitrateBps });
 }
 
-/// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
+/** 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。 */
 export async function setAudioMuted(sessionId: string, muted: boolean): Promise<void> {
   await invoke("set_audio_muted", { sessionId, muted });
 }
 
-/// 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
-/// 再開時は別途 requestKeyframe で映像を復帰させる。
+/**
+ * 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
+ * 再開時は別途 requestKeyframe で映像を復帰させる。
+ */
 export async function setVideoPaused(sessionId: string, paused: boolean): Promise<void> {
   await invoke("set_video_paused", { sessionId, paused });
 }
 
-/// 映像へのカーソル合成 ON/OFF をホストへ送る (マウスキャプチャ中だけ ON)。
-/// DXGI はカーソルを映像に含めないため、キャプチャ中はホストが焼き込んだカーソルを表示する。
+/**
+ * 映像へのカーソル合成 ON/OFF をホストへ送る (マウスキャプチャ中だけ ON)。
+ * DXGI はカーソルを映像に含めないため、キャプチャ中はホストが焼き込んだカーソルを表示する。
+ */
 export async function setCursorOverlay(sessionId: string, enabled: boolean): Promise<void> {
   await invoke("set_cursor_overlay", { sessionId, enabled });
 }
 
-/// 送出する映像の最大高さ (px、0 = キャプチャ解像度のまま) をホストへ送る。
-/// ホストが GPU で縮小 (アスペクト比維持) してからエンコードする。
+/**
+ * 送出する映像の最大高さ (px、0 = キャプチャ解像度のまま) をホストへ送る。
+ * ホストが GPU で縮小 (アスペクト比維持) してからエンコードする。
+ */
 export async function setResolution(sessionId: string, maxHeight: number): Promise<void> {
   await invoke("set_resolution", { sessionId, maxHeight });
 }
 
-/// クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
-/// 対応モードへ解像度を変更する (RDP 風・黒帯解消)。
+/**
+ * クライアントの映像表示領域サイズ (物理 px) をホストへ送る。ホストはこれに最も近い
+ * 対応モードへ解像度を変更する (RDP 風・黒帯解消)。
+ */
 export async function setClientViewport(
   sessionId: string,
   width: number,
@@ -225,35 +247,39 @@ export async function requestFile(id: number, path: string): Promise<void> {
   await invoke("request_file", { sessionId: sid(), id, path });
 }
 
-/// ローカルのファイルパス (キャプチャ画面への D&D 由来) を host へアップロードする。
-/// Rust 側がファイルを読み、既存のアップロードプロトコルで送る。
+/**
+ * ローカルのファイルパス (キャプチャ画面への D&D 由来) を host へアップロードする。
+ * Rust 側がファイルを読み、既存のアップロードプロトコルで送る。
+ */
 export async function uploadFileFromPath(id: number, path: string): Promise<void> {
   await invoke("upload_file_from_path", { sessionId: sid(), id, path });
 }
 
-/// 指定セッションのファイル共有 (ProjFS ドライブ投影) を有効/無効にする。有効時は
-/// **このPC (client) の This PC 全体 (全ドライブ)** をホストの仮想ドライブへ公開する。
-/// 設定は接続成立時に session が自分の id で適用する (登録端末のみホストにドライブが出る)。
+/**
+ * 指定セッションのファイル共有 (ProjFS ドライブ投影) を有効/無効にする。有効時は
+ * **このPC (client) の This PC 全体 (全ドライブ)** をホストの仮想ドライブへ公開する。
+ * 設定は接続成立時に session が自分の id で適用する (登録端末のみホストにドライブが出る)。
+ */
 export async function setFileSharing(sessionId: string, enabled: boolean): Promise<void> {
   await invoke("set_file_sharing", { sessionId, enabled });
 }
 
-/// 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。
+/** 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。 */
 export type HostEntry = {
   label: string;
   host: string;
   port: number;
-  /// カードのアバター画像 (data URL、空なら頭文字アバター)。任意 (古い設定/URL 由来は未設定)。
+  /** カードのアバター画像 (data URL、空なら頭文字アバター)。任意 (古い設定/URL 由来は未設定)。 */
   icon?: string;
 };
 
-/// 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。
+/** 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。 */
 export type ThemeId = "auto" | "dark" | "light" | "legacy";
 
-/// ツールバーの配置。left/right では縦並びのサイドバーになる。
+/** ツールバーの配置。left/right では縦並びのサイドバーになる。 */
 export type ToolbarPosition = "top" | "bottom" | "left" | "right";
 
-/// クライアント設定 (Rust 側 config::ClientSettings と対応)。
+/** クライアント設定 (Rust 側 config::ClientSettings と対応)。 */
 export type ClientSettings = {
   default_fullscreen: boolean;
   show_stats: boolean;
@@ -271,32 +297,32 @@ export type ClientSettings = {
   share_files: boolean;
 };
 
-/// 接続先 host の履歴を読み込む (最新が先頭)。
+/** 接続先 host の履歴を読み込む (最新が先頭)。 */
 export async function loadRecentHosts(): Promise<HostEntry[]> {
   return await invoke<HostEntry[]>("load_recent_hosts");
 }
 
-/// 接続成功した host を履歴へ保存する (host で重複排除・更新)。
+/** 接続成功した host を履歴へ保存する (host で重複排除・更新)。 */
 export async function saveRecentHost(entry: HostEntry): Promise<void> {
   await invoke("save_recent_host", { entry });
 }
 
-/// 指定 host を履歴から削除する。
+/** 指定 host を履歴から削除する。 */
 export async function deleteRecentHost(host: string): Promise<void> {
   await invoke("delete_recent_host", { host });
 }
 
-/// 履歴の並び順を丸ごと置き換える (ドラッグ並べ替え後)。
+/** 履歴の並び順を丸ごと置き換える (ドラッグ並べ替え後)。 */
 export async function setRecentHosts(hosts: HostEntry[]): Promise<void> {
   await invoke("set_recent_hosts", { hosts });
 }
 
-/// クライアント設定を読み込む。
+/** クライアント設定を読み込む。 */
 export async function loadSettings(): Promise<ClientSettings> {
   return await invoke<ClientSettings>("load_settings");
 }
 
-/// クライアント設定を保存する。
+/** クライアント設定を保存する。 */
 export async function saveSettings(settings: ClientSettings): Promise<void> {
   await invoke("save_settings", { settings });
 }
