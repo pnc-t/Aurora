@@ -51,6 +51,7 @@ impl WinInjector {
 
     fn send_one(&self, input: INPUT) -> Result<()> {
         let arr = [input];
+        // SAFETY: arr は 1 要素の有効な INPUT 配列。サイズ引数は INPUT の実サイズ。
         let n = unsafe { SendInput(&arr, std::mem::size_of::<INPUT>() as i32) };
         if n != 1 {
             return Err(anyhow!("SendInput returned {n}"));

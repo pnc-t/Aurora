@@ -320,6 +320,7 @@ impl Converter {
         };
 
         // 縮小ブリット用の線形サンプラ (アスペクト維持・端はクランプ)。
+        // SAFETY: device は live。CreateSamplerState は OUT に COM を書き、戻り値を ? で確認する。
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -343,6 +344,7 @@ impl Converter {
             inv_scale: 1.0 / scale.max(f32::MIN_POSITIVE),
             _pad: [0.0; 2],
         };
+        // SAFETY: device は live。init.pSysMem=&params は size と整合。CreateBuffer の結果は ? で確認。
         let cbuffer = unsafe {
             let desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<Params>() as u32,
@@ -365,6 +367,7 @@ impl Converter {
         };
 
         // カーソル形状をくっきり重ねるための point サンプラ (端はクランプ)。
+        // SAFETY: device は live。CreateSamplerState は OUT に COM を書き、戻り値を ? で確認する。
         let cursor_sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
@@ -383,6 +386,7 @@ impl Converter {
         };
 
         // カーソル定数バッファ (位置はフレーム毎に変わるため DYNAMIC・CPU 書き込み)。
+        // SAFETY: device は live。CreateBuffer は OUT に COM を書き、戻り値を ? で確認 (初期データなし)。
         let cursor_cbuffer = unsafe {
             let desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<CursorParams>() as u32,
@@ -400,6 +404,7 @@ impl Converter {
         };
 
         // ストレートアルファ合成用ブレンド (dst = src.rgb*src.a + dst*(1-src.a))。
+        // SAFETY: device は live。CreateBlendState は OUT に COM を書き、戻り値を ? で確認する。
         let blend = unsafe {
             let rt = D3D11_RENDER_TARGET_BLEND_DESC {
                 BlendEnable: true.into(),
@@ -421,6 +426,7 @@ impl Converter {
         };
 
         // フルスクリーン三角形の巻き順に依存しないよう cull を無効化。
+        // SAFETY: device は live。CreateRasterizerState は OUT に COM を書き、戻り値を ? で確認する。
         let raster = unsafe {
             let desc = D3D11_RASTERIZER_DESC {
                 FillMode: D3D11_FILL_SOLID,
@@ -1088,6 +1094,7 @@ unsafe fn compile_shader(
     let mut code: Option<ID3DBlob> = None;
     let mut err: Option<ID3DBlob> = None;
     let src = SHADER_HLSL.as_bytes();
+    // SAFETY: src は静的 HLSL のバイト列で ptr/len 整合。OUT の code/err は Option で受ける。
     let result = unsafe {
         D3DCompile(
             src.as_ptr() as *const c_void,

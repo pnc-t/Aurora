@@ -34,8 +34,8 @@ pub struct Frame {
 #[derive(Clone)]
 pub struct SendTexture(pub ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D);
 
-// SAFETY: 上記の根拠 (multithread-protected device) によりスレッド間 move は安全。
 #[cfg(target_os = "windows")]
+// SAFETY: 上記の根拠 (multithread-protected device) によりスレッド間 move は安全。
 unsafe impl Send for SendTexture {}
 
 pub trait ScreenCapturer: Send {

@@ -469,6 +469,7 @@ mod imp {
         let pb = unsafe {
             std::slice::from_raw_parts(paths.as_ptr() as *const u8, std::mem::size_of_val(paths))
         };
+        // SAFETY: 同上 (modes も #[repr(C)] の POD)。ptr/len は size_of_val で整合。
         let mb = unsafe {
             std::slice::from_raw_parts(modes.as_ptr() as *const u8, std::mem::size_of_val(modes))
         };
