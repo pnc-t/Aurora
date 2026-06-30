@@ -469,6 +469,17 @@ pub async fn connect_to_host(
     r
 }
 
+/// この端末の表示名 (PC 名) を返す。host のデバイスピン留め登録時に「どの PC を登録したか」を
+/// 判別できるよう、ハンドシェイク payload で host へ渡す。Windows は `COMPUTERNAME`、他 OS は
+/// `HOSTNAME` を見る。取得できなければ空文字 (host 側で既定ラベル device-xxxx にフォールバック)。
+fn local_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_inner(
     app: tauri::AppHandle,
@@ -542,7 +553,11 @@ async fn connect_inner(
     hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
     hs.read_msg(&buf, &mut tmp).map_err(err)?;
     // -> s, se, psk
-    hs.write_msg(&[], &mut out_msg).map_err(err)?;
+    // 最終メッセージの (暗号化済み) payload にこの端末名 (PC 名) を載せる。host はデバイス
+    // ピン留め登録時にこれを表示ラベルにし、トレイの一覧で「どの PC を登録したか」を判別できる。
+    // 名前は機密ではないが平文露出も避けたいので、payload (XXpsk3 の 3 通目は暗号化される) で渡す。
+    hs.write_msg(local_device_name().as_bytes(), &mut out_msg)
+        .map_err(err)?;
     hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
 
     // snow の StatelessTransportState は encrypt/decrypt とも &self なので、
