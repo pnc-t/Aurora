@@ -4,7 +4,8 @@
 //!
 //! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// host 全体で共有する接続 PSK。net 層が接続受理時に読み、tray がパスワード変更時に書く。
@@ -25,9 +26,113 @@ pub type SharedDevices = Arc<crate::security::DeviceGuard>;
 /// ポート変更を net の accept ループへ伝える反映トリガ (`notify_one` で TCP/UDP 貼り直し)。
 pub type Reload = Arc<tokio::sync::Notify>;
 
+/// tray が `TrayBus` を共有して受け取るための別名。
+pub type SharedTrayBus = Arc<TrayBus>;
+
+/// net→tray へ「何が起きたか」を 1 件ずつ伝える通知イベント。tray が `WM_TIMER` で drain して
+/// バルーン通知に変換する。文字列ラベルは表示用に整形済み (端末名 or peer IP)。
+pub enum TrayEvent {
+    /// クライアント確立 (UDP hello 完了)。
+    Connected(String),
+    /// クライアント切断。
+    Disconnected(String),
+    /// デバイスピン留めのペアリングで新規端末を信頼登録した。
+    Enrolled(String),
+}
+
+/// 最大保持イベント数。あふれたら古いものを捨てる (常駐 UI なので無限に溜めない)。
+const MAX_TRAY_EVENTS: usize = 32;
+
+/// host の実行時ステータスと通知イベントを **net→tray で受け渡す共有バス**。
+///
+/// net (tokio タスク) が接続/切断/登録で更新し、tray (UI スレッド) が `WM_TIMER` でポーリングして
+/// ツールチップ/メニュー/バルーン通知へ反映する。クロススレッドの `PostMessage` や `HWND` 共有を
+/// 避け、本プロジェクトの actor 風 (メッセージ受け渡し) に倣って結合を切るための仕組み。
+/// 中身はプレーンな同期プリミティブのみで Win32 に依存しないため、全 OS でコンパイルできる
+/// (実体のある通知表示は Windows の tray 側だけ)。
+pub struct TrayBus {
+    /// 確立済みクライアント数。アイコン/ツールチップ/メニューの「接続中」表示に使う。
+    connected: AtomicUsize,
+    /// 直近に接続した端末の表示ラベル (ツールチップ/メニュー用)。全切断で `None` に戻す。
+    last_peer: Mutex<Option<String>>,
+    /// 未処理の通知イベント (bounded)。tray が drain する。
+    events: Mutex<VecDeque<TrayEvent>>,
+}
+
+impl TrayBus {
+    /// 空のバスを生成して共有ハンドルで返す。常に `Arc` 越しに使うため `Self` でなく共有別名を返す。
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> SharedTrayBus {
+        Arc::new(Self {
+            connected: AtomicUsize::new(0),
+            last_peer: Mutex::new(None),
+            events: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// 確立済みクライアント数。
+    pub fn connected_count(&self) -> usize {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// 直近に接続した端末ラベル (あれば)。
+    pub fn last_peer(&self) -> Option<String> {
+        self.last_peer.lock().ok().and_then(|p| p.clone())
+    }
+
+    /// クライアント確立を記録する (net が UDP hello 完了後に呼ぶ)。
+    pub fn on_connected(&self, label: String) {
+        self.connected.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut p) = self.last_peer.lock() {
+            *p = Some(label.clone());
+        }
+        self.push(TrayEvent::Connected(label));
+    }
+
+    /// クライアント切断を記録する (net がセッション後始末で呼ぶ)。全切断で直近ラベルを消す。
+    pub fn on_disconnected(&self, label: String) {
+        // 飽和減算で 0 未満にしない (確立/切断は対で呼ぶが、防御的に floor する)。
+        let prev = self
+            .connected
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if prev <= 1 {
+            if let Ok(mut p) = self.last_peer.lock() {
+                *p = None;
+            }
+        }
+        self.push(TrayEvent::Disconnected(label));
+    }
+
+    /// ペアリングでの新規端末登録を記録する。
+    pub fn on_enrolled(&self, label: String) {
+        self.push(TrayEvent::Enrolled(label));
+    }
+
+    /// 溜まった通知イベントを取り出す (tray の `WM_TIMER` が呼ぶ)。
+    pub fn drain_events(&self) -> Vec<TrayEvent> {
+        self.events
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn push(&self, ev: TrayEvent) {
+        if let Ok(mut q) = self.events.lock() {
+            if q.len() >= MAX_TRAY_EVENTS {
+                q.pop_front();
+            }
+            q.push_back(ev);
+        }
+    }
+}
+
 /// トレイ常駐 UI を別スレッドで起動する。`prompt_now` が真なら起動直後に変更ダイアログを
 /// 自動表示する (保存パスワードが無い初回向け)。
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     psk: SharedPsk,
     has_password: SharedHasPassword,
@@ -35,6 +140,7 @@ pub fn spawn(
     reload: Reload,
     auth_failures: SharedAuthFailures,
     devices: SharedDevices,
+    bus: SharedTrayBus,
     prompt_now: bool,
 ) {
     let _ = std::thread::Builder::new()
@@ -47,6 +153,7 @@ pub fn spawn(
                 reload,
                 auth_failures,
                 devices,
+                bus,
                 prompt_now,
             ) {
                 tracing::warn!(error = %e, "tray UI disabled");
@@ -55,6 +162,7 @@ pub fn spawn(
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     _psk: SharedPsk,
     _has_password: SharedHasPassword,
@@ -62,6 +170,7 @@ pub fn spawn(
     _reload: Reload,
     _auth_failures: SharedAuthFailures,
     _devices: SharedDevices,
+    _bus: SharedTrayBus,
     _prompt_now: bool,
 ) {
 }
@@ -70,8 +179,10 @@ pub fn spawn(
 mod imp {
     use super::{
         Reload, SharedAuthFailures, SharedDevices, SharedHasPassword, SharedPort, SharedPsk,
+        SharedTrayBus, TrayEvent,
     };
     use aurora_common::noise::psk_from_password;
+    use std::cell::Cell;
     use std::ffi::c_void;
     use std::sync::atomic::Ordering;
     use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -81,7 +192,8 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
     use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+        NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::core::{PCWSTR, w};
@@ -111,8 +223,18 @@ mod imp {
     /// ポート変更ダイアログの入力欄 ID。
     const ID_EDIT_PORT: i32 = 110;
 
+    /// ステータス監視タイマの ID と間隔 (ms)。接続数の変化検知・通知バルーン・ツールチップ更新を
+    /// 1 秒周期で回す (常駐 UI のため軽量・低頻度で十分)。
+    const TIMER_ID: usize = 1;
+    const TIMER_MS: u32 = 1000;
+    /// 認証失敗バルーンの再通知抑止 (tick 数)。総当たり中に毎秒鳴らさないため。
+    const AUTH_BALLOON_COOLDOWN: u32 = 30;
+
     /// 隠しウィンドウに紐づける共有状態。パスワード変更で PSK を書き換え、設定済みフラグを
     /// 立てる。`GWLP_USERDATA` にこの Box のポインタを格納する。
+    ///
+    /// `last_*` / `auth_cooldown` は `WM_TIMER` (tray スレッド単独) でのみ触る差分検知用の状態で、
+    /// 他スレッドと共有しないため `Cell` で十分 (net 側は `bus` を別 `Arc` で持つ)。
     struct WndState {
         psk: SharedPsk,
         has_password: SharedHasPassword,
@@ -120,6 +242,14 @@ mod imp {
         reload: Reload,
         auth_failures: SharedAuthFailures,
         devices: SharedDevices,
+        /// net→tray の実行時ステータス/通知バス。
+        bus: SharedTrayBus,
+        /// 前 tick の確立済みクライアント数 (変化時のみツールチップ/アイコンを更新)。
+        last_connected: Cell<usize>,
+        /// 前 tick の累計認証失敗数 (増分でバルーン通知)。
+        last_auth: Cell<u32>,
+        /// 認証失敗バルーンのクールダウン残 tick。
+        auth_cooldown: Cell<u32>,
     }
 
     /// UTF-16 NUL 終端へ変換する (固定長配列へのコピー用)。
@@ -163,6 +293,7 @@ mod imp {
         reload: Reload,
         auth_failures: SharedAuthFailures,
         devices: SharedDevices,
+        bus: SharedTrayBus,
         prompt_now: bool,
     ) -> windows::core::Result<()> {
         // SAFETY: トレイ用隠しウィンドウ生成一式。各 Win32 呼び出しの結果は ? で確認する。
@@ -180,6 +311,8 @@ mod imp {
             };
             RegisterClassW(&wc);
 
+            // 起動時点の累計失敗数を基準にする (再起動前の失敗で即バルーンを出さない)。
+            let auth_base = auth_failures.load(Ordering::Relaxed);
             // 共有状態をウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
             let boxed: *mut WndState = Box::into_raw(Box::new(WndState {
                 psk,
@@ -188,6 +321,10 @@ mod imp {
                 reload,
                 auth_failures,
                 devices,
+                bus,
+                last_connected: Cell::new(0),
+                last_auth: Cell::new(auth_base),
+                auth_cooldown: Cell::new(0),
             }));
 
             // メッセージ受信専用の不可視ウィンドウ。表示しないので位置/サイズは既定でよい。
@@ -227,9 +364,17 @@ mod imp {
                 hIcon: hicon,
                 ..Default::default()
             };
-            let tip = to_wide("Aurora Host");
-            nid.szTip[..tip.len()].copy_from_slice(&tip);
+            // 初期ツールチップは待受ポートを含めた状態文。接続が成立したら WM_TIMER が更新する。
+            if let Some(state) = wnd_state(hwnd) {
+                let text = tooltip_text(0, state.port.load(Ordering::Relaxed), None);
+                let init_tip = to_wide_capped(&text, nid.szTip.len());
+                nid.szTip[..init_tip.len()].copy_from_slice(&init_tip);
+            }
             let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+
+            // ステータス監視タイマを開始する。接続/切断/認証失敗を WM_TIMER でポーリングし、
+            // ツールチップ更新とバルーン通知へ反映する (net→tray は bus 経由でポーリング結合)。
+            let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
 
             // 初回 (保存パスワード無し) は起動直後に変更ダイアログを出す。
             if prompt_now {
@@ -279,6 +424,12 @@ mod imp {
                     }
                     LRESULT(0)
                 }
+                WM_TIMER => {
+                    if wparam.0 == TIMER_ID {
+                        on_timer(hwnd);
+                    }
+                    LRESULT(0)
+                }
                 WM_COMMAND => {
                     let cmd = wparam.0 & 0xffff;
                     match cmd {
@@ -302,6 +453,7 @@ mod imp {
                     LRESULT(0)
                 }
                 WM_DESTROY => {
+                    let _ = KillTimer(hwnd, TIMER_ID);
                     PostQuitMessage(0);
                     LRESULT(0)
                 }
@@ -322,6 +474,135 @@ mod imp {
         }
     }
 
+    /// ステータス監視タイマ (`WM_TIMER`)。bus をポーリングし、接続/切断/登録の通知バルーンを出し、
+    /// 接続数の変化でツールチップを更新し、認証失敗の増分を (クールダウン付きで) 警告通知する。
+    fn on_timer(hwnd: HWND) {
+        // SAFETY: wnd_state は run が Box::into_raw でセットした生存中の WndState を返す。
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+
+        // 1) 通知イベント → バルーン。接続/切断/登録をオーナーへ能動通知する (無人ホストの気付き)。
+        for ev in state.bus.drain_events() {
+            match ev {
+                TrayEvent::Connected(label) => balloon(
+                    hwnd,
+                    "Aurora Host",
+                    &format!("端末「{label}」が接続しました"),
+                    false,
+                ),
+                TrayEvent::Disconnected(label) => balloon(
+                    hwnd,
+                    "Aurora Host",
+                    &format!("端末「{label}」が切断しました"),
+                    false,
+                ),
+                TrayEvent::Enrolled(label) => balloon(
+                    hwnd,
+                    "Aurora Host",
+                    &format!("端末「{label}」を登録しました (デバイスピン留め)"),
+                    false,
+                ),
+            }
+        }
+
+        // 2) 接続数が変わったらツールチップを更新する (待受中 ⇄ 接続中)。
+        let n = state.bus.connected_count();
+        if n != state.last_connected.get() {
+            state.last_connected.set(n);
+            let text = tooltip_text(n, state.port.load(Ordering::Relaxed), state.bus.last_peer());
+            update_tooltip(hwnd, &text);
+        }
+
+        // 3) 認証失敗の増分を警告バルーンで通知する (クールダウンで連打を抑える)。
+        let cd = state.auth_cooldown.get();
+        if cd > 0 {
+            state.auth_cooldown.set(cd - 1);
+        }
+        let f = state.auth_failures.load(Ordering::Relaxed);
+        if f > state.last_auth.get() {
+            state.last_auth.set(f);
+            if state.auth_cooldown.get() == 0 {
+                state.auth_cooldown.set(AUTH_BALLOON_COOLDOWN);
+                balloon(
+                    hwnd,
+                    "Aurora Host — 認証失敗",
+                    &format!(
+                        "認証に失敗した接続があります (起動以降 合計 {f} 回)。\n\
+                         心当たりが無ければパスワード変更を検討してください。"
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+
+    /// ツールチップ本文を組み立てる。接続中は端末名、待受中は待受ポートを示す。
+    fn tooltip_text(connected: usize, port: u16, last_peer: Option<String>) -> String {
+        if connected == 0 {
+            return format!("Aurora Host — 待受中 (ポート {port})");
+        }
+        match last_peer {
+            Some(label) if connected == 1 => format!("Aurora Host — 接続中: {label}"),
+            Some(label) => format!("Aurora Host — 接続中: {connected} 台 ({label} 他)"),
+            None => format!("Aurora Host — 接続中: {connected} 台"),
+        }
+    }
+
+    /// トレイアイコンのツールチップ (ホバー表示) を更新する。`szTip` は 128 wchar 固定長。
+    fn update_tooltip(hwnd: HWND, text: &str) {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_TIP,
+            ..Default::default()
+        };
+        let tip = to_wide_capped(text, nid.szTip.len());
+        nid.szTip[..tip.len()].copy_from_slice(&tip);
+        // SAFETY: nid は同じ hWnd+uID の既存アイコンを指し、szTip は NUL 終端済みで配列内に収まる。
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    /// バルーン通知 (トースト) を表示する。`warning` で警告アイコンにする。
+    fn balloon(hwnd: HWND, title: &str, text: &str, warning: bool) {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_INFO,
+            dwInfoFlags: if warning { NIIF_WARNING } else { NIIF_INFO },
+            ..Default::default()
+        };
+        let info = to_wide_capped(text, nid.szInfo.len());
+        nid.szInfo[..info.len()].copy_from_slice(&info);
+        let head = to_wide_capped(title, nid.szInfoTitle.len());
+        nid.szInfoTitle[..head.len()].copy_from_slice(&head);
+        // SAFETY: nid は既存アイコン (同 hWnd+uID) を指し、szInfo/szInfoTitle は NUL 終端で配列内に収まる。
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    /// UTF-16 へ変換し、NUL 終端込みで `cap` wchar に収める (固定長 `sz*` 配列へのコピー用)。
+    fn to_wide_capped(s: &str, cap: usize) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().take(cap.saturating_sub(1)).collect();
+        v.push(0);
+        v
+    }
+
+    /// トグル項目のラベル。現在状態 (オン/オフ) を名前直後に置き、操作は副次的に併記して
+    /// 「今どちらか」と「押すとどうなるか」を取り違えないようにする (チェックマークと併用)。
+    fn toggle_label(name: &str, on: bool) -> String {
+        if on {
+            format!("{name}：オン  ―  クリックでオフにする")
+        } else {
+            format!("{name}：オフ  ―  クリックでオンにする")
+        }
+    }
+
     /// トレイの右クリックメニューを表示する。
     unsafe fn show_menu(hwnd: HWND) {
         // SAFETY: メニュー構築一式の Win32 呼び出し。hwnd は有効で各 API の結果は確認する。
@@ -330,16 +611,35 @@ mod imp {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            // 認証失敗の累計を情報行 (操作不可) として先頭に出す。0 のときは出さない。
-            // 総当たりに晒されていればここで数が伸びるので、オーナーが気付ける。
+            // 先頭に現在のステータスを情報行 (操作不可) として出す。一目で「今だれか繋いでいるか」
+            // 「待受ポート」「総当たりに晒されていないか」が分かるようにする。
+            // AppendMenuW は文字列を内部コピーするので、各ラベルは直後に drop してよい。
             if let Some(state) = wnd_state(hwnd) {
-                let n = state.auth_failures.load(Ordering::Relaxed);
-                if n > 0 {
-                    let label = to_wide(&format!("認証失敗: {n} 回 (起動以降)"));
-                    // AppendMenuW は文字列を内部コピーするので label は直後に drop してよい。
-                    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(label.as_ptr()));
-                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                let n = state.bus.connected_count();
+                let conn = if n == 0 {
+                    "○ 接続なし (待受中)".to_string()
+                } else {
+                    match state.bus.last_peer() {
+                        Some(l) if n == 1 => format!("● 接続中: {l}"),
+                        Some(l) => format!("● 接続中: {n} 台 ({l} 他)"),
+                        None => format!("● 接続中: {n} 台"),
+                    }
+                };
+                let conn_w = to_wide(&conn);
+                let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(conn_w.as_ptr()));
+
+                let port_w = to_wide(&format!(
+                    "　待受ポート: {}",
+                    state.port.load(Ordering::Relaxed)
+                ));
+                let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(port_w.as_ptr()));
+
+                let failures = state.auth_failures.load(Ordering::Relaxed);
+                if failures > 0 {
+                    let fail_w = to_wide(&format!("　認証失敗: {failures} 回 (起動以降)"));
+                    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(fail_w.as_ptr()));
                 }
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
             let _ = AppendMenuW(menu, MF_STRING, ID_CHANGE, w!("パスワードを変更..."));
             let _ = AppendMenuW(menu, MF_STRING, ID_PORT, w!("ポートを変更..."));
@@ -349,11 +649,7 @@ mod imp {
             // はラベルの UTF-16 バッファを TrackPopupMenu まで生かすための保持先 (AppendMenuW は
             // 内部コピーするが、後続のサブメニュー構築をまたぐため明示的に束ねる)。
             let installed = crate::system::is_installed();
-            let autostart_label = to_wide(if installed {
-                "ログオン時に自動起動: 有効 (クリックで無効化)"
-            } else {
-                "ログオン時に自動起動: 無効 (クリックで有効化)"
-            });
+            let autostart_label = to_wide(&toggle_label("ログオン時に自動起動", installed));
             let autostart_flags = MF_STRING | if installed { MF_CHECKED } else { MF_UNCHECKED };
             let _ = AppendMenuW(
                 menu,
@@ -373,11 +669,7 @@ mod imp {
             let mut _submenus: Vec<HMENU> = Vec::new();
             if let Some(state) = wnd_state(hwnd) {
                 let enabled = state.devices.enabled();
-                let toggle = to_wide(if enabled {
-                    "デバイスピン留め: 有効 (クリックで無効化)"
-                } else {
-                    "デバイスピン留め: 無効 (クリックで有効化)"
-                });
+                let toggle = to_wide(&toggle_label("デバイスピン留め", enabled));
                 let toggle_flags = MF_STRING | if enabled { MF_CHECKED } else { MF_UNCHECKED };
                 let _ = AppendMenuW(menu, toggle_flags, ID_PIN_TOGGLE, PCWSTR(toggle.as_ptr()));
                 _keep.push(toggle);

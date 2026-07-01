@@ -100,6 +100,9 @@ pub struct ServerConfig {
     /// クライアントの RequestKeyframe で立て、capture が直近フレームを再投入する。画面静止中に
     /// 接続/再同期しても黒画面のまま固まらないようにするための仕組み (DXGI は変化フレームのみ返す)。
     pub force_frame: Arc<std::sync::atomic::AtomicBool>,
+    /// net→tray の実行時ステータス/通知バス。接続確立/切断/ペアリング登録を記録し、tray が
+    /// ツールチップ更新・バルーン通知に使う。
+    pub tray_bus: Arc<crate::tray::TrayBus>,
 }
 
 /// 同一アドレスで TCP/UDP を bind する。キャプチャ固着回復の re-exec 直後は、旧プロセスが
@@ -337,6 +340,8 @@ pub(crate) struct ClientArgs {
     conn_id: u64,
     /// 接続/キーフレーム要求時に capture へ現在の画面の強制送出を促す共有フラグ ([`ServerConfig`])。
     force_frame: Arc<std::sync::atomic::AtomicBool>,
+    /// net→tray の実行時ステータス/通知バス ([`ServerConfig`])。
+    tray_bus: Arc<crate::tray::TrayBus>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -514,6 +519,7 @@ pub async fn run_server(
                 registry: registry.clone(),
                 conn_id,
                 force_frame: cfg.force_frame.clone(),
+                tray_bus: cfg.tray_bus.clone(),
             };
             // 各接続を独立 task で処理する (await で占有しない = 複数クライアント同時)。
             tokio::spawn(

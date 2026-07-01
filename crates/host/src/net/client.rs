@@ -1,6 +1,25 @@
 //! 1 接続の処理: Noise ハンドシェイク〜UDP hello〜映像/音声/入力/制御/ファイル転送のセッションループ。
 use super::*;
 
+/// tray 表示 (ツールチップ/バルーン) 用の端末ラベルを作る。クライアント申告の端末名を
+/// 制御文字除去・trim・長さ制限してそのまま使い、空なら peer IP へフォールバックする。
+/// 申告名は任意値なので表示専用に整える (認証は公開鍵で行い、ここでは身元保証に使わない)。
+fn display_label(device_name: &str, ip: std::net::IpAddr) -> String {
+    let cleaned: String = device_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(40)
+        .collect();
+    if cleaned.is_empty() {
+        ip.to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     let ClientArgs {
         peer,
@@ -22,6 +41,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         registry,
         conn_id,
         force_frame,
+        tray_bus,
     } = args;
     // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
     // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop) で
@@ -99,8 +119,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
     // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
+    // tray のツールチップ/バルーン通知に出す表示ラベル (端末名 or peer IP)。確立と切断で同じ
+    // ラベルを使い、通知の対を揃える。
+    let peer_label = display_label(&device_name, peer.ip());
     if let crate::security::Admit::Enrolled = &admit {
         tracing::info!(peer = %peer, name = %device_name, "device pinning: enrolled this device via pairing window");
+        tray_bus.on_enrolled(peer_label.clone());
     }
     tracing::info!(peer = %peer, "noise handshake complete");
 
@@ -175,6 +199,10 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     tracing::info!(peer_udp = %peer_udp, "UDP peer registered");
     // ここまで来たら TCP 認証 + UDP 対向確定 = 接続確立。映像配信を開始する地点。
     tracing::info!("client connected");
+    // tray へ確立を通知する (接続中バルーン + ツールチップ/メニューの「接続中」表示)。以降は
+    // 早期 return せずセッション後始末を必ず通るため、ここの on_connected と後始末の
+    // on_disconnected が必ず対になる (接続数のカウントがズレない)。
+    tray_bus.on_connected(peer_label.clone());
 
     let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
@@ -707,6 +735,8 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     .await;
 
     // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
+    // 0) tray へ切断を通知する (切断バルーン + 接続数デクリメント)。確立時の on_connected と対。
+    tray_bus.on_disconnected(peer_label);
     // 1) stuck key 防止: 押下中のキー/マウスボタンへ解放イベントを注入する (クライアント毎)。
     let releases = held.release_events();
     if !releases.is_empty() {
