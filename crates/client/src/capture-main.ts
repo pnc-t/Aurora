@@ -33,7 +33,7 @@ import { initToast, showToast, type ToastKind } from "./ui/toast";
 import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./ui/stats-overlay";
 import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
 import { installWebviewGuard } from "./core/webview-guard";
-import { isFullscreen, toggleFullscreen } from "./core/fullscreen";
+import { exitFullscreen, isFullscreen, toggleFullscreen } from "./core/fullscreen";
 import { closeWindow, setResizable } from "./ui/window-controls";
 import { installGlobalErrorLogging, logger } from "./core/log";
 
@@ -283,20 +283,47 @@ async function addSession(
   await s.start();
 }
 
-// --- ローカル UI ホットキー ---
-installWebviewGuard((hotkey) => {
-  if (hotkey === "toggle-stats") {
-    toggleStats();
-    toolbar.setStatsToggled(statsHud.classList.contains("visible"));
-  } else if (hotkey === "toggle-bar") {
-    toolbar.toggleBar();
-  } else if (hotkey === "toggle-fullscreen") {
-    void doToggleFullscreen();
-  } else if (hotkey === "toggle-capture") {
-    const s = active();
-    if (s) s.setCaptureMode(!s.isCaptured());
+// フルスクリーン＋キャプチャからの「脱出」: マウス解放 + 全画面解除 + ツールバー表示。
+// Esc 2 連打 (webview-guard) から呼ぶ。フルスクリーン中は keyboard lock で Esc がホストへ
+// 流れ単押しでは抜けられないため、確実に client 側へ戻れる手段として用意する。
+// 脱出対象 (キャプチャ中 or 全画面) があったら実行して true、無ければ false (Esc はホストへ)。
+function breakout(): boolean {
+  const s = active();
+  const capturing = !!s?.isCaptured();
+  const fs = isFullscreen();
+  if (!capturing && !fs) return false;
+  if (capturing) s?.setCaptureMode(false);
+  if (fs) {
+    void exitFullscreen().then(() => {
+      // doToggleFullscreen の解除側と同じ UI 復帰 (ボタン状態 / タブ再表示 / リサイズ可)。
+      toolbar.setFullscreenToggled(false);
+      tabs.setFullscreen(false);
+      if (active()?.isConnected) void setResizable(true);
+    });
   }
-});
+  // 抜けた直後にツールバーが自動格納だと操作不能なので確実に表示する。
+  toolbar.revealBar();
+  showToast("マウス解放・全画面解除しました");
+  return true;
+}
+
+// --- ローカル UI ホットキー ---
+installWebviewGuard(
+  (hotkey) => {
+    if (hotkey === "toggle-stats") {
+      toggleStats();
+      toolbar.setStatsToggled(statsHud.classList.contains("visible"));
+    } else if (hotkey === "toggle-bar") {
+      toolbar.toggleBar();
+    } else if (hotkey === "toggle-fullscreen") {
+      void doToggleFullscreen();
+    } else if (hotkey === "toggle-capture") {
+      const s = active();
+      if (s) s.setCaptureMode(!s.isCaptured());
+    }
+  },
+  breakout,
+);
 
 // --- ランチャーからの host 単位の切断要求 ---
 // ランチャーの切断ボタンが `aurora://disconnect-host` を全ウィンドウへ emit する。

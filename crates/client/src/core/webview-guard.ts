@@ -9,7 +9,14 @@ import { matchHotkey, type LocalHotkey } from "./shortcuts";
 // 後方互換のため型を re-export (キー定義の正本は core/shortcuts.ts)。
 export type { LocalHotkey };
 
-export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): void {
+/** Esc 2 回連打を「脱出」とみなす最大間隔 (ms)。 */
+const ESC_DOUBLE_TAP_MS = 400;
+
+export function installWebviewGuard(
+  onHotkey?: (hotkey: LocalHotkey) => void,
+  // 脱出した (= マウス解放/全画面解除した) なら true。何もしなければ false で Esc はホストへ通す。
+  onEscapeBreakout?: () => boolean,
+): void {
   // 右クリックメニュー無効化。
   window.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -21,6 +28,9 @@ export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): v
     },
     { passive: false, capture: true },
   );
+
+  // Esc 2 連打の検出用。前回 Esc の時刻を保持する。
+  let lastEsc = 0;
 
   // ブラウザ既定のショートカット抑止 + ローカルホットキー処理 (capture 段階)。
   window.addEventListener(
@@ -34,6 +44,23 @@ export function installWebviewGuard(onHotkey?: (hotkey: LocalHotkey) => void): v
         e.stopImmediatePropagation();
         onHotkey?.(hotkey);
         return;
+      }
+      // Esc 2 連打 = ローカル「脱出」(マウス解放 + 全画面解除)。フルスクリーン中は
+      // keyboard lock で Esc がホストへ転送され、ブラウザの「Esc で解除」も奪われるため、
+      // 押下が遮断されない確実な脱出手段を別に用意する (オートリピートは無視)。
+      // 1 回目は通常どおりホストへ送り (単押し Esc はホスト用)、2 回目「かつ実際に脱出した」
+      // ときだけ握ってホストへ送らない。脱出対象が無い (キャプチャ/全画面でない) 2 連打は
+      // ホストへ素通しする (ホストへ素早く Esc×2 を送る用途を潰さない)。
+      if (onEscapeBreakout && e.code === "Escape" && !e.repeat) {
+        const now = performance.now();
+        const isDouble = now - lastEsc <= ESC_DOUBLE_TAP_MS;
+        lastEsc = now;
+        if (isDouble && onEscapeBreakout()) {
+          lastEsc = 0;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return;
+        }
       }
       if (shouldBlock(e)) e.preventDefault();
     },

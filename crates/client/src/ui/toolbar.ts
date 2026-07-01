@@ -40,6 +40,8 @@ export type ToolbarHandle = {
   setAudioAvailable: (available: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
+  /** ツールバーを確実に表示する (脱出時など)。ピン留めして自動格納されないようにする。 */
+  revealBar: () => void;
   /** ツールバーの配置を切り替える (top/bottom = 横帯、left/right = 縦サイドバー)。 */
   setPosition: (pos: ToolbarPosition) => void;
   /** 接続状態を反映する。pinnedDefault でこのセッションの初期ピン留めを決める。 */
@@ -360,6 +362,11 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     toggleBar(): void {
       if (!connected) return;
       setPinned(!pinned);
+    },
+    /** 脱出時に呼ぶ。トグルでなく確実に表示させたいのでピン留めする (未接続なら無視)。 */
+    revealBar(): void {
+      if (!connected) return;
+      setPinned(true);
     },
     setConnected(isConnected: boolean, pinnedDefault = false): void {
       connected = isConnected;
