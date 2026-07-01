@@ -18,20 +18,16 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 mod audio;
-mod autostart;
 mod capture;
-mod conn;
-mod devices;
 mod display;
 mod encode;
 mod input;
 mod net;
 mod perf;
 mod projfs;
-mod secret;
-mod settings;
+mod security;
+mod system;
 mod tray;
-mod virtualdisplay;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
@@ -224,10 +220,10 @@ fn main() -> Result<()> {
 
     if args.install {
         // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
-        return autostart::install(&autostart::current_forward_args());
+        return system::install(&system::current_forward_args());
     }
     if args.uninstall {
-        return autostart::uninstall();
+        return system::uninstall();
     }
     if args.set_password {
         return finish_console_command(set_password_interactive(), owns_console);
@@ -237,7 +233,7 @@ fn main() -> Result<()> {
         // (素通しだと接続中の操作者が認証を消して締め出し/乗っ取りできてしまう)。
         let result = (|| -> Result<()> {
             require_password_change_authorization()?;
-            secret::clear_password()?;
+            security::clear_password()?;
             println!("stored password cleared");
             Ok(())
         })();
@@ -265,7 +261,7 @@ fn main() -> Result<()> {
     let port = if args.port_explicit {
         args.port
     } else {
-        settings::load_port().unwrap_or(args.port)
+        system::load_port().unwrap_or(args.port)
     };
     let bind = resolve_bind_spec(args.bind.as_deref());
     run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port, bind)
@@ -638,7 +634,7 @@ fn list_displays_cmd() -> Result<()> {
             );
         }
     }
-    match virtualdisplay::detect() {
+    match display::detect() {
         Some(vdd) => {
             let _ = writeln!(out, "\nvirtual display detected: {} (MttVDD)", vdd.gdi_name);
         }
@@ -661,11 +657,11 @@ fn list_displays_cmd() -> Result<()> {
 fn vdd_enrich_cmd() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        if virtualdisplay::detect().is_none() {
+        if display::detect().is_none() {
             println!("no virtual display (MttVDD) detected; install/enable the VDD first");
             return Ok(());
         }
-        match virtualdisplay::ensure_common_resolutions()? {
+        match display::ensure_common_resolutions()? {
             true => {
                 println!("added missing resolutions to vdd_settings.xml.");
                 println!(
@@ -695,7 +691,7 @@ fn vdd_enrich_cmd() -> Result<()> {
 fn vdd_test_restore_cmd() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let Some(vdd) = virtualdisplay::detect() else {
+        let Some(vdd) = display::detect() else {
             println!("no virtual display (MttVDD) detected; enable the VDD first");
             return Ok(());
         };
@@ -780,14 +776,14 @@ fn require_password_change_authorization() -> Result<()> {
     use std::io::Write;
 
     // 接続中は変更を拒否する (リモート操作者による締め出し/乗っ取り防止)。
-    if conn::is_active() {
+    if net::is_active() {
         return Err(anyhow!(
             "クライアント接続中はパスワードを変更できません。切断してから実行してください"
         ));
     }
 
     // 既存パスワードがあるなら、まず現在のパスワードを要求して本人確認する。
-    if let Ok(Some(current)) = secret::load_password() {
+    if let Ok(Some(current)) = security::load_password() {
         if !current.is_empty() {
             print!("Enter current Aurora password: ");
             std::io::stdout().flush().ok();
@@ -830,7 +826,7 @@ fn set_password_interactive() -> Result<()> {
     if let Some(reason) = aurora_common::noise::weak_password_reason(&pw1) {
         eprintln!("warning: {reason}。より強いパスワードを推奨します (このまま保存します)。");
     }
-    secret::save_password(&pw1)?;
+    security::save_password(&pw1)?;
     println!("password saved to secure store (DPAPI, current user)");
     Ok(())
 }
@@ -933,12 +929,12 @@ fn run_server(
     // VDD がデスクトップにアタッチされていたら切り離す。
     // 未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。
     // テイクオーバーが接続時に再アタッチするため、接続の妨げにはならない。
-    if let Some(vdd) = virtualdisplay::detect() {
+    if let Some(vdd) = display::detect() {
         display::detach_vdd_if_attached(&vdd.gdi_name);
     }
     // 保存パスワードの有無を覚えておく。無ければトレイ起動直後に設定ダイアログを促す。
     let mut have_stored = false;
-    let password = match secret::load_password() {
+    let password = match security::load_password() {
         Ok(Some(p)) if !p.is_empty() => {
             println!("password: (from secure store)");
             have_stored = true;
@@ -992,7 +988,7 @@ fn run_server(
     let auth_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
     // デバイスピン留め (クライアント静的鍵の許可リスト) の実行時状態。既定無効。永続化済みの
     // 有効フラグ・許可リストを読み込む。net (照合) と tray (操作) で共有する。
-    let devices = Arc::new(devices::DeviceGuard::load());
+    let devices = Arc::new(security::DeviceGuard::load());
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
     tray::spawn(
@@ -1377,7 +1373,7 @@ fn capture_loop(
                 // するのでここでは扱わない。ここでは解像度変更後に Windows が仮想ディスプレイの GDI 名を
                 // 振り直し cur_name が stale 化する問題のみ救済する (MTT1337 で引き直し、変われば乗換)。
                 if crate::display::is_takeover_active() {
-                    if let Some(v) = crate::virtualdisplay::detect() {
+                    if let Some(v) = crate::display::detect() {
                         if v.gdi_name != cur_name {
                             tracing::info!(old = %cur_name, new = %v.gdi_name, "takeover stall: virtual GDI name changed; retargeting capture");
                             cur_name = v.gdi_name;

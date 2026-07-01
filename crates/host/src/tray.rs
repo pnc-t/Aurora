@@ -20,7 +20,7 @@ pub type SharedPort = Arc<AtomicU16>;
 pub type SharedAuthFailures = Arc<AtomicU32>;
 
 /// デバイスピン留めの実行時状態。net が照合し、tray が有効化/ペアリング/削除を操作する。
-pub type SharedDevices = Arc<crate::devices::DeviceGuard>;
+pub type SharedDevices = Arc<crate::security::DeviceGuard>;
 
 /// ポート変更を net の accept ループへ伝える反映トリガ (`notify_one` で TCP/UDP 貼り直し)。
 pub type Reload = Arc<tokio::sync::Notify>;
@@ -348,7 +348,7 @@ mod imp {
             // ログオン時自動起動のトグル。現在の登録状態をチェックマークで示す。`_autostart`
             // はラベルの UTF-16 バッファを TrackPopupMenu まで生かすための保持先 (AppendMenuW は
             // 内部コピーするが、後続のサブメニュー構築をまたぐため明示的に束ねる)。
-            let installed = crate::autostart::is_installed();
+            let installed = crate::system::is_installed();
             let autostart_label = to_wide(if installed {
                 "ログオン時に自動起動: 有効 (クリックで無効化)"
             } else {
@@ -445,7 +445,7 @@ mod imp {
             return;
         };
         // 接続中はリモート操作者による締め出し/乗っ取りを防ぐため変更を拒否する。
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中はパスワードを変更できません。\n切断してから操作してください。",
@@ -461,7 +461,7 @@ mod imp {
             None
         };
         if let Some(pw) = prompt_password(hwnd, expect_current) {
-            if let Err(e) = crate::secret::save_password(&pw) {
+            if let Err(e) = crate::security::save_password(&pw) {
                 message_box(hwnd, &format!("保存に失敗しました: {e}"), "Aurora Host");
                 return;
             }
@@ -485,7 +485,7 @@ mod imp {
             return;
         };
         // 接続中はソケット貼り直しで相手を切ってしまうため拒否する (パスワード変更と同じ方針)。
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中はポートを変更できません。\n切断してから操作してください。",
@@ -508,7 +508,7 @@ mod imp {
                 );
                 return;
             }
-            if let Err(e) = crate::settings::save_port(new_port) {
+            if let Err(e) = crate::system::save_port(new_port) {
                 message_box(hwnd, &format!("保存に失敗しました: {e}"), "Aurora Host");
                 return;
             }
@@ -555,8 +555,8 @@ mod imp {
     /// その旨をメッセージで案内する。接続中でも安全な操作 (映像/入力経路に影響しない) のため
     /// 接続中ガードは設けない。
     fn toggle_autostart(hwnd: HWND) {
-        if crate::autostart::is_installed() {
-            match crate::autostart::uninstall() {
+        if crate::system::is_installed() {
+            match crate::system::uninstall() {
                 Ok(()) => message_box(
                     hwnd,
                     "ログオン時の自動起動を無効にしました。",
@@ -571,8 +571,8 @@ mod imp {
                 ),
             }
         } else {
-            let args = crate::autostart::current_forward_args();
-            match crate::autostart::install(&args) {
+            let args = crate::system::current_forward_args();
+            match crate::system::install(&args) {
                 Ok(()) => message_box(
                     hwnd,
                     "ログオン時に自動起動するようにしました。",
@@ -598,7 +598,7 @@ mod imp {
             return;
         };
         let currently_on = state.devices.enabled();
-        if currently_on && crate::conn::is_active() {
+        if currently_on && crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中はデバイスピン留めを無効化できません。\n切断してから操作してください。",
@@ -633,7 +633,7 @@ mod imp {
             );
             return;
         }
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中は新しい端末を登録できません。\n切断してから操作してください。",
@@ -655,7 +655,7 @@ mod imp {
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中は登録端末を削除できません。\n切断してから操作してください。",
@@ -706,7 +706,7 @@ mod imp {
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中は登録端末を削除できません。\n切断してから操作してください。",

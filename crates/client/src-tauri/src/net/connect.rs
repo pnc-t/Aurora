@@ -1,0 +1,639 @@
+//! TCP 制御チャネルの確立とループ (connect/handshake, TCP 読み書き, hs_io)。
+use super::*;
+
+/// ハンドシェイク I/O を `CONNECT_TIMEOUT` で包む。タイムアウト/失敗を String に正規化する。
+async fn hs_io(fut: impl std::future::Future<Output = anyhow::Result<()>>) -> Result<(), String> {
+    tokio::time::timeout(CONNECT_TIMEOUT, fut)
+        .await
+        .map_err(|_| "handshake timed out".to_string())?
+        .map_err(err)
+}
+/// 指定セッションの制御チャネルへ 1 メッセージ送る共通処理。未知 id は拒否する。
+pub(crate) async fn send_ctrl(
+    state: &SessionState,
+    session_id: &str,
+    msg: ControlMsg,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.get(session_id).ok_or("unknown session")?;
+    s.ctrl_tx
+        .send(msg)
+        .map_err(|_| "ctrl channel closed".to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+// Tauri コマンドの引数 (state/channel) 注入で増える
+// session_id を span で全ログへ付ける。host 側 conn_id と peer/時刻で突き合わせて 1 接続を
+// 追跡できる。後段で spawn する I/O タスクにも同じ span を継承させる (Span::current)。
+// 失敗時はここで 1 度だけ warn に残す。実体 (connect_inner) は各 `?` で String を早期 return
+// するため、そのままでは接続失敗 (誤パスワード・タイムアウト等) が client.log に出ない。
+#[tracing::instrument(skip_all, fields(session = %session_id, host = %host, port = port))]
+pub async fn connect_to_host(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    session_id: String,
+    host: String,
+    port: u16,
+    save: bool,
+    event_channel: Channel<ClientEvent>,
+    video_channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let r = connect_inner(
+        app,
+        window,
+        session_id,
+        host,
+        port,
+        save,
+        event_channel,
+        video_channel,
+        state,
+    )
+    .await;
+    if let Err(e) = &r {
+        tracing::warn!(error = %e, "connect failed");
+    }
+    r
+}
+
+/// この端末の表示名 (PC 名) を返す。host のデバイスピン留め登録時に「どの PC を登録したか」を
+/// 判別できるよう、ハンドシェイク payload で host へ渡す。Windows は `COMPUTERNAME`、他 OS は
+/// `HOSTNAME` を見る。取得できなければ空文字 (host 側で既定ラベル device-xxxx にフォールバック)。
+fn local_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_inner(
+    app: tauri::AppHandle,
+    // このコマンドを呼んだ capture ウィンドウ。セッションを所有ウィンドウへ紐付け、
+    // ウィンドウ破棄時にそのウィンドウの全タブをまとめて停止できるようにする。
+    window: WebviewWindow,
+    session_id: String,
+    host: String,
+    port: u16,
+    // パスワードを DPAPI ストアへ保存してよいか (接続ダイアログの「保存する」由来)。
+    // 手入力かつ true のときだけ保存し、「今回だけ接続」を可能にする。
+    // 保存済み即接続/自動再接続では false 相当で、既存値に触れない。
+    save: bool,
+    event_channel: Channel<ClientEvent>,
+    video_channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    // 接続資格情報は staging マップ (open_capture_window が積む) から取り出す。平文を
+    // ウィンドウ URL に載せないための受け渡し。再接続は staging が空なので None 扱いになり、
+    // 下の分岐で保存済みパスワード (DPAPI) を使う。
+    let staged = state.staging.lock().await.remove(&session_id);
+    let password = match staged.flatten() {
+        Some(p) => p,
+        None => crate::secret::get(&app, &host)
+            .ok_or_else(|| "保存済みパスワードがありません".to_string())?,
+    };
+    // 同 id の既存セッションがあれば閉じる (再接続・置換)。
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(s) = guard.remove(&session_id) {
+            s.shutdown();
+        }
+    }
+
+    // ホスト名 (Tailscale MagicDNS 名等) も解決する。SocketAddr::parse は数値 IP しか
+    // 受け付けないため、lookup_host で名前解決し IPv4/IPv6 の最初のアドレスを採る。
+    let target = format!("{host}:{port}");
+    let tcp_addr: SocketAddr = tokio::net::lookup_host(&target)
+        .await
+        .map_err(|e| format!("resolve {host}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}"))?;
+    let udp_addr = tcp_addr;
+
+    tracing::info!(%tcp_addr, "connecting");
+    let mut tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp_addr))
+        .await
+        .map_err(|_| "TCP connect timed out".to_string())?
+        .map_err(|e| format!("TCP connect: {e}"))?;
+    tcp.set_nodelay(true).ok();
+
+    let psk = psk_from_password(&password);
+
+    // この端末の永続 ID 鍵を読み込む (無ければ生成保存)。host のデバイスピン留めで端末を
+    // 識別できるよう、毎回同じ静的公開鍵で接続する。取得失敗時は None=従来の使い捨て鍵。
+    let identity = crate::secret::load_or_create_identity(&app);
+    let identity_priv = identity.as_ref().map(|id| id.private.as_slice());
+
+    // --- Noise XX-PSK initiator ---
+    // ハンドシェイク I/O には全てタイムアウトを設ける。これが無いと、ポートは開いているが
+    // 応答しないホスト (別アプリがポートを掴んでいる等) に対して connect_to_host が永久に
+    // 返らず、UI が「connecting…」のままキャンセル不能になる (host 側の HANDSHAKE_TIMEOUT と対)。
+    let mut hs = HandshakeState::new_initiator(&psk, identity_priv).map_err(err)?;
+    let mut buf = Vec::new();
+    let mut tmp = Vec::new();
+    // -> e
+    let mut out_msg = Vec::new();
+    hs.write_msg(&[], &mut out_msg).map_err(err)?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
+    // <- e, ee, s, es
+    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
+    hs.read_msg(&buf, &mut tmp).map_err(err)?;
+    // -> s, se, psk
+    // 最終メッセージの (暗号化済み) payload にこの端末名 (PC 名) を載せる。host はデバイス
+    // ピン留め登録時にこれを表示ラベルにし、トレイの一覧で「どの PC を登録したか」を判別できる。
+    // 名前は機密ではないが平文露出も避けたいので、payload (XXpsk3 の 3 通目は暗号化される) で渡す。
+    hs.write_msg(local_device_name().as_bytes(), &mut out_msg)
+        .map_err(err)?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
+
+    // snow の StatelessTransportState は encrypt/decrypt とも &self なので、
+    // 複数タスク (writer/reader/udp) 間の共有は Arc だけで足り Mutex は不要。
+    // 映像 UDP のパケット毎 decrypt が TCP 制御とロック競合しなくなる。
+    let session = Arc::new(hs.into_transport().map_err(err)?);
+    tracing::info!("noise handshake complete");
+
+    // ハンドシェイク成功 = PSK (パスワード) 一致。ユーザーが「保存する」を選んだときだけ
+    // DPAPI 暗号化保存する (無断永続化を避け「今回だけ接続」を可能にする)。失敗してもログ
+    // のみで接続は続行する (保存は補助機能)。`save=false` (今回だけ/保存済み即接続/再接続) は
+    // 既存の保存値に触れない (= 保存済みなら維持、未保存なら未保存のまま)。
+    if save {
+        if let Err(e) = crate::secret::put(&app, &host, &password) {
+            tracing::warn!(error = %e, "failed to save host password");
+        }
+    }
+
+    // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
+    // 以降の TCP 受信は reader ループが nonce 1 から続ける。
+    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
+    let mut plain = Vec::new();
+    session
+        .decrypt(NONCE_DOMAIN_CTRL, &buf, &mut plain)
+        .map_err(err)?;
+    let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
+    let host_info: ControlMsg = opts.deserialize(&plain).map_err(err)?;
+
+    // 映像/イベントの表示先を差し替え可能 sink にまとめる。以降タスクへはこの sink を
+    // clone して渡し、タブのウィンドウ移動 (attach/detach) で表示先だけ付け替えられるようにする。
+    let sink = Sink::new(event_channel, video_channel);
+
+    sink.send_event(ClientEvent::Connected);
+    // HostInfo の中身を取り出すだけにし、フロントへの通知はセッションハンドルを管理状態へ
+    // 格納した後に行う (関数末尾)。先に通知すると、フロントが host_info を受けて即
+    // selectDisplay/setClientViewport を invoke した時にハンドル未格納 (再接続時は古い閉じた
+    // ctrl_tx) で送信が失敗し、仮想ディスプレイのテイクオーバーが起動しないレースになる。
+    let (host_displays, host_audio) = match host_info {
+        ControlMsg::HostInfo { displays, audio } => (displays, audio),
+        other => return Err(format!("expected HostInfo, got {other:?}")),
+    };
+
+    // UDP ソケットをローカル任意ポートで開き、サーバへ向けて "AURHELLO"。
+    // 高 fps 時のバースト受信での取りこぼし (= 映像ノイズ) を抑えるため受信バッファを拡大する。
+    let udp =
+        Arc::new(make_udp_socket(udp_addr.is_ipv6()).map_err(|e| format!("UDP socket: {e}"))?);
+    udp.connect(udp_addr)
+        .await
+        .map_err(|e| format!("UDP connect: {e}"))?;
+    udp.send(b"AURHELLO")
+        .await
+        .map_err(|e| format!("UDP hello: {e}"))?;
+
+    let (read_half, write_half) = tcp.into_split();
+    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let (file_tx, file_rx) = mpsc::channel::<ControlMsg>(32);
+
+    // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
+    let (clip_handle, mut clip_change_rx) = clipboard::spawn();
+    let clip_apply_tx = clip_handle.apply_tx.clone();
+
+    // 受信品質メトリクス。Ping の基準時刻と共有して RTT を算出する。
+    let stats = StatsCollector::new();
+    let session_start = Instant::now();
+
+    let sink_w = sink.clone();
+    let sess_w = session.clone();
+    let writer_task = tokio::spawn(
+        async move {
+            let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
+            sink_w.send_event(ClientEvent::Disconnected {
+                reason: "writer closed".into(),
+            });
+        }
+        .instrument(tracing::Span::current()),
+    );
+
+    let sink_r = sink.clone();
+    let sess_r = session.clone();
+    let clip_apply_for_reader = clip_apply_tx.clone();
+    let stats_for_reader = stats.clone();
+    // FS RPC 応答は制御チャネル経由で writer ループへ流す (host の同期コールバックを起こす)。
+    let fs_reply_tx = ctrl_tx.clone();
+    // このセッションのファイル共有スコープ (既定 Disabled = 無効)。reader と SessionHandle で共有。
+    let share_scope: Arc<Mutex<ShareScope>> = Arc::new(Mutex::new(ShareScope::Disabled));
+    let share_scope_for_reader = share_scope.clone();
+    // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
+    let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
+    let pending_for_reader = pending_downloads.clone();
+    let reader_task = tokio::spawn(
+        async move {
+            let res = tcp_reader_loop(
+                read_half,
+                sess_r,
+                sink_r.clone(),
+                clip_apply_for_reader,
+                stats_for_reader,
+                session_start,
+                fs_reply_tx,
+                share_scope_for_reader,
+                pending_for_reader,
+            )
+            .await;
+            let reason = match res {
+                Ok(()) => "server closed".to_string(),
+                Err(e) => format!("read error: {e}"),
+            };
+            tracing::info!(%reason, "session closed (tcp reader)");
+            sink_r.send_event(ClientEvent::Disconnected { reason });
+        }
+        .instrument(tracing::Span::current()),
+    );
+
+    // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。
+    let audio_player = match audio::spawn() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "audio playback disabled");
+            None
+        }
+    };
+    let audio_tx = audio_player.as_ref().map(|p| p.sender());
+
+    let sess_u = session.clone();
+    let stats_for_udp = stats.clone();
+    let sink_u = sink.clone();
+    // ロス検出時にキーフレームを要求して映像を即時回復させるための送信口。
+    let keyframe_tx = ctrl_tx.clone();
+    let udp_task = tokio::spawn(
+        async move {
+            if let Err(e) =
+                udp_reader_loop(udp, sess_u, sink_u, audio_tx, stats_for_udp, keyframe_tx).await
+            {
+                tracing::warn!(error = %e, "UDP reader ended");
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+
+    // クリップボード変化 → ControlMsg::Clipboard 送信
+    let ctrl_for_clip = ctrl_tx.clone();
+    let clip_forward_task = tokio::spawn(async move {
+        while let Some(text) = clip_change_rx.recv().await {
+            if ctrl_for_clip.send(ControlMsg::Clipboard { text }).is_err() {
+                break;
+            }
+        }
+    });
+
+    // ping ループ (1 秒)。RTT を細かく取り、適応制御の応答性を上げる。
+    let ctrl_for_ping = ctrl_tx.clone();
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let ts_us = session_start.elapsed().as_micros() as u64;
+            if ctrl_for_ping.send(ControlMsg::Ping { ts_us }).is_err() {
+                break;
+            }
+        }
+    });
+
+    // 統計タスク (1 秒窓)。計測結果をホスト (適応制御用) とフロント (表示用) に送る。
+    let ctrl_for_stats = ctrl_tx.clone();
+    let sink_s = sink.clone();
+    let stats_for_task = stats.clone();
+    let stats_task = tokio::spawn(async move {
+        let mut window = StatsWindow::new(&stats_for_task);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let s = window.sample(&stats_for_task);
+            let _ = ctrl_for_stats.send(ControlMsg::Stats {
+                bitrate_kbps: s.bitrate_kbps,
+                fps: s.fps,
+                rtt_us: s.rtt_us,
+                loss_permille: s.loss_permille,
+            });
+            sink_s.send_event(ClientEvent::Stats {
+                bitrate_kbps: s.bitrate_kbps,
+                fps: s.fps,
+                rtt_us: s.rtt_us,
+                loss_permille: s.loss_permille,
+            });
+        }
+    });
+
+    let handle = SessionHandle {
+        sink: sink.clone(),
+        host: host.clone(),
+        ctrl_tx,
+        file_tx,
+        tasks: vec![
+            writer_task,
+            reader_task,
+            udp_task,
+            ping_task,
+            stats_task,
+            clip_forward_task,
+        ],
+        clipboard: clip_handle,
+        audio: audio_player,
+        pending_downloads,
+        share_scope,
+        window_label: window.label().to_string(),
+    };
+    {
+        let mut guard = state.inner.lock().await;
+        // 所有ウィンドウがハンドシェイク中に閉じられていたら、孤児セッション (どの窓からも
+        // 停止できず単一クライアントの host を占有し続け、以降の接続を全て塞ぐ) を作らず即停止
+        // する。ウィンドウ破棄ハンドラと inner ロックで直列化し取りこぼしを防ぐ。
+        if app.get_webview_window(&handle.window_label).is_none() {
+            drop(guard);
+            handle.shutdown();
+            return Err("ウィンドウが閉じられました".to_string());
+        }
+        guard.insert(session_id.clone(), handle);
+    }
+
+    // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
+    // 受けて即 selectDisplay/setClientViewport を呼んでも ctrl_tx に確実に届く。
+    sink.send_event(ClientEvent::HostInfo {
+        displays: host_displays.into_iter().map(Into::into).collect(),
+        audio: host_audio,
+    });
+    // ランチャーへ接続中 host 一覧を通知 (接続中表示・保存バッジ更新)。
+    emit_connections(&app, &state).await;
+    // 接続確立完了 (host 側「client connected」と対)。span に session/host/port が乗る。
+    tracing::info!("connected");
+    Ok(())
+}
+// -------- internal loops --------
+
+async fn tcp_writer_loop(
+    mut write_half: OwnedWriteHalf,
+    session: Arc<TransportSession>,
+    mut ctrl_rx: mpsc::UnboundedReceiver<ControlMsg>,
+    mut file_rx: mpsc::Receiver<ControlMsg>,
+) -> anyhow::Result<()> {
+    let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
+    // クライアント → ホストの TCP 制御は CTRL ドメインの連番 nonce。ホスト側 rx と
+    // TCP の順序保証により歩調が合う。
+    let mut tcp_tx_nonce: u64 = 0;
+    loop {
+        // 制御チャネルとファイルチャネルの両方を待つ。どちらかが閉じたら終了。
+        let msg = tokio::select! {
+            m = ctrl_rx.recv() => m,
+            m = file_rx.recv() => m,
+        };
+        let Some(msg) = msg else { break };
+        let plain = opts.serialize(&msg)?;
+        let nonce = NONCE_DOMAIN_CTRL | tcp_tx_nonce;
+        tcp_tx_nonce += 1;
+        let mut cipher = Vec::new();
+        session.encrypt(nonce, &plain, &mut cipher)?;
+        write_tcp_frame(&mut write_half, &cipher).await?;
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+async fn tcp_reader_loop(
+    mut read_half: OwnedReadHalf,
+    session: Arc<TransportSession>,
+    sink: Sink,
+    clip_apply_tx: mpsc::UnboundedSender<String>,
+    stats: Arc<StatsCollector>,
+    session_start: Instant,
+    fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
+    share_scope: Arc<Mutex<ShareScope>>,
+    pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
+) -> anyhow::Result<()> {
+    let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
+    let mut buf = Vec::new();
+    let mut plain = Vec::new();
+    let mut download: Option<DownloadState> = None;
+    // HostInfo (nonce 0) は connect_to_host で消費済みなので 1 から続ける。
+    let mut tcp_rx_nonce: u64 = 1;
+    loop {
+        read_tcp_frame(&mut read_half, &mut buf).await?;
+        plain.clear();
+        let nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
+        tcp_rx_nonce += 1;
+        session.decrypt(nonce, &buf, &mut plain)?;
+        let msg: ControlMsg = opts.deserialize(&plain)?;
+        match msg {
+            ControlMsg::Pong { ts_us } => {
+                // ts_us は Ping 送信時の session_start からの経過。往復差で RTT を得る。
+                let now_us = session_start.elapsed().as_micros() as u64;
+                let rtt_us = now_us.saturating_sub(ts_us);
+                stats.set_rtt_us(rtt_us.min(u32::MAX as u64) as u32);
+                sink.send_event(ClientEvent::Pong {
+                    rtt_us: rtt_us as i64,
+                });
+            }
+            ControlMsg::HostInfo { displays, audio } => {
+                sink.send_event(ClientEvent::HostInfo {
+                    displays: displays.into_iter().map(Into::into).collect(),
+                    audio,
+                });
+            }
+            ControlMsg::DisplayResized { id, width, height } => {
+                sink.send_event(ClientEvent::DisplayResized { id, width, height });
+            }
+            ControlMsg::Clipboard { text } => {
+                if clip_apply_tx.send(text).is_err() {
+                    tracing::debug!("clipboard apply channel closed");
+                }
+            }
+            ControlMsg::FileResult { id, ok, message } => {
+                sink.send_event(ClientEvent::FileResult { id, ok, message });
+            }
+            // --- ダウンロード受信 (ホスト → クライアント) ---
+            // ユーザーが request_file で明示的に要求した id の FileOffer だけを受理する。
+            // 未要求のオファーは、悪意あるホストがファイルを無断で押し付ける経路なので拒否する。
+            ControlMsg::FileOffer { id, name, size } => {
+                let solicited = pending_downloads
+                    .lock()
+                    .map(|s| s.contains(&id))
+                    .unwrap_or(false);
+                if !solicited {
+                    tracing::warn!(id, name = %name, "unsolicited FileOffer ignored (no matching request)");
+                } else {
+                    match open_download(&name).await {
+                        Ok((file, path)) => {
+                            tracing::info!(id, name = %name, size, path = %path, "download start");
+                            download = Some(DownloadState {
+                                id,
+                                file,
+                                written: 0,
+                                total: size,
+                                path,
+                            });
+                        }
+                        Err(e) => {
+                            if let Ok(mut s) = pending_downloads.lock() {
+                                s.remove(&id);
+                            }
+                            sink.send_event(ClientEvent::FileResult {
+                                id,
+                                ok: false,
+                                message: format!("open failed: {e}"),
+                            });
+                        }
+                    }
+                }
+            }
+            ControlMsg::FileChunk {
+                id,
+                offset,
+                data,
+                last,
+            } => match download.as_mut() {
+                Some(d) if d.id == id => {
+                    if offset != d.written {
+                        // TCP は順序保証があるため offset 不一致は本来起きない。発生したら
+                        // データ欠落/重複の可能性が高く、書き込むと破損ファイルを残すため
+                        // 中断する (host 側アップロード受信と対称の防御)。
+                        tracing::warn!(
+                            id,
+                            expected = d.written,
+                            got = offset,
+                            "download offset mismatch, aborting"
+                        );
+                        if let Ok(mut s) = pending_downloads.lock() {
+                            s.remove(&id);
+                        }
+                        sink.send_event(ClientEvent::FileResult {
+                            id,
+                            ok: false,
+                            message: format!(
+                                "download offset mismatch: expected {}, got {offset}",
+                                d.written
+                            ),
+                        });
+                        download = None;
+                    } else if d.written.saturating_add(data.len() as u64) > d.total {
+                        // 告知サイズ超過は中断する。悪意あるホストが告知より多く送り、
+                        // クライアントのディスクを埋めるのを防ぐ。
+                        tracing::warn!(
+                            id,
+                            total = d.total,
+                            "download exceeds declared size, aborting"
+                        );
+                        if let Ok(mut s) = pending_downloads.lock() {
+                            s.remove(&id);
+                        }
+                        sink.send_event(ClientEvent::FileResult {
+                            id,
+                            ok: false,
+                            message: "download exceeds declared size".into(),
+                        });
+                        download = None;
+                    } else if let Err(e) = d.file.write_all(&data).await {
+                        let message = format!("write failed: {e}");
+                        if let Ok(mut s) = pending_downloads.lock() {
+                            s.remove(&id);
+                        }
+                        sink.send_event(ClientEvent::FileResult {
+                            id,
+                            ok: false,
+                            message,
+                        });
+                        download = None;
+                    } else {
+                        d.written += data.len() as u64;
+                        if last {
+                            let (written, path) = (d.written, d.path.clone());
+                            let res = d.file.flush().await;
+                            download = None;
+                            if let Ok(mut s) = pending_downloads.lock() {
+                                s.remove(&id);
+                            }
+                            let ev = match res {
+                                Ok(()) => {
+                                    tracing::info!(id, written, path = %path, "download complete");
+                                    ClientEvent::FileResult {
+                                        id,
+                                        ok: true,
+                                        message: path,
+                                    }
+                                }
+                                Err(e) => ClientEvent::FileResult {
+                                    id,
+                                    ok: false,
+                                    message: format!("flush failed: {e}"),
+                                },
+                            };
+                            sink.send_event(ev);
+                        }
+                    }
+                }
+                _ => tracing::warn!(id, "download chunk without matching offer, ignored"),
+            },
+            // --- ProjFS ドライブリダイレクト: 自分のファイルをホストへ配信 ---
+            // 共有スコープが Disabled なら resolve が error を返し、read は error 応答・破壊系は
+            // ログのみで無視する (無断アクセス防止)。WholePc なら This PC 全体を投影する。
+            ControlMsg::FsList {
+                req_id,
+                path,
+                offset,
+            } => {
+                let scope = share_scope.lock().await.clone();
+                let reply = fs_list(&scope, &path, offset).await;
+                let _ = fs_reply_tx.send(reply.into_msg(req_id));
+            }
+            ControlMsg::FsRead {
+                req_id,
+                path,
+                offset,
+                length,
+            } => {
+                let scope = share_scope.lock().await.clone();
+                let (data, error) = fs_read(&scope, &path, offset, length).await;
+                let _ = fs_reply_tx.send(ControlMsg::FsReadReply {
+                    req_id,
+                    data,
+                    error,
+                });
+            }
+            // --- 書き戻し (ホスト Explorer → クライアント、一方向) ---
+            ControlMsg::FsCreate { path, is_dir } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_create(&scope, &path, is_dir).await {
+                    tracing::warn!(path = %path, error = %e, "FsCreate failed");
+                }
+            }
+            ControlMsg::FsWrite { path, offset, data } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_write(&scope, &path, offset, &data).await {
+                    tracing::warn!(path = %path, error = %e, "FsWrite failed");
+                }
+            }
+            ControlMsg::FsDelete { path } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_delete(&scope, &path).await {
+                    tracing::warn!(path = %path, error = %e, "FsDelete failed");
+                }
+            }
+            ControlMsg::FsRename { from, to } => {
+                let scope = share_scope.lock().await.clone();
+                if let Err(e) = fs_rename(&scope, &from, &to).await {
+                    tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
+                }
+            }
+            other => tracing::debug!(?other, "ignored control msg"),
+        }
+    }
+}
