@@ -1,0 +1,287 @@
+//! クライアント側ネットワーク。
+//! - TCP 制御チャネル: Noise XX-PSK initiator、ControlMsg を bincode で送受信
+//! - UDP 映像チャネル: 暗号化 VideoPacket を受信、フレーム再構成して Channel<Response> でフロントへ
+//!
+//! セッションは `session_id` をキーに `SessionState` (managed state) の HashMap で多重保持する。
+//! 1 capture ウィンドウ = 1 セッション。ウィンドウ生成 (`open_capture_window`) も Rust 側で行う。
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use aurora_common::clipboard::{self, ClipboardHandle};
+use aurora_common::framing::{
+    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+};
+use aurora_common::noise::{
+    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO,
+    TransportSession, psk_from_password,
+};
+use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
+use bincode::Options;
+use serde::Serialize;
+use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+use crate::audio::{self, AudioPlayer};
+use crate::stats::{StatsCollector, StatsWindow};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tracing::Instrument;
+
+// クライアント net の実装を関心事ごとに分割したサブモジュール群。mod.rs は共有型
+// (ClientEvent/Session*/Sink) と TCP framing ヘルパを保持し、以下へ各関心事を委譲する。
+mod commands;
+mod connect;
+mod fileshare;
+mod video;
+mod window;
+
+// main.rs の invoke_handler が `net::<コマンド名>` で参照する tauri コマンドを再エクスポート。
+pub use commands::*;
+pub use connect::*;
+pub use window::*;
+// net モジュール内でサブモジュール間参照する型/関数 (`use super::*` で各ファイルへ供給)。
+pub(crate) use connect::send_ctrl;
+pub(crate) use fileshare::{
+    DownloadState, ShareScope, fs_create, fs_delete, fs_list, fs_read, fs_rename, fs_write,
+    open_download,
+};
+pub(crate) use video::{make_udp_socket, udp_reader_loop};
+pub(crate) use window::emit_connections;
+
+const MAX_TCP_FRAME: usize = 64 * 1024;
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// 接続確立 (TCP connect + Noise ハンドシェイク + 最初の HostInfo) の各 I/O 上限。
+/// host 側 `HANDSHAKE_TIMEOUT` と対。無応答ホストでの無限ハングを防ぐ。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// フロント (TS) に流す制御イベント。タグ付き enum。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientEvent {
+    Connected,
+    HostInfo {
+        displays: Vec<DisplayDto>,
+        audio: bool,
+    },
+    /// ホストが解像度を変更した (SetClientViewport / ディスプレイ切替の結果)。
+    /// クライアントは入力スケールとデコーダを新解像度へ更新する。
+    DisplayResized {
+        id: u32,
+        width: u32,
+        height: u32,
+    },
+    Pong {
+        rtt_us: i64,
+    },
+    Stats {
+        bitrate_kbps: u32,
+        fps: u8,
+        rtt_us: u32,
+        loss_permille: u16,
+    },
+    FileResult {
+        id: u32,
+        ok: bool,
+        message: String,
+    },
+    Disconnected {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DisplayDto {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub name: String,
+    pub is_virtual: bool,
+}
+
+impl From<Display> for DisplayDto {
+    fn from(d: Display) -> Self {
+        Self {
+            id: d.id,
+            width: d.width,
+            height: d.height,
+            name: d.name,
+            is_virtual: d.is_virtual,
+        }
+    }
+}
+
+/// 差し替え可能な表示先 (sink)。セッションの networking (TCP/UDP/各タスク) はそのままに、
+/// 映像/イベントをどの webview の `Channel` へ流すかを実行時に差し替えられるようにする。
+/// これがタブのウィンドウ間移動 (Phase 3 ドラッグ分割) の土台:
+/// 旧ウィンドウで `clear`、新ウィンドウで `set` することで、ネットワークを止めずに表示先だけ移す。
+///
+/// send は短時間で await を跨がないため同期 `std::sync::Mutex` で足りる (tokio タスクから
+/// 呼ぶが、ロック保持中に await しない)。`Channel` 自体が Arc 内部の安価な複製。
+#[derive(Clone, Default)]
+pub struct Sink {
+    event: Arc<std::sync::Mutex<Option<Channel<ClientEvent>>>>,
+    video: Arc<std::sync::Mutex<Option<Channel<InvokeResponseBody>>>>,
+}
+
+impl Sink {
+    fn new(event: Channel<ClientEvent>, video: Channel<InvokeResponseBody>) -> Self {
+        Self {
+            event: Arc::new(std::sync::Mutex::new(Some(event))),
+            video: Arc::new(std::sync::Mutex::new(Some(video))),
+        }
+    }
+    /// 現在の表示先へイベントを送る (未アタッチ = デタッチ中なら捨てる)。
+    fn send_event(&self, ev: ClientEvent) {
+        if let Ok(g) = self.event.lock() {
+            if let Some(ch) = g.as_ref() {
+                let _ = ch.send(ev);
+            }
+        }
+    }
+    /// 現在の表示先へ映像フレームを送る (未アタッチなら捨てる。次キーフレームで回復)。
+    fn send_video(&self, body: InvokeResponseBody) {
+        if let Ok(g) = self.video.lock() {
+            if let Some(ch) = g.as_ref() {
+                let _ = ch.send(body);
+            }
+        }
+    }
+    /// 表示先を差し替える (新ウィンドウのアタッチ)。
+    fn set(&self, event: Channel<ClientEvent>, video: Channel<InvokeResponseBody>) {
+        if let Ok(mut g) = self.event.lock() {
+            *g = Some(event);
+        }
+        if let Ok(mut g) = self.video.lock() {
+            *g = Some(video);
+        }
+    }
+    /// 表示先を外す (旧ウィンドウのデタッチ)。ネットワークは継続する。
+    fn clear(&self) {
+        if let Ok(mut g) = self.event.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.video.lock() {
+            *g = None;
+        }
+    }
+}
+
+/// セッションごとに保持するハンドル。
+pub struct SessionHandle {
+    /// 差し替え可能な表示先 (映像/イベント Channel)。タブのウィンドウ間移動で attach/detach する。
+    pub sink: Sink,
+    /// 制御メッセージを書き込み側タスクに投げる
+    pub ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
+    /// ファイル転送チャンク専用の bounded チャネル。満杯時に送信が待つことで
+    /// JS 側の読み込みにバックプレッシャがかかり、入力など他の制御を詰まらせない。
+    pub file_tx: mpsc::Sender<ControlMsg>,
+    /// ダウンロード要求済み (= ユーザーが明示的に取得を依頼した) 転送 id の集合。
+    /// reader ループはこの集合にある id の FileOffer だけを受理し、未要求のオファー
+    /// (悪意あるホストが押し付けるファイル) を拒否する。`request_file` で追加し、
+    /// reader が転送の終端で除去する。同期 Mutex だが await を跨いで保持しない。
+    pub pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
+    /// 読み書き両タスクをまとめて止める
+    pub tasks: Vec<JoinHandle<()>>,
+    /// クリップボード同期ハンドル
+    pub clipboard: ClipboardHandle,
+    /// 音声再生 (ホストが音声非対応なら None)。保持目的は RAII: SessionHandle の drop で
+    /// 再生スレッドへ EOF が伝わり停止する。直接読み出すことはない。
+    #[allow(dead_code)]
+    pub audio: Option<AudioPlayer>,
+    /// このセッションのファイル共有スコープ。`set_file_sharing` で設定する。
+    /// **既定は `Disabled` (共有無効)。** 有効時は This PC 全体 (全ドライブ) をホストの仮想
+    /// ドライブへ投影する。reader タスクと共有するため Arc。セッション毎に独立させ、ある
+    /// ウィンドウの共有設定が別ウィンドウの接続に漏れないようにする。
+    pub share_scope: Arc<Mutex<ShareScope>>,
+    /// 接続先 host (ランチャーの接続中表示 / 切断ボタンで host 単位に扱うために保持)。
+    pub host: String,
+    /// このセッションを表示している capture ウィンドウのラベル (`connect_to_host` を呼んだ
+    /// webview)。1 ウィンドウに複数タブ (セッション) がぶら下がるため、ウィンドウ破棄時に
+    /// このラベルを持つ全セッションをまとめて停止する (タブの取りこぼし防止)。
+    pub window_label: String,
+}
+
+impl SessionHandle {
+    /// セッションを停止する: クリップボードスレッドへ shutdown 通知 + tokio タスク abort。
+    /// `audio` は self の drop で再生スレッドへ EOF が伝わり停止する。
+    pub fn shutdown(mut self) {
+        self.clipboard.shutdown();
+        for t in std::mem::take(&mut self.tasks) {
+            t.abort();
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SessionState {
+    /// session_id → 稼働中セッション。1 capture ウィンドウ = 1 セッション。
+    pub inner: Mutex<HashMap<String, SessionHandle>>,
+    /// `open_capture_window` が一時的に積む接続資格情報 (session_id → password)。
+    /// `connect_to_host` が pop して使う。URL に平文パスワードを載せないための受け渡し。
+    /// 値 `None` は「保存済みパスワード (DPAPI) を使う」を意味する。
+    pub staging: Mutex<HashMap<String, Option<String>>>,
+    /// タブのウィンドウ分割 (Phase 3) の引き継ぎデータ。`open_session_window` が移譲元の
+    /// セッション表示状態 (JSON) を session_id をキーに積み、移譲先ウィンドウの JS が
+    /// `take_handoff` で取り出して `Session` を復元する。networking は継続したまま表示先だけ移す。
+    pub adopt: Mutex<HashMap<String, String>>,
+}
+
+/// セッション id の発番。プロセス生存期間で一意ならよいので単調増加カウンタで足りる。
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+/// クエリ文字列値の最小 percent-encode (unreserved 以外を %XX に)。URL に host 等を
+/// 載せるとき IPv6 のコロンや空白で壊れないようにする。JS 側は URLSearchParams が復号する。
+fn q(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+// -------- TCP framing util (host net.rs と同形) --------
+
+async fn read_tcp_frame<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    // 長さは u16 なので最大 65535。受信サイズはこれで自然に有界で、メッセージ本体の
+    // 上限は復号後の bincode (with_limit MAX_TCP_FRAME) が守る。
+    let len = u16::from_be_bytes(len_buf) as usize;
+    out.resize(len, 0);
+    stream.read_exact(out).await?;
+    Ok(())
+}
+
+async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    if data.len() > u16::MAX as usize {
+        anyhow::bail!("frame too large: {}", data.len());
+    }
+    let len = (data.len() as u16).to_be_bytes();
+    stream.write_all(&len).await?;
+    stream.write_all(data).await?;
+    stream.flush().await.ok();
+    Ok(())
+}
+
+fn err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
