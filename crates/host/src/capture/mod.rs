@@ -123,7 +123,7 @@ impl From<&DisplayInfo> for aurora_common::proto::Display {
             width: d.width,
             height: d.height,
             name: d.name.clone(),
-            // 仮想ディスプレイ判定は net 側で virtualdisplay::detect() の GDI 名と
+            // 仮想ディスプレイ判定は net 側で display::detect() の GDI 名と
             // 突き合わせて設定する (ここでは判定材料を持たないため既定 false)。
             is_virtual: false,
         }

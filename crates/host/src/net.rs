@@ -305,7 +305,7 @@ pub struct ServerConfig {
     pub auth_failures: Arc<AtomicU32>,
     /// デバイスピン留め (クライアント静的鍵の許可リスト照合)。既定無効。tray が有効化/
     /// ペアリングを操作し、net が PSK 認証後に相手公開鍵を照合する (= 2 要素目)。
-    pub devices: Arc<crate::devices::DeviceGuard>,
+    pub devices: Arc<crate::security::DeviceGuard>,
     /// capture スレッドへ「現在の画面を 1 枚強制送出せよ」と促す共有フラグ。接続確立時と
     /// クライアントの RequestKeyframe で立て、capture が直近フレームを再投入する。画面静止中に
     /// 接続/再同期しても黒画面のまま固まらないようにするための仕組み (DXGI は変化フレームのみ返す)。
@@ -606,7 +606,7 @@ struct ClientArgs {
     nal_btx: broadcast::Sender<Arc<EncodedNal>>,
     audio_btx: broadcast::Sender<Arc<EncodedAudio>>,
     throttle: Arc<AuthThrottle>,
-    devices: Arc<crate::devices::DeviceGuard>,
+    devices: Arc<crate::security::DeviceGuard>,
     shared: Arc<tokio::sync::Mutex<SharedControl>>,
     registry: Registry,
     conn_id: u64,
@@ -684,7 +684,7 @@ pub async fn run_server(
     // 仮想ディスプレイ (MttVDD) が検出されたら、未接続時はデスクトップ未アタッチで DXGI に
     // 出ないため、合成エントリ (番兵 id) を 1 度だけ足してクライアントが選べるようにする。
     let mut displays = cfg.displays.clone();
-    let vdd_gdi_name = crate::virtualdisplay::detect().map(|v| {
+    let vdd_gdi_name = crate::display::detect().map(|v| {
         if !displays.iter().any(|d| d.name == v.gdi_name) {
             displays.push(DisplayInfo {
                 id: VIRTUAL_SENTINEL_ID,
@@ -900,7 +900,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // PSK 漏洩でも「登録した端末の秘密鍵」を持たない相手を弾く。判定は record_success の前に
     // 行い、拒否はバックオフを伸ばす (= 履歴を消さない) ことで未許可端末の連投も減速させる。
     let admit = devices.admit(remote_key.as_deref(), Some(device_name.as_str()));
-    if let crate::devices::Admit::Rejected = &admit {
+    if let crate::security::Admit::Rejected = &admit {
         let delay = throttle.record_failure(peer.ip());
         tracing::warn!(peer = %peer, delay_ms = delay.as_millis() as u64, "device not in allowlist; rejecting (device pinning)");
         tokio::time::sleep(delay).await;
@@ -909,7 +909,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
     // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
-    if let crate::devices::Admit::Enrolled = &admit {
+    if let crate::security::Admit::Enrolled = &admit {
         tracing::info!(peer = %peer, name = %device_name, "device pinning: enrolled this device via pairing window");
     }
     tracing::info!(peer = %peer, "noise handshake complete");
@@ -1324,7 +1324,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
                                             // CCD で物理を落とすと仮想の GDI 名が変わることがあるため
                                             // MTT1337 で再検出し、capture 対象 (名前ベース) を更新する。
                                             let new_name = tokio::task::spawn_blocking(
-                                                crate::virtualdisplay::detect,
+                                                crate::display::detect,
                                             )
                                             .await
                                             .ok()
@@ -1563,7 +1563,7 @@ async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     // 5) VDD を再デタッチ: テイクオーバー復元後も VDD がデスクトップに残るため切り離す。
     //    未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。最後の 1 本のみ。
     if is_last {
-        if let Some(vdd) = crate::virtualdisplay::detect() {
+        if let Some(vdd) = crate::display::detect() {
             let vn = vdd.gdi_name;
             let _ = tokio::task::spawn_blocking(move || {
                 crate::display::detach_vdd_if_attached(&vn);
