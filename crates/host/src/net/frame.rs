@@ -68,31 +68,3 @@ pub(crate) async fn send_control_msg<W: AsyncWriteExt + Unpin>(
     write_tcp_frame(stream, &cipher).await?;
     Ok(())
 }
-
-pub(crate) async fn read_tcp_frame<R: AsyncReadExt + Unpin>(
-    stream: &mut R,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await.context("read len")?;
-    // 長さは u16 なので最大 65535。受信サイズはこれで自然に有界で、メッセージ本体の
-    // 上限は復号後の bincode (with_limit 64KiB) が守る。
-    let len = u16::from_be_bytes(len_buf) as usize;
-    out.resize(len, 0);
-    stream.read_exact(out).await.context("read frame body")?;
-    Ok(())
-}
-
-pub(crate) async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(
-    stream: &mut W,
-    data: &[u8],
-) -> Result<()> {
-    if data.len() > u16::MAX as usize {
-        return Err(anyhow!("frame too large: {}", data.len()));
-    }
-    let len = (data.len() as u16).to_be_bytes();
-    stream.write_all(&len).await.context("write len")?;
-    stream.write_all(data).await.context("write body")?;
-    stream.flush().await.ok();
-    Ok(())
-}

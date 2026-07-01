@@ -437,7 +437,8 @@ export class Decoder {
     if (buf.byteLength < 3) return;
     const u8 = new Uint8Array(buf);
     const keyframe = (u8[0] & 1) === 1;
-    // u8[1..3] = frame_id (将来 RTT 算出用、いまは未使用)
+    // ヘッダ: u8[0]=フラグ(bit0=keyframe)、u8[1..3]=frame_id。frame_id はクライアント側では
+    // 参照しないので読み飛ばし、u8[3..] の Annex-B を取り出す。
     const annexB = u8.subarray(3);
 
     const decoder = this.decoder;

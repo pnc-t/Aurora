@@ -2,7 +2,7 @@
 use super::*;
 
 /// ハンドシェイク I/O を `CONNECT_TIMEOUT` で包む。タイムアウト/失敗を String に正規化する。
-async fn hs_io(fut: impl std::future::Future<Output = anyhow::Result<()>>) -> Result<(), String> {
+async fn hs_io(fut: impl std::future::Future<Output = std::io::Result<()>>) -> Result<(), String> {
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
         .await
         .map_err(|_| "handshake timed out".to_string())?

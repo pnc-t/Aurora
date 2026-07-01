@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use aurora_common::clipboard::{self, ClipboardHandle};
 use aurora_common::framing::{
-    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags, read_tcp_frame,
+    write_tcp_frame,
 };
 use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO,
@@ -250,36 +251,6 @@ fn q(s: &str) -> String {
         }
     }
     out
-}
-
-// -------- TCP framing util (host net.rs と同形) --------
-
-async fn read_tcp_frame<R: AsyncReadExt + Unpin>(
-    stream: &mut R,
-    out: &mut Vec<u8>,
-) -> anyhow::Result<()> {
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    // 長さは u16 なので最大 65535。受信サイズはこれで自然に有界で、メッセージ本体の
-    // 上限は復号後の bincode (with_limit MAX_TCP_FRAME) が守る。
-    let len = u16::from_be_bytes(len_buf) as usize;
-    out.resize(len, 0);
-    stream.read_exact(out).await?;
-    Ok(())
-}
-
-async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(
-    stream: &mut W,
-    data: &[u8],
-) -> anyhow::Result<()> {
-    if data.len() > u16::MAX as usize {
-        anyhow::bail!("frame too large: {}", data.len());
-    }
-    let len = (data.len() as u16).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(data).await?;
-    stream.flush().await.ok();
-    Ok(())
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
