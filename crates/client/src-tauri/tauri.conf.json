@@ -17,8 +17,7 @@
         "height": 600,
         "resizable": false,
         "decorations": false,
-        "fullscreen": false,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msExclusiveAccessBubble"
+        "fullscreen": false
       }
     ],
     "security": {
