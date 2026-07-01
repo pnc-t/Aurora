@@ -19,15 +19,14 @@ use tracing_subscriber::EnvFilter;
 
 mod audio;
 mod capture;
-mod conn;
 mod display;
 mod encode;
 mod input;
 mod net;
-mod security;
-mod system;
 mod perf;
 mod projfs;
+mod security;
+mod system;
 mod tray;
 
 use audio::EncodedAudio;
@@ -777,7 +776,7 @@ fn require_password_change_authorization() -> Result<()> {
     use std::io::Write;
 
     // 接続中は変更を拒否する (リモート操作者による締め出し/乗っ取り防止)。
-    if conn::is_active() {
+    if net::is_active() {
         return Err(anyhow!(
             "クライアント接続中はパスワードを変更できません。切断してから実行してください"
         ));

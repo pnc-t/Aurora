@@ -445,7 +445,7 @@ mod imp {
             return;
         };
         // 接続中はリモート操作者による締め出し/乗っ取りを防ぐため変更を拒否する。
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中はパスワードを変更できません。\n切断してから操作してください。",
@@ -485,7 +485,7 @@ mod imp {
             return;
         };
         // 接続中はソケット貼り直しで相手を切ってしまうため拒否する (パスワード変更と同じ方針)。
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中はポートを変更できません。\n切断してから操作してください。",
@@ -598,7 +598,7 @@ mod imp {
             return;
         };
         let currently_on = state.devices.enabled();
-        if currently_on && crate::conn::is_active() {
+        if currently_on && crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中はデバイスピン留めを無効化できません。\n切断してから操作してください。",
@@ -633,7 +633,7 @@ mod imp {
             );
             return;
         }
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中は新しい端末を登録できません。\n切断してから操作してください。",
@@ -655,7 +655,7 @@ mod imp {
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中は登録端末を削除できません。\n切断してから操作してください。",
@@ -706,7 +706,7 @@ mod imp {
         let Some(state) = (unsafe { wnd_state(hwnd) }) else {
             return;
         };
-        if crate::conn::is_active() {
+        if crate::net::is_active() {
             message_box(
                 hwnd,
                 "クライアント接続中は登録端末を削除できません。\n切断してから操作してください。",
