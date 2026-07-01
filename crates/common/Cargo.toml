@@ -21,3 +21,8 @@ tracing-appender = { workspace = true }
 arboard = { workspace = true }
 bitflags = "2.6"
 argon2 = { workspace = true }
+
+# DPAPI (dpapi.rs) 用。秘密のローカル暗号化保存を host/client 双方でここに集約する。
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_Security_Cryptography"]

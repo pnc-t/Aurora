@@ -110,6 +110,48 @@ impl<'a> AudioPacket<'a> {
     }
 }
 
+// --- TCP 制御チャネルのフレーミング (host / client 共通) ---
+//
+// 制御メッセージは Noise で暗号化した後、`[u16 BE 長さ] + [本体]` の 1 フレームとして TCP に
+// 流す。長さが u16 のため 1 フレームは最大 65535B に自然に有界で、本体の意味的上限は復号後の
+// bincode (`with_limit`) が守る。host/client の net 層に同一実装がコピーされていたのを集約した。
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// TCP から 1 フレーム (u16 BE 長さ prefix + 本体) を読み、本体を `out` に入れる。
+///
+/// **キャンセル安全ではない** (`read_exact` を 2 回行う複数段の await)。`select!` の枝に直接
+/// 置かず、専用タスク内で回すこと (途中キャンセルでフレーム境界がズレる)。
+pub async fn read_tcp_frame<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    out.resize(len, 0);
+    stream.read_exact(out).await?;
+    Ok(())
+}
+
+/// `data` を 1 フレーム (u16 BE 長さ prefix + 本体) として TCP に書く。u16 を超える長さは
+/// フレーミングできないためエラー (呼び出し側で分割・上限管理する前提)。
+pub async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let len: u16 = data.len().try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("frame too large: {}", data.len()),
+        )
+    })?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(data).await?;
+    stream.flush().await.ok();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -151,95 +151,16 @@ pub fn delete_host_password(app: AppHandle, host: String) -> Result<(), String> 
     Ok(())
 }
 
-// --- DPAPI バイト列の暗号化/復号 (Windows) ---
+// --- DPAPI バイト列の暗号化/復号 ---
+//
+// DPAPI 呼び出しは [`aurora_common::dpapi`] に集約 (host/client 共通、unsafe FFI は 1 箇所)。
+// 非 Windows は `protect`/`unprotect` が `Unsupported` を返すので、従来どおり `encrypt` は
+// Err、`decrypt` は None になる。
 
-/// DPAPI 出力 BLOB。`pbData` は DPAPI が `LocalAlloc` した領域なので Drop で `LocalFree`。
-#[cfg(target_os = "windows")]
-struct OutBlob(windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB);
-
-#[cfg(target_os = "windows")]
-impl Drop for OutBlob {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::{HLOCAL, LocalFree};
-        if !self.0.pbData.is_null() {
-            // SAFETY: pbData は DPAPI が LocalAlloc した領域。null 化で二重解放を防ぐ。
-            unsafe {
-                let _ = LocalFree(HLOCAL(self.0.pbData as *mut core::ffi::c_void));
-            }
-            self.0.pbData = std::ptr::null_mut();
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
-    use windows::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
-    };
-    use windows::core::PCWSTR;
-
-    let mut input = plain.to_vec();
-    let in_blob = CRYPT_INTEGER_BLOB {
-        cbData: input.len() as u32,
-        pbData: input.as_mut_ptr(),
-    };
-    let mut out = CRYPT_INTEGER_BLOB::default();
-    // SAFETY: in_blob は input が指す cbData バイトの有効領域を指す。成功すると out は
-    // DPAPI が LocalAlloc した領域を指すので OutBlob でラップして必ず解放する。
-    let result = unsafe {
-        CryptProtectData(
-            &in_blob,
-            PCWSTR::null(),
-            None,
-            None,
-            None,
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut out,
-        )
-    };
-    let out = OutBlob(out);
-    result.map_err(|e| format!("CryptProtectData failed: {e}"))?;
-    // SAFETY: 成功したので out.0 は cbData バイトの有効領域。
-    Ok(unsafe { std::slice::from_raw_parts(out.0.pbData, out.0.cbData as usize) }.to_vec())
+    aurora_common::dpapi::protect(plain).map_err(|e| format!("CryptProtectData failed: {e}"))
 }
 
-#[cfg(target_os = "windows")]
 fn decrypt(enc: &[u8]) -> Option<Vec<u8>> {
-    use windows::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
-    };
-
-    let mut input = enc.to_vec();
-    let in_blob = CRYPT_INTEGER_BLOB {
-        cbData: input.len() as u32,
-        pbData: input.as_mut_ptr(),
-    };
-    let mut out = CRYPT_INTEGER_BLOB::default();
-    // SAFETY: in_blob は input が指す cbData バイトの有効領域を指す。成功すると out は
-    // DPAPI が LocalAlloc した領域を指すので OutBlob でラップして必ず解放する。
-    let result = unsafe {
-        CryptUnprotectData(
-            &in_blob,
-            None,
-            None,
-            None,
-            None,
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut out,
-        )
-    };
-    let out = OutBlob(out);
-    result.ok()?;
-    // SAFETY: 成功したので out.0 は cbData バイトの有効領域。
-    Some(unsafe { std::slice::from_raw_parts(out.0.pbData, out.0.cbData as usize) }.to_vec())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn encrypt(_plain: &[u8]) -> Result<Vec<u8>, String> {
-    Err("password storage is only supported on Windows".into())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decrypt(_enc: &[u8]) -> Option<Vec<u8>> {
-    None
+    aurora_common::dpapi::unprotect(enc).ok()
 }

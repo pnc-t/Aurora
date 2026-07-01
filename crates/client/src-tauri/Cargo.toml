@@ -33,7 +33,6 @@ socket2 = "0.5"
 version = "0.58"
 features = [
     "Win32_Foundation",
-    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
 ]
 

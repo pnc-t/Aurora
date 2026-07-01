@@ -4,6 +4,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod clipboard;
+pub mod dpapi;
 pub mod framing;
 pub mod fsname;
 pub mod logging;

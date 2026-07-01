@@ -1,4 +1,5 @@
-//! TCP 制御 + UDP 映像のサーバ。単一クライアントモデル。
+//! TCP 制御 + UDP 映像のサーバ。共有 capture/encode の出力を最大 `MAX_CLIENTS` 接続へ
+//! ファンアウトするマルチクライアントモデル (1 エンコーダを最悪リンクに合わせて全員へ配る)。
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -6,9 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use aurora_common::framing::{
     AudioPacket, MAX_PAYLOAD, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
+    read_tcp_frame, write_tcp_frame,
 };
 use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_VIDEO, TransportSession,
@@ -43,9 +45,7 @@ pub(crate) use bitrate::BitrateController;
 pub use bitrate::{EncoderCommand, InputCmd};
 pub(crate) use client::handle_client;
 pub(crate) use files::{UploadState, open_upload, stream_file_to_client};
-pub(crate) use frame::{
-    encrypt_udp, read_tcp_frame, send_control_msg, wait_udp_hello, write_tcp_frame,
-};
+pub(crate) use frame::{encrypt_udp, send_control_msg, wait_udp_hello};
 
 /// 接続ごとの相関 ID 採番カウンタ。ログの `conn` span に載せ、クライアント側の
 /// session_id と peer/時刻で突き合わせて 1 接続を端から端まで追跡できるようにする。
