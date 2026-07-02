@@ -1,7 +1,9 @@
 // 接続中の操作ツールバー。
 // 既定で常時表示 (上端の透明な帯に、角丸+影のピルを 1 枚浮かせて中央配置するフローティング型)。
 // Ctrl+Alt+Shift+B で一時的に隠せる。
-// 構成 (ピル内): [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替] | [プリセット(+カスタム時のみ fps/Mbps)] | [pin] | [min/close]
+// 構成 (ピル内): [切断] | [全画面/キャプチャ/ファイル/統計] [画面切替▼] | [画質/解像度▼] | [pin] | [min/close]
+// ピルはアイコンボタンのみの一定幅。テキストを持つコントロール (画面切替/画質/解像度) は
+// どの配置でもアイコンをクリックするとバー脇のポップオーバーに開く。
 // 各操作はフラットなアイコンボタン + ツールチップ。ピル本体 (.tb-pill) と透明な帯 (#topbar)、
 // 構造スパンに data-tauri-drag-region を付け、ボタン/入力/select 以外の余白・隔て・帯の余白どこを
 // 掴んでもウィンドウ移動できる。
@@ -119,10 +121,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
   const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
 
-  // 縦バー (left/right) 時のポップオーバー。テキストを持つコントロール (画質/解像度/
-  // ディスプレイ) はバーを横長にするため、縦配置ではアイコン (.tb-pop-trigger) に畳み、
-  // クリックでバー脇にパネル (.tb-pop-panel) を開く。横帯 (top/bottom) ではトリガを隠して
-  // パネルをそのままインライン表示する (見た目は従来どおり・CSS 側で出し分け)。
+  // ポップオーバー。テキストを持つコントロール (画質/解像度/ディスプレイ) はピルを
+  // 長くするため、全配置でアイコン (.tb-pop-trigger) に畳み、クリックでバー脇に
+  // パネル (.tb-pop-panel) を開く (開く向きは CSS が配置ごとに決める)。
   const popgroups = Array.from(opts.topbar.querySelectorAll<HTMLElement>(".tb-popgroup"));
   function closePopovers(except?: HTMLElement): void {
     for (const g of popgroups) if (g !== except) g.classList.remove("pop-open");
@@ -226,18 +227,33 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     document.body.classList.add(`bar-${position}`);
   }
 
-  // バーの「厚み」。top/bottom は高さ、left/right は幅で端ホバー判定する。
-  function barExtent(): number {
-    if (position === "left" || position === "right") return opts.topbar.offsetWidth || 56;
-    return opts.topbar.offsetHeight || 48;
+  // 端ホバー判定: カーソルが「ウィンドウ端〜帯の内側の縁」の間にあるか。
+  // 帯はタブストリップと同じ端に来たとき CSS でその厚み分 inset される (tabs.css) ため、
+  // 固定の厚みでなく帯の実位置 (offsetTop/offsetLeft = transform 非適用のレイアウト位置)
+  // から判定する。これで格納中でも表示時と同じ領域で反応する。
+  function nearBarEdge(e: MouseEvent): boolean {
+    const tb = opts.topbar;
+    switch (position) {
+      case "bottom":
+        return e.clientY >= tb.offsetTop - 6;
+      case "left":
+        return e.clientX <= tb.offsetLeft + tb.offsetWidth + 6;
+      case "right":
+        return e.clientX >= tb.offsetLeft - 6;
+      default:
+        return e.clientY <= tb.offsetTop + tb.offsetHeight + 6;
+    }
   }
 
   function applyVisibility(): void {
     const visible = connected && (pinned || revealed);
     opts.topbar.classList.toggle("visible", visible);
     if (visible) {
-      // 実測したバー高を CSS 変数へ (統計 HUD を top 配置のときこの分だけ下げる)。
-      document.documentElement.style.setProperty("--topbar-h", `${opts.topbar.offsetHeight}px`);
+      // 「上端からバー下端まで」を CSS 変数へ (統計 HUD を top 配置のときこの分だけ下げる)。
+      // タブストリップと同じ端では帯が inset される (offsetTop > 0) ため、高さでなく
+      // 下端位置で渡さないと HUD がピルに重なる。
+      const tb = opts.topbar;
+      document.documentElement.style.setProperty("--topbar-h", `${tb.offsetTop + tb.offsetHeight}px`);
     }
     pinBtn?.classList.toggle("toggled", pinned);
     hideBtn?.classList.toggle("toggled", autoHideLocked);
@@ -272,24 +288,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   // 来なくても revealed は維持される。
   window.addEventListener("mousemove", (e) => {
     if (!connected || pinned || autoHideLocked) return;
-    const ext = barExtent() + 6;
-    let want: boolean;
-    switch (position) {
-      case "bottom":
-        want = e.clientY >= window.innerHeight - ext;
-        break;
-      case "left":
-        want = e.clientX <= ext;
-        break;
-      case "right":
-        want = e.clientX >= window.innerWidth - ext;
-        break;
-      default:
-        want = e.clientY <= ext;
-    }
-    // ポップオーバー (画質/ディスプレイ) は縦バーではバーの外側に開くため、そこへ
-    // カーソルを移すと端ホバー域を外れる。開いている間は畳まない (閉じれば次の
-    // mousemove で通常判定に戻る)。これが無いとパネル操作中にバーごと格納される。
+    const want = nearBarEdge(e);
+    // ポップオーバー (画質/ディスプレイ) はバーの外側に開くため、そこへカーソルを
+    // 移すと端ホバー域を外れる。開いている間は畳まない (閉じれば次の mousemove で
+    // 通常判定に戻る)。これが無いとパネル操作中にバーごと格納される。
     if (!want && popgroups.some((g) => g.classList.contains("pop-open"))) return;
     if (want !== revealed) {
       revealed = want;

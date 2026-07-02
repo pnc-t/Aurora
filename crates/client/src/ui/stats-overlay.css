@@ -21,8 +21,8 @@
  * 組み合わせを考慮せず、逃げた先の不透明タブに HUD が潜って見えなくなっていた。左右双方の占有を
  * 見て配置する。 */
 
-/* 横バー (上配置) の厚みぶん下へ下げる。--topbar-h は toolbar.ts が設定。タブ上配置時はピルが
- * タブ下に押し下げられ #topbar の実測高に含まれるため、タブ厚も自然に加味される。 */
+/* 横バー (上配置) の下へ下げる。--topbar-h は toolbar.ts が「上端からバー下端まで」で設定する
+ * ため、タブ上配置で帯が inset されていてもタブ厚込みの値になる。 */
 body.tab-top:not(.tab-fs) #stats-hud { top: calc(var(--tabstrip-h, 43px) + 8px); }
 body.bar-open.bar-top #stats-hud { top: calc(var(--topbar-h, 44px) + 8px); }
 

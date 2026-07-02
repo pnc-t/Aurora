@@ -55,27 +55,21 @@
 .tb-sep { width: 1px; height: 18px; align-self: center; margin: 0 4px; background: var(--panel-border); opacity: 0.8; }
 
 /* --- 縦サイドバー (left/right 配置) ---
- * ピルと内部の並び方向を縦にし、区切り線も横線へ向きを変える。
- * テキストを持つコントロール (画質/解像度/ディスプレイ) は縦バーを横長にするので、
- * 縦配置ではアイコン (.tb-pop-trigger) に畳み、クリックでバー脇のポップオーバー
- * (.tb-pop-panel) として開く (下の .tb-popgroup 規則)。 */
+ * ピルと内部の並び方向を縦にし、区切り線も横線へ向きを変える。 */
 #topbar.vertical .tb-pill { flex-direction: column; }
 #topbar.vertical .tb-group { flex-direction: column; }
 #topbar.vertical .tb-sep { width: 18px; height: 1px; margin: 4px 0; }
 #topbar.vertical .window-controls { flex-direction: column; }
 
 /* --- ポップオーバー化するコントロール群 (画質/解像度/ディスプレイ) ---
- * 既定 (横帯 top/bottom): トリガを隠し、パネルをそのままインライン表示する
- * (従来の見た目を維持)。 */
-.tb-popgroup { display: inline-flex; align-items: center; position: relative; }
-.tb-pop-trigger { display: none; }
-.tb-pop-panel { display: inline-flex; align-items: center; gap: 4px; }
-
-/* 縦バー: トリガをアイコンとして出し、パネルはバー脇に開くポップオーバーにする。 */
-#topbar.vertical .tb-popgroup { width: 100%; justify-content: center; }
-#topbar.vertical .tb-pop-trigger { display: inline-flex; }
-#topbar.vertical .tb-pop-panel {
-  position: absolute; top: 0; z-index: 40;
+ * テキストを持つコントロールはどの向きでもピルを長くするため、全配置でアイコン
+ * (.tb-pop-trigger) に畳み、クリックでバー脇にパネル (.tb-pop-panel) を開く。
+ * これでピルはアイコンボタンだけの一定幅になる (カスタム時の fps/Mbps 入力も
+ * パネル内に収まり、ピル幅が状況で伸縮しない)。 */
+.tb-popgroup { display: inline-flex; align-items: center; justify-content: center; position: relative; }
+.tb-pop-trigger { display: inline-flex; }
+.tb-pop-panel {
+  position: absolute; z-index: 40;
   display: none; /* .pop-open まで隠す */
   align-items: center; gap: 6px;
   padding: 8px 10px;
@@ -86,14 +80,17 @@
   backdrop-filter: blur(12px) saturate(1.3);
   -webkit-backdrop-filter: blur(12px) saturate(1.3);
 }
-#topbar.vertical .tb-popgroup.pop-open .tb-pop-panel { display: inline-flex; }
-/* 開く向き: 左バーは右側へ、右バーは左側へ。 */
-#topbar.pos-left.vertical .tb-pop-panel { left: 100%; margin-left: 10px; }
-#topbar.pos-right.vertical .tb-pop-panel { right: 100%; margin-right: 10px; }
-/* ポップオーバー内は通常の横並び・無制限幅に戻す (狭いピル幅の制約を受けない)。 */
-#topbar.vertical .tb-pop-panel.tb-video { flex-direction: row; }
-#topbar.vertical .tb-pop-panel .tb-custom { flex-direction: row; }
-#topbar.vertical .tb-pop-panel select { max-width: none; }
+.tb-popgroup.pop-open .tb-pop-panel { display: inline-flex; }
+/* 開く向き: 帯の反対側へ。横帯はトリガ中心の下/上、縦バーは脇 (左バー→右・右バー→左)。 */
+#topbar.pos-top .tb-pop-panel { top: 100%; margin-top: 10px; left: 50%; transform: translateX(-50%); }
+#topbar.pos-bottom .tb-pop-panel { bottom: 100%; margin-bottom: 10px; left: 50%; transform: translateX(-50%); }
+#topbar.pos-left .tb-pop-panel { left: 100%; margin-left: 10px; top: 0; }
+#topbar.pos-right .tb-pop-panel { right: 100%; margin-right: 10px; top: 0; }
+/* ポップオーバー内は通常の横並び・無制限幅 (狭いピル幅の制約を受けない)。 */
+.tb-pop-panel.tb-video { flex-direction: row; }
+.tb-pop-panel .tb-custom { flex-direction: row; }
+.tb-pop-panel select { max-width: none; }
+#topbar.vertical .tb-popgroup { width: 100%; }
 
 /* フラットなアイコンボタン: 既定は枠なし・透明、ホバー時だけ淡い背景。 */
 .tb-btn {
