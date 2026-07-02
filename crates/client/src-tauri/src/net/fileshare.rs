@@ -12,29 +12,11 @@ pub(crate) struct DownloadState {
     pub(crate) path: String,
 }
 
-/// ダウンロード保存ディレクトリ (`%USERPROFILE%\Aurora\downloads`)。
-///
-/// インストール版アプリはショートカット起動で CWD が不定 (書き込み不可の場所もある) の
-/// ため、CWD 相対では保存に失敗したり場所が予測不能になる。host 側 `upload_dir` と対称に、
-/// ユーザープロファイル配下の固定パスへ絶対化して discoverable にする。
-/// `USERPROFILE` (非 Windows では `HOME`) が無ければ最後の手段としてカレントディレクトリ。
-fn download_dir() -> PathBuf {
-    let base = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("Aurora").join("downloads")
-}
-
-/// `download_dir()` 配下に保存先ファイルを作る。ファイル名はパス区切りを除去して安全化する。
+/// `%USERPROFILE%\Aurora\downloads` 配下に保存先ファイルを作る。ディレクトリ解決・
+/// ファイル名の安全化は host `open_upload` と共通の
+/// [`aurora_common::fsname::create_incoming_file`] (防御の対称性はそちらで担保)。
 pub(crate) async fn open_download(name: &str) -> anyhow::Result<(tokio::fs::File, String)> {
-    let dir = download_dir();
-    tokio::fs::create_dir_all(&dir).await?;
-    // パス区切り・ADS (`:`) を中和し、ファイル名成分のみを採用する (host open_upload と対称)。
-    let safe = aurora_common::fsname::sanitize_filename(name, "download.bin");
-    let path = dir.join(&safe);
-    let file = tokio::fs::File::create(&path).await?;
-    Ok((file, path.display().to_string()))
+    Ok(aurora_common::fsname::create_incoming_file("downloads", name, "download.bin").await?)
 }
 /// このセッションのファイル共有スコープ。
 #[derive(Clone, Default)]

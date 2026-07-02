@@ -10,33 +10,13 @@ pub(crate) struct UploadState {
     pub(crate) path: String,
 }
 
-/// アップロード受信ディレクトリ (`%USERPROFILE%\Aurora\received`)。
-///
-/// トレイ常駐 + ログオン時自動起動だと CWD が `System32` 等になり得るため、CWD 相対では
-/// 保存先が予測不能になる。ユーザープロファイル配下の固定パスに絶対化して discoverable にする。
-/// `USERPROFILE` (非 Windows では `HOME`) が無ければ最後の手段としてカレントディレクトリを使う。
-fn upload_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("Aurora").join("received")
-}
-
-/// `%USERPROFILE%\Aurora\received` 配下に保存先ファイルを作る。
-/// ファイル名はパス区切りを除去して安全化する。
+/// `%USERPROFILE%\Aurora\received` 配下に保存先ファイルを作る。ディレクトリ解決・
+/// ファイル名の安全化は client `open_download` と共通の
+/// [`aurora_common::fsname::create_incoming_file`] (防御の対称性はそちらで担保)。
 pub(crate) async fn open_upload(name: &str) -> Result<(tokio::fs::File, String)> {
-    let dir = upload_dir();
-    tokio::fs::create_dir_all(&dir)
+    aurora_common::fsname::create_incoming_file("received", name, "upload.bin")
         .await
-        .context("create aurora-received dir")?;
-    // パス区切り・ADS (`:`) を中和し、ファイル名成分のみを採用する (client open_download と対称)。
-    let safe = aurora_common::fsname::sanitize_filename(name, "upload.bin");
-    let path = dir.join(&safe);
-    let file = tokio::fs::File::create(&path)
-        .await
-        .with_context(|| format!("create {}", path.display()))?;
-    Ok((file, path.display().to_string()))
+        .context("create upload file under %USERPROFILE%\\Aurora\\received")
 }
 
 /// 要求されたファイルを開き、FileOffer + FileChunk 列を `out_tx` 経由でクライアントへ送る。

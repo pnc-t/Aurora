@@ -187,7 +187,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
             .collect();
         ControlMsg::HostInfo { displays, audio }
     };
-    send_control_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
+    send_ctrl_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
 
     // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "AURHELLO" を送る想定。
     // ハンドシェイクを完了した TCP ピアと同一 IP からの hello のみ受理する。これが無いと、
@@ -204,7 +204,6 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // on_disconnected が必ず対になる (接続数のカウントがズレない)。
     tray_bus.on_connected(peer_label.clone());
 
-    let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
     let mut upload: Option<UploadState> = None;
     // ダウンロード (ホスト → クライアント) のチャンクと、host→クライアントへの制御 push
     // (DisplayResized / Clipboard 等、登録簿経由) を select ループへ流す出口。送信タスク/他接続が
@@ -383,14 +382,10 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     break;
                 };
                 let mut plain = Vec::new();
-                let rx_nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
-                tcp_rx_nonce += 1;
-                session.decrypt(rx_nonce, &frame, &mut plain)?;
-                let msg: ControlMsg = bincode_opts.deserialize(&plain)
-                    .context("decode ControlMsg")?;
+                let msg = decode_ctrl_msg(&session, &frame, &mut tcp_rx_nonce, &mut plain)?;
                 match msg {
                     ControlMsg::Ping { ts_us } => {
-                        send_control_msg(&mut write_half, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
+                        send_ctrl_msg(&mut write_half, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
                     }
                     ControlMsg::RequestKeyframe => {
                         // 画面静止中の再同期でも現在の画面を 1 枚送れるよう capture を促す
@@ -625,7 +620,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                             Err(e) => {
                                 tracing::warn!(error = %e, "open upload failed");
                                 let msg = ControlMsg::FileResult { id, ok: false, message: e.to_string() };
-                                send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                                send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                             }
                         }
                     }
@@ -639,7 +634,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch, aborting upload");
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
-                                    send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                                    send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if u.written.saturating_add(data.len() as u64) > u.total {
                                     // 告知サイズ (FileOffer.size) を超える書き込みは拒否する。これが無いと
                                     // size:0 を告知してから無限にチャンクを送り、ホストのディスクを埋められる
@@ -648,13 +643,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     tracing::warn!(id, total = u.total, written = u.written, got = data.len(), "upload exceeds declared size, aborting");
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
-                                    send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                                    send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
-                                    send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                                    send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else {
                                     u.written += data.len() as u64;
                                     if last {
@@ -668,7 +663,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                             }
                                             Err(e) => ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") },
                                         };
-                                        send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                                        send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                     }
                                 }
                             }
@@ -698,11 +693,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
             }
             // ダウンロード送信タスクからのメッセージ (FileOffer/FileChunk/FileResult)
             Some(msg) = out_rx.recv() => {
-                send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
             }
             // ProjFS コールバックからの FS RPC 要求 (FsList/FsRead) を TCP へ送る
             Some(msg) = fs_req_rx.recv() => {
-                send_control_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
             }
             // (映像 UDP 送信は専用タスク (上の video_task) へ分離済み。ここでは扱わない。)
             // 音声フレーム受信 (broadcast ファンアウト) → UDP 送信 (STREAM_AUDIO)

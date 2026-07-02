@@ -219,8 +219,8 @@ impl FsBridge {
 /// に固定して discoverable にする。Windows 以外は ProjFS 自体が no-op なので値は使われない。
 pub fn remote_root() -> std::path::PathBuf {
     #[cfg(windows)]
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        return std::path::PathBuf::from(base).join("Aurora").join("remote");
+    if let Some(base) = aurora_common::paths::data_dir() {
+        return base.join("remote");
     }
     std::path::PathBuf::from("aurora-remote")
 }

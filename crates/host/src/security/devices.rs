@@ -231,11 +231,7 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn store_path(file: &str) -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    let mut p = std::path::PathBuf::from(base);
-    p.push("Aurora");
-    p.push(file);
-    Some(p)
+    Some(aurora_common::paths::data_dir()?.join(file))
 }
 
 #[cfg(target_os = "windows")]

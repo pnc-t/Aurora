@@ -10,13 +10,12 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use aurora_common::framing::{
     AudioPacket, MAX_PAYLOAD, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags,
-    read_tcp_frame, write_tcp_frame,
+    decode_ctrl_msg, read_tcp_frame, send_ctrl_msg, write_tcp_frame,
 };
 use aurora_common::noise::{
-    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_VIDEO, TransportSession,
+    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_VIDEO, TransportSession,
 };
 use aurora_common::proto::{ControlMsg, Display, InputEvent, MouseButton};
-use bincode::Options;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc};
@@ -45,7 +44,7 @@ pub(crate) use bitrate::BitrateController;
 pub use bitrate::{EncoderCommand, InputCmd};
 pub(crate) use client::handle_client;
 pub(crate) use files::{UploadState, open_upload, stream_file_to_client};
-pub(crate) use frame::{encrypt_udp, send_control_msg, wait_udp_hello};
+pub(crate) use frame::{encrypt_udp, wait_udp_hello};
 
 /// 接続ごとの相関 ID 採番カウンタ。ログの `conn` span に載せ、クライアント側の
 /// session_id と peer/時刻で突き合わせて 1 接続を端から端まで追跡できるようにする。
