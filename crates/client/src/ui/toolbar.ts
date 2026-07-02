@@ -247,6 +247,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
 
   function applyVisibility(): void {
     const visible = connected && (pinned || revealed);
+    // バーが視界から消えるとき (自動格納/隠すボタン/ホットキー/再接続) は開いている
+    // ポップオーバーも必ず畳む。パネルは帯にぶら下がる絶対配置なので、開いたまま帯だけ
+    // スライドするとパネルがタブストリップの下からはみ出して浮いて見える。
+    if (!visible) closePopovers();
     opts.topbar.classList.toggle("visible", visible);
     if (visible) {
       // 「上端からバー下端まで」を CSS 変数へ (統計 HUD を top 配置のときこの分だけ下げる)。
