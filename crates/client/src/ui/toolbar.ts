@@ -134,6 +134,19 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       const willOpen = !g.classList.contains("pop-open");
       closePopovers(g);
       g.classList.toggle("pop-open", willOpen);
+      // トリガ→パネル→select と 2 クリック要るのは冗長なので、開いたら先頭の select の
+      // ドロップダウンまで即展開する (クリックハンドラ内 = ユーザージェスチャなので許可される)。
+      // showPicker 非対応の古い WebView2 ではパネル表示までで従来どおり。
+      if (willOpen) {
+        const sel = g.querySelector<HTMLSelectElement>(".tb-pop-panel select");
+        if (sel && "showPicker" in sel) {
+          try {
+            sel.showPicker();
+          } catch {
+            // NotAllowedError 等は無視してパネル表示のみにフォールバック。
+          }
+        }
+      }
     });
   }
   // パネル外をクリックしたら全て閉じる (パネル内の select 操作では閉じない)。

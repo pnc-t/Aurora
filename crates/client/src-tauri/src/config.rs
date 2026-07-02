@@ -109,7 +109,9 @@ fn default_fps() -> u32 {
 }
 
 fn default_max_mbps() -> u32 {
-    15
+    // 標準プリセット (video-presets.ts) と一致させる。15M 以上は 1440p HW エンコードの
+    // 持続可能上限を超えバッファブロートで遅延・カクつきが悪化する実測 (2026-07-02)。
+    8
 }
 
 fn default_true() -> bool {

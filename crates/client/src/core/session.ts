@@ -81,6 +81,12 @@ export interface SessionHost {
   removed(s: Session): void;
   /** 窓単位のリサイズ可否を設定する。 */
   setResizable(on: boolean): void;
+  /**
+   * ツールバーで変えた映像パラメータを保存済み設定へ書き戻す。
+   * セッション内メモリだけだと再接続・新規接続のたびに保存値へ巻き戻ってしまうため、
+   * ツールバーとランチャー設定は同一設定の 2 つのビューとして扱う。
+   */
+  persistVideoParams(fps: number, mbps: number): void;
 }
 
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
@@ -296,6 +302,7 @@ export class Session {
     this.videoFps = fps;
     this.videoMbps = mbps;
     void setVideoParams(this.id, fps, mbps * 1_000_000);
+    this.host.persistVideoParams(fps, mbps);
   }
   setResolution(maxHeight: number): void {
     void setResolution(this.id, maxHeight);

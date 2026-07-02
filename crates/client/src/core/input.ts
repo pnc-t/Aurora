@@ -223,6 +223,10 @@ export class Input {
   }
 
   private onKeyDown(e: KeyboardEvent): void {
+    // ツールバーの入力欄/セレクト等にフォーカスがあるときはローカル編集を優先する。
+    // window レベルで握って preventDefault するとテキスト入力が一切できなくなるため
+    // (カスタム fps/Mbps 欄が入力不能だった)、転送も抑止もせず素通しする。
+    if (isLocalEditTarget(e.target)) return;
     const vk = vkFromKeyboardEvent(e);
     if (vk == null) return;
     e.preventDefault();
@@ -236,10 +240,23 @@ export class Input {
   private onKeyUp(e: KeyboardEvent): void {
     const vk = vkFromKeyboardEvent(e);
     if (vk == null) return;
+    // 編集要素フォーカス中の keyup は素通し。ただし canvas 上で押下→編集要素へフォーカス移動後に
+    // 離した場合 (pressedKeys に残っている) は up を転送しないとホスト側でキーが押しっぱなしになる。
+    if (isLocalEditTarget(e.target) && !this.pressedKeys.has(vk)) return;
     e.preventDefault();
     this.pressedKeys.delete(vk);
     this.dispatch({ Key: { vk, down: false } });
   }
+}
+
+/** キーイベントの対象がローカルで編集すべき要素 (入力欄/セレクト等) か。 */
+function isLocalEditTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  );
 }
 
 // ピクセル単位ホイール (トラックパッド/高解像度マウス) の 1 ノッチあたりの px 量。
