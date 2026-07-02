@@ -371,6 +371,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   function persist(): void {
     void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+    // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
+    void emit("aurora://settings-changed", settings);
   }
 
   // --- ページ切替 ---
@@ -911,13 +913,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     },
   };
 
-  // 初期ロード: 設定を読み込んでコントロールへ反映 (アクセント色は即適用)。
-  void (async () => {
-    try {
-      settings = await loadSettings();
-    } catch {
-      settings = { ...DEFAULT_SETTINGS };
-    }
+  /** 現在の settings を設定フォームの各コントロールへ反映する (テーマ/アクセント色は即適用)。 */
+  function applySettingsToForm(): void {
     if (fullscreenToggle) fullscreenToggle.checked = settings.default_fullscreen;
     if (statsToggle) statsToggle.checked = settings.show_stats;
     if (captureToggle) captureToggle.checked = settings.default_capture;
@@ -934,7 +931,25 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
     syncPresetSelect();
     applyTheme(settings.theme, settings.accent_color);
+  }
+
+  // 初期ロード: 設定を読み込んでコントロールへ反映。
+  void (async () => {
+    try {
+      settings = await loadSettings();
+    } catch {
+      settings = { ...DEFAULT_SETTINGS };
+    }
+    applySettingsToForm();
   })();
+
+  // 他ウィンドウ (capture のツールバー等) が設定を保存したら、この窓のコピーとフォームを
+  // 追従させる。古いコピーのまま persist() すると他窓の変更を巻き戻すため必須。
+  // 自分の persist() の同報も受けるが、同値の再反映になるだけで無害。
+  void listen<ClientSettings>("aurora://settings-changed", (e) => {
+    settings = e.payload;
+    applySettingsToForm();
+  });
   void handle.refreshHosts();
 
   // 接続中 host の変化 (capture ウィンドウでの接続/切断/ウィンドウ破棄) を購読し、

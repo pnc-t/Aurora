@@ -6,12 +6,13 @@
 // は Rust 側 staging が持つためここには載らない。「+」で同じ窓に新しいタブを追加できる。
 
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
   initPerfFlag,
   loadSettings,
   openSessionWindow,
+  saveSettings,
   stageSession,
   takeHandoff,
   uploadFileFromPath,
@@ -182,7 +183,19 @@ const host: SessionHost = {
   refreshTab: (s) => tabs.update(s.id, s.tabLabel, s.tabStatus),
   removed: (s) => removeSession(s),
   setResizable: (on) => void setResizable(on),
+  persistVideoParams: (fps, mbps) => {
+    // ローカルコピーを即更新してから保存し、他窓 (ランチャー/別 capture 窓) へも同報する。
+    // 同報しないと、古いコピーを持つ窓が次に persist したとき変更が巻き戻る。
+    settings = { ...getSettings(), fps, max_mbps: mbps };
+    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+    void emit("aurora://settings-changed", settings);
+  },
 };
+
+// 他ウィンドウの設定保存に追従する (この窓の再接続・新規タブが古い値で始まらないように)。
+void listen<ClientSettings>("aurora://settings-changed", (e) => {
+  settings = e.payload;
+});
 
 // --- 共有ツールバー (操作は常にアクティブ Session へ) ---
 let fileVisible = false;
