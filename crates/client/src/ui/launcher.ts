@@ -64,7 +64,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   accent_color: "#3a82f7",
   theme: "dark",
   fps: 60,
-  max_mbps: 15,
+  max_mbps: 8,
   auto_reconnect: true,
   use_virtual_display: false,
   share_files: false,

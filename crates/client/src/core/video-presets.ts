@@ -12,11 +12,14 @@ export type VideoPreset = {
   mbps: number;
 };
 
-/** 既定のプリセット一覧。標準が出荷時の既定値 (60fps / 15Mbps) と一致する。 */
+/** 既定のプリセット一覧。標準が出荷時の既定値 (60fps / 8Mbps) と一致する。
+ *  標準 8Mbps の根拠: 1440p/AMD/Tailnet の実測で持続可能上限は ~17Mbps 弱。上限 15M 以上に
+ *  すると適応制御が天井到達→バッファブロート→急降下のノコギリ波に入り遅延とカクつきが体感悪化、
+ *  8M では適応イベントゼロで安定した (2026-07-02 A/B)。15M は余裕のある回線向けの高画質扱い。 */
 export const VIDEO_PRESETS: readonly VideoPreset[] = [
   { id: "light", label: "軽量 (30fps / 5Mbps)", fps: 30, mbps: 5 },
-  { id: "standard", label: "標準 (60fps / 15Mbps)", fps: 60, mbps: 15 },
-  { id: "high", label: "高画質 (60fps / 30Mbps)", fps: 60, mbps: 30 },
+  { id: "standard", label: "標準 (60fps / 8Mbps)", fps: 60, mbps: 8 },
+  { id: "high", label: "高画質 (60fps / 15Mbps)", fps: 60, mbps: 15 },
 ];
 
 /** プリセットに一致しない手動値を表す id。 */
