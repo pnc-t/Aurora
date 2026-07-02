@@ -18,11 +18,8 @@ const FILE_NAME: &str = "password.bin";
 #[cfg(target_os = "windows")]
 fn store_path() -> Result<std::path::PathBuf> {
     use anyhow::Context;
-    let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
-    let mut p = std::path::PathBuf::from(base);
-    p.push("Aurora");
-    p.push(FILE_NAME);
-    Ok(p)
+    let dir = aurora_common::paths::data_dir().context("LOCALAPPDATA is not set")?;
+    Ok(dir.join(FILE_NAME))
 }
 
 /// パスワードを DPAPI で暗号化してローカルに保存する。DPAPI 呼び出しは

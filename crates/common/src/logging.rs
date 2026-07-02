@@ -45,24 +45,7 @@ pub struct LogGuard(#[allow(dead_code)] Option<WorkerGuard>);
 ///
 /// 「ログフォルダを開く」等の運用導線からも参照する。
 pub fn default_log_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        let mut p = PathBuf::from(base);
-        p.push("Aurora");
-        p.push("logs");
-        Some(p)
-    }
-    #[cfg(not(windows))]
-    {
-        let base = std::env::var_os("HOME")?;
-        let mut p = PathBuf::from(base);
-        p.push(".local");
-        p.push("share");
-        p.push("Aurora");
-        p.push("logs");
-        Some(p)
-    }
+    Some(crate::paths::data_dir()?.join("logs"))
 }
 
 /// `tracing` を初期化する。ファイル出力 (日次ローテ + 7 世代) と、任意で console 出力を

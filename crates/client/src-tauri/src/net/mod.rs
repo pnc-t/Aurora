@@ -14,15 +14,14 @@ use std::time::Duration;
 
 use aurora_common::clipboard::{self, ClipboardHandle};
 use aurora_common::framing::{
-    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags, read_tcp_frame,
-    write_tcp_frame,
+    AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags, decode_ctrl_msg,
+    read_tcp_frame, send_ctrl_msg, write_tcp_frame,
 };
 use aurora_common::noise::{
-    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_CTRL, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO,
-    TransportSession, psk_from_password,
+    HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO, TransportSession,
+    psk_from_password,
 };
 use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
-use bincode::Options;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -37,7 +36,8 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 // クライアント net の実装を関心事ごとに分割したサブモジュール群。mod.rs は共有型
-// (ClientEvent/Session*/Sink) と TCP framing ヘルパを保持し、以下へ各関心事を委譲する。
+// (ClientEvent/Session*/Sink) を保持し、以下へ各関心事を委譲する (TCP 制御フレームの
+// 送受信は host と共通の `aurora_common::framing`)。
 mod commands;
 mod connect;
 mod fileshare;
@@ -57,7 +57,6 @@ pub(crate) use fileshare::{
 pub(crate) use video::{make_udp_socket, udp_reader_loop};
 pub(crate) use window::emit_connections;
 
-const MAX_TCP_FRAME: usize = 64 * 1024;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// 接続確立 (TCP connect + Noise ハンドシェイク + 最初の HostInfo) の各 I/O 上限。
 /// host 側 `HANDSHAKE_TIMEOUT` と対。無応答ホストでの無限ハングを防ぐ。
@@ -69,7 +68,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum ClientEvent {
     Connected,
     HostInfo {
-        displays: Vec<DisplayDto>,
+        // proto::Display をそのまま流す (フィールドが snake_case で TS 側の期待と一致するため
+        // DTO への詰め替えは不要。詰め替えを挟むと proto 側のフィールド追加が黙って落ちる)。
+        displays: Vec<Display>,
         audio: bool,
     },
     /// ホストが解像度を変更した (SetClientViewport / ディスプレイ切替の結果)。
@@ -96,27 +97,6 @@ pub enum ClientEvent {
     Disconnected {
         reason: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DisplayDto {
-    pub id: u32,
-    pub width: u32,
-    pub height: u32,
-    pub name: String,
-    pub is_virtual: bool,
-}
-
-impl From<Display> for DisplayDto {
-    fn from(d: Display) -> Self {
-        Self {
-            id: d.id,
-            width: d.width,
-            height: d.height,
-            name: d.name,
-            is_virtual: d.is_virtual,
-        }
-    }
 }
 
 /// 差し替え可能な表示先 (sink)。セッションの networking (TCP/UDP/各タスク) はそのままに、

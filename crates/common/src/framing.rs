@@ -152,6 +152,78 @@ pub async fn write_tcp_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+// --- 制御メッセージ (ControlMsg) の暗号化フレーム化 (host / client 共通) ---
+//
+// ワイヤ形式: bincode(ControlMsg) を CTRL ドメインの連番 nonce で Noise 暗号化し、上の
+// `write_tcp_frame` で 1 フレームとして送る。nonce 採番・bincode 上限・暗号化→フレームの
+// 順序はプロトコル不変条件なので、host/client にコピーを持たせず必ずここを通す
+// (片側だけ変えると相手側とワイヤ互換が静かに壊れる)。
+
+use crate::noise::{NONCE_DOMAIN_CTRL, NoiseError, TransportSession};
+use crate::proto::ControlMsg;
+use bincode::Options;
+
+/// ControlMsg 1 件の最大シリアライズ長 (bincode `with_limit`)。u16 長さ prefix (65535B) と
+/// 対の上限で、host/client は必ず同じ値で送受する (送信側だけ上げると大きいメッセージが
+/// 相手側の deserialize でだけ失敗し、フレーキーな切断に見える)。
+pub const MAX_CTRL_MSG: u64 = 64 * 1024;
+
+/// 制御メッセージの送受信の失敗。
+#[derive(Debug, Error)]
+pub enum CtrlMsgError {
+    #[error("encode ControlMsg: {0}")]
+    Encode(#[source] bincode::Error),
+    #[error("decode ControlMsg: {0}")]
+    Decode(#[source] bincode::Error),
+    #[error(transparent)]
+    Crypto(#[from] NoiseError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+fn ctrl_bincode_opts() -> impl Options {
+    bincode::DefaultOptions::new().with_limit(MAX_CTRL_MSG)
+}
+
+/// `msg` を bincode で直列化し、CTRL ドメインの連番 nonce (`tx_nonce` を採番して +1) で
+/// 暗号化して 1 TCP フレームとして送る。
+pub async fn send_ctrl_msg<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    session: &TransportSession,
+    msg: &ControlMsg,
+    tx_nonce: &mut u64,
+) -> Result<(), CtrlMsgError> {
+    let plain = ctrl_bincode_opts()
+        .serialize(msg)
+        .map_err(CtrlMsgError::Encode)?;
+    let nonce = NONCE_DOMAIN_CTRL | *tx_nonce;
+    *tx_nonce += 1;
+    let mut cipher = Vec::new();
+    session.encrypt(nonce, &plain, &mut cipher)?;
+    write_tcp_frame(stream, &cipher).await?;
+    Ok(())
+}
+
+/// 受信済みの 1 TCP フレーム (暗号文) を CTRL ドメインの連番 nonce (`rx_nonce` を採番して
+/// +1) で復号し ControlMsg へ戻す。`plain` は復号バッファ (呼び出し側で再利用可)。
+///
+/// フレームの読み取り自体は含めない: host はフレーム読み取りを専用タスクへ隔離して
+/// チャネル経由で受けるため (キャンセル安全性)、読み取りと復号は同じ場所にできない。
+pub fn decode_ctrl_msg(
+    session: &TransportSession,
+    frame: &[u8],
+    rx_nonce: &mut u64,
+    plain: &mut Vec<u8>,
+) -> Result<ControlMsg, CtrlMsgError> {
+    plain.clear();
+    let nonce = NONCE_DOMAIN_CTRL | *rx_nonce;
+    *rx_nonce += 1;
+    session.decrypt(nonce, frame, plain)?;
+    ctrl_bincode_opts()
+        .deserialize(plain)
+        .map_err(CtrlMsgError::Decode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +272,55 @@ mod tests {
         };
         let mut buf = Vec::new();
         assert!(pkt.encode(&mut buf).is_err());
+    }
+
+    /// send_ctrl_msg → (フレーム読み取り) → decode_ctrl_msg の往復。host/client が共有する
+    /// ワイヤ形式 (nonce 採番・bincode 上限・暗号化→フレームの順序) の互換性をここで固定する。
+    #[tokio::test]
+    async fn ctrl_msg_roundtrip() {
+        use crate::noise::{HandshakeState, psk_from_password};
+        use crate::proto::ControlMsg;
+
+        let psk = psk_from_password("hunter2");
+        let mut ini = HandshakeState::new_initiator(&psk, None).unwrap();
+        let mut res = HandshakeState::new_responder(&psk, None).unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = Vec::new();
+        ini.write_msg(&[], &mut buf).unwrap();
+        res.read_msg(&buf, &mut tmp).unwrap();
+        res.write_msg(&[], &mut buf).unwrap();
+        ini.read_msg(&buf, &mut tmp).unwrap();
+        ini.write_msg(&[], &mut buf).unwrap();
+        res.read_msg(&buf, &mut tmp).unwrap();
+        let ini_t = ini.into_transport().unwrap();
+        let res_t = res.into_transport().unwrap();
+
+        // 送信 (initiator) → TCP フレーム → 受信 (responder)。連番 nonce が両側で歩調を保つ。
+        let mut wire = Vec::new();
+        let mut tx_nonce: u64 = 0;
+        for ts_us in [1u64, 2, 3] {
+            send_ctrl_msg(
+                &mut wire,
+                &ini_t,
+                &ControlMsg::Ping { ts_us },
+                &mut tx_nonce,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(tx_nonce, 3);
+
+        let mut reader = std::io::Cursor::new(wire);
+        let mut frame = Vec::new();
+        let mut plain = Vec::new();
+        let mut rx_nonce: u64 = 0;
+        for expect in [1u64, 2, 3] {
+            read_tcp_frame(&mut reader, &mut frame).await.unwrap();
+            let msg = decode_ctrl_msg(&res_t, &frame, &mut rx_nonce, &mut plain).unwrap();
+            match msg {
+                ControlMsg::Ping { ts_us } => assert_eq!(ts_us, expect),
+                other => panic!("unexpected msg: {other:?}"),
+            }
+        }
     }
 }

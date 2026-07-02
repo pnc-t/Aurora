@@ -9,6 +9,7 @@ pub mod framing;
 pub mod fsname;
 pub mod logging;
 pub mod noise;
+pub mod paths;
 pub mod proto;
 
 pub use framing::{AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags};

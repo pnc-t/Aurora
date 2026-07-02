@@ -1,8 +1,9 @@
-//! 受信ファイル名のサニタイズ。
+//! 受信ファイル名のサニタイズと保存先ファイルの作成。
 //!
 //! ファイル転送 (アップロード/ダウンロード) で対向から受け取った名前を、保存先
 //! ディレクトリ内の単一ファイルへ確実に閉じ込めるための共通処理。host (`open_upload`)
-//! と client (`open_download`) で同一規則を使い、防御を対称に保つ。
+//! と client (`open_download`) で同一実装 ([`create_incoming_file`]) を使い、防御を
+//! 対称に保つ (片側だけ強化して危険な方向が未強化のまま残るのを防ぐ)。
 
 /// Windows の予約デバイス名 (大文字小文字無視)。拡張子を付けても予約扱い
 /// (`aux.txt` 等) のため、最初の `.` より前の語幹で判定する。
@@ -55,6 +56,35 @@ pub fn sanitize_filename(name: &str, default: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// 受信ファイルの保存ルート (`%USERPROFILE%\Aurora\<subdir>`、非 Windows は `$HOME` 配下)。
+///
+/// トレイ常駐・ログオン時自動起動・ショートカット起動では CWD が `System32` 等の不定な
+/// (書き込み不可もありうる) 場所になるため、CWD 相対ではなくユーザープロファイル配下の
+/// 固定パスへ絶対化して discoverable にする。`USERPROFILE`/`HOME` が無ければ最後の手段
+/// としてカレントディレクトリ。
+fn incoming_dir(subdir: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("Aurora").join(subdir)
+}
+
+/// [`incoming_dir`] 配下に受信ファイルを作成する。ファイル名は [`sanitize_filename`] で
+/// 単一ファイル名へ正規化する。戻り値は (作成した `File`, 表示用フルパス)。
+pub async fn create_incoming_file(
+    subdir: &str,
+    name: &str,
+    fallback: &str,
+) -> std::io::Result<(tokio::fs::File, String)> {
+    let dir = incoming_dir(subdir);
+    tokio::fs::create_dir_all(&dir).await?;
+    let safe = sanitize_filename(name, fallback);
+    let path = dir.join(&safe);
+    let file = tokio::fs::File::create(&path).await?;
+    Ok((file, path.display().to_string()))
 }
 
 #[cfg(test)]

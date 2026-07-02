@@ -16,11 +16,8 @@ const FILE_NAME: &str = "port";
 #[cfg(target_os = "windows")]
 fn store_path() -> Result<std::path::PathBuf> {
     use anyhow::Context;
-    let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
-    let mut p = std::path::PathBuf::from(base);
-    p.push("Aurora");
-    p.push(FILE_NAME);
-    Ok(p)
+    let dir = aurora_common::paths::data_dir().context("LOCALAPPDATA is not set")?;
+    Ok(dir.join(FILE_NAME))
 }
 
 /// 保存済み待受ポートを読む。未保存・不正値 (0 や非数値)・読めない場合は `None`。

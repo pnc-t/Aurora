@@ -169,11 +169,9 @@ async fn connect_inner(
     // 以降の TCP 受信は reader ループが nonce 1 から続ける。
     hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
     let mut plain = Vec::new();
-    session
-        .decrypt(NONCE_DOMAIN_CTRL, &buf, &mut plain)
-        .map_err(err)?;
-    let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
-    let host_info: ControlMsg = opts.deserialize(&plain).map_err(err)?;
+    let mut hostinfo_rx_nonce: u64 = 0;
+    let host_info =
+        decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain).map_err(err)?;
 
     // 映像/イベントの表示先を差し替え可能 sink にまとめる。以降タスクへはこの sink を
     // clone して渡し、タブのウィンドウ移動 (attach/detach) で表示先だけ付け替えられるようにする。
@@ -371,7 +369,7 @@ async fn connect_inner(
     // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
     // 受けて即 selectDisplay/setClientViewport を呼んでも ctrl_tx に確実に届く。
     sink.send_event(ClientEvent::HostInfo {
-        displays: host_displays.into_iter().map(Into::into).collect(),
+        displays: host_displays,
         audio: host_audio,
     });
     // ランチャーへ接続中 host 一覧を通知 (接続中表示・保存バッジ更新)。
@@ -388,7 +386,6 @@ async fn tcp_writer_loop(
     mut ctrl_rx: mpsc::UnboundedReceiver<ControlMsg>,
     mut file_rx: mpsc::Receiver<ControlMsg>,
 ) -> anyhow::Result<()> {
-    let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     // クライアント → ホストの TCP 制御は CTRL ドメインの連番 nonce。ホスト側 rx と
     // TCP の順序保証により歩調が合う。
     let mut tcp_tx_nonce: u64 = 0;
@@ -399,12 +396,7 @@ async fn tcp_writer_loop(
             m = file_rx.recv() => m,
         };
         let Some(msg) = msg else { break };
-        let plain = opts.serialize(&msg)?;
-        let nonce = NONCE_DOMAIN_CTRL | tcp_tx_nonce;
-        tcp_tx_nonce += 1;
-        let mut cipher = Vec::new();
-        session.encrypt(nonce, &plain, &mut cipher)?;
-        write_tcp_frame(&mut write_half, &cipher).await?;
+        send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
     }
     Ok(())
 }
@@ -420,7 +412,6 @@ async fn tcp_reader_loop(
     share_scope: Arc<Mutex<ShareScope>>,
     pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
 ) -> anyhow::Result<()> {
-    let opts = bincode::DefaultOptions::new().with_limit(MAX_TCP_FRAME as u64);
     let mut buf = Vec::new();
     let mut plain = Vec::new();
     let mut download: Option<DownloadState> = None;
@@ -428,11 +419,7 @@ async fn tcp_reader_loop(
     let mut tcp_rx_nonce: u64 = 1;
     loop {
         read_tcp_frame(&mut read_half, &mut buf).await?;
-        plain.clear();
-        let nonce = NONCE_DOMAIN_CTRL | tcp_rx_nonce;
-        tcp_rx_nonce += 1;
-        session.decrypt(nonce, &buf, &mut plain)?;
-        let msg: ControlMsg = opts.deserialize(&plain)?;
+        let msg = decode_ctrl_msg(&session, &buf, &mut tcp_rx_nonce, &mut plain)?;
         match msg {
             ControlMsg::Pong { ts_us } => {
                 // ts_us は Ping 送信時の session_start からの経過。往復差で RTT を得る。
@@ -444,10 +431,7 @@ async fn tcp_reader_loop(
                 });
             }
             ControlMsg::HostInfo { displays, audio } => {
-                sink.send_event(ClientEvent::HostInfo {
-                    displays: displays.into_iter().map(Into::into).collect(),
-                    audio,
-                });
+                sink.send_event(ClientEvent::HostInfo { displays, audio });
             }
             ControlMsg::DisplayResized { id, width, height } => {
                 sink.send_event(ClientEvent::DisplayResized { id, width, height });

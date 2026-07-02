@@ -1,4 +1,4 @@
-//! TCP 制御フレームと UDP メディアデータグラムのフレーミング/暗号化ヘルパ。
+//! UDP メディアデータグラムの暗号化と対向確定 (TCP 制御フレームは `aurora_common::framing`)。
 use super::*;
 
 /// UDP メディアデータグラムを構築する。
@@ -51,20 +51,4 @@ pub(crate) async fn wait_udp_hello(
         }
         tracing::debug!(?src, n, "unexpected UDP probe");
     }
-}
-
-pub(crate) async fn send_control_msg<W: AsyncWriteExt + Unpin>(
-    stream: &mut W,
-    session: &TransportSession,
-    msg: &ControlMsg,
-    tcp_tx_nonce: &mut u64,
-) -> Result<()> {
-    let bincode_opts = bincode::DefaultOptions::new().with_limit(64 * 1024);
-    let plain = bincode_opts.serialize(msg).context("encode ControlMsg")?;
-    let nonce = NONCE_DOMAIN_CTRL | *tcp_tx_nonce;
-    *tcp_tx_nonce += 1;
-    let mut cipher = Vec::new();
-    session.encrypt(nonce, &plain, &mut cipher)?;
-    write_tcp_frame(stream, &cipher).await?;
-    Ok(())
 }
