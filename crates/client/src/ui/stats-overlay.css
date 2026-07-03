@@ -23,7 +23,7 @@
 
 /* 横バー (上配置) の下へ下げる。--topbar-h は toolbar.ts が「上端からバー下端まで」で設定する
  * ため、タブ上配置で帯が inset されていてもタブ厚込みの値になる。 */
-body.tab-top:not(.tab-fs) #stats-hud { top: calc(var(--tabstrip-h, 43px) + 8px); }
+body.tab-top:not(.tab-fs) #stats-hud { top: calc(var(--tabstrip-h, 37px) + 8px); }
 body.bar-open.bar-top #stats-hud { top: calc(var(--topbar-h, 44px) + 8px); }
 
 /* ツールバー (ピル) が左右にあれば反対側へ逃がす。下のタブ規則と特異度が同じなので、

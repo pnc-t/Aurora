@@ -5,6 +5,11 @@
   display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
   pointer-events: none;
 }
+
+/* タブストリップ (z-index 4000) と重なる配置ではその厚み分だけ逃がす
+ * (stats-overlay.css の body.tab-* 規則と同じパターン)。フルスクリーン中は帯が消えるので寄せない。 */
+body.tab-bottom:not(.tab-fs) #toast-container { bottom: calc(var(--tabstrip-h, 37px) + 12px); }
+body.tab-right:not(.tab-fs) #toast-container { right: calc(var(--tabstrip-w, 200px) + 12px); }
 .toast {
   padding: 8px 14px; border-radius: 8px; max-width: 360px;
   background: var(--toast-bg); color: var(--fg);

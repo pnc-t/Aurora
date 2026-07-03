@@ -8,6 +8,11 @@
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
 }
 #file-panel.visible { display: flex; }
+
+/* タブストリップ (z-index 4000) と重なる配置ではその厚み分だけ逃がす
+ * (stats-overlay.css の body.tab-* 規則と同じパターン)。フルスクリーン中は帯が消えるので寄せない。 */
+body.tab-top:not(.tab-fs) #file-panel { top: calc(var(--tabstrip-h, 37px) + 46px); }
+body.tab-right:not(.tab-fs) #file-panel { right: calc(var(--tabstrip-w, 200px) + 10px); }
 #file-panel .row { display: flex; gap: 6px; align-items: center; }
 #file-panel .section-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
 #file-panel input[type="text"] { flex: 1; min-width: 0; }

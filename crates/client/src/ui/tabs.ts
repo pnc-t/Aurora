@@ -32,19 +32,27 @@ export type TabsHandle = {
   setPosition: (pos: ToolbarPosition) => void;
 };
 
+// 縦配置 (左右) のサイドバー折りたたみ。窓を跨いで記憶したいだけの UI 選好なので
+// Rust 設定ではなく localStorage に持つ。
+const COLLAPSE_KEY = "aurora.tabstrip.collapsed";
+
 export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   // data-tauri-drag-region は **クリック対象そのもの** に属性が無いとドラッグ移動しない
-  // (Tauri v2 は exact target 判定)。tabstrip-list が flex:1 で空き領域を覆うため、
-  // list 自身にも付けないとタブ以外の余白でウィンドウを掴めない。タブ/ボタンは子要素
-  // (属性無し) なので掴み対象から外れる。
+  // (Tauri v2 は exact target 判定)。spacer が余白を担う要素なのでそこに付ける。
+  // list はタブで埋まり空き領域を持たないため付けない。
   container.innerHTML = `
     <div class="tabstrip" data-tauri-drag-region>
-      <div class="tabstrip-list" id="tabstrip-list" data-tauri-drag-region></div>
-      <button type="button" class="tab-add" id="tab-add" title="接続を追加">${icon("add")}</button>
+      <button type="button" class="tab-collapse" id="tab-collapse" title="タブバーを折りたたむ">${icon("chevron")}</button>
+      <div class="tabstrip-list" id="tabstrip-list"></div>
+      <!-- 横配置では .tab-add-label が display:none になり、applyAriaLabels も textContent
+           非空 (非表示でも) と判定して補わないため、aria-label を明示して名前を確定させる。 -->
+      <button type="button" class="tab-add" id="tab-add" title="接続を追加" aria-label="接続を追加">${icon("add")}<span class="tab-add-label">新しいタブ</span></button>
+      <div class="tabstrip-spacer" data-tauri-drag-region></div>
     </div>
   `;
   const list = container.querySelector<HTMLElement>("#tabstrip-list");
   const strip = container.querySelector<HTMLElement>(".tabstrip");
+  const collapseBtn = container.querySelector<HTMLButtonElement>("#tab-collapse");
   container.querySelector<HTMLButtonElement>("#tab-add")?.addEventListener("click", () => opts.onAdd());
   applyAriaLabels(container); // 「+」など アイコンのみボタンに aria-label を補う
 
@@ -55,10 +63,16 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   // フルスクリーン中はストリップを完全に隠す (端ホバーでも出さない)。ツールバーピルと違い、
   // タブは没入時に不要なため一時表示もしない。
   let position: ToolbarPosition = "top";
+  let collapsed = localStorage.getItem(COLLAPSE_KEY) === "1";
+
+  function collapseTitle(): string {
+    return collapsed ? "タブバーを展開" : "タブバーを折りたたむ";
+  }
 
   function applyPosition(): void {
     container.classList.remove("pos-top", "pos-bottom", "pos-left", "pos-right");
     container.classList.add(`pos-${position}`);
+    container.classList.toggle("collapsed", collapsed); // 横配置にも付くが CSS は縦配置でのみ参照する
     document.body.classList.remove("tab-top", "tab-bottom", "tab-left", "tab-right");
     document.body.classList.add(`tab-${position}`);
     // 横帯 (上/下) のときだけ実測のストリップ厚を公開し、統計 HUD をその下へ逃がす
@@ -66,8 +80,30 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     if ((position === "top" || position === "bottom") && strip) {
       document.documentElement.style.setProperty("--tabstrip-h", `${strip.offsetHeight}px`);
     }
+    // 縦配置 (左右) のときだけ幅を公開する。映像 (#screen-wrap) やツールバー/統計 HUD の
+    // 逃げ幅が折りたたみ状態に追従するよう documentElement に置く (tabs.css がフォールバックのみ持つ)。
+    if (position === "left" || position === "right") {
+      document.documentElement.style.setProperty("--tabstrip-w", collapsed ? "44px" : "200px");
+    } else {
+      document.documentElement.style.removeProperty("--tabstrip-w");
+    }
+    if (collapseBtn) {
+      const title = collapseTitle();
+      collapseBtn.title = title;
+      collapseBtn.setAttribute("aria-label", title);
+    }
   }
   applyPosition();
+
+  collapseBtn?.addEventListener("click", () => {
+    collapsed = !collapsed;
+    if (collapsed) {
+      localStorage.setItem(COLLAPSE_KEY, "1");
+    } else {
+      localStorage.removeItem(COLLAPSE_KEY);
+    }
+    applyPosition();
+  });
 
   function makeTab(id: string, label: string, status: TabStatus): HTMLElement {
     const el = document.createElement("div");

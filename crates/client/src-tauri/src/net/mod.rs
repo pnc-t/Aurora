@@ -213,6 +213,9 @@ pub struct SessionState {
     /// セッション表示状態 (JSON) を session_id をキーに積み、移譲先ウィンドウの JS が
     /// `take_handoff` で取り出して `Session` を復元する。networking は継続したまま表示先だけ移す。
     pub adopt: Mutex<HashMap<String, String>>,
+    /// 最後にフォーカスされた capture ウィンドウのラベル。launcher からの接続を
+    /// 既存窓のタブへルーティングするために使う (同期ハンドラから触るので std::sync::Mutex)。
+    pub last_focused_capture: std::sync::Mutex<Option<String>>,
 }
 
 /// セッション id の発番。プロセス生存期間で一意ならよいので単調増加カウンタで足りる。
