@@ -1089,6 +1089,34 @@ fn run_server(
         None => system::load_encode_gpu(),
     };
 
+    // VDD の描画 GPU をキャプチャ GPU に一致させる (クロス GPU keyed mutex 固着の恒久対策)。
+    // 別 GPU が VDD を描画すると Windows がクロスアダプタ共有サーフェス (keyed mutex) で橋渡しし、
+    // キャプチャ側 Desktop Duplication が ACCESS_LOST 恒常化で固まる (Optimus ノートで実機確認)。
+    // friendlyname 変更の反映には**デバイス再起動が要る** (RELOAD_DRIVER pipe は loadSettings を
+    // 再実行しないため無効)。startup 時点なら接続なし=安全。昇格 (autostart /RL HIGHEST) なら成功、
+    // 非昇格の手動起動では失敗しうるので best-effort (失敗はログのみ、次回 reboot で反映)。
+    #[cfg(target_os = "windows")]
+    {
+        let gpu = device.adapter_name.clone();
+        if !gpu.is_empty() {
+            match display::ensure_vdd_render_gpu(&gpu) {
+                Ok(true) => {
+                    tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; restarting VDD device to apply");
+                    match display::restart_vdd_device() {
+                        Ok(()) => tracing::info!("VDD device restarted"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "VDD device restart failed; change applies on next reboot or manual device restart")
+                        }
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(gpu = %gpu, "VDD render GPU already matches capture GPU (or VDD not installed)")
+                }
+                Err(e) => tracing::warn!(error = %e, "could not align VDD render GPU"),
+            }
+        }
+    }
+
     // フレームと一緒に capture 時刻 (Instant) を運び、encode 側で capture→encode 待ちを測る
     // (--perf 時のみ集計)。Instant は Copy で安価。
     let (frame_tx, frame_rx) = mpsc::channel::<(Instant, Frame)>(2);

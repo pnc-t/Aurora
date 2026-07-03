@@ -14,7 +14,9 @@
 // 仮想ディスプレイ (MttVDD / IddCx) の検出と制御。解像度テイクオーバーの土台であり
 // display の関心事なので配下に置く (旧 `crate::virtualdisplay` → `crate::display`)。
 pub mod virtual_display;
-pub use virtual_display::{detect, ensure_common_resolutions};
+pub use virtual_display::{
+    detect, ensure_common_resolutions, ensure_vdd_render_gpu, restart_vdd_device,
+};
 
 /// 診断: 指定ディスプレイ (`\\.\DISPLAYn`) で解像度変更→復元を実測する (`--vdd-test-restore`)。
 /// 「切断後に解像度/fps が戻らない」原因切り分け用。安全な仮想ディスプレイ等で使う。

@@ -36,6 +36,9 @@ pub struct DeviceBundle {
     /// MFT を優先する LUID フィルタ) に使う。取得失敗時はゼロ LUID (後段のフィルタが
     /// 総当たり列挙へ劣化するだけで致命ではない)。
     pub adapter_luid: LUID,
+    /// このデバイスが載っているアダプタの DXGI 名 (Description)。VDD の描画 GPU を
+    /// キャプチャ GPU に一致させる (friendlyname 照合) のに使う。取得失敗時は空文字列。
+    pub adapter_name: String,
 }
 
 // SAFETY: device は SetMultithreadProtected(TRUE) 済みで、即時コンテキストへの
@@ -109,7 +112,7 @@ impl DeviceBundle {
             .and_then(|dxgi_device| unsafe { dxgi_device.GetAdapter() }.ok())
             // SAFETY: adp は live。GetDesc は値 (OUT 構造体) を返す。
             .and_then(|adp| unsafe { adp.GetDesc() }.ok());
-        let adapter_luid = match &desc {
+        let (adapter_luid, adapter_name) = match &desc {
             Some(desc) => {
                 let name = String::from_utf16_lossy(&desc.Description)
                     .trim_end_matches('\0')
@@ -119,13 +122,13 @@ impl DeviceBundle {
                     explicit_adapter = adapter.is_some(),
                     "shared D3D11 device adapter"
                 );
-                desc.AdapterLuid
+                (desc.AdapterLuid, name)
             }
             None => {
                 tracing::warn!(
                     "adapter LUID unavailable; encoder LUID filter degrades to enumeration order"
                 );
-                LUID::default()
+                (LUID::default(), String::new())
             }
         };
 
@@ -156,6 +159,7 @@ impl DeviceBundle {
             context,
             manager,
             adapter_luid,
+            adapter_name,
         })
     }
 }
