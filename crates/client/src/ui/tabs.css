@@ -209,22 +209,29 @@ body.tab-right:not(.tab-fs) #screen-wrap {
   color: var(--fg);
 }
 
-/* ツールバー (フローティングピル) とタブストリップが同じ端に来たとき重ならないよう、
- * ピルをストリップの厚み分だけ内側へずらす (id+class でセレクタ優先度を確保)。
- * 別の端どうしならずらさない (body.tab-* で同一端のときだけ効かせる)。
+/* ツールバー帯 (#topbar) とタブストリップの重なり回避。同じ端だけでなく直交する配置
+ * (例: ツールバー上 × タブ右) でも、タブストリップの厚み分だけ帯自体を inset する。
+ * ピルの margin でなく帯を寄せることで、横帯の中央寄せも「タブを除いた映像エリア」基準に
+ * なり、ピルが伸びてもタブ列に重ならない (id+class でセレクタ優先度を確保)。
  * フルスクリーン中 (body.tab-fs) はタブストリップが display:none になるので、寄せると
  * ピルだけが端から内側へずれて見える。tab-fs では寄せない (#screen-wrap と同じ扱い)。 */
-body.tab-top:not(.tab-fs) #topbar.pos-top .tb-pill {
-  margin-top: 42px;
+body.tab-top:not(.tab-fs) #topbar.pos-top,
+body.tab-top:not(.tab-fs) #topbar.vertical {
+  top: var(--tabstrip-h, 42px);
 }
-body.tab-bottom:not(.tab-fs) #topbar.pos-bottom .tb-pill {
-  margin-bottom: 42px;
+body.tab-bottom:not(.tab-fs) #topbar.pos-bottom,
+body.tab-bottom:not(.tab-fs) #topbar.vertical {
+  bottom: var(--tabstrip-h, 42px);
 }
-body.tab-left:not(.tab-fs) #topbar.pos-left .tb-pill {
-  margin-left: var(--tabstrip-w, 160px);
+body.tab-left:not(.tab-fs) #topbar.pos-left,
+body.tab-left:not(.tab-fs) #topbar.pos-top,
+body.tab-left:not(.tab-fs) #topbar.pos-bottom {
+  left: var(--tabstrip-w, 160px);
 }
-body.tab-right:not(.tab-fs) #topbar.pos-right .tb-pill {
-  margin-right: var(--tabstrip-w, 160px);
+body.tab-right:not(.tab-fs) #topbar.pos-right,
+body.tab-right:not(.tab-fs) #topbar.pos-top,
+body.tab-right:not(.tab-fs) #topbar.pos-bottom {
+  right: var(--tabstrip-w, 160px);
 }
 
 /* フルスクリーン中はタブストリップを完全に隠す。常時表示のままだと不透明な帯が

@@ -193,8 +193,12 @@ const host: SessionHost = {
 };
 
 // 他ウィンドウの設定保存に追従する (この窓の再接続・新規タブが古い値で始まらないように)。
+// ツールバー/タブの配置は接続を跨がず即反映する (再接続や新窓を開くまで古い配置が
+// 残ると、設定を変えたのに効かないように見える)。
 void listen<ClientSettings>("aurora://settings-changed", (e) => {
   settings = e.payload;
+  tabs.setPosition(e.payload.tab_position);
+  toolbar.setPosition(e.payload.toolbar_position);
 });
 
 // --- 共有ツールバー (操作は常にアクティブ Session へ) ---
