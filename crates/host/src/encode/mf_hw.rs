@@ -4,6 +4,12 @@
 //! `IMFDXGIDeviceManager` 経由で共有 D3D11 デバイスを渡して **GPU 上の NV12 テクスチャ
 //! を直接** `MFCreateDXGISurfaceBuffer` でラップして食わせる (ゼロコピー)。
 //!
+//! エンコーダ選択は既定で**キャプチャデバイスと同一 LUID** の MFT に限定する
+//! (`MFTEnum2` + `MFT_ENUM_ADAPTER_LUID`。別 GPU の MFT を誤選択して映像が全滅するのを防ぐ)。
+//! `--encode-gpu` で別 GPU を指定した場合のみクロスアダプタ経路になり、D3D マネージャを
+//! 渡さず staging readback → システムメモリサンプルで入力する (ゼロコピー禁則の意図的例外。
+//! Optimus ノートの iGPU キャプチャ + dGPU NVENC 用)。
+//!
 //! HW MFT は非同期 (async) なので `IMFMediaEventGenerator` を `GetEvent` (ブロッキング)
 //! で回し、`METransformNeedInput`→`ProcessInput` / `METransformHaveOutput`→`ProcessOutput`
 //! を駆動する。encode スレッドは 1 本なので IMFAsyncCallback は使わない。
@@ -13,20 +19,26 @@
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, anyhow};
-use windows::Win32::Foundation::FALSE;
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Foundation::{FALSE, LUID};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMF2DBuffer,
-    IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFTransform,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput, METransformNeedInput,
-    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateDXGISurfaceBuffer, MFCreateSample, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
+    IMF2DBuffer2, IMFActivate, IMFAttributes, IMFMediaBuffer, IMFMediaEventGenerator, IMFSample,
+    IMFTransform, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput,
+    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_TRANSFORM_ASYNC_UNLOCK, MF2DBuffer_LockFlags_Write,
+    MFCreate2DMediaBuffer, MFCreateAttributes, MFCreateDXGISurfaceBuffer, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnum2, MFVideoFormat_H264,
+    MFVideoFormat_NV12,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{Interface, PWSTR};
@@ -51,6 +63,11 @@ pub struct MfHwH264Encoder {
     max_bitrate: u32,
     frame_id: u16,
     force_keyframe: bool,
+    /// エンコードに使う GPU の LUID (未指定ならキャプチャデバイスと同一 GPU)。
+    encode_luid: LUID,
+    /// `encode_luid` がキャプチャ共有デバイスと異なる GPU か。true ならクロスアダプタ
+    /// (CPU 経由) 入力経路になる。
+    cross: bool,
 }
 
 struct Inner {
@@ -68,10 +85,19 @@ struct Inner {
     /// 受信済みで未消化の `METransformNeedInput` 数 (= MFT の空き入力スロット)。
     /// submit 呼び出しをまたいで保持し、トークンを 1 個も捨てないことでストールを防ぐ。
     pending_need_input: u32,
+    /// クロスアダプタ入力用の staging readback (`build_cpu_sample` 専用)。共有デバイス
+    /// (キャプチャ側 GPU) の `Arc` を保持する。
+    device: SharedDevice,
+    /// true ならエンコーダは別 GPU 上にあり、入力は CPU 経由 (staging readback) になる。
+    cross: bool,
+    /// クロスアダプタ readback 用の staging テクスチャ 2 面 (交互使用)。cross=false では未使用。
+    staging: [Option<ID3D11Texture2D>; 2],
+    /// 次回 `build_cpu_sample` が使う `staging` の面インデックス (0/1 交互)。
+    staging_idx: usize,
 }
 
 impl MfHwH264Encoder {
-    pub fn new(device: SharedDevice, max_bitrate: u32) -> Result<Self> {
+    pub fn new(device: SharedDevice, max_bitrate: u32, encode_luid: Option<LUID>) -> Result<Self> {
         crate::capture::device::init_thread_com()?;
         // 起動時に HW H.264 エンコーダの存在を確認する。無ければ Err を返し、呼び出し側
         // (PlatformEncoder::new) が SW MFT へフォールバックできるようにする。ここで確認
@@ -81,6 +107,8 @@ impl MfHwH264Encoder {
         if !hw_h264_encoder_present()? {
             return Err(anyhow!("no hardware H.264 encoder MFT found"));
         }
+        let encode_luid = encode_luid.unwrap_or(device.adapter_luid);
+        let cross = encode_luid != device.adapter_luid;
         Ok(Self {
             device,
             inner: None,
@@ -88,6 +116,8 @@ impl MfHwH264Encoder {
             max_bitrate,
             frame_id: 0,
             force_keyframe: true,
+            encode_luid,
+            cross,
         })
     }
 
@@ -103,13 +133,37 @@ impl MfHwH264Encoder {
                 bitrate = self.bitrate,
                 "building HW H.264 MFT"
             );
-            self.inner = Some(Inner::new(
+            self.inner = match Inner::new(
                 &self.device,
                 width,
                 height,
                 self.bitrate,
                 self.max_bitrate,
-            )?);
+                self.encode_luid,
+                self.cross,
+            ) {
+                Ok(inner) => Some(inner),
+                // dGPU が省電力設定/ドライバ不備等で掴めない環境でも映像を止めないため、
+                // 一度だけキャプチャ GPU 側 (常に掴めるはずの経路) へ切り替えて再試行する。
+                Err(e) if self.cross => {
+                    tracing::warn!(
+                        error = %e,
+                        "cross-GPU HW encoder init failed; falling back to capture GPU encoder"
+                    );
+                    self.cross = false;
+                    self.encode_luid = self.device.adapter_luid;
+                    Some(Inner::new(
+                        &self.device,
+                        width,
+                        height,
+                        self.bitrate,
+                        self.max_bitrate,
+                        self.encode_luid,
+                        self.cross,
+                    )?)
+                }
+                Err(e) => return Err(e),
+            };
             self.force_keyframe = true;
         }
         Ok(())
@@ -123,9 +177,11 @@ impl Inner {
         height: u32,
         bitrate: u32,
         max_bitrate: u32,
+        target_luid: LUID,
+        cross: bool,
     ) -> Result<Self> {
-        let (transform, friendly) = enum_hw_encoder()?;
-        tracing::info!(encoder = %friendly, "selected HW H.264 MFT");
+        let (transform, friendly) = enum_hw_encoder(target_luid)?;
+        tracing::info!(encoder = %friendly, cross, "selected HW H.264 MFT");
 
         // async HW MFT を使う前にアンロックする (必須)。
         // SAFETY: transform live。GetAttributes は IMFAttributes を返す。
@@ -138,13 +194,17 @@ impl Inner {
                 .context("set MF_TRANSFORM_ASYNC_UNLOCK")?;
         }
 
-        // 共有 D3D11 デバイスを MFT に渡す (ゼロコピー入力の前提)。
-        // SAFETY: manager は live。ulparam は IUnknown ポインタ。MFT が AddRef する。
-        unsafe {
-            let manager_ptr = device.manager.as_raw() as usize;
-            transform
-                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr)
-                .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
+        // 共有 D3D11 デバイスを MFT に渡す (ゼロコピー入力の前提)。クロスアダプタ (別 GPU の
+        // MFT) では、このデバイスマネージャは対象 GPU から掴めず設定しても無意味 (最悪エラー)
+        // なので渡さない。入力はシステムメモリサンプル (build_cpu_sample) に切り替える。
+        if !cross {
+            // SAFETY: manager は live。ulparam は IUnknown ポインタ。MFT が AddRef する。
+            unsafe {
+                let manager_ptr = device.manager.as_raw() as usize;
+                transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr)
+                    .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
+            }
         }
 
         // 出力 (H.264) → 入力 (NV12) の順に設定する。
@@ -196,27 +256,23 @@ impl Inner {
             out_queue: VecDeque::new(),
             in_flight: VecDeque::new(),
             pending_need_input: 0,
+            device: device.clone(),
+            cross,
+            staging: [None, None],
+            staging_idx: 0,
         })
     }
 
     /// NV12 テクスチャを IMFSample 化して投入し、エンコーダが次入力を要求するまで
     /// イベントを回す (途中の出力は out_queue に積む)。
     fn submit(&mut self, texture: &ID3D11Texture2D, fid: u16, force_keyframe: bool) -> Result<()> {
-        let nv12_size = self.width * self.height * 3 / 2;
-        // SAFETY: texture は共有デバイス上の live な NV12。riid は ID3D11Texture2D。
-        let sample = unsafe {
-            let buffer: IMFMediaBuffer =
-                MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, FALSE)
-                    .context("MFCreateDXGISurfaceBuffer")?;
-            // 入力長を設定 (2D バッファの連続長、無ければ NV12 サイズ)。
-            let len = match buffer.cast::<IMF2DBuffer>() {
-                Ok(b2) => b2.GetContiguousLength().unwrap_or(nv12_size),
-                Err(_) => nv12_size,
-            };
-            let _ = buffer.SetCurrentLength(len);
-
-            let sample = MFCreateSample().context("MFCreateSample (in)")?;
-            sample.AddBuffer(&buffer).context("AddBuffer (in)")?;
+        let sample = if self.cross {
+            self.build_cpu_sample(texture)?
+        } else {
+            self.build_gpu_sample(texture)?
+        };
+        // SAFETY: sample は直前に構築した live な IMFSample。各 Set* は値をコピーする。
+        unsafe {
             sample
                 .SetSampleTime(self.sample_time_100ns)
                 .context("SetSampleTime")?;
@@ -226,8 +282,7 @@ impl Inner {
             if force_keyframe {
                 let _ = sample.SetUINT32(&MFSampleExtension_CleanPoint, 1);
             }
-            sample
-        };
+        }
         self.sample_time_100ns += FRAME_DURATION_100NS;
 
         // このフレームの入力を 1 つだけ投入する。NeedInput トークン (空き入力スロット通知) は
@@ -268,6 +323,184 @@ impl Inner {
             self.dispatch_event(&event)?;
         }
         Ok(())
+    }
+
+    /// 既定経路: 同一 GPU 上の共有 D3D11 テクスチャをそのまま MFT に渡す (ゼロコピー)。
+    fn build_gpu_sample(&self, texture: &ID3D11Texture2D) -> Result<IMFSample> {
+        let nv12_size = self.width * self.height * 3 / 2;
+        // SAFETY: texture は共有デバイス上の live な NV12。riid は ID3D11Texture2D。
+        unsafe {
+            let buffer: IMFMediaBuffer =
+                MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, FALSE)
+                    .context("MFCreateDXGISurfaceBuffer")?;
+            // 入力長を設定 (2D バッファの連続長、無ければ NV12 サイズ)。
+            let len = match buffer.cast::<IMF2DBuffer>() {
+                Ok(b2) => b2.GetContiguousLength().unwrap_or(nv12_size),
+                Err(_) => nv12_size,
+            };
+            let _ = buffer.SetCurrentLength(len);
+
+            let sample = MFCreateSample().context("MFCreateSample (in)")?;
+            sample.AddBuffer(&buffer).context("AddBuffer (in)")?;
+            Ok(sample)
+        }
+    }
+
+    /// クロスアダプタ経路: staging へ readback した NV12 をシステムメモリサンプルとして渡す。
+    ///
+    /// ゼロコピー禁則 (CLAUDE.md §6) の意図的な例外。クロスアダプタでは D3D11 テクスチャを
+    /// 別 GPU の MFT と共有できず、CPU 経由 (staging readback → システムメモリサンプル) が
+    /// 唯一の経路。Optimus ノートで iGPU キャプチャ + dGPU NVENC を使うための追加コスト
+    /// (1080p60 の NV12 で ~190MB/s) を意図して払う。
+    fn build_cpu_sample(&mut self, texture: &ID3D11Texture2D) -> Result<IMFSample> {
+        let idx = self.staging_idx;
+        self.staging_idx = (self.staging_idx + 1) % 2;
+
+        if self.staging[idx].is_none() {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: self.width,
+                Height: self.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            // SAFETY: device live、desc 全フィールド初期化済み。
+            unsafe {
+                self.device
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut tex))
+                    .context("CreateTexture2D(cross-GPU NV12 staging)")?;
+            }
+            self.staging[idx] = Some(tex.ok_or_else(|| anyhow!("cross-GPU staging texture null"))?);
+        }
+        // Map は直前フレームの GPU コピー完了までブロックするため、staging を 2 面交互に
+        // 使って前フレームの完了待ちと今回のコピーを重ねる (完全な隠蔽ではないが、単一面より
+        // ストールしにくい)。
+        let staging = self.staging[idx]
+            .as_ref()
+            .ok_or_else(|| anyhow!("staging texture missing"))?;
+
+        // SAFETY: staging/texture は同一デバイス・同フォーマット・同サイズ (NV12)。
+        unsafe { self.device.context.CopyResource(staging, texture) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: staging は STAGING + CPU_ACCESS_READ。Map は安全に呼べる。
+        unsafe {
+            self.device
+                .context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Map(cross-GPU NV12 staging)")?;
+        }
+
+        let result = self.copy_mapped_nv12_into_2d_buffer(&mapped);
+
+        // SAFETY: 直前の Map に対応する Unmap。コピーの成否によらず必ず呼ぶ (漏れ防止)。
+        unsafe { self.device.context.Unmap(staging, 0) };
+        result
+    }
+
+    /// `build_cpu_sample` の内側: Map 済みの staging から 2D メディアバッファへ NV12 をコピーし
+    /// IMFSample を組み立てる。Unlock2D/Unmap を確実に対にするため、Lock2DSize 以降の失敗経路
+    /// でも Unlock2D を必ず呼んでから return する。
+    fn copy_mapped_nv12_into_2d_buffer(
+        &self,
+        mapped: &D3D11_MAPPED_SUBRESOURCE,
+    ) -> Result<IMFSample> {
+        let w = self.width;
+        let h = self.height;
+        let src_pitch = mapped.RowPitch as usize;
+
+        // SAFETY: MFCreate2DMediaBuffer は幅高さから 2D バッファを確保する。fbottomup=false
+        // (NV12 はトップダウンのみ想定)。
+        let buffer: IMFMediaBuffer =
+            unsafe { MFCreate2DMediaBuffer(w, h, MFVideoFormat_NV12.data1, false) }
+                .context("MFCreate2DMediaBuffer")?;
+        let buf2d: IMF2DBuffer2 = buffer.cast().context("cast IMF2DBuffer2")?;
+
+        let mut scanline0: *mut u8 = std::ptr::null_mut();
+        let mut pitch: i32 = 0;
+        // バッファ全体の先頭 (アライメント等で scanline0 と異なりうる)。範囲検証は buf_len のみ
+        // で行うため使わないが、Lock2DSize の OUT パラメータとして必須。
+        let mut _buf_start: *mut u8 = std::ptr::null_mut();
+        let mut buf_len: u32 = 0;
+        // SAFETY: buf2d は live。Lock2DSize は各 OUT パラメータを埋める。
+        unsafe {
+            buf2d
+                .Lock2DSize(
+                    MF2DBuffer_LockFlags_Write,
+                    &mut scanline0,
+                    &mut pitch,
+                    &mut _buf_start,
+                    &mut buf_len,
+                )
+                .context("Lock2DSize")?;
+        }
+
+        // Lock2DSize 成功後は、この後のどの経路でも Unlock2D を必ず呼ぶ (早期 return しない)。
+        let copy_result: Result<()> = if pitch < 0 {
+            // NV12 は bottom-up を扱わない (想定外個体)。
+            Err(anyhow!(
+                "unexpected bottom-up NV12 2D buffer (negative pitch)"
+            ))
+        } else {
+            let dst_pitch = pitch as usize;
+            let need = dst_pitch * h as usize * 3 / 2;
+            if (buf_len as usize) < need {
+                Err(anyhow!("2D buffer too small: have {buf_len} need {need}"))
+            } else {
+                let src = mapped.pData as *const u8;
+                // SAFETY: src は Map 済み staging の有効範囲 (h 行 + h/2 行、各 src_pitch
+                // バイト)。dst (scanline0 起点) は Lock2DSize が返した buf_len (>= need を
+                // 検証済み) の範囲内。
+                unsafe {
+                    for row in 0..h as usize {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(row * src_pitch),
+                            scanline0.add(row * dst_pitch),
+                            w as usize,
+                        );
+                    }
+                    let src_uv = src.add(src_pitch * h as usize);
+                    let dst_uv = scanline0.add(dst_pitch * h as usize);
+                    for row in 0..(h as usize) / 2 {
+                        std::ptr::copy_nonoverlapping(
+                            src_uv.add(row * src_pitch),
+                            dst_uv.add(row * dst_pitch),
+                            w as usize,
+                        );
+                    }
+                }
+                Ok(())
+            }
+        };
+
+        // SAFETY: Lock2DSize 成功と対になる Unlock2D。コピーの成否によらず必ず呼ぶ。
+        unsafe {
+            let _ = buf2d.Unlock2D();
+        }
+        copy_result?;
+
+        let len = w * h * 3 / 2;
+        // SAFETY: buffer live。SetCurrentLength は長さのみ更新する。
+        unsafe {
+            buffer.SetCurrentLength(len).context("SetCurrentLength")?;
+        }
+
+        // SAFETY: buffer/sample は live。
+        unsafe {
+            let sample = MFCreateSample().context("MFCreateSample (cross)")?;
+            sample.AddBuffer(&buffer).context("AddBuffer (cross)")?;
+            Ok(sample)
+        }
     }
 
     /// 投入済み (`in_flight`) だが未出力のフレームを、後続フレームの `submit` を待たずに
@@ -533,40 +766,134 @@ fn hw_h264_encoder_present() -> Result<bool> {
     Ok(count > 0)
 }
 
-/// HW H.264 エンコーダ MFT を `MFTEnumEx` で列挙し、**実際に `ActivateObject` できた最初の 1 つ**を
-/// (transform, friendly name) で返す。
+/// HW H.264 エンコーダ MFT を選ぶ。`target_luid` が非ゼロなら **まず同一 GPU の MFT に限定**して
+/// 列挙する (`MFTEnum2` + `MFT_ENUM_ADAPTER_LUID`)。
 ///
-/// ハイブリッド GPU (Optimus) のノートでは複数ベンダの HW MFT が列挙される。プロセスの GPU
-/// プリファレンスを iGPU(Intel) に固定していると、列挙先頭に来がちな dGPU(NVENC) の MFT は
-/// `ActivateObject` が失敗する (プロセスから dGPU を掴めない)。先頭だけを試すと QSV にたどり着けず
-/// 毎フレーム失敗するため、列挙順に総当たりして最初に起動できた MFT を採る (= キャプチャ共有デバイスと
-/// 同じ iGPU 上の QSV に自然に落ちる)。`MFTEnumEx` は LUID フィルタ非対応なのでこの方式で吸収する。
-fn enum_hw_encoder() -> Result<(IMFTransform, String)> {
+/// 従来の「列挙順で総当たりして最初に activate できた MFT を無条件に採る」方式は、NVENC 等
+/// 別 GPU の MFT が activate 可能な環境で「別 GPU の MFT + このキャプチャデバイス」という
+/// 不整合構成を選び映像が全滅しうる (実機で発生しうる危険な組み合わせ)。そのため既定では
+/// キャプチャデバイスと同一 LUID の MFT に絞ってから総当たりする。LUID フィルタが 0 件/失敗
+/// (LUID 取得不可・ドライバ不備等) の場合のみ、ハイブリッド GPU 環境向けの全 MFT 総当たり
+/// (`MFTEnumEx`、`MFTEnumEx` は LUID フィルタ非対応) にフォールバックする。
+///
+/// いずれの経路でも `ActivateObject` に失敗する候補が混在するのは想定内 (Optimus ではプロセス
+/// GPU プリファレンス次第で一部ベンダの MFT が掴めない) なので、列挙順に総当たりして最初に
+/// 起動できた MFT を採る。
+fn enum_hw_encoder(target_luid: LUID) -> Result<(IMFTransform, String)> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
     };
     let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
 
+    let has_luid = target_luid.LowPart != 0 || target_luid.HighPart != 0;
+    let mut candidates = if has_luid {
+        match enum_hw_encoder_by_luid(&out_info, flags, target_luid) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                tracing::debug!(
+                    "MFTEnum2(ADAPTER_LUID) matched no HW MFT; falling back to full enumeration"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "MFTEnum2(ADAPTER_LUID) failed; falling back to full enumeration"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if candidates.is_empty() {
+        candidates = enum_hw_encoder_all(&out_info, flags)?;
+    }
+
+    activate_first_candidate(candidates)
+}
+
+/// `target_luid` の GPU に限定して HW H.264 MFT を列挙する。
+fn enum_hw_encoder_by_luid(
+    out_info: &MFT_REGISTER_TYPE_INFO,
+    flags: MFT_ENUM_FLAG,
+    target_luid: LUID,
+) -> Result<Vec<IMFActivate>> {
+    // MFTEnumEx は LUID フィルタ非対応だが、MFTEnum2 は MFT_ENUM_ADAPTER_LUID 属性 (BLOB) で
+    // 対象 GPU の HW MFT だけを列挙できる。キャプチャと別 GPU の MFT を誤選択しないための本命経路。
+    let mut attrs: Option<IMFAttributes> = None;
+    // SAFETY: MFCreateAttributes は OUT パラメータを初期化する。
+    unsafe { MFCreateAttributes(&mut attrs, 1) }.context("MFCreateAttributes")?;
+    let attrs = attrs.ok_or_else(|| anyhow!("IMFAttributes null"))?;
+    let luid_blob: [u8; 8] = {
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&target_luid.LowPart.to_le_bytes());
+        b[4..].copy_from_slice(&target_luid.HighPart.to_le_bytes());
+        b
+    };
+    // SAFETY: attrs は live。SetBlob は値をコピーする。
+    unsafe { attrs.SetBlob(&MFT_ENUM_ADAPTER_LUID, &luid_blob) }
+        .context("SetBlob(ADAPTER_LUID)")?;
+
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    // SAFETY: MFTEnum2 は activate 配列 (CoTaskMem) と件数を OUT で返す。
+    unsafe {
+        mft_enum2_call(flags, out_info, &attrs, &mut activates, &mut count)?;
+    }
+    // SAFETY: MFTEnum2 が成功時に (0 件を含め) 有効な配列を返す。
+    Ok(unsafe { collect_activates(activates, count) })
+}
+
+/// GPU 限定なしで HW H.264 MFT を総当たり列挙する (`MFTEnumEx`)。
+fn enum_hw_encoder_all(
+    out_info: &MFT_REGISTER_TYPE_INFO,
+    flags: MFT_ENUM_FLAG,
+) -> Result<Vec<IMFActivate>> {
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
     // SAFETY: MFTEnumEx は activate 配列 (CoTaskMem) と件数を OUT で返す。
     unsafe {
-        mft_enum_ex_call(flags, &out_info, &mut activates, &mut count)?;
+        mft_enum_ex_call(flags, out_info, &mut activates, &mut count)?;
     }
     if count == 0 || activates.is_null() {
         return Err(anyhow!("no hardware H.264 encoder MFT found"));
     }
+    // SAFETY: MFTEnumEx が成功時に count 要素の配列を返す。
+    Ok(unsafe { collect_activates(activates, count) })
+}
 
-    // 列挙結果を Vec へ移し、配列メモリは即解放する。以後は Vec 上で総当たりする。
-    // SAFETY: activates は count 要素の Option<IMFActivate> 配列。各要素を take して所有権を移す。
-    let candidates: Vec<IMFActivate> = unsafe {
+/// 列挙結果 (CoTaskMem 配列) を Vec へ移し、配列メモリは即解放する。以後は Vec 上で扱い、
+/// CoTaskMem の生ポインタを引きずらないようにする。
+///
+/// # Safety
+/// `activates` は null か、`count` 要素の `Option<IMFActivate>` の CoTaskMem 配列であること。
+unsafe fn collect_activates(activates: *mut Option<IMFActivate>, count: u32) -> Vec<IMFActivate> {
+    if activates.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: 呼び出し元の契約により activates は count 要素の Option<IMFActivate> 配列。
+    // 各要素を take して所有権を移す。
+    unsafe {
         let slice = std::slice::from_raw_parts_mut(activates, count as usize);
         let v: Vec<IMFActivate> = slice.iter_mut().filter_map(|s| s.take()).collect();
         CoTaskMemFree(Some(activates as *const _ as *const std::ffi::c_void));
         v
-    };
+    }
+}
 
+/// 列挙済み候補を先頭から `ActivateObject` を試し、**実際に起動できた最初の 1 つ**を
+/// (transform, friendly name) で返す。
+///
+/// ハイブリッド GPU (Optimus) のノートでは複数ベンダの HW MFT が列挙される。プロセスの GPU
+/// プリファレンスを iGPU(Intel) に固定していると、列挙先頭に来がちな dGPU(NVENC) の MFT は
+/// `ActivateObject` が失敗する (プロセスから dGPU を掴めない)。先頭だけを試すと QSV にたどり着けず
+/// 毎フレーム失敗するため、列挙順に総当たりして最初に起動できた MFT を採る。
+fn activate_first_candidate(candidates: Vec<IMFActivate>) -> Result<(IMFTransform, String)> {
+    if candidates.is_empty() {
+        return Err(anyhow!("no hardware H.264 encoder MFT found"));
+    }
     let mut skipped: Vec<String> = Vec::new();
     for activate in &candidates {
         let friendly = read_friendly_name(activate).unwrap_or_else(|| "unknown HW MFT".to_string());
@@ -583,7 +910,9 @@ fn enum_hw_encoder() -> Result<(IMFTransform, String)> {
                 return Ok((transform, friendly));
             }
             Err(e) => {
-                tracing::debug!(
+                // debug から warn に昇格: 既定ログレベルに HRESULT が残らず実機診断が遅れたため
+                // (2026-07-03)。
+                tracing::warn!(
                     encoder = %friendly,
                     error = %e,
                     "HW H.264 MFT ActivateObject failed; trying next candidate"
@@ -619,6 +948,32 @@ unsafe fn mft_enum_ex_call(
             count,
         )
         .context("MFTEnumEx")
+    }
+}
+
+/// `MFTEnum2` の薄いラッパー (unsafe 呼び出しを 1 箇所に閉じる)。
+///
+/// # Safety
+/// OUT パラメータは MF が初期化する。呼び出し側が配列を解放する。
+unsafe fn mft_enum2_call(
+    flags: MFT_ENUM_FLAG,
+    out_info: &MFT_REGISTER_TYPE_INFO,
+    attrs: &IMFAttributes,
+    activates: *mut *mut Option<IMFActivate>,
+    count: *mut u32,
+) -> Result<()> {
+    // SAFETY: activates/count は呼び出し側が渡す有効な OUT ポインタ。MFTEnum2 が結果を確保する。
+    unsafe {
+        MFTEnum2(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            None,
+            Some(out_info),
+            attrs,
+            activates,
+            count,
+        )
+        .context("MFTEnum2")
     }
 }
 

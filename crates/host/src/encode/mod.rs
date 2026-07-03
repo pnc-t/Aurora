@@ -47,22 +47,43 @@ pub enum PlatformEncoder {
     Sw(mf::MfH264Encoder),
 }
 
+/// プラットフォームエンコーダを生成する。`encode_gpu` は使用 GPU の名前部分一致指定
+/// (None = キャプチャと同一 GPU)。Optimus ノートでキャプチャ (iGPU) と別の dGPU (NVENC)
+/// を使うための入口で、名前→LUID の解決と失敗時のフォールバックはここで行う。
 #[cfg(target_os = "windows")]
-impl PlatformEncoder {
-    pub fn new(device: SharedDevice, max_bitrate_bps: u32) -> anyhow::Result<Self> {
-        if std::env::var_os("AURORA_FORCE_SW_ENCODER").is_some() {
-            tracing::warn!("AURORA_FORCE_SW_ENCODER set: forcing software H.264 MFT");
-            return Ok(Self::Sw(mf::MfH264Encoder::new(device, max_bitrate_bps)?));
+pub fn create(
+    device: SharedDevice,
+    max_bitrate_bps: u32,
+    encode_gpu: Option<&str>,
+) -> anyhow::Result<PlatformEncoder> {
+    let encode_luid = encode_gpu.and_then(|q| match crate::capture::find_adapter_luid(q) {
+        Some((luid, name)) => {
+            tracing::info!(query = %q, gpu = %name, "encode GPU resolved (--encode-gpu)");
+            Some(luid)
         }
-        match mf_hw::MfHwH264Encoder::new(device.clone(), max_bitrate_bps) {
-            Ok(e) => {
-                tracing::info!("video encoder: hardware H.264 MFT (zero-copy NV12)");
-                Ok(Self::Hw(e))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "HW H.264 encoder unavailable; falling back to software MFT (NV12 read-back)");
-                Ok(Self::Sw(mf::MfH264Encoder::new(device, max_bitrate_bps)?))
-            }
+        None => {
+            tracing::warn!(query = %q, "encode GPU not found; using capture GPU");
+            None
+        }
+    });
+    if std::env::var_os("AURORA_FORCE_SW_ENCODER").is_some() {
+        tracing::warn!("AURORA_FORCE_SW_ENCODER set: forcing software H.264 MFT");
+        return Ok(PlatformEncoder::Sw(mf::MfH264Encoder::new(
+            device,
+            max_bitrate_bps,
+        )?));
+    }
+    match mf_hw::MfHwH264Encoder::new(device.clone(), max_bitrate_bps, encode_luid) {
+        Ok(e) => {
+            tracing::info!("video encoder: hardware H.264 MFT (zero-copy NV12)");
+            Ok(PlatformEncoder::Hw(e))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "HW H.264 encoder unavailable; falling back to software MFT (NV12 read-back)");
+            Ok(PlatformEncoder::Sw(mf::MfH264Encoder::new(
+                device,
+                max_bitrate_bps,
+            )?))
         }
     }
 }
@@ -108,3 +129,13 @@ impl VideoEncoder for PlatformEncoder {
 mod ffmpeg;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use ffmpeg::FfmpegH264Encoder as PlatformEncoder;
+
+/// 非 Windows: GPU 選択は未対応 (ffmpeg 側が実行時に選ぶ)。指定は無視する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn create(
+    device: crate::capture::SharedDevice,
+    max_bitrate_bps: u32,
+    _encode_gpu: Option<&str>,
+) -> anyhow::Result<PlatformEncoder> {
+    PlatformEncoder::new(device, max_bitrate_bps)
+}

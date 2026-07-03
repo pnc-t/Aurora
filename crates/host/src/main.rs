@@ -79,6 +79,9 @@ struct Args {
     /// 引数でファイルログのレベルを上げられるようにする。`debug` 等の素のレベル、または
     /// `aurora=debug,snow=warn` のような完全なディレクティブを受け付ける。
     log_level: Option<String>,
+    /// エンコード GPU の名前部分一致指定 (`--encode-gpu`)。"auto" で保存を消し既定
+    /// (キャプチャと同一 GPU) へ戻す。トレイ UI が無く CLI が唯一の入口のため明示時は永続化する。
+    encode_gpu: Option<String>,
 }
 
 impl Default for Args {
@@ -100,6 +103,7 @@ impl Default for Args {
             clear_password: false,
             log_level: None,
             bind: None,
+            encode_gpu: None,
         }
     }
 }
@@ -169,6 +173,9 @@ fn parse_args() -> Args {
             }
             "--bind" => {
                 args.bind = Some(take_value(&mut it, "--bind"));
+            }
+            "--encode-gpu" => {
+                args.encode_gpu = Some(take_value(&mut it, "--encode-gpu"));
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -278,7 +285,14 @@ fn main() -> Result<()> {
         system::load_port().unwrap_or(args.port)
     };
     let bind = resolve_bind_spec(args.bind.as_deref());
-    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port, bind)
+    run_server(
+        args.perf,
+        args.fps_cap,
+        args.max_bitrate_bps,
+        port,
+        bind,
+        args.encode_gpu,
+    )
 }
 
 /// 待受アドレスの解決方法 ([`BindSpec`]) を決める。
@@ -747,7 +761,7 @@ fn dump_h264(n: usize) -> Result<()> {
         .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
     let device = capture::create_shared_device(&primary)?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
-    let mut enc = PlatformEncoder::new(device, MAX_BITRATE_BPS)?;
+    let mut enc = encode::create(device, MAX_BITRATE_BPS, None)?;
     let mut out = std::fs::File::create("out.h264").context("create out.h264")?;
     use std::io::Write;
 
@@ -917,6 +931,7 @@ fn run_server(
     max_bitrate_bps: u32,
     port: u16,
     bind: BindSpec,
+    encode_gpu_arg: Option<String>,
 ) -> Result<()> {
     // DPAPI で保存済みのパスワードがあればそれを使う (再起動しても固定・無人起動で読める)。
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
@@ -1056,6 +1071,24 @@ fn run_server(
     // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
     let device = capture::create_shared_device(&initial_name)?;
 
+    // --encode-gpu の解決: CLI 明示 > 保存値 > 既定 (キャプチャ GPU)。"auto" は保存を消して既定へ。
+    // 保存失敗は映像機能に影響しないため warn で続行する。
+    let encode_gpu: Option<String> = match encode_gpu_arg.as_deref() {
+        Some(v) if v.eq_ignore_ascii_case("auto") => {
+            if let Err(e) = system::clear_encode_gpu() {
+                tracing::warn!(error = %e, "failed to clear encode GPU setting");
+            }
+            None
+        }
+        Some(v) => {
+            if let Err(e) = system::save_encode_gpu(v) {
+                tracing::warn!(error = %e, "failed to save encode GPU setting");
+            }
+            Some(v.to_string())
+        }
+        None => system::load_encode_gpu(),
+    };
+
     // フレームと一緒に capture 時刻 (Instant) を運び、encode 側で capture→encode 待ちを測る
     // (--perf 時のみ集計)。Instant は Copy で安価。
     let (frame_tx, frame_rx) = mpsc::channel::<(Instant, Frame)>(2);
@@ -1148,8 +1181,15 @@ fn run_server(
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
-            if let Err(e) = encode_loop(device, frame_rx, nal_tx, enc_cmd_rx, perf, max_bitrate_bps)
-            {
+            if let Err(e) = encode_loop(
+                device,
+                frame_rx,
+                nal_tx,
+                enc_cmd_rx,
+                perf,
+                max_bitrate_bps,
+                encode_gpu,
+            ) {
                 tracing::error!(error = %e, "encode loop ended");
             }
         })?;
@@ -1485,8 +1525,9 @@ fn encode_loop(
     mut cmd_rx: mpsc::Receiver<EncoderCommand>,
     perf: bool,
     max_bitrate_bps: u32,
+    encode_gpu: Option<String>,
 ) -> Result<()> {
-    let mut enc = PlatformEncoder::new(device, max_bitrate_bps)?;
+    let mut enc = encode::create(device, max_bitrate_bps, encode_gpu.as_deref())?;
     let mut meter = perf.then(perf::EncodeMeter::new);
     // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
     let mut nals: Vec<EncodedNal> = Vec::new();
