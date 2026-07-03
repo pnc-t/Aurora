@@ -179,6 +179,20 @@ fn parse_args() -> Args {
 }
 
 fn main() -> Result<()> {
+    // DPI 非対応プロセスでは GetSystemMetrics が拡大率で縮小した仮想値を返し、マウス絶対座標の
+    // 正規化 (input/windows.rs) が物理ピクセルのキャプチャ座標と食い違ってカーソルがずれる。
+    // 従来は HDR キャプチャ経路のみで設定されていたため、SDR ホストで顕在化した。起動最初期に
+    // 全経路で必ず設定する (二重呼び出しは失敗するだけで無害)。
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: プロセス全体の DPI 設定を変えるだけで、メモリ安全性に影響しない。
+        unsafe {
+            let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
+    }
+
     let args = parse_args();
 
     // CLI サブコマンドは端末への入出力が要る。既定のサーバ起動はバックグラウンド

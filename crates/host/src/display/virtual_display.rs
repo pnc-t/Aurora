@@ -37,6 +37,30 @@ pub fn detect() -> Option<VddInfo> {
         String::from_utf16_lossy(&buf[..len])
     }
 
+    // 同じ GDI 名を持つアダプタが何個あるか数える。デタッチ済みの VDD がアタッチ済み
+    // 物理ディスプレイと同じ `\\.\DISPLAYn` を名乗る実機事象があり (2026-07-03)、その場合
+    // 名前指定 API (ChangeDisplaySettingsExW 等) がどちらのアダプタに効くか不定になる。
+    fn count_adapters_named(name: &str) -> u32 {
+        let mut count = 0u32;
+        let mut j = 0u32;
+        loop {
+            let mut adapter = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: 第 1 引数 NULL でアダプタ (\\.\DISPLAYn) を順に列挙する。範囲外で FALSE。
+            let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), j, &mut adapter, 0) };
+            if !ok.as_bool() {
+                break;
+            }
+            j += 1;
+            if wstr(&adapter.DeviceName) == name {
+                count += 1;
+            }
+        }
+        count
+    }
+
     let mut i = 0u32;
     loop {
         let mut adapter = DISPLAY_DEVICEW {
@@ -69,6 +93,17 @@ pub fn detect() -> Option<VddInfo> {
         let dev_id = wstr(&mon.DeviceID);
         let dev_str = wstr(&mon.DeviceString);
         if dev_id.contains(VDD_MONITOR_HWID) || dev_str.contains("VDD by MTT") {
+            // 名前が一意でないと、この後の名前指定 API がどちらのアダプタに効くか不定になり
+            // 物理ディスプレイへ誤ってテイクオーバーする恐れがある。衝突時は VDD なしに倒す。
+            let count = count_adapters_named(&adapter_name);
+            if count > 1 {
+                tracing::warn!(
+                    name = %adapter_name,
+                    count,
+                    "VDD の GDI 名が別のディスプレイアダプタと重複しているため VDD を利用不可として扱う"
+                );
+                continue;
+            }
             let (width, height) = match current_resolution(&aw) {
                 Some(wh) => wh,
                 None => {
