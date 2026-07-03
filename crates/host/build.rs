@@ -35,7 +35,8 @@ fn main() {
         // ComCtl32 v6 への依存を宣言し、ビジュアルスタイル (テーマ) を有効化する。これが無いと
         // BUTTON/EDIT が Win95 風のフラットなグレー 3D 表示になる。宣言すると tray の設定
         // ダイアログのボタン/入力欄が現行 Windows のテーマで描画される。DPI awareness は
-        // capture が実行時に SetProcessDpiAwarenessContext で設定するためマニフェストには書かない。
+        // main 起動時に SetProcessDpiAwarenessContext で全経路必ず設定するためマニフェストには
+        // 書かない。
         res.set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
