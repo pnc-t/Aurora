@@ -48,35 +48,53 @@ fn main() {
         .manage(SessionState::default())
         // ウィンドウ破棄時の後始末: capture ウィンドウはその session を切断、launcher
         // (main) を閉じたらアプリ全体を終了する。
-        .on_window_event(|window, event| {
-            if !matches!(event, tauri::WindowEvent::Destroyed) {
-                return;
+        .on_window_event(|window, event| match event {
+            // launcher からの接続を既存 capture 窓のタブへルーティングするため、直近の
+            // フォーカス窓を追跡する (open_capture_window が同期的に参照する)。
+            tauri::WindowEvent::Focused(true) => {
+                let label = window.label().to_string();
+                if label.starts_with("capture-") {
+                    let state = window.app_handle().state::<SessionState>();
+                    if let Ok(mut g) = state.last_focused_capture.lock() {
+                        *g = Some(label);
+                    }
+                }
             }
-            let label = window.label().to_string();
-            if label == "main" {
-                window.app_handle().exit(0);
-            } else if label.starts_with("capture-") {
-                // 1 capture ウィンドウに複数タブ (セッション) がぶら下がるため、このウィンドウ
-                // を所有ウィンドウとする全セッションをまとめて停止する (タブの取りこぼし防止)。
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<SessionState>();
-                    let mut guard = state.inner.lock().await;
-                    let ids: Vec<String> = guard
-                        .iter()
-                        .filter(|(_, h)| h.window_label == label)
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for id in ids {
-                        if let Some(h) = guard.remove(&id) {
-                            h.shutdown();
+            tauri::WindowEvent::Destroyed => {
+                let label = window.label().to_string();
+                if label == "main" {
+                    window.app_handle().exit(0);
+                } else if label.starts_with("capture-") {
+                    // 死んだ窓へ以後ルーティングしないよう、追跡していたなら外す。
+                    let state = window.app_handle().state::<SessionState>();
+                    if let Ok(mut g) = state.last_focused_capture.lock() {
+                        if g.as_deref() == Some(label.as_str()) {
+                            *g = None;
                         }
                     }
-                    drop(guard);
-                    // ランチャーへ接続中 host 一覧を通知 (ウィンドウを閉じた分の切断を反映)。
-                    net::emit_connections(&app, &state).await;
-                });
+                    // 1 capture ウィンドウに複数タブ (セッション) がぶら下がるため、このウィンドウ
+                    // を所有ウィンドウとする全セッションをまとめて停止する (タブの取りこぼし防止)。
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<SessionState>();
+                        let mut guard = state.inner.lock().await;
+                        let ids: Vec<String> = guard
+                            .iter()
+                            .filter(|(_, h)| h.window_label == label)
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        for id in ids {
+                            if let Some(h) = guard.remove(&id) {
+                                h.shutdown();
+                            }
+                        }
+                        drop(guard);
+                        // ランチャーへ接続中 host 一覧を通知 (ウィンドウを閉じた分の切断を反映)。
+                        net::emit_connections(&app, &state).await;
+                    });
+                }
             }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             net::connect_to_host,
@@ -87,6 +105,9 @@ fn main() {
             net::open_session_window,
             net::take_handoff,
             net::attach_session,
+            net::unstage_session,
+            net::find_capture_window_at,
+            net::handoff_session_to_window,
             net::connected_hosts,
             net::send_input,
             net::request_keyframe,

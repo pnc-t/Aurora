@@ -111,6 +111,25 @@ export async function takeHandoff(sessionId: string): Promise<string | null> {
   return await invoke<string | null>("take_handoff", { sessionId });
 }
 
+/** staging へ積んだ未使用の接続資格情報を破棄する (同一 host 重複でタブを作らなかったとき)。 */
+export async function unstageSession(sessionId: string): Promise<void> {
+  await invoke("unstage_session", { sessionId });
+}
+
+/** ドロップ点 (論理 px スクリーン座標) にある自分以外の capture 窓のラベル (無ければ null)。 */
+export async function findCaptureWindowAt(x: number, y: number): Promise<string | null> {
+  return await invoke<string | null>("find_capture_window_at", { x, y });
+}
+
+/** 既存セッションを既存の別 capture 窓へ移譲する (タブのドラッグ合流)。 */
+export async function handoffSessionToWindow(
+  sessionId: string,
+  targetLabel: string,
+  snapshot: string,
+): Promise<void> {
+  await invoke("handoff_session_to_window", { sessionId, targetLabel, snapshot });
+}
+
 /**
  * 既存セッションの表示先を、この webview の Channel へ差し替える (移譲先がアタッチ)。
  * networking はそのままなので、別途 requestKeyframe で映像を復帰させる。

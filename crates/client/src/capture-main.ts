@@ -6,15 +6,20 @@
 // は Rust 側 staging が持つためここには載らない。「+」で同じ窓に新しいタブを追加できる。
 
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
+  findCaptureWindowAt,
+  handoffSessionToWindow,
   initPerfFlag,
   loadSettings,
   openSessionWindow,
   saveSettings,
   stageSession,
   takeHandoff,
+  unstageSession,
   uploadFileFromPath,
   type ClientSettings,
   type DisplayDto,
@@ -251,8 +256,14 @@ async function splitTab(id: string, screenX: number, screenY: number): Promise<v
   const s = sessions.get(id);
   // 接続確立済みのタブだけ移譲する (接続中/エラー中は表示状態が定まらない)。
   if (!s || !s.isConnected) return;
+  // ドロップ点が他の capture 窓の上なら新窓を作らず合流 (Brave 的)。判定失敗は分割へフォールバック。
+  const targetLabel = await findCaptureWindowAt(screenX, screenY).catch(() => null);
   try {
-    await openSessionWindow(id, JSON.stringify(s.snapshot()), screenX, screenY);
+    if (targetLabel) {
+      await handoffSessionToWindow(id, targetLabel, JSON.stringify(s.snapshot()));
+    } else {
+      await openSessionWindow(id, JSON.stringify(s.snapshot()), screenX, screenY);
+    }
   } catch (e) {
     showToast(`分割に失敗: ${String(e)}`, "error");
     return;
@@ -267,9 +278,7 @@ async function splitTab(id: string, screenX: number, screenY: number): Promise<v
 function openAddTab(): void {
   openConnectPicker(pickerBackdrop, {
     onConnect: async (entry: HostEntry, password: string | null, save: boolean) => {
-      // host は単一クライアントモデル。同じ host へ二重接続するとホストが先客を掴んだまま
-      // ハンドシェイクが進まず固まる (窓を閉じると孤児セッション化して host を塞ぐ)。
-      // 既に同 host のタブがあればそれへ切替えて新規接続は張らない。
+      // 同一 host のタブを同じ窓に 2 枚開いても意味がないため既存タブへ切替える。
       const target = entry.host.trim().toLowerCase();
       const existing = [...sessions.values()].find(
         (s) => s.entry.host.trim().toLowerCase() === target,
@@ -352,6 +361,52 @@ void listen<{ host: string }>("aurora://disconnect-host", (e) => {
   }
 });
 
+// --- launcher からの接続をこの窓のタブとして追加 (Rust が最後にフォーカスされた capture 窓へルーティング) ---
+type AddTabPayload = { session_id: string; host: string; port: number; label: string; save: boolean };
+
+void getCurrentWebviewWindow().listen<AddTabPayload>("aurora://add-tab", (e) => {
+  void (async () => {
+    const p = e.payload;
+    // ユーザーは接続操作をした直後なので対象窓を前面に出す。失敗しても追加処理は続行する。
+    try {
+      const win = getCurrentWindow();
+      if (await win.isMinimized()) await win.unminimize();
+      await win.setFocus();
+    } catch {
+      // 前面化に失敗してもタブ追加自体は続行する。
+    }
+    const target = p.host.trim().toLowerCase();
+    const existing = [...sessions.values()].find((s) => s.entry.host.trim().toLowerCase() === target);
+    if (existing) {
+      setActive(existing.id);
+      showToast(`${p.host} は既にこのウィンドウで接続中です`);
+      void unstageSession(p.session_id);
+      return;
+    }
+    try {
+      await addSession(p.session_id, { host: p.host, port: p.port, label: p.label }, p.save, true);
+    } catch (e) {
+      showToast(`接続に失敗しました: ${String(e)}`, "error");
+    }
+  })();
+});
+
+// --- 別ウィンドウからドラッグされたタブを引き受ける (タブのドラッグ合流) ---
+type AdoptTabPayload = { session_id: string };
+
+void getCurrentWebviewWindow().listen<AdoptTabPayload>("aurora://adopt-tab", (e) => {
+  void (async () => {
+    const p = e.payload;
+    // ドロップ先の窓は既に見えているので unminimize は不要、前面化のみ行う。
+    try {
+      await getCurrentWindow().setFocus();
+    } catch {
+      // 前面化に失敗してもタブ引き受け自体は続行する。
+    }
+    await adoptTab(p.session_id, false);
+  })();
+});
+
 // --- 窓リサイズ → アクティブ Session のビューポート追従 ---
 window.addEventListener("resize", () => active()?.onWindowResize());
 
@@ -411,14 +466,18 @@ void getCurrentWebview().onDragDropEvent((event) => {
 });
 
 // --- 別ウィンドウから移譲されたタブを引き受ける (ドラッグ分割の受け側) ---
-async function adoptInitial(id: string): Promise<void> {
+// initial: 起動直後の唯一のタブとして引き受けるとき true。false は稼働中の窓へ既存タブ群に
+// 合流させるとき (失敗時に窓全体をエラー画面にせず、既存タブの表示を壊さないため分岐する)。
+async function adoptTab(id: string, initial: boolean): Promise<void> {
   let snap: SessionSnapshot;
   try {
     const json = await takeHandoff(id);
     if (!json) throw new Error("引き継ぎデータがありません");
     snap = JSON.parse(json) as SessionSnapshot;
   } catch (e) {
-    renderStatusOverlay("error", `タブの引き継ぎに失敗しました: ${String(e)}`, true);
+    const msg = `タブの引き継ぎに失敗しました: ${String(e)}`;
+    if (initial) renderStatusOverlay("error", msg, true);
+    else showToast(msg, "error");
     return;
   }
   logger.info(`adopting handed-off tab: ${id} (${snap.entry.host})`);
@@ -426,7 +485,9 @@ async function adoptInitial(id: string): Promise<void> {
   try {
     await s.adoptFrom(snap);
   } catch (e) {
-    renderStatusOverlay("error", `アタッチに失敗しました: ${String(e)}`, true);
+    const msg = `アタッチに失敗しました: ${String(e)}`;
+    if (initial) renderStatusOverlay("error", msg, true);
+    else showToast(msg, "error");
     return;
   }
   sessions.set(id, s);
@@ -434,7 +495,8 @@ async function adoptInitial(id: string): Promise<void> {
   setActive(id); // activate(): 映像再開 (unpause) + keyframe + 入力 attach + 共有 UI 同期
   void setResizable(true);
   if (snap.captured) s.setCaptureMode(true);
-  if (getSettings().show_stats && !statsHud.classList.contains("visible")) {
+  // 稼働中の窓は既にユーザーが決めた表示状態があるため、統計 HUD の自動 ON は初回起動時のみ。
+  if (initial && getSettings().show_stats && !statsHud.classList.contains("visible")) {
     toggleStats();
     toolbar.setStatsToggled(true);
   }
@@ -456,7 +518,7 @@ void (async () => {
   tabs.setPosition(getSettings().tab_position);
   logger.info(`capture window ready (mode=${adoptId ? "adopt" : "connect"})`);
   if (adoptId) {
-    await adoptInitial(adoptId);
+    await adoptTab(adoptId, true);
     return;
   }
   const initialId = params.get("session") ?? "";

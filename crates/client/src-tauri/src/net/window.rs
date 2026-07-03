@@ -1,9 +1,47 @@
 //! ウィンドウ/セッションのライフサイクル tauri コマンド (capture ウィンドウ生成・受け渡し・接続一覧)。
 use super::*;
 
+/// launcher からの接続をタブとして追加してもらうための通知ペイロード (`aurora://add-tab`)。
+/// `open_capture_window` が既存 capture 窓へルーティングする際に emit する。
+#[derive(Clone, serde::Serialize)]
+struct AddTabPayload {
+    session_id: String,
+    host: String,
+    port: u16,
+    label: String,
+    save: bool,
+}
+
+/// タブのドラッグ合流の通知ペイロード (`aurora://adopt-tab`)。移譲先窓へ「この session_id を
+/// `take_handoff` で引き取れ」と伝える。
+#[derive(Clone, serde::Serialize)]
+struct AdoptTabPayload {
+    session_id: String,
+}
+
+/// launcher からの接続を流し込む先を決める。直近フォーカスした capture 窓が生存していれば
+/// それを優先し、無ければ生存している capture 窓を (順序不定で) 1 つ選ぶ。1 つも無ければ
+/// None を返し、呼び出し側が従来どおり新窓を生成する。
+fn route_target(app: &tauri::AppHandle, state: &SessionState) -> Option<String> {
+    if let Ok(g) = state.last_focused_capture.lock() {
+        if let Some(label) = g.as_deref() {
+            if app.get_webview_window(label).is_some() {
+                return Some(label.to_string());
+            }
+        }
+    }
+    // フォーカス追跡が無い/死んでいる場合のフォールバック。webview_windows() の順序は
+    // HashMap 由来で不定だが、生きている capture 窓のどれかへ合流できれば新窓乱立は防げる。
+    app.webview_windows()
+        .keys()
+        .find(|l| l.starts_with("capture-"))
+        .cloned()
+}
+
 /// capture ウィンドウを Rust 側で生成する (JS にウィンドウ生成権限を与えない)。
 /// 接続資格情報 (password) は staging マップへ積み、URL には session/host/port/save のみ
 /// 載せる (平文をウィンドウ URL に出さない)。生成した session_id を返す。
+/// 既存の capture 窓があれば新窓は作らず、そちらへタブ追加を通知する (`route_target`)。
 #[tauri::command]
 pub async fn open_capture_window(
     app: tauri::AppHandle,
@@ -18,6 +56,30 @@ pub async fn open_capture_window(
 ) -> Result<String, String> {
     let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("s{n}");
+
+    if let Some(target_label) = route_target(&app, &state) {
+        state
+            .staging
+            .lock()
+            .await
+            .insert(session_id.clone(), password.clone());
+        let payload = AddTabPayload {
+            session_id: session_id.clone(),
+            host: host.clone(),
+            port,
+            label: label.clone(),
+            save,
+        };
+        if app
+            .emit_to(&target_label, "aurora://add-tab", payload)
+            .is_ok()
+        {
+            return Ok(session_id);
+        }
+        // 窓は生きているが emit できない異常時は、接続不能にしないため新窓生成へフォールバックする。
+        state.staging.lock().await.remove(&session_id);
+    }
+
     let win_label = format!("capture-{session_id}");
     // パスワードを staging へ積んでから window を作る (connect_to_host が pop する)。
     state
@@ -137,6 +199,94 @@ pub async fn attach_session(
     let s = guard.get_mut(&session_id).ok_or("unknown session")?;
     s.sink.set(event_channel, video_channel);
     s.window_label = window.label().to_string();
+    Ok(())
+}
+
+/// staging へ積んだ未使用の接続資格情報を破棄する。ルーティング先で同一 host のタブが
+/// 既にあり接続しなかった場合など、平文パスワードをメモリに残さないための後始末。
+#[tauri::command]
+pub async fn unstage_session(
+    session_id: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    state.staging.lock().await.remove(&session_id);
+    Ok(())
+}
+
+/// ドロップ点 (論理 px、スクリーン座標) を含む「自分以外の capture ウィンドウ」のラベルを
+/// 返す。タブのドラッグ合流のヒットテスト。z-order は考慮しない (重なりは不定) — ドラッグ
+/// 合流はカーソル直下の窓を大まかに当てられれば十分で、厳密な最前面判定までは不要なため。
+#[tauri::command]
+pub async fn find_capture_window_at(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    x: f64,
+    y: f64,
+) -> Result<Option<String>, String> {
+    let self_label = window.label().to_string();
+    for (label, w) in app.webview_windows() {
+        if label == self_label || !label.starts_with("capture-") {
+            continue;
+        }
+        if w.is_minimized().unwrap_or(true) {
+            continue;
+        }
+        let Ok(scale) = w.scale_factor() else {
+            continue;
+        };
+        let Ok(pos) = w.outer_position() else {
+            continue;
+        };
+        let Ok(size) = w.outer_size() else {
+            continue;
+        };
+        let pos = pos.to_logical::<f64>(scale);
+        let size = size.to_logical::<f64>(scale);
+        if x >= pos.x && x < pos.x + size.width && y >= pos.y && y < pos.y + size.height {
+            return Ok(Some(label));
+        }
+    }
+    Ok(None)
+}
+
+/// 既存セッションを「既存の別 capture ウィンドウ」へ移譲する (タブのドラッグ合流)。
+/// `open_session_window` の姉妹コマンド: 新窓は作らず、所有権付替え + sink デタッチ + 引き継ぎ
+/// JSON を積んでから移譲先へ adopt を通知する。
+#[tauri::command]
+pub async fn handoff_session_to_window(
+    app: tauri::AppHandle,
+    session_id: String,
+    target_label: String,
+    snapshot: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    if app.get_webview_window(&target_label).is_none() {
+        return Err("target window not found".into());
+    }
+    // 所有権 (window_label) を移譲先へ移し、表示先を外す (open_session_window と同じ理由:
+    // 通知より前に所有権を移すことで、移譲元の Destroyed ハンドラに巻き込まれない)。
+    {
+        let mut guard = state.inner.lock().await;
+        let s = guard.get_mut(&session_id).ok_or("unknown session")?;
+        s.window_label = target_label.clone();
+        s.sink.clear();
+    }
+    state
+        .adopt
+        .lock()
+        .await
+        .insert(session_id.clone(), snapshot);
+    let payload = AdoptTabPayload {
+        session_id: session_id.clone(),
+    };
+    if app
+        .emit_to(&target_label, "aurora://adopt-tab", payload)
+        .is_err()
+    {
+        // 通知できなければ引き継ぎデータを残さない (open_session_window の失敗時と同様の後始末)。
+        state.adopt.lock().await.remove(&session_id);
+        return Err("failed to notify target window".into());
+    }
     Ok(())
 }
 
