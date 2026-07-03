@@ -35,7 +35,8 @@ export type IconName =
   | "eye-off"
   | "tune"
   | "resolution"
-  | "key";
+  | "key"
+  | "check";
 
 // viewBox 0 0 24 24 の path/shape 部分のみ (共通の <svg> ラッパーは icon() で付与)。
 const PATHS: Record<IconName, string> = {
@@ -64,6 +65,7 @@ const PATHS: Record<IconName, string> = {
   tune: `<path d="M4 8h5M13 8h7M4 16h11M19 16h1"/><circle cx="11" cy="8" r="2.3"/><circle cx="17" cy="16" r="2.3"/>`,
   resolution: `<path d="M15 3h6v6M21 3l-7 7M9 21H3v-6M3 21l7-7"/>`,
   key: `<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2M16 7l3 3"/>`,
+  check: `<path d="M20 6L9 17l-5-5"/>`,
 };
 
 // assets/icons/ 配下の画像を URL として一括取り込み (ビルド時に解決)。

@@ -90,11 +90,21 @@
 #topbar.pos-bottom .tb-pop-panel { bottom: 100%; margin-bottom: 10px; left: 50%; transform: translateX(-50%); }
 #topbar.pos-left .tb-pop-panel { left: 100%; margin-left: 10px; top: 0; }
 #topbar.pos-right .tb-pop-panel { right: 100%; margin-right: 10px; top: 0; }
-/* ポップオーバー内は通常の横並び・無制限幅 (狭いピル幅の制約を受けない)。 */
-.tb-pop-panel.tb-video { flex-direction: row; }
-.tb-pop-panel .tb-custom { flex-direction: row; }
-.tb-pop-panel select { max-width: none; }
 #topbar.vertical .tb-popgroup { width: 100%; }
+
+/* メニュー型パネル: パネル自体が選択肢リスト (アイコン → 一段で選択肢)。 */
+.tb-pop-panel.tb-menu { flex-direction: column; align-items: stretch; padding: 6px; min-width: 190px; }
+.tb-menu-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border: none; border-radius: 8px;
+  background: transparent; color: var(--fg);
+  font-size: 12px; text-align: left; white-space: nowrap; cursor: pointer;
+}
+.tb-menu-item:hover { background: var(--menu-hover); }
+/* チェック列は常に幅を確保し、非選択でも項目のラベル位置を揃える。 */
+.tb-menu-check { width: 16px; display: inline-flex; color: var(--accent); visibility: hidden; }
+.tb-menu-item[aria-checked="true"] .tb-menu-check { visibility: visible; }
+.tb-custom { display: none; align-items: center; gap: 4px; padding: 6px 10px; font-size: 12px; color: var(--muted); }
 
 /* フラットなアイコンボタン: 既定は枠なし・透明、ホバー時だけ淡い背景。 */
 .tb-btn {
@@ -113,34 +123,18 @@
 
 /* ディスプレイ切替 (複数ディスプレイ時のみ表示。display は JS が制御) */
 #display-wrap { display: none; align-items: center; gap: 4px; margin-left: 2px; }
-#display-wrap .tb-ico { display: inline-flex; align-items: center; font-size: 17px; color: var(--muted); }
-
-/* select はフラット化。地は透明にしてホバー/フォーカス時だけ面を出す。 */
-#topbar select {
-  background: transparent; color: var(--fg);
-  border: none; border-radius: 8px;
-  padding: 4px 6px; cursor: pointer; font-size: 12px;
-  transition: background 0.12s ease;
-}
-#topbar select:hover { background: var(--menu-hover); }
-#topbar select:focus { outline: none; background: var(--menu-hover); }
 
 /* 画質プリセット + (カスタム時のみ) fps/Mbps 手動入力 */
-/* display はここで指定しない: パネル開閉は .tb-pop-panel 系規則が司る。同詳細度の
- * 後勝ちで display:none が打ち消され、パネルが常時表示になっていた (詳細度衝突)。 */
-.tb-video { align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
-/* fps/Mbps 欄。既定は非表示で、プリセット=カスタムのとき JS が inline-flex にする。 */
-.tb-custom { display: none; align-items: center; gap: 4px; }
-.tb-video input {
+.tb-custom input {
   width: 42px; text-align: right; background: var(--control); color: var(--fg);
   border: 1px solid transparent; border-radius: 7px; padding: 4px 6px;
 }
-.tb-video input:focus { outline: none; border-color: var(--accent); }
+.tb-custom input:focus { outline: none; border-color: var(--accent); }
 
 /* ドラッグ可能領域は移動カーソルにして掴めることを示す。 */
 [data-tauri-drag-region] { cursor: grab; }
 /* 操作要素はドラッグ領域内でも通常カーソルに戻す。 */
-.tb-btn, #topbar select, #topbar input, .winctl { cursor: pointer; }
+.tb-btn, #topbar input, .winctl { cursor: pointer; }
 #topbar input { cursor: text; }
 
 /* ピル右端のウィンドウ操作 (フレームレス用)。共有 .winctl の見た目を打ち消し、

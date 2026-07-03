@@ -10,7 +10,7 @@
 // 接続先情報は省スペース化のためバーの title (ホバー tooltip) に退避し、行内には常駐させない。
 
 import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
-import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
+import { CUSTOM_PRESET_ID, VIDEO_PRESETS, matchPreset } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels } from "../core/a11y";
 import { shortcutLabel } from "../core/shortcuts";
@@ -50,6 +50,25 @@ export type ToolbarHandle = {
   setConnected: (connected: boolean, pinnedDefault?: boolean) => void;
 };
 
+// メニュー内の選択肢 1 行。ラベルはホスト由来文字列 (ディスプレイ名) があり得るため
+// textContent で入れる (innerHTML 経由の XSS を避ける)。チェック表示は aria-checked に一元化する。
+function makeMenuItem(label: string, onPick: () => void): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "tb-menu-item";
+  btn.setAttribute("role", "menuitemradio");
+  btn.setAttribute("aria-checked", "false");
+  const check = document.createElement("span");
+  check.className = "tb-menu-check";
+  check.innerHTML = icon("check"); // 固定 SVG のみなので innerHTML で問題ない
+  const labelSpan = document.createElement("span");
+  labelSpan.className = "tb-menu-label";
+  labelSpan.textContent = label;
+  btn.append(check, labelSpan);
+  btn.addEventListener("click", onPick);
+  return btn;
+}
+
 export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   opts.topbar.innerHTML = `
     <div class="tb-pill" data-tauri-drag-region>
@@ -66,26 +85,22 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       </div>
       <div id="display-wrap" class="tb-popgroup" data-pop="display" title="表示するディスプレイ" data-tauri-drag-region>
         <button type="button" class="tb-btn tb-pop-trigger" id="tb-display-trigger" title="ディスプレイ">${icon("display")}</button>
-        <span class="tb-pop-panel" data-tauri-drag-region>
-          <span class="tb-ico" data-tauri-drag-region>${icon("display")}</span>
-          <select id="display-select"></select>
-        </span>
+        <div class="tb-pop-panel tb-menu" id="tb-display-menu" role="menu"></div>
       </div>
       <span class="tb-sep" data-tauri-drag-region></span>
       <div class="tb-popgroup" data-pop="quality" data-tauri-drag-region>
-        <button type="button" class="tb-btn tb-pop-trigger" id="tb-quality-trigger" title="画質 / 解像度">${icon("tune")}</button>
-        <span class="tb-video tb-pop-panel" title="画質プリセット / 送出 fps 上限 (0=無制限) / ビットレート上限" data-tauri-drag-region>
-          <select id="tb-preset" title="画質プリセット">${presetOptionsHtml()}</select>
-          <span id="tb-custom" class="tb-custom">
+        <button type="button" class="tb-btn tb-pop-trigger" id="tb-quality-trigger" title="画質">${icon("tune")}</button>
+        <div class="tb-pop-panel tb-menu" role="menu">
+          <div id="tb-quality-items"></div>
+          <div id="tb-custom" class="tb-custom" title="送出 fps 上限 (0=無制限) / ビットレート上限">
             <input type="text" inputmode="numeric" id="tb-fps" />fps
             <input type="text" inputmode="numeric" id="tb-mbps" />Mbps
-          </span>
-          <select id="tb-resolution" title="解像度 (送出する映像の高さ・アスペクト比維持)">
-            <option value="0">フル</option>
-            <option value="1080">1080p</option>
-            <option value="720">720p</option>
-          </select>
-        </span>
+          </div>
+        </div>
+      </div>
+      <div class="tb-popgroup" data-pop="resolution">
+        <button type="button" class="tb-btn tb-pop-trigger" id="tb-resolution-trigger" title="解像度 (送出する映像の高さ・アスペクト比維持)">${icon("resolution")}</button>
+        <div class="tb-pop-panel tb-menu" id="tb-resolution-menu" role="menu"></div>
       </div>
       <span class="tb-sep" data-tauri-drag-region></span>
       <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}">${icon("pin")}</button>
@@ -107,7 +122,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
 
   const disconnectBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-disconnect");
   const displayWrap = opts.topbar.querySelector<HTMLElement>("#display-wrap");
-  const displaySelect = opts.topbar.querySelector<HTMLSelectElement>("#display-select");
+  const displayMenu = opts.topbar.querySelector<HTMLElement>("#tb-display-menu");
   const filesBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-files");
   const statsBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-stats");
   const audioBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-audio");
@@ -115,15 +130,16 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
   const hideBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-hide");
-  const presetSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-preset");
-  const resolutionSelect = opts.topbar.querySelector<HTMLSelectElement>("#tb-resolution");
+  const qualityItemsWrap = opts.topbar.querySelector<HTMLElement>("#tb-quality-items");
+  const resolutionMenu = opts.topbar.querySelector<HTMLElement>("#tb-resolution-menu");
   const customWrap = opts.topbar.querySelector<HTMLElement>("#tb-custom");
   const fpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-fps");
   const mbpsInput = opts.topbar.querySelector<HTMLInputElement>("#tb-mbps");
 
   // ポップオーバー。テキストを持つコントロール (画質/解像度/ディスプレイ) はピルを
   // 長くするため、全配置でアイコン (.tb-pop-trigger) に畳み、クリックでバー脇に
-  // パネル (.tb-pop-panel) を開く (開く向きは CSS が配置ごとに決める)。
+  // パネル (.tb-pop-panel) を開く (開く向きは CSS が配置ごとに決める)。パネル自体が
+  // 選択肢メニューなので、開けば一段で選べる (中間の select 展開は不要)。
   const popgroups = Array.from(opts.topbar.querySelectorAll<HTMLElement>(".tb-popgroup"));
   function closePopovers(except?: HTMLElement): void {
     for (const g of popgroups) if (g !== except) g.classList.remove("pop-open");
@@ -135,37 +151,47 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       const willOpen = !g.classList.contains("pop-open");
       closePopovers(g);
       g.classList.toggle("pop-open", willOpen);
-      // トリガ→パネル→select と 2 クリック要るのは冗長なので、開いたら先頭の select の
-      // ドロップダウンまで即展開する (クリックハンドラ内 = ユーザージェスチャなので許可される)。
-      // showPicker 非対応の古い WebView2 ではパネル表示までで従来どおり。
-      if (willOpen) {
-        const sel = g.querySelector<HTMLSelectElement>(".tb-pop-panel select");
-        if (sel && "showPicker" in sel) {
-          try {
-            sel.showPicker();
-          } catch {
-            // NotAllowedError 等は無視してパネル表示のみにフォールバック。
-          }
-        }
-      }
     });
   }
-  // パネル外をクリックしたら全て閉じる (パネル内の select 操作では閉じない)。
+  // パネル外をクリックしたら全て閉じる (パネル内のメニュー項目クリックでは各 pick が閉じる)。
   document.addEventListener("pointerdown", (e) => {
     if (!(e.target as HTMLElement).closest(".tb-popgroup")) closePopovers();
   });
 
+  // 画質メニュー: プリセット項目 + 末尾カスタム。現在値は aria-checked で一元管理する。
+  const qualityItems: { id: string; btn: HTMLButtonElement }[] = [];
+  function syncQualityChecks(activeId: string): void {
+    for (const it of qualityItems) it.btn.setAttribute("aria-checked", String(it.id === activeId));
+  }
   // fps/Mbps の手動入力欄はプリセット=カスタムのときだけ出す (常時表示は情報重複で幅を食う)。
   function applyCustomVisibility(presetId: string): void {
-    if (customWrap) customWrap.style.display = presetId === CUSTOM_PRESET_ID ? "inline-flex" : "none";
+    if (customWrap) customWrap.style.display = presetId === CUSTOM_PRESET_ID ? "flex" : "none";
   }
-
   function syncPreset(fps: number, mbps: number): void {
     const id = matchPreset(fps, mbps);
-    if (presetSelect) presetSelect.value = id;
+    syncQualityChecks(id);
     applyCustomVisibility(id);
   }
-
+  if (qualityItemsWrap) {
+    for (const p of VIDEO_PRESETS) {
+      const btn = makeMenuItem(p.label, () => {
+        if (fpsInput) fpsInput.value = String(p.fps);
+        if (mbpsInput) mbpsInput.value = String(p.mbps);
+        opts.onSetVideoParams(p.fps, p.mbps);
+        syncPreset(p.fps, p.mbps);
+        closePopovers();
+      });
+      qualityItemsWrap.appendChild(btn);
+      qualityItems.push({ id: p.id, btn });
+    }
+    // カスタム行はメニューを閉じない: 適用は下の fps/Mbps 入力の change (emitVideoParams) が担う。
+    const customBtn = makeMenuItem("カスタム", () => {
+      syncQualityChecks(CUSTOM_PRESET_ID);
+      applyCustomVisibility(CUSTOM_PRESET_ID);
+    });
+    qualityItemsWrap.appendChild(customBtn);
+    qualityItems.push({ id: CUSTOM_PRESET_ID, btn: customBtn });
+  }
   function emitVideoParams(): void {
     const fps = Math.max(0, Math.floor(Number(fpsInput?.value) || 0));
     const mbps = Math.max(1, Math.floor(Number(mbpsInput?.value) || 1));
@@ -176,19 +202,38 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   }
   fpsInput?.addEventListener("change", emitVideoParams);
   mbpsInput?.addEventListener("change", emitVideoParams);
-  // プリセット選択で fps/Mbps 欄を埋めて即適用 (カスタムは手動入力を維持)。
-  presetSelect?.addEventListener("change", () => {
-    applyCustomVisibility(presetSelect.value);
-    const p = findPreset(presetSelect.value);
-    if (!p) return; // カスタム: 入力欄をそのまま使う
-    if (fpsInput) fpsInput.value = String(p.fps);
-    if (mbpsInput) mbpsInput.value = String(p.mbps);
-    opts.onSetVideoParams(p.fps, p.mbps);
-  });
-  // 初期表示 (まだ setVideoParams 前) でも custom 欄の出し分けを確定させる。
-  applyCustomVisibility(presetSelect?.value ?? "");
 
-  let displays: DisplayDto[] = [];
+  // 解像度メニュー: 固定 3 択。現在値は mountToolbar スコープの変数で保持する。
+  let resolutionValue = 0;
+  const resolutionItems: { value: number; btn: HTMLButtonElement }[] = [];
+  function syncResolutionChecks(): void {
+    for (const it of resolutionItems) it.btn.setAttribute("aria-checked", String(it.value === resolutionValue));
+  }
+  if (resolutionMenu) {
+    const options: { value: number; label: string }[] = [
+      { value: 0, label: "フル" },
+      { value: 1080, label: "1080p" },
+      { value: 720, label: "720p" },
+    ];
+    for (const r of options) {
+      const btn = makeMenuItem(r.label, () => {
+        resolutionValue = r.value;
+        opts.onSetResolution(r.value);
+        syncResolutionChecks();
+        closePopovers();
+      });
+      resolutionMenu.appendChild(btn);
+      resolutionItems.push({ value: r.value, btn });
+    }
+    syncResolutionChecks();
+  }
+
+  // ディスプレイメニュー: setDisplays() のたびに項目を作り直す (ホスト一覧は接続毎に変わる)。
+  let displayItems: { id: number; btn: HTMLButtonElement }[] = [];
+  function syncDisplayChecks(activeId: number | undefined): void {
+    for (const it of displayItems) it.btn.setAttribute("aria-checked", String(it.id === activeId));
+  }
+
   let connected = false;
   // 音声ミュート状態。ホストが音声非対応ならボタン自体を隠す (audioAvailable=false)。
   let muted = false;
@@ -312,17 +357,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     opts.onToggleMute(muted);
   });
   captureBtn?.addEventListener("click", () => opts.onToggleCapture());
-  resolutionSelect?.addEventListener("change", () => {
-    opts.onSetResolution(Math.max(0, Math.floor(Number(resolutionSelect.value) || 0)));
-  });
   fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
   pinBtn?.addEventListener("click", () => setPinned(!pinned));
   hideBtn?.addEventListener("click", () => setAutoHideLocked(!autoHideLocked));
-  displaySelect?.addEventListener("change", () => {
-    const id = Number(displaySelect.value);
-    const d = displays.find((x) => x.id === id);
-    if (d) opts.onSelectDisplay(d);
-  });
 
   return {
     setConnLabel(text: string): void {
@@ -330,19 +367,20 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       opts.topbar.title = text;
     },
     setDisplays(list: DisplayDto[], selectedId?: number): void {
-      displays = list;
-      if (!displaySelect || !displayWrap) return;
-      // 表示名はホスト由来 (リモート) の文字列なので innerHTML に流さず、DOM + textContent
-      // で組んで XSS を防ぐ (悪意あるホストが Display.name に <img onerror> 等を仕込む経路を塞ぐ)。
-      displaySelect.replaceChildren(
-        ...list.map((x) => {
-          const opt = document.createElement("option");
-          opt.value = String(x.id);
-          opt.textContent = `${formatDisplayName(x.name)} (${x.width}x${x.height})`;
-          return opt;
-        }),
-      );
-      if (selectedId !== undefined) displaySelect.value = String(selectedId);
+      if (!displayMenu || !displayWrap) return;
+      // 表示名はホスト由来 (リモート) の文字列なので innerHTML に流さず makeMenuItem の
+      // textContent 経由で組んで XSS を防ぐ (悪意あるホストが Display.name に仕込む経路を塞ぐ)。
+      displayItems = list.map((x) => {
+        const label = `${formatDisplayName(x.name)} (${x.width}x${x.height})`;
+        const btn = makeMenuItem(label, () => {
+          opts.onSelectDisplay(x);
+          syncDisplayChecks(x.id);
+          closePopovers();
+        });
+        return { id: x.id, btn };
+      });
+      displayMenu.replaceChildren(...displayItems.map((it) => it.btn));
+      syncDisplayChecks(selectedId);
       // ディスプレイが複数あるときだけ切替 UI を出す。
       displayWrap.style.display = list.length > 1 ? "inline-flex" : "none";
     },
@@ -391,7 +429,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       connected = isConnected;
       // 新規接続のたびに解像度はフルから始める (ホスト capture スレッドは
       // セッションをまたいで設定を保持するため、UI と確実に揃える)。
-      if (isConnected && resolutionSelect) resolutionSelect.value = "0";
+      if (isConnected) {
+        resolutionValue = 0;
+        syncResolutionChecks();
+      }
       // 接続のたびに設定の既定ピン留めから始める (未ピンなら自動格納・端ホバーで一時表示)。
       pinned = isConnected && pinnedDefault;
       autoHideLocked = false;
