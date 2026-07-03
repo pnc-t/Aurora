@@ -126,7 +126,9 @@
 #topbar select:focus { outline: none; background: var(--menu-hover); }
 
 /* 画質プリセット + (カスタム時のみ) fps/Mbps 手動入力 */
-.tb-video { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+/* display はここで指定しない: パネル開閉は .tb-pop-panel 系規則が司る。同詳細度の
+ * 後勝ちで display:none が打ち消され、パネルが常時表示になっていた (詳細度衝突)。 */
+.tb-video { align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
 /* fps/Mbps 欄。既定は非表示で、プリセット=カスタムのとき JS が inline-flex にする。 */
 .tb-custom { display: none; align-items: center; gap: 4px; }
 .tb-video input {
