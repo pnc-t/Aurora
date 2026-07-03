@@ -30,7 +30,9 @@
   gap: 0;
   height: 36px;
   padding: 0;
-  background: var(--toolbar-bg);
+  /* 不透明にする (--toolbar-bg は 4% 透過)。格納中のツールバーは自身の寸法基準 (-130%) で
+   * しか退避せず、タブ帯の inset 分だけ帯の裏に残留するため、透過だと裏のバーが透けて見える。 */
+  background: var(--panel);
   border-bottom: 1px solid var(--panel-border);
   box-shadow: 0 1px 4px var(--shadow);
 }
