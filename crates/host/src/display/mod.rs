@@ -598,10 +598,9 @@ mod imp {
     }
 
     /// アダプタ (`\\.\DISPLAYn`) のモニタ hardware ID を調べ MttVDD かを判定する。
-    ///
-    /// phase1 後に Windows が GDI 名を再割当てする場合でも仮想ディスプレイを確実に識別するため。
-    /// GDI 名のみで判定すると「古い名前が別の物理ディスプレイに付いてしまう」問題が起きうる。
-    fn is_vdd_adapter(adapter_name: &str) -> bool {
+    /// モニタ子が取得できない場合は `None` (「VDD でない」と区別する。デタッチ済み VDD は
+    /// モニタ情報が読めないことがあり、これを false 扱いすると誤検出につながるため)。
+    fn monitor_is_vdd(adapter_name: &str) -> Option<bool> {
         let aw: Vec<u16> = adapter_name
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -613,9 +612,20 @@ mod imp {
         // SAFETY: aw は NUL 終端の有効なアダプタ名。0 番モニタの情報を取る。
         let ok = unsafe { EnumDisplayDevicesW(PCWSTR(aw.as_ptr()), 0, &mut mon, 0) };
         if !ok.as_bool() {
-            return false;
+            return None;
         }
-        wstr(&mon.DeviceID).contains("MTT1337") || wstr(&mon.DeviceString).contains("VDD by MTT")
+        Some(
+            wstr(&mon.DeviceID).contains("MTT1337")
+                || wstr(&mon.DeviceString).contains("VDD by MTT"),
+        )
+    }
+
+    /// アダプタ (`\\.\DISPLAYn`) のモニタ hardware ID を調べ MttVDD かを判定する。
+    ///
+    /// phase1 後に Windows が GDI 名を再割当てする場合でも仮想ディスプレイを確実に識別するため。
+    /// GDI 名のみで判定すると「古い名前が別の物理ディスプレイに付いてしまう」問題が起きうる。
+    fn is_vdd_adapter(adapter_name: &str) -> bool {
+        monitor_is_vdd(adapter_name).unwrap_or(false)
     }
 
     /// アタッチ済み全ディスプレイの右端 (max(x+width))。仮想を、既存デスクトップに
@@ -993,6 +1003,25 @@ mod imp {
         w: u32,
         h: u32,
     ) -> anyhow::Result<(i32, i32, u32, u32)> {
+        // 最終防壁: detect() 側の GDI 名衝突ガードとは独立に、ここでも対象が本当に VDD か
+        // 再確認する。誤検出で物理ディスプレイが VDD 扱いされてもここで弾き、以降のレジストリ
+        // 永続書き換え (save_topology 等) が物理へ及ぶのを防ぐ。
+        match monitor_is_vdd(virtual_name) {
+            Some(false) => {
+                return Err(anyhow::anyhow!(
+                    "takeover target {virtual_name} is not the VDD monitor (MTT1337)"
+                ));
+            }
+            None => {
+                // デタッチ済み VDD はモニタ子が読めない場合がありうる。拒否すると正規の
+                // テイクオーバーを壊すため、読めないだけなら続行する。
+                tracing::debug!(
+                    virtual_name,
+                    "takeover target monitor unreadable; proceeding"
+                );
+            }
+            Some(true) => {}
+        }
         let topo = save_topology();
         // 先にディスクへ保存する (クラッシュしても次回起動で復元できるように)。
         // CCD バイナリが本命の復元元、テキストはフォールバック。両方を書く。

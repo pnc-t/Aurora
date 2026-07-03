@@ -277,6 +277,10 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 音声ミュート状態 (クライアントの SetAudioMuted)。true の間は音声 UDP を送らない。
     // クライアント毎ローカル (各自が自分の送出のみ gate し、共有エンコーダは止めない)。
     let mut audio_muted = false;
+    // この接続が SelectDisplay で仮想 (番兵 id) を明示選択したか。テイクオーバー発動はこれを
+    // 必須条件にする (名前一致だけで発動すると、VDD の GDI 名が物理と衝突した際にクライアントが
+    // 要求していないテイクオーバーが走る実機事象があった)。
+    let mut virtual_selected = false;
     // 映像一時停止 (クライアントの SetVideoPaused)。true の間は映像 UDP を送らない
     // (マルチタブで非アクティブなタブの帯域を止める)。再開時はクライアントが RequestKeyframe を
     // 送って映像を復帰させる。これもクライアント毎ローカル。映像送信は専用タスクで走るため、
@@ -459,6 +463,9 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // 未登録端末は仮想ディスプレイ (テイクオーバー) を選べない。
                                     tracing::warn!(id, "rejected virtual display select from untrusted client");
                                 } else {
+                                    // SetClientViewport のテイクオーバー判定はこのフラグを必須条件にする
+                                    // (このアームを正常通過した = 明示的に選択済み)。
+                                    virtual_selected = id == VIRTUAL_SENTINEL_ID;
                                     // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
                                     // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
                                     // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
@@ -510,8 +517,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                             let mut sc = shared.lock().await;
                             let ai = sc.active_idx;
                             let active_name = sc.displays[ai].name.clone();
-                            // 仮想ディスプレイのテイクオーバーは登録済み端末のみ (特権ゲート)。
+                            // 仮想ディスプレイのテイクオーバーは登録済み端末のみ (特権ゲート)、かつ
+                            // この接続が SelectDisplay で仮想を明示選択済みのときのみ発動する。名前一致
+                            // だけで判定すると、VDD の GDI 名が物理と衝突した場合にクライアントが要求
+                            // していないテイクオーバー (物理暗転) が走る実機事象があったため。
                             let is_virtual = client_trusted
+                                && virtual_selected
                                 && sc.vdd_gdi_name.as_deref() == Some(active_name.as_str());
                             // 「リサイズで固まる」のライブ再現用 (RUST_LOG=aurora=debug)。どの viewport が
                             // いつ来てテイクオーバー/リサイズのどちらに入ったかを追える。
@@ -520,6 +531,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                 height,
                                 taken_over = sc.taken_over,
                                 is_virtual,
+                                virtual_selected,
                                 active = %active_name,
                                 "SetClientViewport"
                             );
