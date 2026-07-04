@@ -337,7 +337,7 @@ pub fn ensure_vdd_render_gpu(gpu_name: &str) -> anyhow::Result<bool> {
 
 /// VDD (`Root\MttVDD`) デバイスを再起動し、変更した friendlyname (描画 GPU) を loadSettings
 /// 再実行で反映させる。RELOAD_DRIVER pipe は loadSettings を再実行しないため使えない。
-/// デバイス再起動は昇格が要る (autostart /RL HIGHEST なら成功)。
+/// デバイス再起動は昇格が要る (autostart /RL HIGHEST なら成功。非昇格では 0x80041001 で失敗)。
 #[cfg(target_os = "windows")]
 pub fn restart_vdd_device() -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
@@ -346,19 +346,19 @@ pub fn restart_vdd_device() -> anyhow::Result<()> {
     // 自前のコンソールを開かずに起動する (autostart.rs の CREATE_NO_WINDOW と同じ流儀)。
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    // `Restart-PnpDevice` は PnpDevice モジュールに存在しない (実機で "not recognized" を確認,
-    // 2026-07-04)。同モジュールの Disable→Enable で等価の再起動を行う。try/finally で必ず
-    // Enable を試み、途中失敗でデバイスを無効のまま放置しない。Disable が失敗 (非昇格など) した
-    // 時点ではまだ無効化していないので Enable もせず、そのままエラーを伝播する。
+    // Device Manager と同じ SetupAPI 機構で再起動する `pnputil /restart-device` を使う。WMI 経由の
+    // `Disable/Enable-PnpDevice` はこの IddCx 仮想ディスプレイに対し WBEM_E_FAILED (0x80041001) を
+    // 返しうるうえ 2 段階で途中失敗すると無効のまま残るリスクがある。pnputil は単一アトミック操作で
+    // 実機でも成功を確認済み (2026-07-04, exit 0)。`Restart-PnpDevice` は存在しない cmdlet。
+    // instance ID は環境依存 (ROOT\DISPLAY\NNNN) なので Get-PnpDevice で HardwareID から解決して渡す。
     const SCRIPT: &str = "$ErrorActionPreference='Stop'; \
-        $d = Get-PnpDevice -Class Display | Where-Object { $_.HardwareID -match 'MttVDD' }; \
-        if (-not $d) { Write-Error 'MttVDD device not found'; exit 2 }; \
-        $disabled = $false; \
-        try { $d | Disable-PnpDevice -Confirm:$false; $disabled = $true; Start-Sleep -Milliseconds 400 } \
-        finally { if ($disabled) { $d | Enable-PnpDevice -Confirm:$false } }";
+        $id = (Get-PnpDevice -Class Display | Where-Object { $_.HardwareID -match 'MttVDD' } | Select-Object -First 1).InstanceId; \
+        if (-not $id) { Write-Error 'MttVDD device not found'; exit 2 }; \
+        pnputil /restart-device \"$id\"; \
+        exit $LASTEXITCODE";
 
-    // stderr を捨てると失敗時に exit コードしか残らず切り分けできない (今回の教訓)。output で
-    // 捕捉し、失敗理由をそのままエラーメッセージへ載せる。
+    // stderr を捨てると失敗時に exit コードしか残らず切り分けできない (今回の教訓)。pnputil は
+    // 失敗理由を stdout に出す (日本語ロケールでは CP932 なので化けるが手掛かりにはなる) ため両方拾う。
     let out = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
         .creation_flags(CREATE_NO_WINDOW)
@@ -366,13 +366,54 @@ pub fn restart_vdd_device() -> anyhow::Result<()> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let err = err.trim();
+        let sout = String::from_utf8_lossy(&out.stdout);
+        let sout = sout.trim();
+        let detail = if !err.is_empty() {
+            err
+        } else if !sout.is_empty() {
+            sout
+        } else {
+            "<no output>"
+        };
         anyhow::bail!(
-            "Disable/Enable-PnpDevice failed (exit {:?}): {}",
+            "pnputil /restart-device failed (exit {:?}): {}",
             out.status.code(),
-            if err.is_empty() { "<no stderr>" } else { err }
+            detail
         );
     }
     Ok(())
+}
+
+/// 現プロセスが昇格 (elevated) トークンで動いているか。VDD デバイス再起動 (pnputil) は昇格が要り、
+/// 非昇格の手動起動 (インストーラ完了時の起動など) では 0x80041001 で失敗する。そこで非昇格時は
+/// 再起動を試みずリブート反映に委ねる判定に使う (無駄な失敗と怖い WARN を避ける)。
+#[cfg(target_os = "windows")]
+pub fn process_is_elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: OpenProcessToken で現プロセスのトークンを開き、TokenElevation を問い合わせる。token は
+    // 取得成功時のみ CloseHandle で閉じる。elevation は size 指定どおりに埋められる。失敗は保守的に false。
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        let _ = CloseHandle(token);
+        ok.is_ok() && elevation.TokenIsElevated != 0
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -383,4 +424,9 @@ pub fn ensure_vdd_render_gpu(_gpu_name: &str) -> anyhow::Result<bool> {
 #[cfg(not(target_os = "windows"))]
 pub fn restart_vdd_device() -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn process_is_elevated() -> bool {
+    false
 }

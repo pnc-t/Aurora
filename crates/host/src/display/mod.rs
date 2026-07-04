@@ -15,7 +15,8 @@
 // display の関心事なので配下に置く (旧 `crate::virtualdisplay` → `crate::display`)。
 pub mod virtual_display;
 pub use virtual_display::{
-    detect, ensure_common_resolutions, ensure_vdd_render_gpu, restart_vdd_device,
+    detect, ensure_common_resolutions, ensure_vdd_render_gpu, process_is_elevated,
+    restart_vdd_device,
 };
 
 /// 診断: 指定ディスプレイ (`\\.\DISPLAYn`) で解像度変更→復元を実測する (`--vdd-test-restore`)。
