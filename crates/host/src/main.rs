@@ -82,6 +82,11 @@ struct Args {
     /// エンコード GPU の名前部分一致指定 (`--encode-gpu`)。"auto" で保存を消し既定
     /// (キャプチャと同一 GPU) へ戻す。トレイ UI が無く CLI が唯一の入口のため明示時は永続化する。
     encode_gpu: Option<String>,
+    /// VDD の描画 GPU をキャプチャ GPU に一致させて (必要なら) デバイス再起動し終了する
+    /// (`--align-vdd`)。インストーラ (install_vdd.ps1、昇格) が VDD 登録直後に呼び、初回から
+    /// クロス GPU keyed mutex 固着を避ける (WMI の VRAM 最大推測では dGPU を誤選択するため、
+    /// 実際にキャプチャする GPU を run_server と同じ経路で判定する)。
+    align_vdd: bool,
 }
 
 impl Default for Args {
@@ -104,6 +109,7 @@ impl Default for Args {
             log_level: None,
             bind: None,
             encode_gpu: None,
+            align_vdd: false,
         }
     }
 }
@@ -177,6 +183,7 @@ fn parse_args() -> Args {
             "--encode-gpu" => {
                 args.encode_gpu = Some(take_value(&mut it, "--encode-gpu"));
             }
+            "--align-vdd" => args.align_vdd = true,
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -269,6 +276,9 @@ fn main() -> Result<()> {
     }
     if args.vdd_test_restore {
         return vdd_test_restore_cmd();
+    }
+    if args.align_vdd {
+        return align_vdd_cmd();
     }
     if args.dump_bmp {
         return dump_one_bmp();
@@ -733,6 +743,51 @@ fn vdd_test_restore_cmd() -> Result<()> {
         println!("display mode test is Windows-only");
     }
     Ok(())
+}
+
+/// `--align-vdd`: VDD の描画 GPU をキャプチャ GPU に一致させ、変わっていれば VDD デバイスを
+/// 再起動して即反映するワンショット。インストーラ (install_vdd.ps1、昇格) が VDD 登録直後に
+/// 呼び、初回からクロス GPU keyed mutex 固着を避ける (WMI の VRAM 最大推測では dGPU を誤選択
+/// するため host の実測に一元化)。run_server 起動時の整合ステップと同じ処理を、常駐せず 1 回
+/// だけ行う。muxless Optimus では dGPU プロセスから複製できず GPU 名を誤るため、run_server と
+/// 同様に iGPU へ寄せる re-exec を通してから判定する (昇格プロセスで呼ばれる前提なのでデバイス
+/// 再起動も通る)。
+#[cfg(target_os = "windows")]
+fn align_vdd_cmd() -> Result<()> {
+    let primary = capture::enumerate_displays()
+        .ok()
+        .and_then(|d| d.into_iter().next().map(|d| d.name))
+        .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
+    maybe_reexec_for_igpu_capture(&primary);
+    let device = capture::create_shared_device(&primary)?;
+    let gpu = device.adapter_name.clone();
+    if gpu.is_empty() {
+        tracing::warn!(
+            "align-vdd: capture GPU name unavailable; leaving VDD friendlyname unchanged"
+        );
+        return Ok(());
+    }
+    match display::ensure_vdd_render_gpu(&gpu) {
+        Ok(true) => {
+            tracing::info!(gpu = %gpu, "align-vdd: VDD render GPU aligned to capture GPU; restarting VDD device");
+            match display::restart_vdd_device() {
+                Ok(()) => tracing::info!("align-vdd: VDD device restarted"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "align-vdd: VDD device restart failed; applies on next reboot")
+                }
+            }
+        }
+        Ok(false) => {
+            tracing::info!(gpu = %gpu, "align-vdd: VDD render GPU already matches capture GPU")
+        }
+        Err(e) => tracing::warn!(error = %e, "align-vdd: could not align VDD render GPU"),
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn align_vdd_cmd() -> Result<()> {
+    anyhow::bail!("--align-vdd is only supported on Windows")
 }
 
 fn dump_one_bmp() -> Result<()> {

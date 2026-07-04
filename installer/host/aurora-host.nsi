@@ -119,8 +119,10 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   File "install_vdd.ps1"
 
   ; 配置 + ノード作成 + ドライバ束縛 + 検証を install_vdd.ps1 が行う (昇格が 1 回必要)。
+  ; -HostExe を渡し、VDD 登録直後に host --align-vdd で描画 GPU をキャプチャ GPU に合わせる
+  ; (クロス GPU 固着の恒久回避。SecCore は先に実行済みなので exe は配置済み)。
   ExecShellWait "runas" "powershell.exe" \
-    '-NoProfile -ExecutionPolicy Bypass -File "$TEMP\AuroraVDDSetup\install_vdd.ps1"' SW_HIDE
+    '-NoProfile -ExecutionPolicy Bypass -File "$TEMP\AuroraVDDSetup\install_vdd.ps1" -HostExe "$INSTDIR\${EXENAME}"' SW_HIDE
 
   ; 一時ファイルを削除。
   RMDir /r "$TEMP\AuroraVDDSetup"
