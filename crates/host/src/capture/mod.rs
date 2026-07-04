@@ -139,7 +139,7 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{
     DxgiCapturer as PlatformCapturer, debug_frame_to_bgra, debug_list_outputs, enumerate_displays,
-    input_desktop_is_default,
+    find_adapter_luid, input_desktop_is_default,
 };
 
 /// Windows 以外: ロック画面/セキュアデスクトップ相当の概念を扱わないため常に true

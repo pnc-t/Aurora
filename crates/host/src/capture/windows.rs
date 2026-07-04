@@ -254,6 +254,42 @@ pub fn select_capture_adapter(target: &str) -> CaptureAdapter {
     }
 }
 
+/// GPU 名の部分一致 (大文字小文字無視) で DXGI アダプタを探し、(LUID, 完全名) を返す。
+/// ハイブリッド GPU ノートでは同名アダプタが複数列挙されることがある (実機: RTX 3060 が
+/// 2 個) ため、呼び出し側へは名前でなく解決済み LUID を渡す。ソフトウェアアダプタ
+/// (Microsoft Basic Render Driver) は除外し、最初に一致したものを採用する。
+pub fn find_adapter_luid(name_substr: &str) -> Option<(windows::Win32::Foundation::LUID, String)> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
+    };
+    // SAFETY: CreateDXGIFactory1 は OUT パラメータを初期化する。
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let needle = name_substr.to_lowercase();
+    let mut ai = 0u32;
+    loop {
+        // SAFETY: EnumAdapters1 は範囲外で NOT_FOUND を返す。
+        let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(ai) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        ai += 1;
+        // SAFETY: adapter は live。GetDesc1 は OUT 構造体を値で返す。
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+            continue;
+        }
+        let name = String::from_utf16_lossy(&desc.Description)
+            .trim_end_matches('\0')
+            .to_string();
+        if name.to_lowercase().contains(&needle) {
+            return Some((desc.AdapterLuid, name));
+        }
+    }
+    None
+}
+
 /// [`select_capture_adapter`] の結果。`create_shared_device` のアダプタ選択と、main の
 /// iGPU フォールバック判定 ([`super::capture_all_adapters_unsupported`]) の両方で使う。
 pub enum CaptureAdapter {

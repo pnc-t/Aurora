@@ -79,6 +79,14 @@ struct Args {
     /// 引数でファイルログのレベルを上げられるようにする。`debug` 等の素のレベル、または
     /// `aurora=debug,snow=warn` のような完全なディレクティブを受け付ける。
     log_level: Option<String>,
+    /// エンコード GPU の名前部分一致指定 (`--encode-gpu`)。"auto" で保存を消し既定
+    /// (キャプチャと同一 GPU) へ戻す。トレイ UI が無く CLI が唯一の入口のため明示時は永続化する。
+    encode_gpu: Option<String>,
+    /// VDD の描画 GPU をキャプチャ GPU に一致させて (必要なら) デバイス再起動し終了する
+    /// (`--align-vdd`)。インストーラ (install_vdd.ps1、昇格) が VDD 登録直後に呼び、初回から
+    /// クロス GPU keyed mutex 固着を避ける (WMI の VRAM 最大推測では dGPU を誤選択するため、
+    /// 実際にキャプチャする GPU を run_server と同じ経路で判定する)。
+    align_vdd: bool,
 }
 
 impl Default for Args {
@@ -100,6 +108,8 @@ impl Default for Args {
             clear_password: false,
             log_level: None,
             bind: None,
+            encode_gpu: None,
+            align_vdd: false,
         }
     }
 }
@@ -170,6 +180,10 @@ fn parse_args() -> Args {
             "--bind" => {
                 args.bind = Some(take_value(&mut it, "--bind"));
             }
+            "--encode-gpu" => {
+                args.encode_gpu = Some(take_value(&mut it, "--encode-gpu"));
+            }
+            "--align-vdd" => args.align_vdd = true,
             other => {
                 eprintln!("unknown arg: {other}");
             }
@@ -263,6 +277,9 @@ fn main() -> Result<()> {
     if args.vdd_test_restore {
         return vdd_test_restore_cmd();
     }
+    if args.align_vdd {
+        return align_vdd_cmd();
+    }
     if args.dump_bmp {
         return dump_one_bmp();
     }
@@ -278,7 +295,14 @@ fn main() -> Result<()> {
         system::load_port().unwrap_or(args.port)
     };
     let bind = resolve_bind_spec(args.bind.as_deref());
-    run_server(args.perf, args.fps_cap, args.max_bitrate_bps, port, bind)
+    run_server(
+        args.perf,
+        args.fps_cap,
+        args.max_bitrate_bps,
+        port,
+        bind,
+        args.encode_gpu,
+    )
 }
 
 /// 待受アドレスの解決方法 ([`BindSpec`]) を決める。
@@ -721,6 +745,51 @@ fn vdd_test_restore_cmd() -> Result<()> {
     Ok(())
 }
 
+/// `--align-vdd`: VDD の描画 GPU をキャプチャ GPU に一致させ、変わっていれば VDD デバイスを
+/// 再起動して即反映するワンショット。インストーラ (install_vdd.ps1、昇格) が VDD 登録直後に
+/// 呼び、初回からクロス GPU keyed mutex 固着を避ける (WMI の VRAM 最大推測では dGPU を誤選択
+/// するため host の実測に一元化)。run_server 起動時の整合ステップと同じ処理を、常駐せず 1 回
+/// だけ行う。muxless Optimus では dGPU プロセスから複製できず GPU 名を誤るため、run_server と
+/// 同様に iGPU へ寄せる re-exec を通してから判定する (昇格プロセスで呼ばれる前提なのでデバイス
+/// 再起動も通る)。
+#[cfg(target_os = "windows")]
+fn align_vdd_cmd() -> Result<()> {
+    let primary = capture::enumerate_displays()
+        .ok()
+        .and_then(|d| d.into_iter().next().map(|d| d.name))
+        .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
+    maybe_reexec_for_igpu_capture(&primary);
+    let device = capture::create_shared_device(&primary)?;
+    let gpu = device.adapter_name.clone();
+    if gpu.is_empty() {
+        tracing::warn!(
+            "align-vdd: capture GPU name unavailable; leaving VDD friendlyname unchanged"
+        );
+        return Ok(());
+    }
+    match display::ensure_vdd_render_gpu(&gpu) {
+        Ok(true) => {
+            tracing::info!(gpu = %gpu, "align-vdd: VDD render GPU aligned to capture GPU; restarting VDD device");
+            match display::restart_vdd_device() {
+                Ok(()) => tracing::info!("align-vdd: VDD device restarted"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "align-vdd: VDD device restart failed; applies on next reboot")
+                }
+            }
+        }
+        Ok(false) => {
+            tracing::info!(gpu = %gpu, "align-vdd: VDD render GPU already matches capture GPU")
+        }
+        Err(e) => tracing::warn!(error = %e, "align-vdd: could not align VDD render GPU"),
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn align_vdd_cmd() -> Result<()> {
+    anyhow::bail!("--align-vdd is only supported on Windows")
+}
+
 fn dump_one_bmp() -> Result<()> {
     let primary = capture::enumerate_displays()
         .ok()
@@ -747,7 +816,7 @@ fn dump_h264(n: usize) -> Result<()> {
         .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
     let device = capture::create_shared_device(&primary)?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
-    let mut enc = PlatformEncoder::new(device, MAX_BITRATE_BPS)?;
+    let mut enc = encode::create(device, MAX_BITRATE_BPS, None)?;
     let mut out = std::fs::File::create("out.h264").context("create out.h264")?;
     use std::io::Write;
 
@@ -917,6 +986,7 @@ fn run_server(
     max_bitrate_bps: u32,
     port: u16,
     bind: BindSpec,
+    encode_gpu_arg: Option<String>,
 ) -> Result<()> {
     // DPAPI で保存済みのパスワードがあればそれを使う (再起動しても固定・無人起動で読める)。
     // 無ければランダム生成して表示する (手動/開発・初回起動向け)。機密はログに出さない
@@ -1056,6 +1126,59 @@ fn run_server(
     // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
     let device = capture::create_shared_device(&initial_name)?;
 
+    // --encode-gpu の解決: CLI 明示 > 保存値 > 既定 (キャプチャ GPU)。"auto" は保存を消して既定へ。
+    // 保存失敗は映像機能に影響しないため warn で続行する。
+    let encode_gpu: Option<String> = match encode_gpu_arg.as_deref() {
+        Some(v) if v.eq_ignore_ascii_case("auto") => {
+            if let Err(e) = system::clear_encode_gpu() {
+                tracing::warn!(error = %e, "failed to clear encode GPU setting");
+            }
+            None
+        }
+        Some(v) => {
+            if let Err(e) = system::save_encode_gpu(v) {
+                tracing::warn!(error = %e, "failed to save encode GPU setting");
+            }
+            Some(v.to_string())
+        }
+        None => system::load_encode_gpu(),
+    };
+
+    // VDD の描画 GPU をキャプチャ GPU に一致させる (クロス GPU keyed mutex 固着の恒久対策)。
+    // 別 GPU が VDD を描画すると Windows がクロスアダプタ共有サーフェス (keyed mutex) で橋渡しし、
+    // キャプチャ側 Desktop Duplication が ACCESS_LOST 恒常化で固まる (Optimus ノートで実機確認)。
+    // friendlyname 変更の反映には**デバイス再起動が要る** (RELOAD_DRIVER pipe は loadSettings を
+    // 再実行しないため無効)。startup 時点なら接続なし=安全。デバイス再起動は昇格が要るので
+    // (autostart /RL HIGHEST なら成功)、非昇格時は再起動を試みず次回 reboot 反映に委ねる。
+    #[cfg(target_os = "windows")]
+    {
+        let gpu = device.adapter_name.clone();
+        if !gpu.is_empty() {
+            match display::ensure_vdd_render_gpu(&gpu) {
+                Ok(true) => {
+                    // デバイス再起動は昇格が要る (非昇格では WMI/pnputil とも 0x80041001 等で失敗)。
+                    // 非昇格の手動起動 (インストーラ完了時の起動など) では無駄に試して怖い WARN を
+                    // 出さず、リブート反映に委ねる。autostart (/RL HIGHEST) は昇格するので即反映される。
+                    if display::process_is_elevated() {
+                        tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; restarting VDD device to apply");
+                        match display::restart_vdd_device() {
+                            Ok(()) => tracing::info!("VDD device restarted"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "VDD device restart failed; change applies on next reboot or manual device restart")
+                            }
+                        }
+                    } else {
+                        tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; device restart needs elevation (run via autostart), change applies on next reboot");
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(gpu = %gpu, "VDD render GPU already matches capture GPU (or VDD not installed)")
+                }
+                Err(e) => tracing::warn!(error = %e, "could not align VDD render GPU"),
+            }
+        }
+    }
+
     // フレームと一緒に capture 時刻 (Instant) を運び、encode 側で capture→encode 待ちを測る
     // (--perf 時のみ集計)。Instant は Copy で安価。
     let (frame_tx, frame_rx) = mpsc::channel::<(Instant, Frame)>(2);
@@ -1148,8 +1271,15 @@ fn run_server(
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
-            if let Err(e) = encode_loop(device, frame_rx, nal_tx, enc_cmd_rx, perf, max_bitrate_bps)
-            {
+            if let Err(e) = encode_loop(
+                device,
+                frame_rx,
+                nal_tx,
+                enc_cmd_rx,
+                perf,
+                max_bitrate_bps,
+                encode_gpu,
+            ) {
                 tracing::error!(error = %e, "encode loop ended");
             }
         })?;
@@ -1485,8 +1615,9 @@ fn encode_loop(
     mut cmd_rx: mpsc::Receiver<EncoderCommand>,
     perf: bool,
     max_bitrate_bps: u32,
+    encode_gpu: Option<String>,
 ) -> Result<()> {
-    let mut enc = PlatformEncoder::new(device, max_bitrate_bps)?;
+    let mut enc = encode::create(device, max_bitrate_bps, encode_gpu.as_deref())?;
     let mut meter = perf.then(perf::EncodeMeter::new);
     // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
     let mut nals: Vec<EncodedNal> = Vec::new();

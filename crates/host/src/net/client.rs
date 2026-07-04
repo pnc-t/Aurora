@@ -786,6 +786,22 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     //    方針なので、テイクオーバー以外の解像度復元は不要。
     if restore_takeover {
         let _ = tokio::task::spawn_blocking(crate::display::end_takeover).await;
+        // テイクオーバー解除後は入力座標系と選択ディスプレイを物理 primary へ戻す。仮想 OFF で
+        // 再接続したクライアントは既定の displays[0] (物理) を明示 SelectDisplay しない
+        // (session.ts: target==displays[0] のとき送らない) ため、ここで戻さないと入力座標系が
+        // 仮想解像度 (例 2560x1440) に取り残され、物理 (1920x1200) でカーソルがずれる (実機確認)。
+        let geom = {
+            let mut sc = shared.lock().await;
+            sc.active_idx = 0;
+            let d = &sc.displays[0];
+            DisplayGeom {
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+            }
+        };
+        let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
     }
     // 5) VDD を再デタッチ: テイクオーバー復元後も VDD がデスクトップに残るため切り離す。
     //    未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。最後の 1 本のみ。

@@ -8,6 +8,7 @@
 //! `ID3D11Multithread::SetMultithreadProtected(TRUE)` で内部直列化を有効化する。
 
 use anyhow::{Context, Result, anyhow};
+use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_1,
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -31,6 +32,13 @@ pub struct DeviceBundle {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     pub manager: IMFDXGIDeviceManager,
+    /// このデバイスが載っているアダプタの LUID。エンコーダ選択 (キャプチャと同一 GPU の
+    /// MFT を優先する LUID フィルタ) に使う。取得失敗時はゼロ LUID (後段のフィルタが
+    /// 総当たり列挙へ劣化するだけで致命ではない)。
+    pub adapter_luid: LUID,
+    /// このデバイスが載っているアダプタの DXGI 名 (Description)。VDD の描画 GPU を
+    /// キャプチャ GPU に一致させる (friendlyname 照合) のに使う。取得失敗時は空文字列。
+    pub adapter_name: String,
 }
 
 // SAFETY: device は SetMultithreadProtected(TRUE) 済みで、即時コンテキストへの
@@ -96,23 +104,33 @@ impl DeviceBundle {
             )
         };
 
-        // 選択されたアダプタ名をログに出す (ハイブリッド GPU の取り違え診断用)。
-        if let Ok(dxgi_device) = device.cast::<IDXGIDevice>() {
+        // 選択されたアダプタ名 (+ LUID) をログに出す (ハイブリッド GPU の取り違え診断用)。
+        let desc = device
+            .cast::<IDXGIDevice>()
+            .ok()
             // SAFETY: dxgi_device は live。GetAdapter は所有権付き COM を返す。
-            if let Ok(adp) = unsafe { dxgi_device.GetAdapter() } {
-                // SAFETY: adp は live。GetDesc は値 (OUT 構造体) を返す。
-                if let Ok(desc) = unsafe { adp.GetDesc() } {
-                    let name = String::from_utf16_lossy(&desc.Description)
-                        .trim_end_matches('\0')
-                        .to_string();
-                    tracing::info!(
-                        gpu = %name,
-                        explicit_adapter = adapter.is_some(),
-                        "shared D3D11 device adapter"
-                    );
-                }
+            .and_then(|dxgi_device| unsafe { dxgi_device.GetAdapter() }.ok())
+            // SAFETY: adp は live。GetDesc は値 (OUT 構造体) を返す。
+            .and_then(|adp| unsafe { adp.GetDesc() }.ok());
+        let (adapter_luid, adapter_name) = match &desc {
+            Some(desc) => {
+                let name = String::from_utf16_lossy(&desc.Description)
+                    .trim_end_matches('\0')
+                    .to_string();
+                tracing::info!(
+                    gpu = %name,
+                    explicit_adapter = adapter.is_some(),
+                    "shared D3D11 device adapter"
+                );
+                (desc.AdapterLuid, name)
             }
-        }
+            None => {
+                tracing::warn!(
+                    "adapter LUID unavailable; encoder LUID filter degrades to enumeration order"
+                );
+                (LUID::default(), String::new())
+            }
+        };
 
         // capture スレッドと MFT 内部スレッドが同一デバイスを触るため必須。
         let mt: ID3D11Multithread = device.cast().context("cast ID3D11Multithread")?;
@@ -140,6 +158,8 @@ impl DeviceBundle {
             device,
             context,
             manager,
+            adapter_luid,
+            adapter_name,
         })
     }
 }

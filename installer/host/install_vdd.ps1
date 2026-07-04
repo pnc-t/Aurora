@@ -4,6 +4,11 @@
 # extracted side-by-side by NSIS into $PSScriptRoot.
 # ASCII only (launched via powershell.exe = PS5.1, which decodes BOM-less files
 # as ANSI -- Japanese would mojibake and break parsing).
+#
+# -HostExe: full path to aurora-host.exe. After the VDD device is created we invoke it
+# with --align-vdd to set friendlyname to the REAL capture GPU (step 6).
+param([string]$HostExe = "")
+
 $ErrorActionPreference = 'Continue'
 $src = $PSScriptRoot
 $dst = 'C:\VirtualDisplayDriver'
@@ -33,30 +38,15 @@ foreach ($f in @('MttVDD.dll','MttVDD.inf','mttvdd.cat','nefconw.exe','vdd_setti
 }
 if (-not (Test-Path (Join-Path $dst 'MttVDD.inf'))) { Log "FATAL: MttVDD.inf not staged"; exit 1 }
 
-# 1b) Pin the VDD to the host's real GPU. With gpu=default, IddCx can place the
-# virtual display on a render-only adapter whose output is NOT exposed through DXGI
-# EnumOutputs, so the host cannot Desktop-Duplicate it (capture hangs / black screen,
-# and modes degrade). Binding it to the physical GPU's model name makes the virtual
-# output enumerate on that adapter (verified: appears as adapter[0] output[N], full
-# mode list). The driver matches <friendlyname> as a substring of the DXGI adapter
-# description, so we strip the vendor prefix (AMD's DXGI desc has a double space that a
-# WMI single-spaced full name would NOT substring-match; the model portion does).
-$xmlPath = Join-Path $dst 'vdd_settings.xml'
-try {
-    $gpu = Get-CimInstance Win32_VideoController -ErrorAction Stop |
-        Where-Object { $_.Name -and $_.Name -notmatch 'Basic|Virtual|Idd|Meta|Parsec|Microsoft|Remote|VDD' } |
-        Sort-Object -Property AdapterRAM -Descending | Select-Object -First 1
-    if ($gpu -and (Test-Path $xmlPath)) {
-        $name = ($gpu.Name -replace '^(AMD|NVIDIA|Intel(\(R\))?|Advanced Micro Devices(, Inc\.)?)\s+', '').Trim()
-        if ($name) {
-            $xml = Get-Content $xmlPath -Raw
-            $xml = $xml -replace '<friendlyname>.*?</friendlyname>', "<friendlyname>$name</friendlyname>"
-            # BOM-less UTF-8: the driver/PS5.1 read this file as ANSI; a BOM would corrupt it.
-            [System.IO.File]::WriteAllText($xmlPath, $xml, (New-Object System.Text.UTF8Encoding($false)))
-            Log "pinned VDD GPU friendlyname='$name' (from '$($gpu.Name)')"
-        } else { Log "GPU name empty after strip ('$($gpu.Name)'); leaving gpu=default" }
-    } else { Log "no physical GPU found via WMI; leaving gpu=default" }
-} catch { Log "GPU pin failed: $($_.Exception.Message); leaving gpu=default" }
+# 1b) friendlyname (VDD render GPU) is intentionally left at the shipped default here.
+# Picking it via WMI VRAM-max is WRONG on muxless Optimus laptops: it selects the dGPU
+# (e.g. NVIDIA), but the host captures on the iGPU (Intel). The VDD then renders on a
+# different GPU than the one duplicating the desktop, and Windows bridges them with a
+# cross-adapter keyed-mutex surface that gets abandoned -> AcquireNextFrame returns
+# 0x887A0026 forever (virtual desktop freezes to black, never recovers). Only the host's
+# actual DuplicateOutput probe knows the true capture GPU, so we defer to it: step 6
+# invokes `aurora-host --align-vdd` after the device exists, which writes the correct
+# friendlyname and restarts the VDD device so it applies immediately (no reboot).
 
 # 2) Remove any pre-existing MttVDD nodes so we don't pile up duplicates.
 $old = @(Get-PnpDevice | Where-Object { $_.HardwareID -match 'MttVDD' -or $_.HardwareID -match 'MTT1337' })
@@ -86,4 +76,16 @@ else {
     $mon = Get-PnpDevice | Where-Object { $_.HardwareID -match 'MTT1337' -or $_.FriendlyName -match 'VDD by MTT' }
     if ($mon) { Log "SUCCESS after retry: MTT1337 present" } else { Log "STILL MISSING: see this log" }
 }
+# 6) Align the VDD render GPU to the host's REAL capture GPU (see 1b). The host probes
+# DuplicateOutput the same way it does at runtime, writes friendlyname, and restarts the
+# VDD device so the fix applies now instead of only on the next reboot. It re-execs to
+# reach the iGPU on hybrid laptops, so launch it fire-and-forget (it finishes in a few
+# seconds on its own); its result is written to the host log, not this one.
+if ($HostExe -and (Test-Path $HostExe)) {
+    Log "aligning VDD render GPU to capture GPU via: $HostExe --align-vdd"
+    Start-Process -FilePath $HostExe -ArgumentList '--align-vdd' -WindowStyle Hidden
+} else {
+    Log "host exe not provided ($HostExe); skipping GPU align (host self-heals on next run + reboot)"
+}
+
 Log "=== Aurora VDD install end ==="
