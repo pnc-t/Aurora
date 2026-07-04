@@ -145,7 +145,8 @@ function renderStatusOverlay(kind: StatusKind, text: string, showClose: boolean)
   card.appendChild(msg);
   if (showClose) {
     const btn = document.createElement("button");
-    btn.textContent = "閉じる";
+    // connecting 中 (準備中/再接続中含む) はキャンセル操作、error 後は文字通り閉じる操作として文言を出し分ける。
+    btn.textContent = kind === "error" ? "閉じる" : "キャンセル";
     Object.assign(btn.style, {
       padding: "8px 18px",
       borderRadius: "8px",
@@ -534,7 +535,7 @@ void (async () => {
     renderStatusOverlay("error", "接続情報が不正です", true);
     return;
   }
-  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, false);
+  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, true);
   try {
     await addSession(initialId, initialEntry, initialSave, /*activate=*/ true);
     // 接続時の自動フルスクリーン (窓単位、最初のタブのみで判断)。

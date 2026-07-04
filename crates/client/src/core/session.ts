@@ -146,6 +146,11 @@ export class Session {
   private lastSentVw = 0;
   private lastSentVh = 0;
 
+  // 仮想ディスプレイのテイクオーバー待ち (host が物理→仮想へ切替中、完了 (display_resized) まで
+  // 固まった物理側の映像を隠すためオーバーレイを維持する)。
+  private preparingVirtual = false;
+  private prepareTimer: number | null = null;
+
   constructor(
     id: string,
     entry: HostEntry,
@@ -170,7 +175,7 @@ export class Session {
   /** 最初の接続を開く (起動時に orchestrator が呼ぶ)。 */
   async start(): Promise<void> {
     logger.info(`session start: ${this.entry.host}:${this.entry.port}`);
-    this.setStatus(`connecting to ${this.entry.host}…`, "connecting");
+    this.setStatus(`connecting to ${this.entry.host}…`, "connecting", true);
     await this.openSession(this.save);
   }
 
@@ -210,6 +215,11 @@ export class Session {
       clearTimeout(this.viewportTimer);
       this.viewportTimer = null;
     }
+    if (this.prepareTimer !== null) {
+      clearTimeout(this.prepareTimer);
+      this.prepareTimer = null;
+    }
+    this.preparingVirtual = false;
     this.input.detach();
     this.decoder.close();
     void disconnect(this.id);
@@ -244,6 +254,11 @@ export class Session {
       clearTimeout(this.viewportTimer);
       this.viewportTimer = null;
     }
+    if (this.prepareTimer !== null) {
+      clearTimeout(this.prepareTimer);
+      this.prepareTimer = null;
+    }
+    this.preparingVirtual = false;
     this.input.detach();
     this.decoder.close();
     this.sessionGen++;
@@ -347,6 +362,18 @@ export class Session {
     this.host.renderStatus(this);
   }
 
+  /** 仮想ディスプレイのテイクオーバー待ちを終える (display_resized 到達 or タイムアウト保険)。 */
+  private finishPreparingVirtual(): void {
+    if (!this.preparingVirtual) return;
+    this.preparingVirtual = false;
+    if (this.prepareTimer !== null) {
+      clearTimeout(this.prepareTimer);
+      this.prepareTimer = null;
+    }
+    // 接続済みなら中央オーバーレイを消して映像を見せる。
+    if (this.connected) this.setStatus("", "hidden");
+  }
+
   /** 脱出方法ヒントを表示済みか (全 Session 共有)。初回キャプチャ時だけ案内する。 */
   private static breakoutHintShown = false;
 
@@ -424,7 +451,7 @@ export class Session {
     if (gen !== this.sessionGen) return; // 旧セッションの残イベントは無視
     switch (ev.kind) {
       case "connected":
-        this.setStatus("handshake complete…", "connecting");
+        this.setStatus("handshake complete…", "connecting", true);
         break;
       case "host_info":
         this.onHostInfo(ev);
@@ -437,6 +464,8 @@ export class Session {
         if (this.currentDisplay && this.currentDisplay.id === ev.id) {
           this.currentDisplay = { ...this.currentDisplay, width: ev.width, height: ev.height };
         }
+        // テイクオーバー完了の合図: 準備中オーバーレイを消して映像を見せる。
+        if (this.preparingVirtual && this.currentDisplay?.id === ev.id) this.finishPreparingVirtual();
         this.decoder.reset();
         if (this.active) this.attachInputToCurrent();
         const dn = this.currentDisplay ? formatDisplayName(this.currentDisplay.name) : `Display ${ev.id}`;
@@ -473,7 +502,6 @@ export class Session {
     this.markSessionEstablished();
     this.connected = true;
     this.tabStatus = "connected";
-    this.setStatus("", "hidden");
     if (this.entry.host) void saveRecentHost(this.entry);
     const settings = this.host.getSettings();
     this.audioAvailable = ev.audio;
@@ -489,6 +517,20 @@ export class Session {
       }
     }
     this.currentDisplay = target ?? null;
+    // 仮想ディスプレイ対象時、host はこの直後にテイクオーバー (物理→仮想切替、数秒) を行う。
+    // 完了までは物理側の固まった映像が映り込むため、display_resized (完了合図) までオーバーレイで隠す。
+    if (settings.use_virtual_display && target?.is_virtual) {
+      this.preparingVirtual = true;
+      this.setStatus("仮想ディスプレイを準備中…", "connecting", true);
+      if (this.prepareTimer !== null) clearTimeout(this.prepareTimer);
+      // テイクオーバー失敗などで display_resized が来ない場合の保険。
+      this.prepareTimer = window.setTimeout(() => {
+        this.prepareTimer = null;
+        this.finishPreparingVirtual();
+      }, 10000);
+    } else {
+      this.setStatus("", "hidden");
+    }
     if (target) {
       if (target.id !== ev.displays[0]?.id) void selectDisplay(this.id, target.id);
       this.connLabel = `${this.entry.host} · ${formatDisplayName(target.name)} ${target.width}x${target.height}`;
@@ -545,6 +587,11 @@ export class Session {
       clearTimeout(this.viewportTimer);
       this.viewportTimer = null;
     }
+    if (this.prepareTimer !== null) {
+      clearTimeout(this.prepareTimer);
+      this.prepareTimer = null;
+    }
+    this.preparingVirtual = false;
     this.lastSentVw = 0;
     this.lastSentVh = 0;
     this.input.detach();
@@ -572,6 +619,11 @@ export class Session {
       clearTimeout(this.viewportTimer);
       this.viewportTimer = null;
     }
+    if (this.prepareTimer !== null) {
+      clearTimeout(this.prepareTimer);
+      this.prepareTimer = null;
+    }
+    this.preparingVirtual = false;
     this.input.detach();
     this.decoder.close();
   }
@@ -620,6 +672,7 @@ export class Session {
     this.setStatus(
       `再接続待機 ${Math.round(delay / 1000)}s… (試行 ${this.reconnectAttempt + 1})`,
       "connecting",
+      true,
     );
     this.reconnectTimer = window.setTimeout(() => void this.attemptReconnect(), delay);
   }
@@ -636,7 +689,7 @@ export class Session {
     }
     this.reconnectAttempt++;
     logger.info(`reconnect attempt ${this.reconnectAttempt}: ${this.entry.host}`);
-    this.setStatus(`再接続中… (試行 ${this.reconnectAttempt})`, "connecting");
+    this.setStatus(`再接続中… (試行 ${this.reconnectAttempt})`, "connecting", true);
     this.host.toast(this, `再接続を試行中… (${this.reconnectAttempt})`);
     try {
       // password=null で保存済み (DPAPI) を使う。再保存不要なので save=false。
