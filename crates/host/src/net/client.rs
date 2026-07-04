@@ -286,6 +286,10 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 送って映像を復帰させる。これもクライアント毎ローカル。映像送信は専用タスクで走るため、
     // 制御ループ (ここ) とタスクで共有する atomic にする。
     let video_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // テイクオーバー (仮想ディスプレイ切替) 実施中フラグ。true の間はキャプチャがまだ物理を
+    // 撮っている固まりフレームを送らないよう映像 UDP 送出を止める。video_paused (クライアント
+    // 駆動のタブ pause) とは別軸なので、送出ゲートは両者の論理和にする (どちらかで停止)。
+    let takeover_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // --- 映像 UDP 送信タスク (制御/入力から分離) ---
     // 映像送信を制御ループの select から外し、専用タスクで回す。同じ select に置くと、ドラッグ中の
@@ -298,6 +302,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         let udp = udp.clone();
         let enc_tx = enc_tx.clone();
         let video_paused = video_paused.clone();
+        let takeover_pending = takeover_pending.clone();
         let mut nal_brx = nal_brx;
         tokio::spawn(async move {
             let mut seq: u32 = 0;
@@ -314,8 +319,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     // 送信元 (encode → フォワーダ) 終了 = 映像供給停止。送信タスクを畳む。
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                // 一時停止中はドレインするだけで送らない (非アクティブタブの帯域節約)。
-                if video_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                // 一時停止中 (非アクティブタブ) またはテイクオーバー中 (物理の固まりフレームを
+                // 送らせない) はドレインするだけで送らない。
+                if video_paused.load(std::sync::atomic::Ordering::Relaxed)
+                    || takeover_pending.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     continue;
                 }
                 let frame_id = nal.frame_id;
@@ -466,6 +474,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // SetClientViewport のテイクオーバー判定はこのフラグを必須条件にする
                                     // (このアームを正常通過した = 明示的に選択済み)。
                                     virtual_selected = id == VIRTUAL_SENTINEL_ID;
+                                    // 仮想選択と同時に送出を止める (この直後の SetClientViewport で
+                                    // begin_takeover が走り、その間キャプチャは物理の固まりフレームを
+                                    // 返し続けるため)。物理へ戻す/通常選択時は false にして残留させない。
+                                    takeover_pending.store(
+                                        virtual_selected,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                     // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
                                     // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
                                     // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
@@ -614,6 +629,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     tracing::info!(id = d.id, nw, nh, "virtual display takeover/resize");
                                 }
                             }
+                            // is_virtual 判定に関わらず、この viewport 処理を抜ける時点で
+                            // テイクオーバーは完了 (begin_takeover は上の is_virtual ブロック内で
+                            // await 済み) または非該当なので、送出停止を必ず解除する。ブロック内に
+                            // 置くと is_virtual=false 経路や失敗時に、直前の SelectDisplay で立てた
+                            // takeover_pending=true が残り送出が永久固着する。
+                            takeover_pending.store(false, std::sync::atomic::Ordering::Relaxed);
                             // 物理ディスプレイのキャプチャ時はホスト解像度を一切変更しない
                             // (はみ出しはクライアント側の object-fit / レターボックスで吸収する)。
                         }
