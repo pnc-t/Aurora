@@ -337,28 +337,40 @@ pub fn ensure_vdd_render_gpu(gpu_name: &str) -> anyhow::Result<bool> {
 
 /// VDD (`Root\MttVDD`) デバイスを再起動し、変更した friendlyname (描画 GPU) を loadSettings
 /// 再実行で反映させる。RELOAD_DRIVER pipe は loadSettings を再実行しないため使えない。
-/// Restart-PnpDevice は昇格が要る (autostart /RL HIGHEST なら成功)。
+/// デバイス再起動は昇格が要る (autostart /RL HIGHEST なら成功)。
 #[cfg(target_os = "windows")]
 pub fn restart_vdd_device() -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     // 自前のコンソールを開かずに起動する (autostart.rs の CREATE_NO_WINDOW と同じ流儀)。
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "try { Get-PnpDevice -Class Display -ErrorAction Stop | Where-Object { $_.HardwareID -match 'MttVDD' } | Restart-PnpDevice -Confirm:$false -ErrorAction Stop } catch { exit 1 }",
-        ])
+    // `Restart-PnpDevice` は PnpDevice モジュールに存在しない (実機で "not recognized" を確認,
+    // 2026-07-04)。同モジュールの Disable→Enable で等価の再起動を行う。try/finally で必ず
+    // Enable を試み、途中失敗でデバイスを無効のまま放置しない。Disable が失敗 (非昇格など) した
+    // 時点ではまだ無効化していないので Enable もせず、そのままエラーを伝播する。
+    const SCRIPT: &str = "$ErrorActionPreference='Stop'; \
+        $d = Get-PnpDevice -Class Display | Where-Object { $_.HardwareID -match 'MttVDD' }; \
+        if (-not $d) { Write-Error 'MttVDD device not found'; exit 2 }; \
+        $disabled = $false; \
+        try { $d | Disable-PnpDevice -Confirm:$false; $disabled = $true; Start-Sleep -Milliseconds 400 } \
+        finally { if ($disabled) { $d | Enable-PnpDevice -Confirm:$false } }";
+
+    // stderr を捨てると失敗時に exit コードしか残らず切り分けできない (今回の教訓)。output で
+    // 捕捉し、失敗理由をそのままエラーメッセージへ載せる。
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
         .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("Restart-PnpDevice failed (exit {:?})", status.code());
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        anyhow::bail!(
+            "Disable/Enable-PnpDevice failed (exit {:?}): {}",
+            out.status.code(),
+            if err.is_empty() { "<no stderr>" } else { err }
+        );
     }
     Ok(())
 }
