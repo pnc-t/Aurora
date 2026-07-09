@@ -13,8 +13,10 @@ import {
   disconnectHost,
   deleteRecentHost,
   deleteHostPassword,
+  focusHostWindow,
   loadRecentHosts,
   loadSettings,
+  probeHosts,
   saveRecentHost,
   savedPasswordHosts,
   setRecentHosts,
@@ -23,12 +25,19 @@ import {
   exportLogsZip,
   type ClientSettings,
   type HostEntry,
+  type HostOverrides,
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
 import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
-import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
+import {
+  findPreset,
+  matchPreset,
+  presetOptionsHtml,
+  VIDEO_PRESETS,
+  CUSTOM_PRESET_ID,
+} from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { SHORTCUTS } from "../core/shortcuts";
@@ -36,10 +45,12 @@ import { icon } from "./icons";
 import "./launcher.css";
 
 // password に null を渡すと Rust 側が保存済みパスワード (DPAPI) を使って接続する。
+// newWindow=true は接続中ホストへ「新しいウィンドウで接続」した場合 (通常接続は false)。
 type ConnectCallback = (
   entry: HostEntry,
   password: string | null,
   save: boolean,
+  newWindow: boolean,
 ) => Promise<void>;
 type ConnState = "idle" | "connecting" | "connected" | "error";
 
@@ -102,7 +113,7 @@ async function imageToIconDataUrl(file: File): Promise<string> {
 }
 
 /** data URL の画像アバターか判定する (描画分岐・保存値の検証に使う)。 */
-function hasImageIcon(icon: string | undefined): icon is string {
+function hasImageIcon(icon: string | null | undefined): icon is string {
   return !!icon && icon.startsWith("data:image/");
 }
 
@@ -153,6 +164,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           <div class="page-head">
             <h2>Hosts</h2>
             <div class="actions">
+              <button class="icon-btn" id="probe-refresh" title="オンライン状態を更新">${icon("refresh")}</button>
               <button class="icon-btn" id="add-host" title="ホストを追加">${icon("add")}</button>
             </div>
           </div>
@@ -359,10 +371,17 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   $("#open-logs")?.addEventListener("click", () => {
     void openLogsFolder().catch((e) => logger.warn("open logs folder failed", e));
   });
+  // 一時メッセージ (ログ出力完了など) が接続状態表示を占有し続けないよう自動で戻すタイマー。
+  let statusRevertTimer: number | null = null;
   $("#export-logs")?.addEventListener("click", () => {
     void exportLogsZip()
       .then((path) => {
         statusText.textContent = `ログを出力しました: ${path}`;
+        if (statusRevertTimer !== null) clearTimeout(statusRevertTimer);
+        statusRevertTimer = window.setTimeout(() => {
+          statusRevertTimer = null;
+          updateStatusBar();
+        }, 5000);
       })
       .catch((e) => logger.warn("export logs failed", e));
   });
@@ -436,10 +455,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   /** ⋯ ボタン (anchor) の下にメニューを開く (編集は直接ボタンへ移した)。
    *  パスワード保存済みなら「忘れる」項目も出す。 */
   function openCardMenu(anchor: HTMLElement, entry: HostEntry): void {
+    const newWinItem = isConnected(entry.host)
+      ? `<button class="menu-item" data-m="newwin">${icon("add")} 新しいウィンドウで接続</button>`
+      : "";
     const forgetItem = hasSaved(entry.host)
       ? `<button class="menu-item" data-m="forget">${icon("key")} パスワードを忘れる</button>`
       : "";
     cardMenu.innerHTML = `
+      ${newWinItem}
       ${forgetItem}
       <button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>
     `;
@@ -448,6 +471,23 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     const r = anchor.getBoundingClientRect();
     cardMenu.style.top = `${r.bottom + 4}px`;
     cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector('[data-m="newwin"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      if (hasSaved(entry.host)) {
+        handle.setConnecting(true);
+        // 保存済み: 即接続 (password=null は Rust が DPAPI 復号)。newWindow=true で必ず新窓。
+        void opts
+          .onConnect(entry, null, false, true)
+          .then(() => updateStatusBar())
+          .catch((e) => {
+            logger.warn("open new window failed", e);
+            updateStatusBar();
+            openConnectDialog(entry, true);
+          });
+      } else {
+        openConnectDialog(entry, true);
+      }
+    });
     cardMenu.querySelector('[data-m="forget"]')?.addEventListener("click", () => {
       closeCardMenu();
       void (async () => {
@@ -477,6 +517,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   function openHostDialog(entry: HostEntry | null): void {
     const isAdd = entry === null;
     const e: HostEntry = entry ?? { label: "", host: "", port: settings.default_port };
+    const o: HostOverrides = e.overrides ?? {};
+    const hasQuality = o.fps != null && o.max_mbps != null;
+    const qualityId = hasQuality ? matchPreset(o.fps as number, o.max_mbps as number) : "default";
+    // 手で JSON を編集した等でプリセット外の値が入っている場合は現値ラベルで残す (保存時は維持)。
+    const customOpt =
+      qualityId === CUSTOM_PRESET_ID
+        ? `<option value="${CUSTOM_PRESET_ID}">カスタム (${o.fps}fps / ${o.max_mbps}Mbps)</option>`
+        : "";
+    const presetOpts =
+      `<option value="default">既定に従う</option>` +
+      VIDEO_PRESETS.map((p) => `<option value="${p.id}">${p.label}</option>`).join("") +
+      customOpt;
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
         <h3>${isAdd ? "ホストを追加" : "ホストを編集"}</h3>
@@ -491,6 +543,15 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <label>表示名 (任意)<input id="h-label" type="text" value="${escapeHtml(e.label)}" placeholder="home-pc" /></label>
         <label>host (Tailscale IP / hostname)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
         <label>port<input id="h-port" type="text" inputmode="numeric" value="${e.port}" /></label>
+        <div class="dlg-sub">このホストだけの設定 (既定を上書き)</div>
+        <label>仮想ディスプレイ
+          <select id="h-virtual" class="select-input">
+            <option value="default">既定に従う</option>
+            <option value="on">使う</option>
+            <option value="off">使わない</option>
+          </select>
+        </label>
+        <label>画質プリセット<select id="h-preset" class="select-input">${presetOpts}</select></label>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="h-cancel">cancel</button>
           <button type="submit" class="btn-primary">${isAdd ? "add" : "save"}</button>
@@ -498,6 +559,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       </form>
     `;
     openBackdrop();
+
+    const virtualSel = backdrop.querySelector<HTMLSelectElement>("#h-virtual");
+    const presetSel = backdrop.querySelector<HTMLSelectElement>("#h-preset");
+    if (virtualSel)
+      virtualSel.value = o.use_virtual_display == null ? "default" : o.use_virtual_display ? "on" : "off";
+    if (presetSel) presetSel.value = qualityId;
 
     // --- アイコン (画像) 選択 ---
     // 画像未設定なら label/host 由来の頭文字アバターをプレビューに出し、選択中は画像を出す。
@@ -556,26 +623,48 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       const label = backdrop.querySelector<HTMLInputElement>("#h-label")?.value.trim() ?? "";
       const port = Number(backdrop.querySelector<HTMLInputElement>("#h-port")?.value) || DEFAULT_PORT;
       if (!host) return;
+      const ov: HostOverrides = {};
+      if (virtualSel?.value === "on") ov.use_virtual_display = true;
+      else if (virtualSel?.value === "off") ov.use_virtual_display = false;
+      const pv = presetSel?.value ?? "default";
+      if (pv === CUSTOM_PRESET_ID) {
+        // プリセット外の既存値をそのまま維持
+        ov.fps = o.fps;
+        ov.max_mbps = o.max_mbps;
+      } else {
+        const p = findPreset(pv);
+        if (p) {
+          ov.fps = p.fps;
+          ov.max_mbps = p.mbps;
+        }
+      }
       void (async () => {
         // host を変えた編集なら旧エントリを消してから保存する (新 host で重複排除される)。
         const hostChanged = e.host.localeCompare(host, undefined, { sensitivity: "accent" }) !== 0;
         if (!isAdd && hostChanged) {
           await deleteRecentHost(e.host);
         }
-        await saveRecentHost({ label: label || host, host, port, icon: currentIcon });
+        // overrides は空オブジェクトも送る: Rust 側が「既定に従う」への明示リセットとして
+        // None へ正規化する (undefined だと「情報なし」扱いで既存値が残ってしまう)。
+        await saveRecentHost({ label: label || host, host, port, icon: currentIcon, overrides: ov });
         closeDialog();
         await handle.refreshHosts();
       })().catch((e) => logger.warn("save host failed", e));
     });
   }
 
-  /** 接続ダイアログ (パスワードのみ)。カード押下から呼ぶ。 */
-  function openConnectDialog(entry: HostEntry): void {
+  /** 接続ダイアログ (パスワードのみ)。カード押下から呼ぶ。newWindow は接続中ホストへの追加窓接続時に true。 */
+  function openConnectDialog(entry: HostEntry, newWindow = false): void {
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
         <h3>${escapeHtml(entry.label || entry.host)}</h3>
         <div class="s-desc" style="font-family:monospace">${escapeHtml(entry.host)}:${entry.port}</div>
-        <label>password<input id="d-pass" type="password" required /></label>
+        <label>password
+          <span class="pass-wrap">
+            <input id="d-pass" type="password" required />
+            <button type="button" class="pass-eye" id="d-eye" title="パスワードを表示">${icon("eye")}</button>
+          </span>
+        </label>
         <label class="dlg-check"><input id="d-save" type="checkbox" checked /> このパスワードを保存する</label>
         <div class="dlg-status" id="d-status"></div>
         <div class="dlg-actions">
@@ -588,6 +677,15 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     const passInput = backdrop.querySelector<HTMLInputElement>("#d-pass");
     const okBtn = backdrop.querySelector<HTMLButtonElement>("#d-ok");
     const statusEl = backdrop.querySelector<HTMLElement>("#d-status");
+    const eyeBtn = backdrop.querySelector<HTMLButtonElement>("#d-eye");
+    eyeBtn?.addEventListener("click", () => {
+      if (!passInput) return;
+      const show = passInput.type === "password";
+      passInput.type = show ? "text" : "password";
+      eyeBtn.innerHTML = icon(show ? "eye-off" : "eye");
+      eyeBtn.title = show ? "パスワードを隠す" : "パスワードを表示";
+      passInput.focus();
+    });
     passInput?.focus();
     backdrop.querySelector("#d-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
@@ -601,7 +699,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       }
       if (statusEl) statusEl.textContent = `connecting to ${entry.host}…`;
       void opts
-        .onConnect(entry, password, save)
+        .onConnect(entry, password, save, newWindow)
         // 解決 = capture ウィンドウが開いた。ランチャーは残るのでダイアログだけ閉じる。
         .then(() => closeDialog())
         .catch((err) => {
@@ -620,6 +718,28 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // --- ホスト一覧の描画 ---
   // 現在表示中の並び (ドラッグ並べ替えの基準)。
   let currentHosts: HostEntry[] = [];
+
+  // 到達性プローブ結果 (host 小文字 → online)。未判定はドット非表示。
+  const probeMap = new Map<string, boolean>();
+  let probing = false;
+  /** 未接続の保存ホストへ並列 TCP プローブし、結果をカードのドットへ反映する。 */
+  async function runProbe(): Promise<void> {
+    if (probing) return;
+    const targets = currentHosts
+      .filter((h) => !isConnected(h.host))
+      .map((h) => ({ host: h.host, port: h.port }));
+    if (targets.length === 0) return;
+    probing = true;
+    try {
+      const results = await probeHosts(targets);
+      for (const r of results) probeMap.set(r.host.trim().toLowerCase(), r.online);
+      renderHosts(currentHosts);
+    } catch (e) {
+      logger.warn("probe hosts failed", e);
+    } finally {
+      probing = false;
+    }
+  }
 
   /** from の要素を to の位置へ移動し、保存して再描画する。 */
   function reorder(from: number, to: number): void {
@@ -696,24 +816,28 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       .map((h, i) => {
         const name = h.label || h.host;
         const initial = escapeHtml((name[0] ?? "?").toUpperCase());
+        const connected = isConnected(h.host);
         // 画像アイコンがあれば img、無ければ頭文字 + 自動生成色。data URL は自前生成
         // (canvas.toDataURL) のみで base64 文字種なので属性を破れない。
         const avatar = hasImageIcon(h.icon)
           ? `<div class="avatar avatar-img"><img src="${h.icon}" alt="" draggable="false" /></div>`
           : `<div class="avatar" style="background:${avatarColor(name)}">${initial}</div>`;
+        // 接続中は緑扱い。プローブ未判定はドットを出さない。
+        const online = connected ? true : probeMap.get(h.host.trim().toLowerCase());
+        const presence =
+          online === undefined ? "" : `<span class="presence ${online ? "online" : "offline"}"></span>`;
         const saved = hasSaved(h.host)
           ? `<span class="saved-badge" title="パスワード保存済み (押すと即接続)">${icon("key")}</span>`
           : "";
-        const connected = isConnected(h.host);
         // 接続中: 緑ピル + 切断ボタン。並べ替えグリップは編集系ボタンと同列なので残す。
         const connPill = connected ? `<span class="conn-pill">接続中</span>` : "";
         const tailBtn = connected
           ? `<button class="card-btn danger" data-act="disconnect" title="切断">${icon("power")}</button>`
           : `<span class="chevron">${icon("chevron")}</span>`;
         return `
-          <div class="host-card${connected ? " connected" : ""}" data-idx="${i}">
+          <div class="host-card${connected ? " connected" : ""}" data-idx="${i}" tabindex="0" role="button">
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
-            ${avatar}
+            <div class="avatar-wrap">${avatar}${presence}</div>
             <div class="meta">
               <div class="label">${escapeHtml(name)}</div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
@@ -750,6 +874,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           // さらに Rust 側で host 単位に直接停止する。接続中にウィンドウを閉じた等で
           // 残った「窓の無い孤児セッション」(emit が届かず host を占有し続ける) も確実に切る。
           void disconnectHost(host);
+        } else if (isConnected(hosts[idx].host)) {
+          // 接続中カードは 2 本目の接続を張らず、既存セッションの窓を前面化+タブ活性化する。
+          void focusHostWindow(hosts[idx].host)
+            .then((found) => {
+              // 見つからない = 接続中表示が古い (窓が閉じた直後など)。一覧を取り直す。
+              if (!found) void handle.refreshHosts();
+            })
+            .catch((e) => logger.warn("focus host window failed", e));
         } else if (hasSaved(hosts[idx].host)) {
           // パスワード保存済み: ダイアログを出さず即接続 (平文はフロントに載らない)。
           // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
@@ -757,7 +889,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           handle.setConnecting(true);
           // 保存済み即接続: password=null (Rust が DPAPI 復号)。再保存は不要なので save=false。
           void opts
-            .onConnect(entry, null, false)
+            .onConnect(entry, null, false, false)
             // capture ウィンドウが開いたら一時的な connecting 表示を解き、実際の接続中集計へ戻す
             // (接続成立は別窓側で起き、`aurora://connections` 経由でドットが緑になる)。
             .then(() => updateStatusBar())
@@ -768,6 +900,16 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             });
         } else {
           openConnectDialog(hosts[idx]);
+        }
+      });
+
+      // マウスなし操作: Enter/Space でクリックと同じ分岐へ (target=card なので接続系の分岐に落ちる)。
+      card.addEventListener("keydown", (e) => {
+        // 子ボタン (編集/メニュー/切断) からのバブリングで接続まで発火しないようカード自身のみ。
+        if (e.target !== card) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          card.click();
         }
       });
 
@@ -783,6 +925,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   // --- アクション配線 ---
   $("#add-host")?.addEventListener("click", () => openHostDialog(null));
+  $("#probe-refresh")?.addEventListener("click", () => void runProbe());
 
   fullscreenToggle?.addEventListener("change", () => {
     settings = { ...settings, default_fullscreen: fullscreenToggle.checked };
@@ -904,6 +1047,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         }
         renderHosts(await loadRecentHosts());
         updateStatusBar();
+        void runProbe();
       } catch {
         // 履歴は補助機能。失敗しても致命的ではない。
       }

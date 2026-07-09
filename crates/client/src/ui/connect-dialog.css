@@ -132,6 +132,13 @@
 .pk-port {
   flex: 0 0 84px;
 }
+.pk-pass-wrap { display: flex; align-items: center; gap: 6px; }
+.pk-pass-wrap input { flex: 1; min-width: 0; }
+.picker-form .pass-eye {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 15px; padding: 6px; border-radius: 6px; display: inline-flex; align-items: center;
+}
+.picker-form .pass-eye:hover { color: var(--fg); background: var(--control-hover); }
 .pk-check {
   display: flex;
   align-items: center;

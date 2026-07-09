@@ -109,6 +109,8 @@ fn main() {
             net::find_capture_window_at,
             net::handoff_session_to_window,
             net::connected_hosts,
+            net::focus_host_window,
+            net::probe_hosts,
             net::send_input,
             net::request_keyframe,
             net::select_display,

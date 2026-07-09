@@ -57,6 +57,7 @@ function sid(): string {
 /**
  * capture ウィンドウを Rust 側で開く (launcher から呼ぶ)。生成された session_id を返す。
  * password は IPC 本文で Rust の staging へ渡し、ウィンドウ URL には載せない。
+ * newWindow=true は既存窓へのタブ合流をせず常に新しいウィンドウを開く。
  */
 export async function openCaptureWindow(
   host: string,
@@ -64,8 +65,16 @@ export async function openCaptureWindow(
   label: string,
   save: boolean,
   password: string | null,
+  newWindow = false,
 ): Promise<string> {
-  return await invoke<string>("open_capture_window", { host, port, label, save, password });
+  return await invoke<string>("open_capture_window", {
+    host,
+    port,
+    label,
+    save,
+    password,
+    newWindow,
+  });
 }
 
 /**
@@ -148,6 +157,21 @@ export async function attachSession(
  */
 export async function connectedHosts(): Promise<string[]> {
   return await invoke<string[]>("connected_hosts");
+}
+
+/** 指定 host のセッションを表示中の capture 窓を前面化+タブ活性化する。見つからなければ false。 */
+export async function focusHostWindow(host: string): Promise<boolean> {
+  return await invoke<boolean>("focus_host_window", { host });
+}
+
+/** ホスト到達性プローブの 1 件分の結果。 */
+export type ProbeResult = { host: string; online: boolean };
+
+/** 各ホストの制御ポートへ TCP 到達性を並列プローブする (launcher のオンライン表示用)。 */
+export async function probeHosts(
+  targets: { host: string; port: number }[],
+): Promise<ProbeResult[]> {
+  return await invoke<ProbeResult[]>("probe_hosts", { targets });
 }
 
 /** パスワードを保存済みの host(小文字) 一覧。カードのマーキング/即接続判定に使う。 */
@@ -283,13 +307,23 @@ export async function setFileSharing(sessionId: string, enabled: boolean): Promi
   await invoke("set_file_sharing", { sessionId, enabled });
 }
 
+/** ホスト別のクライアント設定上書き。未指定フィールドはグローバル設定に従う (Rust 側 config::HostOverrides と対応)。 */
+export type HostOverrides = {
+  use_virtual_display?: boolean | null;
+  fps?: number | null;
+  max_mbps?: number | null;
+};
+
 /** 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。 */
 export type HostEntry = {
   label: string;
   host: string;
   port: number;
-  /** カードのアバター画像 (data URL、空なら頭文字アバター)。任意 (古い設定/URL 由来は未設定)。 */
-  icon?: string;
+  /** カードのアバター画像 (data URL、空文字は明示解除)。無指定 (null/undefined) は「情報なし」で
+   *  Rust 側が保存済みの既存値を保持する (接続成功時の再保存でアバターが消えないため)。 */
+  icon?: string | null;
+  /** ホスト別の設定上書き (無ければグローバル設定に従う)。任意。 */
+  overrides?: HostOverrides | null;
 };
 
 /** 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。 */

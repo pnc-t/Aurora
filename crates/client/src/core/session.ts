@@ -159,7 +159,7 @@ export class Session {
   ) {
     this.id = id;
     this.entry = entry;
-    const settings = host.getSettings();
+    const settings = this.effectiveSettings();
     this.videoFps = settings.fps;
     this.videoMbps = settings.max_mbps;
     this.decoder = new Decoder(host.canvas, {
@@ -396,8 +396,21 @@ export class Session {
     }
   }
 
+  /** グローバル設定にホスト別オーバーライド (entry.overrides) を重ねた実効設定。 */
+  private effectiveSettings(): ClientSettings {
+    const s = this.host.getSettings();
+    const o = this.entry.overrides;
+    if (!o) return s;
+    return {
+      ...s,
+      use_virtual_display: o.use_virtual_display ?? s.use_virtual_display,
+      fps: o.fps ?? s.fps,
+      max_mbps: o.max_mbps ?? s.max_mbps,
+    };
+  }
+
   private toolbarDisplayList(): DisplayDto[] {
-    if (this.host.getSettings().use_virtual_display) {
+    if (this.effectiveSettings().use_virtual_display) {
       const v = this.currentDisplays.find((d) => d.is_virtual);
       return v ? [v] : [];
     }
@@ -503,7 +516,7 @@ export class Session {
     this.connected = true;
     this.tabStatus = "connected";
     if (this.entry.host) void saveRecentHost(this.entry);
-    const settings = this.host.getSettings();
+    const settings = this.effectiveSettings();
     this.audioAvailable = ev.audio;
     this.currentDisplays = ev.displays;
 
