@@ -41,12 +41,14 @@ use tracing::Instrument;
 mod commands;
 mod connect;
 mod fileshare;
+mod probe;
 mod video;
 mod window;
 
 // main.rs の invoke_handler が `net::<コマンド名>` で参照する tauri コマンドを再エクスポート。
 pub use commands::*;
 pub use connect::*;
+pub use probe::*;
 pub use window::*;
 // net モジュール内でサブモジュール間参照する型/関数 (`use super::*` で各ファイルへ供給)。
 pub(crate) use connect::send_ctrl;

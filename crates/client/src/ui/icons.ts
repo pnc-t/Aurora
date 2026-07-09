@@ -33,6 +33,8 @@ export type IconName =
   | "volume"
   | "mute"
   | "eye-off"
+  | "eye"
+  | "refresh"
   | "tune"
   | "resolution"
   | "key"
@@ -62,6 +64,8 @@ const PATHS: Record<IconName, string> = {
   volume: `<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/>`,
   mute: `<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M22 9l-6 6M16 9l6 6"/>`,
   "eye-off": `<path d="M9.9 4.2A9.1 9.1 0 0 1 12 4c5 0 9 5 9 8a11 11 0 0 1-2.3 3.3M6.6 6.6A11.2 11.2 0 0 0 3 12c0 3 4 8 9 8a9 9 0 0 0 4.3-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18"/>`,
+  eye: `<path d="M2 12s4-7.5 10-7.5S22 12 22 12s-4 7.5-10 7.5S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>`,
+  refresh: `<path d="M22 4v6h-6"/><path d="M19.5 15a8.5 8.5 0 1 1-2-8.9L22 10"/>`,
   tune: `<path d="M4 8h5M13 8h7M4 16h11M19 16h1"/><circle cx="11" cy="8" r="2.3"/><circle cx="17" cy="16" r="2.3"/>`,
   resolution: `<path d="M15 3h6v6M21 3l-7 7M9 21H3v-6M3 21l7-7"/>`,
   key: `<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2M16 7l3 3"/>`,

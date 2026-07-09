@@ -31,7 +31,10 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
           <input id="pk-host" type="text" placeholder="host (100.x.x.x / hostname)" required />
           <input id="pk-port" type="text" inputmode="numeric" placeholder="port" class="pk-port" />
         </div>
-        <input id="pk-pass" type="password" placeholder="password" />
+        <span class="pk-pass-wrap">
+          <input id="pk-pass" type="password" placeholder="password" />
+          <button type="button" class="pass-eye" id="pk-eye" title="パスワードを表示">${icon("eye")}</button>
+        </span>
         <label class="pk-check"><input id="pk-save" type="checkbox" checked /> パスワードを保存する</label>
         <div class="pk-status" id="pk-status"></div>
         <div class="pk-actions">
@@ -50,6 +53,15 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
   const saveInput = root.querySelector<HTMLInputElement>("#pk-save");
   const statusEl = root.querySelector<HTMLElement>("#pk-status");
   const connectBtn = root.querySelector<HTMLButtonElement>(".pk-connect");
+  const eyeBtn = root.querySelector<HTMLButtonElement>("#pk-eye");
+  eyeBtn?.addEventListener("click", () => {
+    if (!passInput) return;
+    const show = passInput.type === "password";
+    passInput.type = show ? "text" : "password";
+    eyeBtn.innerHTML = icon(show ? "eye-off" : "eye");
+    eyeBtn.title = show ? "パスワードを隠す" : "パスワードを表示";
+    passInput.focus();
+  });
 
   const releaseTrap = trapFocus(root);
   const onKeydown = (e: KeyboardEvent): void => {

@@ -19,6 +19,13 @@ struct AdoptTabPayload {
     session_id: String,
 }
 
+/// 接続中 host のタブアクティブ化通知 (`aurora://activate-host`)。`focus_host_window` が
+/// 前面化した窓へ「この host のタブへ切り替えろ」と伝える。
+#[derive(Clone, serde::Serialize)]
+struct ActivateHostPayload {
+    host: String,
+}
+
 /// launcher からの接続を流し込む先を決める。直近フォーカスした capture 窓が生存していれば
 /// それを優先し、無ければ生存している capture 窓を (順序不定で) 1 つ選ぶ。1 つも無ければ
 /// None を返し、呼び出し側が従来どおり新窓を生成する。
@@ -42,7 +49,10 @@ fn route_target(app: &tauri::AppHandle, state: &SessionState) -> Option<String> 
 /// 接続資格情報 (password) は staging マップへ積み、URL には session/host/port/save のみ
 /// 載せる (平文をウィンドウ URL に出さない)。生成した session_id を返す。
 /// 既存の capture 窓があれば新窓は作らず、そちらへタブ追加を通知する (`route_target`)。
+/// `new_window` が true ならこのルーティングをスキップし常に新しいウィンドウを作る
+/// (ランチャーの「新しいウィンドウで接続」)。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_capture_window(
     app: tauri::AppHandle,
     host: String,
@@ -52,32 +62,35 @@ pub async fn open_capture_window(
     save: bool,
     // 手入力パスワード (今回だけ/保存) は Some、保存済み即接続/再接続は None。
     password: Option<String>,
+    new_window: bool,
     state: tauri::State<'_, SessionState>,
 ) -> Result<String, String> {
     let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("s{n}");
 
-    if let Some(target_label) = route_target(&app, &state) {
-        state
-            .staging
-            .lock()
-            .await
-            .insert(session_id.clone(), password.clone());
-        let payload = AddTabPayload {
-            session_id: session_id.clone(),
-            host: host.clone(),
-            port,
-            label: label.clone(),
-            save,
-        };
-        if app
-            .emit_to(&target_label, "aurora://add-tab", payload)
-            .is_ok()
-        {
-            return Ok(session_id);
+    if !new_window {
+        if let Some(target_label) = route_target(&app, &state) {
+            state
+                .staging
+                .lock()
+                .await
+                .insert(session_id.clone(), password.clone());
+            let payload = AddTabPayload {
+                session_id: session_id.clone(),
+                host: host.clone(),
+                port,
+                label: label.clone(),
+                save,
+            };
+            if app
+                .emit_to(&target_label, "aurora://add-tab", payload)
+                .is_ok()
+            {
+                return Ok(session_id);
+            }
+            // 窓は生きているが emit できない異常時は、接続不能にしないため新窓生成へフォールバックする。
+            state.staging.lock().await.remove(&session_id);
         }
-        // 窓は生きているが emit できない異常時は、接続不能にしないため新窓生成へフォールバックする。
-        state.staging.lock().await.remove(&session_id);
     }
 
     let win_label = format!("capture-{session_id}");
@@ -333,4 +346,37 @@ pub(crate) async fn emit_connections(app: &tauri::AppHandle, state: &SessionStat
 #[tauri::command]
 pub async fn connected_hosts(state: tauri::State<'_, SessionState>) -> Result<Vec<String>, String> {
     Ok(distinct_hosts(&*state.inner.lock().await))
+}
+
+/// launcher からの接続中カードクリック: 指定 host のセッションを表示している capture
+/// ウィンドウを前面化し、該当タブのアクティブ化を通知する。見つからなければ false
+/// (launcher 側が接続中表示の取り直しにフォールバックする)。
+#[tauri::command]
+pub async fn focus_host_window(
+    app: tauri::AppHandle,
+    host: String,
+    state: tauri::State<'_, SessionState>,
+) -> Result<bool, String> {
+    let host_norm = host.trim().to_lowercase();
+    let label = {
+        let guard = state.inner.lock().await;
+        guard
+            .values()
+            .find(|h| h.host.trim().to_lowercase() == host_norm)
+            .map(|h| h.window_label.clone())
+    };
+    let Some(label) = label else { return Ok(false) };
+    let Some(w) = app.get_webview_window(&label) else {
+        return Ok(false);
+    };
+    if w.is_minimized().unwrap_or(false) {
+        let _ = w.unminimize();
+    }
+    let _ = w.set_focus();
+    let _ = app.emit_to(
+        &label,
+        "aurora://activate-host",
+        ActivateHostPayload { host },
+    );
+    Ok(true)
 }

@@ -89,14 +89,24 @@
   background: var(--panel); border: 1px solid var(--panel-border); cursor: pointer;
 }
 .host-card:hover { border-color: var(--card-hover-border); background: var(--raised-faint); }
+/* キーボード操作のフォーカスリング */
+.host-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .host-card .avatar {
-  width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+  width: 42px; height: 42px; border-radius: 10px;
   display: flex; align-items: center; justify-content: center;
   font-size: 18px; font-weight: 700; color: #fff;
 }
 /* 画像アバター: 角丸内に収め、はみ出しを隠す (中央クロップ済みだが念のため cover)。 */
 .host-card .avatar.avatar-img { background: var(--control); overflow: hidden; }
 .host-card .avatar.avatar-img img { width: 100%; height: 100%; object-fit: cover; }
+/* 到達性ドット: アバター右下に重ねる (avatar-img の overflow:hidden で切れないようラッパー側)。 */
+.host-card .avatar-wrap { position: relative; flex-shrink: 0; display: flex; }
+.host-card .avatar-wrap .presence {
+  position: absolute; right: -2px; bottom: -2px; width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid var(--panel); box-sizing: border-box;
+}
+.host-card .avatar-wrap .presence.online { background: var(--ok); }
+.host-card .avatar-wrap .presence.offline { background: var(--muted); }
 .host-card .meta { flex: 1; min-width: 0; }
 .host-card .meta .label { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .host-card .meta .addr { font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px; }
@@ -238,6 +248,20 @@ input[type="number"] { -moz-appearance: textfield; }
 .dialog label.dlg-check input { width: auto; padding: 0; }
 .dialog .dlg-status { min-height: 14px; font-size: 12px; font-family: monospace; color: var(--muted); }
 .dialog .dlg-status.error { color: var(--danger-fg); }
+/* ダイアログ内の小見出し (ホスト別設定) */
+.dialog .dlg-sub {
+  font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: 600; margin-top: 4px;
+}
+.dialog .select-input { width: 100%; box-sizing: border-box; }
+/* パスワード表示トグル */
+.dialog .pass-wrap { display: flex; align-items: center; gap: 6px; }
+.dialog .pass-wrap input { flex: 1; min-width: 0; }
+.dialog .pass-eye {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 16px; padding: 6px; border-radius: 6px; display: inline-flex; align-items: center;
+}
+.dialog .pass-eye:hover { color: var(--fg); background: var(--menu-hover); }
 .dialog .dlg-actions { display: flex; gap: 8px; margin-top: 4px; }
 .dialog .dlg-actions button {
   flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;

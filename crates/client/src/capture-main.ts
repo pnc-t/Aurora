@@ -14,6 +14,7 @@ import {
   findCaptureWindowAt,
   handoffSessionToWindow,
   initPerfFlag,
+  loadRecentHosts,
   loadSettings,
   openSessionWindow,
   saveSettings,
@@ -145,7 +146,8 @@ function renderStatusOverlay(kind: StatusKind, text: string, showClose: boolean)
   card.appendChild(msg);
   if (showClose) {
     const btn = document.createElement("button");
-    btn.textContent = "閉じる";
+    // connecting 中 (準備中/再接続中含む) はキャンセル操作、error 後は文字通り閉じる操作として文言を出し分ける。
+    btn.textContent = kind === "error" ? "閉じる" : "キャンセル";
     Object.assign(btn.style, {
       padding: "8px 18px",
       borderRadius: "8px",
@@ -302,6 +304,17 @@ async function addSession(
   save: boolean,
   activateNew: boolean,
 ): Promise<void> {
+  // URL/add-tab 経由の entry にはホスト別オーバーライドが載らないため、保存済み履歴から補完する。
+  if (!entry.overrides) {
+    try {
+      const hosts = await loadRecentHosts();
+      const target = entry.host.trim().toLowerCase();
+      const m = hosts.find((h) => h.host.trim().toLowerCase() === target);
+      if (m?.overrides) entry = { ...entry, overrides: m.overrides };
+    } catch {
+      // 履歴は補助情報。読めなくてもグローバル設定で接続は成立する。
+    }
+  }
   const s = new Session(id, entry, save, host);
   sessions.set(id, s);
   tabs.add(id, s.tabLabel, "connecting");
@@ -389,6 +402,13 @@ void getCurrentWebviewWindow().listen<AddTabPayload>("aurora://add-tab", (e) => 
       showToast(`接続に失敗しました: ${String(e)}`, "error");
     }
   })();
+});
+
+// --- launcher の接続中カードクリック: 該当 host のタブをアクティブ化 (窓の前面化は Rust 側で済んでいる) ---
+void getCurrentWebviewWindow().listen<{ host: string }>("aurora://activate-host", (e) => {
+  const target = e.payload.host.trim().toLowerCase();
+  const s = [...sessions.values()].find((x) => x.entry.host.trim().toLowerCase() === target);
+  if (s) setActive(s.id);
 });
 
 // --- 別ウィンドウからドラッグされたタブを引き受ける (タブのドラッグ合流) ---
@@ -534,7 +554,7 @@ void (async () => {
     renderStatusOverlay("error", "接続情報が不正です", true);
     return;
   }
-  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, false);
+  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, true);
   try {
     await addSession(initialId, initialEntry, initialSave, /*activate=*/ true);
     // 接続時の自動フルスクリーン (窓単位、最初のタブのみで判断)。

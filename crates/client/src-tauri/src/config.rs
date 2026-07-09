@@ -31,8 +31,35 @@ pub struct HostEntry {
     #[serde(default = "default_port")]
     pub port: u16,
     /// カードのアバター画像 (data URL、空なら頭文字アバターにフォールバック)。
-    #[serde(default)]
-    pub icon: String,
+    /// `None` は「情報なし」(capture 側の接続成功時保存)。更新時は既存値を保持し、
+    /// 明示値 (`Some`、空文字 = 解除) はそのまま採用する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// ホスト別の設定上書き (無ければグローバル設定に従う)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<HostOverrides>,
+}
+
+/// ホスト別のクライアント設定上書き。未指定 (None) のフィールドはグローバル設定
+/// (`ClientSettings`) に従う。launcher のホスト編集ダイアログで設定する。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HostOverrides {
+    /// 仮想ディスプレイを使うか (RDP 風)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_virtual_display: Option<bool>,
+    /// 送出 fps 上限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// ビットレート上限 (Mbps)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mbps: Option<u32>,
+}
+
+impl HostOverrides {
+    /// 全フィールド未指定 (= 編集ダイアログの「既定に従う」への明示リセット) か。
+    fn is_empty(&self) -> bool {
+        self.use_virtual_display.is_none() && self.fps.is_none() && self.max_mbps.is_none()
+    }
 }
 
 fn default_port() -> u16 {
@@ -171,7 +198,8 @@ pub fn load_recent_hosts(app: AppHandle) -> Result<Vec<HostEntry>, String> {
             label: host.clone(),
             host,
             port: DEFAULT_PORT,
-            icon: String::new(),
+            icon: None,
+            overrides: None,
         })
         .collect())
 }
@@ -184,11 +212,12 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
     if host.is_empty() {
         return Ok(());
     }
-    let entry = HostEntry {
+    let mut entry = HostEntry {
         label: entry.label.trim().to_string(),
         host,
         port: entry.port,
         icon: entry.icon,
+        overrides: entry.overrides,
     };
 
     let mut hosts = load_recent_hosts(app.clone())?;
@@ -196,8 +225,28 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         .iter()
         .position(|h| h.host.eq_ignore_ascii_case(&entry.host))
     {
-        Some(i) => hosts[i] = entry, // 既存は位置維持で更新
-        None => hosts.insert(0, entry),
+        Some(i) => {
+            // capture 側の接続成功時保存は icon/overrides を持たない (None = 情報なし) ため
+            // 既存値を残す (毎接続でアバター画像・ホスト別設定が消えるのを防ぐ)。編集ダイアログは
+            // 常に明示値を送る: icon の空文字 = 解除、overrides の空オブジェクト = 「既定に従う」
+            // へのリセット (None へ正規化)。
+            if entry.icon.is_none() {
+                entry.icon = hosts[i].icon.clone();
+            }
+            match entry.overrides.as_ref() {
+                None => entry.overrides = hosts[i].overrides.clone(),
+                Some(o) if o.is_empty() => entry.overrides = None,
+                Some(_) => {}
+            }
+            hosts[i] = entry; // 既存は位置維持で更新
+        }
+        None => {
+            // 新規でも空オブジェクトの overrides は保存形を None に正規化する。
+            if entry.overrides.as_ref().is_some_and(|o| o.is_empty()) {
+                entry.overrides = None;
+            }
+            hosts.insert(0, entry);
+        }
     }
     hosts.truncate(MAX_RECENT);
     write_hosts(&app, &hosts)

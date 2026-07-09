@@ -21,9 +21,9 @@ const launcher = mountLauncher({
   root: overlay,
   // onConnect の解決 = capture ウィンドウ生成成功。実際の接続進捗/エラーは capture
   // ウィンドウ側に表示される。ここで reject すると launcher のダイアログがエラーを出す。
-  onConnect: async (entry, password, save) => {
+  onConnect: async (entry, password, save, newWindow) => {
     logger.info(`open capture window: ${entry.host}:${entry.port}`);
-    await openCaptureWindow(entry.host, entry.port, entry.label, save, password);
+    await openCaptureWindow(entry.host, entry.port, entry.label, save, password, newWindow);
   },
 });
 
