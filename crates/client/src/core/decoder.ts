@@ -11,6 +11,7 @@
 
 import { logger } from "./log";
 import { isPerfEnabled } from "./ipc";
+import type { CodecId } from "./codec";
 
 // --- ジッタバッファ (適応クッション) ---
 // 旧実装はデコード完了フレームを onFrame で即 drawImage していた。WebCodecs の出力は
@@ -185,6 +186,9 @@ export class Decoder {
   private decoder: VideoDecoder | null = null;
   private configured = false;
   private readonly ctx: CanvasRenderingContext2D | null;
+  // 現在のコーデック。host からの video_codec_changed で更新される (既定は接続直後の h264 想定)。
+  // 変更時は configure 済み状態を破棄し、次のキーフレームから当該コーデックで再構成する。
+  private codec: CodecId = "h264";
   // デコードエラーログのレート制限。壊れたストリームではエラーがフレーム毎に出て IPC 転送が
   // 連発しうるため、最大 1 秒 1 回に間引き、その間に潰した件数を併記する。
   private lastErrLogMs = 0;
@@ -246,6 +250,16 @@ export class Decoder {
     private readonly opts: DecoderOpts,
   ) {
     this.ctx = canvas.getContext("2d");
+    this.reset();
+  }
+
+  /**
+   * 現在のコーデックを切り替える (video_codec_changed イベント受信時)。変わっていなければ
+   * 何もしない。変わっていればデコーダを作り直し、次のキーフレームから新コーデックで構成する。
+   */
+  setCodec(codec: CodecId): void {
+    if (this.codec === codec) return;
+    this.codec = codec;
     this.reset();
   }
 
@@ -438,8 +452,8 @@ export class Decoder {
     const u8 = new Uint8Array(buf);
     const keyframe = (u8[0] & 1) === 1;
     // ヘッダ: u8[0]=フラグ(bit0=keyframe)、u8[1..3]=frame_id。frame_id はクライアント側では
-    // 参照しないので読み飛ばし、u8[3..] の Annex-B を取り出す。
-    const annexB = u8.subarray(3);
+    // 参照しないので読み飛ばし、u8[3..] のペイロード (h264/hevc は Annex-B、av1 は OBU 列) を取り出す。
+    const payload = u8.subarray(3);
 
     const decoder = this.decoder;
     if (!decoder) return;
@@ -450,21 +464,9 @@ export class Decoder {
         this.opts.requestKeyframe();
         return;
       }
-      // SPS を探して codec 文字列を作る
-      const nalus = splitNalus(annexB);
-      let sps: Uint8Array | null = null;
-      for (const nal of nalus) {
-        const nalType = nal[0] & 0x1f;
-        if (nalType === 7) {
-          sps = nal;
-          break;
-        }
-      }
-      if (!sps) {
-        this.opts.requestKeyframe();
-        return;
-      }
-      const codec = codecStringFromSps(sps);
+      // h264 は従来通り SPS 欠落時にキーフレーム再要求で待つ (回帰防止)。hevc/av1 はパース失敗
+      // しても汎用 codec 文字列にフォールバックして再要求ループに陥らないようにする。
+      const codec = this.codec === "h264" ? codecStringFromH264Sps(payload) : this.buildCodecString(payload);
       if (!codec) {
         this.opts.requestKeyframe();
         return;
@@ -506,7 +508,7 @@ export class Decoder {
       const chunk = new EncodedVideoChunk({
         type: keyframe ? "key" : "delta",
         timestamp: arrivalNow * 1000,
-        data: annexB,
+        data: payload,
       });
       decoder.decode(chunk);
     } catch (e) {
@@ -514,6 +516,41 @@ export class Decoder {
       this.configured = false;
       this.opts.requestKeyframe();
     }
+  }
+
+  /**
+   * hevc/av1 用の codec 文字列を構築する。SPS/sequence header のパースに失敗しても
+   * (h264 と違い) requestKeyframe ループへは入れず、汎用文字列にフォールバックして必ず
+   * configure を進める (パース失敗＝再生不能、を避ける)。
+   */
+  private buildCodecString(payload: Uint8Array): string {
+    if (this.codec === "hevc") {
+      const nalus = splitNalus(payload);
+      let sps: Uint8Array | null = null;
+      for (const nal of nalus) {
+        // HEVC の NALU ヘッダは 2 バイト。nal_unit_type は先頭バイトの bit1-6 (33 = SPS)。
+        const nalType = (nal[0] >> 1) & 0x3f;
+        if (nalType === 33) {
+          sps = nal;
+          break;
+        }
+      }
+      const built = sps ? codecStringFromHevcSps(sps) : null;
+      if (built) return built;
+      logger.warn("hevc SPS parse failed; falling back to generic codec string");
+      return "hvc1.1.6.L120.b0";
+    }
+    // av1: ビットストリームは NALU ではなく OBU 列。h264/hevc の Annex-B スプリットは適用しない。
+    const obu = findAv1SequenceHeaderObu(payload);
+    const parsed = obu ? parseAv1SequenceHeader(obu) : null;
+    if (parsed) {
+      const level = String(parsed.level).padStart(2, "0");
+      const tier = parsed.tier === 0 ? "M" : "H";
+      const depth = String(parsed.bitDepth).padStart(2, "0");
+      return `av01.${parsed.profile}.${level}${tier}.${depth}`;
+    }
+    logger.warn("av1 sequence header parse failed; falling back to generic codec string");
+    return "av01.0.08M.08";
   }
 }
 
@@ -547,8 +584,17 @@ function splitNalus(buf: Uint8Array): Uint8Array[] {
   return out;
 }
 
-/** SPS の先頭 4 バイトから avc1.* codec 文字列を構築 (profile/constraint/level)。 */
-function codecStringFromSps(sps: Uint8Array): string | null {
+/** Annex-B ペイロードから SPS (nal_type 7) を探し、avc1.* codec 文字列を構築する。 */
+function codecStringFromH264Sps(payload: Uint8Array): string | null {
+  const nalus = splitNalus(payload);
+  let sps: Uint8Array | null = null;
+  for (const nal of nalus) {
+    if ((nal[0] & 0x1f) === 7) {
+      sps = nal;
+      break;
+    }
+  }
+  if (!sps) return null;
   // sps[0] = nal_unit_header, sps[1]=profile_idc, sps[2]=constraint_set_flags, sps[3]=level_idc
   if (sps.length < 4) return null;
   const profile = sps[1].toString(16).padStart(2, "0");
@@ -557,4 +603,202 @@ function codecStringFromSps(sps: Uint8Array): string | null {
   // fourCC "avc1" は小文字必須 (Chromium の codec パーサは大小区別する)。
   // 16 進部分は大小どちらも可だが慣例の小文字に揃える。
   return `avc1.${profile}${constraints}${level}`.toLowerCase();
+}
+
+/** NALU 本体 (ヘッダ除く) からエミュレーション防止バイト (00 00 03 → 00 00) を除去する。 */
+function removeEmulationPrevention(buf: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let zeroRun = 0;
+  for (let i = 0; i < buf.length; i++) {
+    if (zeroRun >= 2 && buf[i] === 0x03) {
+      zeroRun = 0;
+      continue;
+    }
+    out.push(buf[i]);
+    zeroRun = buf[i] === 0 ? zeroRun + 1 : 0;
+  }
+  return Uint8Array.from(out);
+}
+
+/**
+ * HEVC SPS (nal_type 33) から profile_tier_level の固定位置だけを読んで hvc1.* codec 文字列を
+ * 構築する最小実装。完全パース (sub-layer 情報等) は複雑なため、SPS ヘッダ直後に profile_tier_level
+ * の "general" 部が来る前提 (sps_max_sub_layers_minus1 の有無に関わらず先頭 1 バイトは固定長) で
+ * general_profile_idc / general_tier_flag / general_level_idc だけを取り出す。互換フラグ・制約フラグ
+ * (WebCodecs のデコーダは実運用上ここを厳密照合しない) は固定値で代用する。
+ */
+function codecStringFromHevcSps(sps: Uint8Array): string | null {
+  // sps[0..2] = nal_unit_header (2 byte)。以降がエミュレーション防止バイト入りの RBSP。
+  if (sps.length < 4) return null;
+  const rbsp = removeEmulationPrevention(sps.subarray(2));
+  // rbsp[0] = sps_video_parameter_set_id(4)+sps_max_sub_layers_minus1(3)+sps_temporal_id_nesting_flag(1)。
+  // rbsp[1] から profile_tier_level の "general" 部 (12 byte 固定) が始まる。
+  if (rbsp.length < 13) return null;
+  const profileByte = rbsp[1];
+  const profileSpace = (profileByte >> 6) & 0x3;
+  const tierFlag = (profileByte >> 5) & 0x1;
+  const profileIdc = profileByte & 0x1f;
+  const levelIdc = rbsp[12];
+  const spacePrefix = profileSpace === 0 ? "" : String.fromCharCode(0x40 + profileSpace); // A/B/C
+  const tier = tierFlag ? "H" : "L";
+  return `hvc1.${spacePrefix}${profileIdc}.6.${tier}${levelIdc}.B0`;
+}
+
+/** AV1 の OBU 列 (raw bitstream) から sequence header OBU (obu_type=1) のペイロードを探す。 */
+function findAv1SequenceHeaderObu(buf: Uint8Array): Uint8Array | null {
+  let i = 0;
+  while (i < buf.length) {
+    const header = buf[i];
+    const obuType = (header >> 3) & 0xf;
+    const extensionFlag = (header >> 2) & 0x1;
+    const hasSizeField = (header >> 1) & 0x1;
+    let pos = i + 1;
+    if (extensionFlag) pos += 1;
+    let size: number;
+    if (hasSizeField) {
+      // leb128 (可変長、最大 8 byte を想定すれば十分)。
+      let value = 0;
+      let shift = 0;
+      let b = 0;
+      for (; b < 8 && pos + b < buf.length; b++) {
+        const byte = buf[pos + b];
+        value |= (byte & 0x7f) << shift;
+        shift += 7;
+        if ((byte & 0x80) === 0) {
+          b++;
+          break;
+        }
+      }
+      pos += b;
+      size = value >>> 0;
+    } else {
+      size = buf.length - pos;
+    }
+    if (obuType === 1) return buf.subarray(pos, Math.min(pos + size, buf.length));
+    i = pos + size;
+  }
+  return null;
+}
+
+/** MSB ファーストのビット読み出し (AV1 sequence header 用の最小実装)。 */
+class Av1BitReader {
+  private pos = 0;
+  constructor(private readonly data: Uint8Array) {}
+  f(n: number): number {
+    let x = 0;
+    for (let i = 0; i < n; i++) {
+      const byte = this.data[this.pos >> 3] ?? 0;
+      const bit = (byte >> (7 - (this.pos & 7))) & 1;
+      x = (x << 1) | bit;
+      this.pos++;
+    }
+    return x >>> 0;
+  }
+  uvlc(): number {
+    let leadingZeros = 0;
+    for (;;) {
+      if (this.f(1)) break;
+      leadingZeros++;
+      if (leadingZeros >= 32) return 0xffffffff;
+    }
+    return this.f(leadingZeros) + (1 << leadingZeros) - 1;
+  }
+}
+
+/**
+ * AV1 sequence header OBU から seq_profile / seq_level_idx[0] / tier / bitdepth を読む最小実装
+ * (AV1 spec 5.5.1 準拠。operating point は先頭の 1 個のみ・color_config の bitdepth までで打ち切り、
+ * それ以降 (chroma subsampling 等) は codec 文字列の構築に使わないので読まない)。
+ */
+function parseAv1SequenceHeader(
+  payload: Uint8Array,
+): { profile: number; level: number; tier: number; bitDepth: number } | null {
+  try {
+    const r = new Av1BitReader(payload);
+    const seqProfile = r.f(3);
+    r.f(1); // still_picture
+    const reducedStillPictureHeader = r.f(1);
+    let seqLevelIdx0 = 0;
+    let seqTier0 = 0;
+    if (reducedStillPictureHeader) {
+      seqLevelIdx0 = r.f(5);
+    } else {
+      const timingInfoPresentFlag = r.f(1);
+      let decoderModelInfoPresentFlag = 0;
+      let bufferDelayLengthMinus1 = 0;
+      if (timingInfoPresentFlag) {
+        r.f(32); // num_units_in_display_tick
+        r.f(32); // time_scale
+        if (r.f(1)) r.uvlc(); // equal_picture_interval → num_ticks_per_picture_minus_1
+        decoderModelInfoPresentFlag = r.f(1);
+        if (decoderModelInfoPresentFlag) {
+          bufferDelayLengthMinus1 = r.f(5);
+          r.f(32); // num_units_in_decoding_tick
+          r.f(5); // buffer_removal_time_length_minus_1
+          r.f(5); // frame_presentation_time_length_minus_1
+        }
+      }
+      const initialDisplayDelayPresentFlag = r.f(1);
+      const operatingPointsCntMinus1 = r.f(5);
+      for (let i = 0; i <= operatingPointsCntMinus1; i++) {
+        r.f(12); // operating_point_idc
+        const seqLevelIdx = r.f(5);
+        const seqTier = seqLevelIdx > 7 ? r.f(1) : 0;
+        if (decoderModelInfoPresentFlag && r.f(1)) {
+          const n = bufferDelayLengthMinus1 + 1;
+          r.f(n); // decoder_buffer_delay
+          r.f(n); // encoder_buffer_delay
+          r.f(1); // low_delay_mode_flag
+        }
+        if (initialDisplayDelayPresentFlag && r.f(1)) r.f(4);
+        if (i === 0) {
+          seqLevelIdx0 = seqLevelIdx;
+          seqTier0 = seqTier;
+        }
+      }
+    }
+    const frameWidthBitsMinus1 = r.f(4);
+    const frameHeightBitsMinus1 = r.f(4);
+    r.f(frameWidthBitsMinus1 + 1); // max_frame_width_minus_1
+    r.f(frameHeightBitsMinus1 + 1); // max_frame_height_minus_1
+    const frameIdNumbersPresentFlag = reducedStillPictureHeader ? 0 : r.f(1);
+    if (frameIdNumbersPresentFlag) {
+      r.f(4); // delta_frame_id_length_minus_2
+      r.f(3); // additional_frame_id_length_minus_1
+    }
+    r.f(1); // use_128x128_superblock
+    r.f(1); // enable_filter_intra
+    r.f(1); // enable_intra_edge_filter
+    if (!reducedStillPictureHeader) {
+      r.f(1); // enable_interintra_compound
+      r.f(1); // enable_masked_compound
+      r.f(1); // enable_warped_motion
+      r.f(1); // enable_dual_filter
+      const enableOrderHint = r.f(1);
+      if (enableOrderHint) {
+        r.f(1); // enable_jnt_comp
+        r.f(1); // enable_ref_frame_mvs
+      }
+      const seqChooseScreenContentTools = r.f(1);
+      const seqForceScreenContentTools = seqChooseScreenContentTools ? 2 : r.f(1);
+      if (seqForceScreenContentTools > 0) {
+        if (!r.f(1)) r.f(1); // !seq_choose_integer_mv → seq_force_integer_mv
+      }
+      if (enableOrderHint) r.f(3); // order_hint_bits_minus_1
+    }
+    r.f(1); // enable_superres
+    r.f(1); // enable_cdef
+    r.f(1); // enable_restoration
+    // color_config(): bitdepth の確定までで打ち切る。
+    const highBitdepth = r.f(1);
+    let bitDepth: number;
+    if (seqProfile === 2 && highBitdepth) {
+      bitDepth = r.f(1) ? 12 : 10; // twelve_bit
+    } else {
+      bitDepth = highBitdepth ? 10 : 8;
+    }
+    return { profile: seqProfile, level: seqLevelIdx0, tier: seqTier0, bitDepth };
+  } catch {
+    return null;
+  }
 }

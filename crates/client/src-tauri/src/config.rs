@@ -61,12 +61,18 @@ pub struct HostOverrides {
     /// ビットレート上限 (Mbps)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_mbps: Option<u32>,
+    /// 映像コーデック ("auto" | "av1" | "hevc" | "h264")。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
 }
 
 impl HostOverrides {
     /// 全フィールド未指定 (= 編集ダイアログの「既定に従う」への明示リセット) か。
     fn is_empty(&self) -> bool {
-        self.use_virtual_display.is_none() && self.fps.is_none() && self.max_mbps.is_none()
+        self.use_virtual_display.is_none()
+            && self.fps.is_none()
+            && self.max_mbps.is_none()
+            && self.codec.is_none()
     }
 }
 
@@ -125,6 +131,11 @@ pub struct ClientSettings {
     /// 接続時にホストへ送るビットレート上限 (Mbps)。
     #[serde(default = "default_max_mbps")]
     pub max_mbps: u32,
+    /// 接続時にホストへ申告する映像コーデック ("auto" | "av1" | "hevc" | "h264")。
+    /// "auto" は host/client 双方が対応する最良 (優先順位 AV1>HEVC>H264) を host が選ぶ。
+    /// 特定値を選ぶと `SetSupportedCodecs` をその 1 つだけに絞って送り実質固定する。
+    #[serde(default = "default_codec")]
+    pub codec: String,
     /// 通信断などで切れたとき自動で再接続を試みる。
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
@@ -141,6 +152,10 @@ pub struct ClientSettings {
 
 fn default_fps() -> u32 {
     60
+}
+
+fn default_codec() -> String {
+    "auto".to_string()
 }
 
 fn default_max_mbps() -> u32 {
@@ -167,6 +182,7 @@ impl Default for ClientSettings {
             theme: default_theme(),
             fps: default_fps(),
             max_mbps: default_max_mbps(),
+            codec: default_codec(),
             auto_reconnect: true,
             use_virtual_display: false,
             share_files: false,

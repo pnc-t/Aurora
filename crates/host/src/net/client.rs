@@ -194,6 +194,18 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         }
     };
     send_ctrl_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
+    // 途中参加クライアントへ現在の送出コーデックを通知する (このクライアントが初回の
+    // SetSupportedCodecs を送る前に届く NAL がどのコーデックかを知らせる)。
+    {
+        let codec = shared.lock().await.current_video_codec;
+        send_ctrl_msg(
+            &mut write_half,
+            &session,
+            &ControlMsg::VideoCodecChanged { codec },
+            &mut tcp_tx_nonce,
+        )
+        .await?;
+    }
 
     // UDP 対向アドレス確定待ち。クライアントは最初に 8B の "AURHELLO" を送る想定。
     // ハンドシェイクを完了した TCP ピアと同一 IP からの hello のみ受理する。これが無いと、
@@ -230,6 +242,9 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     let is_projfs_owner = {
         let mut sc = shared.lock().await;
         sc.active_conns += 1;
+        // 未申告 = H264 とみなす (最初の SetSupportedCodecs 到着まではネゴシエーションを
+        // 保守的に保つ)。到着したら下の select ループの SetSupportedCodecs アームで更新する。
+        sc.client_codecs.insert(conn_id, vec![VideoCodec::H264]);
         if client_trusted && sc.projfs_owner.is_none() {
             sc.projfs_owner = Some(conn_id);
             true
@@ -434,6 +449,21 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     ControlMsg::SetVideoPaused { paused } => {
                         tracing::info!(paused, "client set video paused");
                         video_paused.store(paused, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ControlMsg::SetSupportedCodecs { codecs } => {
+                        // 空申告は無視して H264 のみ扱いに倒す (「対応コーデック無し」は
+                        // あり得ない前提を守る)。
+                        let codecs = if codecs.is_empty() { vec![VideoCodec::H264] } else { codecs };
+                        tracing::info!(?codecs, "client declared supported codecs");
+                        let (recompute, current) = {
+                            let mut sc = shared.lock().await;
+                            sc.client_codecs.insert(conn_id, codecs);
+                            let recompute = sc.recompute_codec();
+                            (recompute, sc.current_video_codec)
+                        };
+                        if recompute != current {
+                            let _ = enc_tx.send(EncoderCommand::SetCodec(recompute)).await;
+                        }
                     }
                     ControlMsg::SetCursorOverlay { enabled } => {
                         tracing::info!(enabled, "client set cursor overlay");
@@ -811,10 +841,19 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 3) 登録解除 + 接続数減算 + ProjFS 所有解放。最後の 1 本かどうかとテイクオーバー復元の要否を
     //    ロック下で原子的に判定する (複数同時切断でも復元は 1 回だけ走る)。
     registry.lock().expect("registry poisoned").remove(&conn_id);
-    let (is_last, restore_takeover) = {
+    let (is_last, restore_takeover, codec_recompute) = {
         let mut sc = shared.lock().await;
         sc.active_conns = sc.active_conns.saturating_sub(1);
         sc.client_stats.remove(&conn_id);
+        sc.client_codecs.remove(&conn_id);
+        // 切断で申告集合が変わり、共通集合が上のコーデックへ広がる (=昇格) ことがある。
+        // 残クライアントが 0 なら次回接続時にゼロから再申告されるため再計算は不要。
+        let codec_recompute = if sc.active_conns > 0 {
+            let recompute = sc.recompute_codec();
+            (recompute != sc.current_video_codec).then_some(recompute)
+        } else {
+            None
+        };
         // カーソル合成要求を取り下げ、残りの要求有無を capture へ反映する (取りこぼし防止)。
         if sc.cursor_overlay.remove(&conn_id) {
             let _ = cursor_tx.send(!sc.cursor_overlay.is_empty());
@@ -827,8 +866,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         if restore {
             sc.taken_over = false;
         }
-        (is_last, restore)
+        (is_last, restore, codec_recompute)
     };
+    if let Some(new_codec) = codec_recompute {
+        let _ = enc_tx.send(EncoderCommand::SetCodec(new_codec)).await;
+    }
     // 4) 最後の 1 本が切れたときだけグローバルな後始末を行う (他クライアントが視聴中なら維持)。
     //    テイクオーバー中なら全トポロジ (物理の再アタッチ含む) を復元する。物理解像度は変更しない
     //    方針なので、テイクオーバー以外の解像度復元は不要。

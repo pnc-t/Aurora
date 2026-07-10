@@ -1,5 +1,6 @@
 // Tauri IPC ラッパー。Rust 側コマンドの薄い型付け窓口。
 import { invoke, Channel } from "@tauri-apps/api/core";
+import type { CodecChoice, CodecId } from "./codec";
 
 export type DisplayDto = {
   id: number;
@@ -27,6 +28,7 @@ export type ClientEvent =
   | { kind: "pong"; rtt_us: number }
   | { kind: "stats"; bitrate_kbps: number; fps: number; rtt_us: number; loss_permille: number }
   | { kind: "file_result"; id: number; ok: boolean; message: string }
+  | { kind: "video_codec_changed"; codec: CodecId }
   | { kind: "disconnected"; reason: string };
 
 export type InputEvent =
@@ -97,8 +99,25 @@ export async function connectToHost(
   save: boolean,
   eventChannel: Channel<ClientEvent>,
   videoChannel: Channel<ArrayBuffer>,
+  supportedCodecs: CodecId[],
 ): Promise<void> {
-  await invoke("connect_to_host", { sessionId, host, port, save, eventChannel, videoChannel });
+  await invoke("connect_to_host", {
+    sessionId,
+    host,
+    port,
+    save,
+    eventChannel,
+    videoChannel,
+    supportedCodecs,
+  });
+}
+
+/**
+ * 接続中に申告コーデック集合を変更する (設定変更時の手動切替)。ホストがエンコーダを
+ * 作り直し、`video_codec_changed` イベントで実際に切り替わったコーデックが届く。
+ */
+export async function setSupportedCodecs(sessionId: string, codecs: CodecId[]): Promise<void> {
+  await invoke("set_supported_codecs", { sessionId, codecs });
 }
 
 /**
@@ -320,6 +339,8 @@ export type HostOverrides = {
   use_virtual_display?: boolean | null;
   fps?: number | null;
   max_mbps?: number | null;
+  /** ホスト別の映像コーデック上書き (未指定/null はグローバル設定に従う)。 */
+  codec?: CodecChoice | null;
 };
 
 /** 保存する 1 件の接続先 (Rust 側 config::HostEntry と対応)。 */
@@ -399,6 +420,8 @@ export type ClientSettings = {
   auto_reconnect: boolean;
   use_virtual_display: boolean;
   share_files: boolean;
+  /** 映像コーデック ("auto" はプローブで対応する全コーデックを申告する)。 */
+  codec: CodecChoice;
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */

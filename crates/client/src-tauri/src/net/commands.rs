@@ -124,6 +124,25 @@ pub async fn set_video_paused(
     send_ctrl(&state, &session_id, ControlMsg::SetVideoPaused { paused }).await
 }
 
+/// 対応映像コーデックの (再) 申告をホストへ送る。接続中の手動切替 (設定で "auto"/"h264" 等を
+/// 選び直した) 用。手動で特定コーデックへ固定する場合はその 1 つだけを含む配列で絞って送る
+/// (host 側は全クライアントの共通集合から最良を選ぶため、これで実質固定できる)。
+#[tauri::command]
+pub async fn set_supported_codecs(
+    session_id: String,
+    codecs: Vec<String>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    send_ctrl(
+        &state,
+        &session_id,
+        ControlMsg::SetSupportedCodecs {
+            codecs: parse_supported_codecs(&codecs),
+        },
+    )
+    .await
+}
+
 /// 映像へのカーソル合成 ON/OFF をホストへ送る (マウスキャプチャ中だけ ON にする)。
 #[tauri::command]
 pub async fn set_cursor_overlay(

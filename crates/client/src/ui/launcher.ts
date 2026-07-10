@@ -29,6 +29,7 @@ import {
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
+import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
 import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
 import {
@@ -80,7 +81,33 @@ const DEFAULT_SETTINGS: ClientSettings = {
   auto_reconnect: true,
   use_virtual_display: false,
   share_files: false,
+  codec: "auto",
 };
+
+/** コーデック select の表示ラベル。 */
+const CODEC_LABELS: Record<Exclude<CodecChoice, "auto">, string> = {
+  h264: "H.264",
+  hevc: "HEVC",
+  av1: "AV1",
+};
+
+// ブラウザ (WebCodecs) が実際に対応するコーデック一覧。起動時に 1 回プローブしてここへ反映し、
+// select の非対応選択肢を disabled にする (probeSupportedCodecs 自体もモジュールスコープで
+// キャッシュされるので、ランチャー/ホスト編集ダイアログ間で再プローブは走らない)。
+let supportedCodecs: CodecChoice[] = [];
+
+/** コーデック `<select>` の option 一覧。includeDefault=true でホスト別 override 用の
+ *  「既定に従う」を先頭に足す。非対応コーデックは disabled + 「(非対応)」表記にする。 */
+function codecOptionsHtml(includeDefault: boolean): string {
+  const items: string[] = [];
+  if (includeDefault) items.push(`<option value="default">既定に従う</option>`);
+  items.push(`<option value="auto">自動</option>`);
+  (["h264", "hevc", "av1"] as const).forEach((c) => {
+    const ok = supportedCodecs.includes(c);
+    items.push(`<option value="${c}"${ok ? "" : " disabled"}>${CODEC_LABELS[c]}${ok ? "" : " (非対応)"}</option>`);
+  });
+  return items.join("");
+}
 
 /** ラベル/host から決定的に色を作りアバター背景に使う。
  *  白いイニシャル文字とのコントラストを確保するため明度は低め (38%) に固定する
@@ -197,6 +224,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
               </div>
               <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
+            </div>
+            <div class="setting-row">
+              <div class="s-meta">
+                <div class="s-title">映像コーデック</div>
+                <div class="s-desc">自動はホストと対応コーデックを相談して選ぶ。手動でこの端末が非対応のものを選ぶと H.264 にフォールバックする</div>
+              </div>
+              <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
             </div>
             <div class="setting-group">接続</div>
             <div class="setting-row">
@@ -362,6 +396,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const presetSelect = $<HTMLSelectElement>("#set-preset");
   const fpsInput = $<HTMLInputElement>("#set-fps");
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
+  const codecSelect = $<HTMLSelectElement>("#set-codec");
   const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
 
   const winControls = $("#win-controls");
@@ -560,6 +595,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           </select>
         </label>
         <label>画質プリセット<select id="h-preset" class="select-input">${presetOpts}</select></label>
+        <label>コーデック<select id="h-codec" class="select-input">${codecOptionsHtml(true)}</select></label>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="h-cancel">cancel</button>
           <button type="submit" class="btn-primary">${isAdd ? "add" : "save"}</button>
@@ -570,9 +606,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
     const virtualSel = backdrop.querySelector<HTMLSelectElement>("#h-virtual");
     const presetSel = backdrop.querySelector<HTMLSelectElement>("#h-preset");
+    const codecSel = backdrop.querySelector<HTMLSelectElement>("#h-codec");
     if (virtualSel)
       virtualSel.value = o.use_virtual_display == null ? "default" : o.use_virtual_display ? "on" : "off";
     if (presetSel) presetSel.value = qualityId;
+    if (codecSel) codecSel.value = o.codec == null ? "default" : o.codec;
 
     // --- アイコン (画像) 選択 ---
     // 画像未設定なら label/host 由来の頭文字アバターをプレビューに出し、選択中は画像を出す。
@@ -634,6 +672,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       const ov: HostOverrides = {};
       if (virtualSel?.value === "on") ov.use_virtual_display = true;
       else if (virtualSel?.value === "off") ov.use_virtual_display = false;
+      if (codecSel?.value && codecSel.value !== "default") ov.codec = codecSel.value as CodecChoice;
       const pv = presetSel?.value ?? "default";
       if (pv === CUSTOM_PRESET_ID) {
         // プリセット外の既存値をそのまま維持
@@ -1014,6 +1053,23 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, share_files: shareFilesToggle.checked };
     persist();
   });
+  codecSelect?.addEventListener("change", () => {
+    settings = { ...settings, codec: codecSelect.value as CodecChoice };
+    persist();
+  });
+
+  /** コーデック select の option を最新のプローブ結果で作り直し、現在値を反映する。 */
+  function syncCodecSelect(): void {
+    if (!codecSelect) return;
+    codecSelect.innerHTML = codecOptionsHtml(false);
+    codecSelect.value = settings.codec;
+  }
+  // 起動時に 1 回だけプローブし、select の非対応表記を更新する (loadSettings と非同期で競合
+  // してもどちらが先でも syncCodecSelect が現在の settings.codec を反映するので問題ない)。
+  void probeSupportedCodecs().then((list) => {
+    supportedCodecs = list;
+    syncCodecSelect();
+  });
 
   // 下端ステータスバーを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
   // 窓側で起きるため、launcher は `aurora://connections` の集計 (connectedSet) だけを映す。
@@ -1082,6 +1138,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
     syncPresetSelect();
+    syncCodecSelect();
     applyTheme(settings.theme, settings.accent_color);
   }
 

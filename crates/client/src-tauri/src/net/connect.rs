@@ -41,6 +41,9 @@ pub async fn connect_to_host(
     host: String,
     port: u16,
     save: bool,
+    // このクライアントが対応する映像コーデック ("av1"/"hevc"/"h264" の小文字文字列。無指定/
+    // 空は h264 のみ扱い)。接続確立直後に `SetSupportedCodecs` として host へ送る。
+    supported_codecs: Vec<String>,
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
@@ -52,6 +55,7 @@ pub async fn connect_to_host(
         host,
         port,
         save,
+        supported_codecs,
         event_channel,
         video_channel,
         state,
@@ -129,6 +133,7 @@ async fn connect_inner(
     // 手入力かつ true のときだけ保存し、「今回だけ接続」を可能にする。
     // 保存済み即接続/自動再接続では false 相当で、既存値に触れない。
     save: bool,
+    supported_codecs: Vec<String>,
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
@@ -255,6 +260,13 @@ async fn connect_inner(
     let (read_half, write_half) = tcp.into_split();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let (file_tx, file_rx) = mpsc::channel::<ControlMsg>(32);
+
+    // 接続確立直後の対応コーデック申告。writer タスクの起動前に積んでおけば、送出される
+    // 最初の制御メッセージになる (nonce 0 の衝突を避けるため、書き込みは必ず writer タスク
+    // 側の単一カウンタ経由に統一する。ここで直接 TCP へ書かない)。
+    let _ = ctrl_tx.send(ControlMsg::SetSupportedCodecs {
+        codecs: parse_supported_codecs(&supported_codecs),
+    });
 
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
@@ -571,6 +583,11 @@ async fn tcp_reader_loop(
             }
             ControlMsg::DisplayResized { id, width, height } => {
                 sink.send_event(ClientEvent::DisplayResized { id, width, height });
+            }
+            ControlMsg::VideoCodecChanged { codec } => {
+                sink.send_event(ClientEvent::VideoCodecChanged {
+                    codec: codec_to_str(codec).to_string(),
+                });
             }
             ControlMsg::Clipboard { text } => {
                 if clip_apply_tx.send(text).is_err() {

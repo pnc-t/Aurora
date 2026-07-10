@@ -2,6 +2,7 @@
 // 既定はオフで、Ctrl+Alt+Shift+S のローカルホットキーで開閉する (main.ts が配線)。
 
 import "./stats-overlay.css";
+import type { CodecId } from "../core/codec";
 
 type Stats = {
   fps: number;
@@ -10,9 +11,16 @@ type Stats = {
   loss_permille: number;
 };
 
+const CODEC_LABEL: Record<CodecId, string> = {
+  h264: "H.264",
+  hevc: "HEVC",
+  av1: "AV1",
+};
+
 let hudEl: HTMLElement | null = null;
 let visible = false;
 let latest: Stats | null = null;
+let latestCodec: CodecId | null = null;
 
 export function initStatsOverlay(el: HTMLElement): void {
   hudEl = el;
@@ -28,14 +36,16 @@ export function isStatsVisible(): boolean {
   return visible;
 }
 
-export function updateStats(s: Stats): void {
+export function updateStats(s: Stats, codec?: CodecId): void {
   latest = s;
+  if (codec !== undefined) latestCodec = codec;
   render();
 }
 
 /** 接続終了時に内容をクリア。 */
 export function clearStats(): void {
   latest = null;
+  latestCodec = null;
   render();
 }
 
@@ -56,5 +66,6 @@ function render(): void {
     ["rtt", `${rttMs} ms`],
     ["loss", `${(loss_permille / 10).toFixed(1)} %`],
   ];
+  if (latestCodec) rows.push(["codec", CODEC_LABEL[latestCodec]]);
   hudEl.textContent = rows.map(([k, v]) => `${k.padEnd(5)}${v.padStart(9)}`).join("\n");
 }

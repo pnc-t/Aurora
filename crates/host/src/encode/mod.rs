@@ -1,12 +1,15 @@
 //! 映像エンコーダ抽象 (Port)。
 
+use aurora_common::proto::VideoCodec;
+
 use crate::capture::Frame;
 #[cfg(target_os = "windows")]
 use crate::capture::SharedDevice;
 
 #[derive(Debug, Clone)]
 pub struct EncodedNal {
-    /// Annex-B (`00 00 00 01` start code 付き) の H.264 バイト列。
+    /// 選択中コーデックのビットストリーム (H.264/HEVC は Annex-B `00 00 00 01` start code 付き、
+    /// AV1 は OBU (Open Bitstream Unit) 列)。
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub frame_id: u16,
@@ -41,21 +44,27 @@ mod mf_hw;
 
 /// Windows のプラットフォームエンコーダ。HW (NVENC/AMF/QSV) を優先し、初期化に失敗
 /// したら SW (Microsoft H.264 MFT) へフォールバックする。どちらも GPU NV12 `Frame` を消費。
+/// SW は H.264 のみ対応 (HEVC/AV1 の SW フォールバックは持たない)。
 #[cfg(target_os = "windows")]
 pub enum PlatformEncoder {
-    Hw(mf_hw::MfHwH264Encoder),
+    Hw(mf_hw::MfHwVideoEncoder),
     Sw(mf::MfH264Encoder),
 }
 
 /// プラットフォームエンコーダを生成する。`encode_gpu` は使用 GPU の名前部分一致指定
 /// (None = キャプチャと同一 GPU)。Optimus ノートでキャプチャ (iGPU) と別の dGPU (NVENC)
 /// を使うための入口で、名前→LUID の解決と失敗時のフォールバックはここで行う。
+///
+/// `codec` は要求コーデック。HW MFT がその codec で初期化できなければ H.264 (SW) へ
+/// フォールバックする。戻り値は `(エンコーダ, 実際に使われたコーデック)` — 呼び出し側は
+/// 要求と食い違ったら (= フォールバック発生) ネゴシエーション状態を更新し直す必要がある。
 #[cfg(target_os = "windows")]
 pub fn create(
     device: SharedDevice,
     max_bitrate_bps: u32,
     encode_gpu: Option<&str>,
-) -> anyhow::Result<PlatformEncoder> {
+    codec: VideoCodec,
+) -> anyhow::Result<(PlatformEncoder, VideoCodec)> {
     let encode_luid = encode_gpu.and_then(|q| match crate::capture::find_adapter_luid(q) {
         Some((luid, name)) => {
             tracing::info!(query = %q, gpu = %name, "encode GPU resolved (--encode-gpu)");
@@ -68,24 +77,49 @@ pub fn create(
     });
     if std::env::var_os("AURORA_FORCE_SW_ENCODER").is_some() {
         tracing::warn!("AURORA_FORCE_SW_ENCODER set: forcing software H.264 MFT");
-        return Ok(PlatformEncoder::Sw(mf::MfH264Encoder::new(
-            device,
-            max_bitrate_bps,
-        )?));
+        return Ok((
+            PlatformEncoder::Sw(mf::MfH264Encoder::new(device, max_bitrate_bps)?),
+            VideoCodec::H264,
+        ));
     }
-    match mf_hw::MfHwH264Encoder::new(device.clone(), max_bitrate_bps, encode_luid) {
+    match mf_hw::MfHwVideoEncoder::new(device.clone(), max_bitrate_bps, encode_luid, codec) {
         Ok(e) => {
-            tracing::info!("video encoder: hardware H.264 MFT (zero-copy NV12)");
-            Ok(PlatformEncoder::Hw(e))
+            tracing::info!(?codec, "video encoder: hardware MFT (zero-copy NV12)");
+            Ok((PlatformEncoder::Hw(e), codec))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "HW H.264 encoder unavailable; falling back to software MFT (NV12 read-back)");
-            Ok(PlatformEncoder::Sw(mf::MfH264Encoder::new(
-                device,
-                max_bitrate_bps,
-            )?))
+            // SW フォールバックは H.264 のみ持つため、要求が H.264 以外だったらここで
+            // コーデックが実質ダウングレードされる (呼び出し側が VideoCodecChanged を再送する)。
+            tracing::warn!(
+                error = %e,
+                ?codec,
+                "HW encoder unavailable for requested codec; falling back to software H.264 MFT (NV12 read-back)"
+            );
+            Ok((
+                PlatformEncoder::Sw(mf::MfH264Encoder::new(device, max_bitrate_bps)?),
+                VideoCodec::H264,
+            ))
         }
     }
+}
+
+/// ホストが実際にエンコードできるコーデックの一覧を返す (実フレーム投入はせず、MFT の
+/// activate + MediaType 設定まで試す)。起動時に 1 度だけ呼び、ネゴシエーションの
+/// 「host 側能力」として使う。H.264 は SW フォールバックが必ずあるため常に含める。
+#[cfg(target_os = "windows")]
+pub fn probe_encoders(device: &SharedDevice, encode_gpu: Option<&str>) -> Vec<VideoCodec> {
+    let encode_luid = encode_gpu.and_then(|q| crate::capture::find_adapter_luid(q).map(|(l, _)| l));
+    let mut out = Vec::new();
+    for codec in [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264] {
+        if mf_hw::probe_hw_encoder(device, encode_luid, codec) {
+            out.push(codec);
+        }
+    }
+    // H.264 は SW MFT (Microsoft H.264 Encoder) が常に使えるため、HW 探索に失敗しても含める。
+    if !out.contains(&VideoCodec::H264) {
+        out.push(VideoCodec::H264);
+    }
+    out
 }
 
 #[cfg(target_os = "windows")]
@@ -131,11 +165,26 @@ mod ffmpeg;
 pub use ffmpeg::FfmpegH264Encoder as PlatformEncoder;
 
 /// 非 Windows: GPU 選択は未対応 (ffmpeg 側が実行時に選ぶ)。指定は無視する。
+/// HEVC/AV1 ネゴシエーションは Windows (Media Foundation) のみ対応のため、要求コーデックに
+/// 関わらず常に H.264 を使う (呼び出し側は戻り値の実効コーデックでネゴシエーション状態を保つ)。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn create(
     device: crate::capture::SharedDevice,
     max_bitrate_bps: u32,
     _encode_gpu: Option<&str>,
-) -> anyhow::Result<PlatformEncoder> {
-    PlatformEncoder::new(device, max_bitrate_bps)
+    _codec: VideoCodec,
+) -> anyhow::Result<(PlatformEncoder, VideoCodec)> {
+    Ok((
+        PlatformEncoder::new(device, max_bitrate_bps)?,
+        VideoCodec::H264,
+    ))
+}
+
+/// 非 Windows: H.264 のみ対応。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn probe_encoders(
+    _device: &crate::capture::SharedDevice,
+    _encode_gpu: Option<&str>,
+) -> Vec<VideoCodec> {
+    vec![VideoCodec::H264]
 }

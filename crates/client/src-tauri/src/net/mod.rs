@@ -21,7 +21,7 @@ use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO, TransportSession,
     psk_from_password,
 };
-use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent};
+use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent, VideoCodec};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -101,6 +101,38 @@ pub enum ClientEvent {
     Disconnected {
         reason: String,
     },
+    /// ホストが確定/変更した送出コーデック ("h264" | "hevc" | "av1")。
+    VideoCodecChanged {
+        codec: String,
+    },
+}
+
+/// TS の `["h264","hevc","av1"]` のような小文字文字列を `VideoCodec` へ変換する
+/// (未知の値は無視)。変換後に空 (無指定/空配列/全て未知) なら `[H264]` を既定にする
+/// (host 側の「未申告 = H264」規約と揃える)。
+pub(crate) fn parse_supported_codecs(codecs: &[String]) -> Vec<VideoCodec> {
+    let mut out: Vec<VideoCodec> = codecs
+        .iter()
+        .filter_map(|s| match s.as_str() {
+            "h264" => Some(VideoCodec::H264),
+            "hevc" => Some(VideoCodec::Hevc),
+            "av1" => Some(VideoCodec::Av1),
+            _ => None,
+        })
+        .collect();
+    if out.is_empty() {
+        out.push(VideoCodec::H264);
+    }
+    out
+}
+
+/// `VideoCodec` → フロントへ渡す小文字文字列。
+pub(crate) fn codec_to_str(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::Hevc => "hevc",
+        VideoCodec::Av1 => "av1",
+    }
 }
 
 /// 差し替え可能な表示先 (sink)。セッションの networking (TCP/UDP/各タスク) はそのままに、

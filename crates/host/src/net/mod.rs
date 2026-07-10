@@ -15,7 +15,7 @@ use aurora_common::framing::{
 use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_VIDEO, TransportSession,
 };
-use aurora_common::proto::{ControlMsg, Display, InputEvent, MouseButton};
+use aurora_common::proto::{ControlMsg, Display, InputEvent, MouseButton, VideoCodec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc};
@@ -32,6 +32,7 @@ use crate::projfs::{self, FsBridge, FsReply};
 mod auth;
 mod bitrate;
 mod client;
+mod codec;
 mod files;
 mod frame;
 mod session;
@@ -43,6 +44,7 @@ pub(crate) use auth::AuthThrottle;
 pub(crate) use bitrate::BitrateController;
 pub use bitrate::{EncoderCommand, InputCmd};
 pub(crate) use client::handle_client;
+pub(crate) use codec::{CodecStatus, negotiate_codec};
 pub(crate) use files::{UploadState, open_upload, stream_file_to_client};
 pub(crate) use frame::{
     HelloRegistry, encrypt_udp, register_hello, spawn_hello_dispatcher, unregister_hello,
@@ -108,6 +110,13 @@ pub struct ServerConfig {
     /// net→tray の実行時ステータス/通知バス。接続確立/切断/ペアリング登録を記録し、tray が
     /// ツールチップ更新・バルーン通知に使う。
     pub tray_bus: Arc<crate::tray::TrayBus>,
+    /// 起動時に 1 度だけ `encode::probe_encoders` した host の映像コーデック能力。
+    /// ネゴシエーションの「host 側能力」の初期値 (実行時のエンコーダ失敗で縮む)。
+    pub host_codecs: Vec<VideoCodec>,
+    /// encode スレッド → net への実効コーデック報告 (`CodecStatus`)。エンコーダの
+    /// (再) 作成は encode_loop (std::thread) 側で行うため、その結果をここで受け取り
+    /// `VideoCodecChanged` の配信とネゴシエーション状態の是正を行う。
+    pub codec_status_rx: mpsc::Receiver<CodecStatus>,
 }
 
 /// 同一アドレスで TCP/UDP を bind する。キャプチャ固着回復の re-exec 直後は、旧プロセスが
@@ -309,6 +318,14 @@ struct SharedControl {
     /// 確立済み (UDP hello 完了) のクライアント数。0 へ落ちた最後の 1 本がテイクオーバー等の
     /// グローバルな後始末を担う。
     active_conns: usize,
+    /// host が実際にエンコードできるコーデック (起動時 probe。実行時のエンコーダ失敗で縮む)。
+    host_codecs: Vec<VideoCodec>,
+    /// クライアント毎の申告コーデック集合 (`SetSupportedCodecs`)。未申告は接続確立時に
+    /// `[H264]` を既定で入れる (§タスク仕様: 未申告 = H264 とみなす)。
+    client_codecs: HashMap<u64, Vec<VideoCodec>>,
+    /// 直近に確定 (encode スレッドが確認済み) した送出コーデック。`VideoCodecChanged` の
+    /// 重複配信を避けるための現在値。
+    current_video_codec: VideoCodec,
 }
 
 impl SharedControl {
@@ -318,6 +335,12 @@ impl SharedControl {
         self.client_stats
             .values()
             .fold((0u16, 0u32), |(l, r), &(cl, cr)| (l.max(cl), r.max(cr)))
+    }
+
+    /// host 能力 ∩ 全クライアント申告から最良コーデックを再計算する (優先順位 AV1>HEVC>H264)。
+    fn recompute_codec(&self) -> VideoCodec {
+        let sets: Vec<Vec<VideoCodec>> = self.client_codecs.values().cloned().collect();
+        negotiate_codec(&self.host_codecs, &sets)
     }
 }
 
@@ -442,6 +465,7 @@ pub async fn run_server(
         names = ?displays.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
         "virtual display detection (shared topology)"
     );
+    tracing::info!(host_codecs = ?cfg.host_codecs, "host video codec capability (probed at startup)");
     let shared = Arc::new(tokio::sync::Mutex::new(SharedControl {
         displays,
         active_idx: 0,
@@ -452,10 +476,70 @@ pub async fn run_server(
         cursor_overlay: HashSet::new(),
         projfs_owner: None,
         active_conns: 0,
+        host_codecs: cfg.host_codecs.clone(),
+        client_codecs: HashMap::new(),
+        // encode_loop はコーデック未指定 (クライアント未接続) では常に H.264 から始める
+        // (安全な既定)。実際の初回 Active(H264) 報告と一致するため広告と齟齬が起きない。
+        current_video_codec: VideoCodec::H264,
     }));
 
     // host→全クライアント push 用の登録簿。
     let registry: Registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // encode スレッド → net への実効コーデック報告を捌くタスク。CodecStatus::Active は
+    // VideoCodecChanged の配信 (変化時のみ)、Fallback は host_codecs から失敗コーデックを
+    // 除いて再ネゴシエーションし、変わっていれば SetCodec を送り直す。host_codecs は
+    // 単調に縮む (H264 は絶対に外れない) ので再帰的なフォールバックも必ず収束する。
+    {
+        let shared = shared.clone();
+        let registry = registry.clone();
+        let enc_tx = enc_tx.clone();
+        let mut codec_status_rx = cfg.codec_status_rx;
+        tokio::spawn(async move {
+            while let Some(status) = codec_status_rx.recv().await {
+                match status {
+                    CodecStatus::Active(effective) => {
+                        let changed = {
+                            let mut sc = shared.lock().await;
+                            let changed = sc.current_video_codec != effective;
+                            sc.current_video_codec = effective;
+                            changed
+                        };
+                        if changed {
+                            tracing::info!(?effective, "video codec active");
+                            broadcast_ctrl(
+                                &registry,
+                                &ControlMsg::VideoCodecChanged { codec: effective },
+                            );
+                            let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                        }
+                    }
+                    CodecStatus::Fallback { failed } => {
+                        tracing::warn!(
+                            ?failed,
+                            "video codec unavailable at runtime; falling back to H.264"
+                        );
+                        let recompute = {
+                            let mut sc = shared.lock().await;
+                            sc.host_codecs.retain(|&c| c != failed);
+                            sc.current_video_codec = VideoCodec::H264;
+                            sc.recompute_codec()
+                        };
+                        broadcast_ctrl(
+                            &registry,
+                            &ControlMsg::VideoCodecChanged {
+                                codec: VideoCodec::H264,
+                            },
+                        );
+                        let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
+                        if recompute != VideoCodec::H264 {
+                            let _ = enc_tx.send(EncoderCommand::SetCodec(recompute)).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // ローカルのクリップボード変化を全クライアントへ配信するフォワーダ。
     {
