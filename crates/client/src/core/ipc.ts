@@ -204,6 +204,14 @@ export async function requestKeyframe(sessionId: string): Promise<void> {
   await invoke("request_keyframe", { sessionId });
 }
 
+/**
+ * キーボード占有 (WH_KEYBOARD_LL) の ON/OFF。マウスキャプチャ連動で、ON 中は Win キー / Alt+Tab
+ * 等がクライアント OS に奪われずホストへ転送される (`grabbed-key` イベントで届く)。
+ */
+export async function setKeyboardGrab(on: boolean): Promise<void> {
+  await invoke("set_keyboard_grab", { on });
+}
+
 // --- 計測フラグ (ホスト --perf 相当) ---
 // 環境変数 AURORA_PERF で有効化されるクライアント側の計測スイッチ。起動時に 1 回 Rust へ
 // 問い合わせて保持し、decoder の vstat (受信→提示の遅延) 集計を有効化する。未取得の間は

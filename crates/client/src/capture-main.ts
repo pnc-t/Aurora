@@ -430,6 +430,13 @@ void getCurrentWebviewWindow().listen<AdoptTabPayload>("aurora://adopt-tab", (e)
 // --- 窓リサイズ → アクティブ Session のビューポート追従 ---
 window.addEventListener("resize", () => active()?.onWindowResize());
 
+// --- キーボード占有 (WH_KEYBOARD_LL) が奪った Win/Alt+Tab 等をアクティブ Session へ注入 ---
+// grab の ON/OFF はマウスキャプチャ中のセッションが呼ぶが、転送先はウィンドウ単位 (Rust 側が
+// 呼び出し元 window を記録) のため、届いたキーは常にこの窓の「今の」アクティブタブへ渡す。
+void getCurrentWebviewWindow().listen<{ vk: number; down: boolean }>("grabbed-key", (e) => {
+  active()?.sendGrabbedKey(e.payload.vk, e.payload.down);
+});
+
 // --- キャプチャ画面へのファイル D&D アップロード (client → host、アクティブ Session 宛) ---
 let dropHint: HTMLElement | null = null;
 function showDropHint(on: boolean): void {
