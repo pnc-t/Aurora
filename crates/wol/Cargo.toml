@@ -1,0 +1,22 @@
+[package]
+name = "aurora-wol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aurora-wol"
+path = "src/main.rs"
+
+[dependencies]
+aurora-common = { path = "../common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+snow = { workspace = true }
+get_if_addrs = "0.5"

@@ -332,7 +332,50 @@ export type HostEntry = {
   icon?: string | null;
   /** ホスト別の設定上書き (無ければグローバル設定に従う)。任意。 */
   overrides?: HostOverrides | null;
+  /** Wake on LAN 用 MAC アドレス (接続時に Rust が自動保存する)。icon と同じ
+   *  None(null/undefined)=「情報なし」で既存値を保持、空文字=明示解除の規約。 */
+  mac?: string | null;
 };
+
+/** WoL 中継先ターゲット (Rust 側 WolTarget と対応)。 */
+export type WolTarget = {
+  id: string;
+  label: string;
+  mac: string;
+  relay_host: string;
+  relay_port: number;
+  host?: string | null;
+  port?: number | null;
+};
+
+/** 保存済み WoL ターゲット一覧を読み込む。 */
+export async function listWolTargets(): Promise<WolTarget[]> {
+  return await invoke<WolTarget[]>("list_wol_targets");
+}
+
+/** WoL ターゲットを保存する (id で重複排除・更新)。 */
+export async function saveWolTarget(target: WolTarget): Promise<void> {
+  await invoke("save_wol_target", { target });
+}
+
+/** 指定 id の WoL ターゲットを削除する。 */
+export async function deleteWolTarget(id: string): Promise<void> {
+  await invoke("delete_wol_target", { id });
+}
+
+/**
+ * raspi 中継経由でマジックパケットを送る。password=null は中継先の保存済みパスワード
+ * (DPAPI) を使う。savePassword=true で入力した password を新たに DPAPI 保存する。
+ */
+export async function wakeHost(
+  relayHost: string,
+  relayPort: number,
+  password: string | null,
+  savePassword: boolean,
+  mac: string,
+): Promise<void> {
+  await invoke("wake_host", { relayHost, relayPort, password, savePassword, mac });
+}
 
 /** 配色テーマ。auto は OS の prefers-color-scheme に追従、legacy はグレーのクラシック調。 */
 export type ThemeId = "auto" | "dark" | "light" | "legacy";

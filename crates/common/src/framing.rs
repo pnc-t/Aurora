@@ -224,6 +224,71 @@ pub fn decode_ctrl_msg(
         .map_err(CtrlMsgError::Decode)
 }
 
+// --- WoL 中継 (WolMsg) の暗号化フレーム化 (client / aurora-wol 共通) ---
+//
+// 映像セッションの ControlMsg とは独立したプロトコルだが、ワイヤ形式 (bincode →
+// CTRL ドメイン nonce で暗号化 → u16 長さ prefix フレーム) は同じなので実装を共有する。
+// client (wake_host) と aurora-wol の両方がここを通ることで、片側だけ変えてワイヤ互換が
+// 静かに壊れるのを防ぐ。
+
+use crate::proto::WolMsg;
+
+/// WolMsg 1 件の最大シリアライズ長。u16 長さ prefix (65535B) と対の上限。
+pub const MAX_WOL_MSG: u64 = 4 * 1024;
+
+/// WolMsg 送受信の失敗。
+#[derive(Debug, Error)]
+pub enum WolMsgError {
+    #[error("encode WolMsg: {0}")]
+    Encode(#[source] bincode::Error),
+    #[error("decode WolMsg: {0}")]
+    Decode(#[source] bincode::Error),
+    #[error(transparent)]
+    Crypto(#[from] NoiseError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+fn wol_bincode_opts() -> impl Options {
+    bincode::DefaultOptions::new().with_limit(MAX_WOL_MSG)
+}
+
+/// `msg` を bincode で直列化し、CTRL ドメインの連番 nonce (`tx_nonce` を採番して +1) で
+/// 暗号化して 1 TCP フレームとして送る。
+pub async fn send_wol_msg<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    session: &TransportSession,
+    msg: &WolMsg,
+    tx_nonce: &mut u64,
+) -> Result<(), WolMsgError> {
+    let plain = wol_bincode_opts()
+        .serialize(msg)
+        .map_err(WolMsgError::Encode)?;
+    let nonce = NONCE_DOMAIN_CTRL | *tx_nonce;
+    *tx_nonce += 1;
+    let mut cipher = Vec::new();
+    session.encrypt(nonce, &plain, &mut cipher)?;
+    write_tcp_frame(stream, &cipher).await?;
+    Ok(())
+}
+
+/// 受信済みの 1 TCP フレーム (暗号文) を CTRL ドメインの連番 nonce (`rx_nonce` を採番して
+/// +1) で復号し WolMsg へ戻す。
+pub fn decode_wol_msg(
+    session: &TransportSession,
+    frame: &[u8],
+    rx_nonce: &mut u64,
+    plain: &mut Vec<u8>,
+) -> Result<WolMsg, WolMsgError> {
+    plain.clear();
+    let nonce = NONCE_DOMAIN_CTRL | *rx_nonce;
+    *rx_nonce += 1;
+    session.decrypt(nonce, frame, plain)?;
+    wol_bincode_opts()
+        .deserialize(plain)
+        .map_err(WolMsgError::Decode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

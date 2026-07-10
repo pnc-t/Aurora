@@ -42,6 +42,7 @@ import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { SHORTCUTS } from "../core/shortcuts";
 import { icon } from "./icons";
+import { mountWolPanel } from "./wol-panel";
 import "./launcher.css";
 
 // password に null を渡すと Rust 側が保存済みパスワード (DPAPI) を使って接続する。
@@ -156,6 +157,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       </div>
       <aside class="sidebar">
         <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
+        <button class="nav-item" data-page="wol" title="Wake on LAN"><span class="ico">${icon("bolt")}</span></button>
         <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
         <div class="sidebar-spacer"></div>
       </aside>
@@ -170,6 +172,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           </div>
           <div class="host-list" id="host-list"></div>
         </section>
+        <section class="page" id="page-wol"></section>
         <section class="page" id="page-settings">
           <div class="page-head"><h2>Settings</h2></div>
           <div class="settings-body">
@@ -363,6 +366,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
+
+  // Wake on LAN タブ: 中継 (raspi) 経由でマジックパケットを送るパネル。接続実行は
+  // launcher と同じ onConnect (open_capture_window 呼び出し) を共有する。
+  const wolRoot = $("#page-wol") as HTMLElement;
+  mountWolPanel(wolRoot, { onConnect: opts.onConnect });
 
   // ナビ (Hosts/Settings) や ＋追加 などアイコンのみボタンに aria-label を補う。
   applyAriaLabels(opts.root);

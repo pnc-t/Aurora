@@ -74,6 +74,48 @@ fn local_device_name() -> String {
         .unwrap_or_default()
 }
 
+fn format_mac(mac: [u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// HostInfo で受け取った MAC を `recent_hosts` の該当 host エントリへ自動保存する
+/// (WoL 対象への流用用)。`icon` と同じ「None=情報なし・既存値保持」規約に従い、
+/// このホストが**未登録** (recent_hosts に無い、まだ一度も保存されていない) なら何もしない
+/// (フロントが接続後に `saveRecentHost` で新規登録した時点で改めて拾われる)。
+/// 保存失敗はログのみ (MAC の自動保存は補助機能で接続を止める理由にはしない)。
+async fn save_host_mac(app: &tauri::AppHandle, host: &str, mac: Option<[u8; 6]>) {
+    let Some(mac) = mac else { return };
+    let app = app.clone();
+    let host = host.to_string();
+    // load/save_recent_hosts は同期ファイル I/O のため tokio タスク内から直接呼ばない。
+    let res = tokio::task::spawn_blocking(move || {
+        let Ok(hosts) = crate::config::load_recent_hosts(app.clone()) else {
+            return Ok(());
+        };
+        let Some(existing) = hosts.iter().find(|h| h.host.eq_ignore_ascii_case(&host)) else {
+            return Ok(());
+        };
+        let entry = crate::config::HostEntry {
+            label: existing.label.clone(),
+            host,
+            port: existing.port,
+            icon: None,
+            overrides: None,
+            mac: Some(format_mac(mac)),
+        };
+        crate::config::save_recent_host(app, entry)
+    })
+    .await;
+    match res {
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to save host MAC"),
+        Err(e) => tracing::warn!(error = %e, "save host MAC task failed"),
+        Ok(Ok(())) => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_inner(
     app: tauri::AppHandle,
@@ -188,7 +230,14 @@ async fn connect_inner(
     // selectDisplay/setClientViewport を invoke した時にハンドル未格納 (再接続時は古い閉じた
     // ctrl_tx) で送信が失敗し、仮想ディスプレイのテイクオーバーが起動しないレースになる。
     let (host_displays, host_audio) = match host_info {
-        ControlMsg::HostInfo { displays, audio } => (displays, audio),
+        ControlMsg::HostInfo {
+            displays,
+            audio,
+            mac,
+        } => {
+            save_host_mac(&app, &host, mac).await;
+            (displays, audio)
+        }
         other => return Err(format!("expected HostInfo, got {other:?}")),
     };
 
@@ -511,7 +560,13 @@ async fn tcp_reader_loop(
                     rtt_us: rtt_us as i64,
                 });
             }
-            ControlMsg::HostInfo { displays, audio } => {
+            ControlMsg::HostInfo {
+                displays,
+                audio,
+                mac: _,
+            } => {
+                // 再接続時等の後続 HostInfo。MAC は接続確立時 (connect_inner) に一度保存すれば
+                // 十分 (実行中に変わらない値) なので、ここでは表示用データだけ通知する。
                 sink.send_event(ClientEvent::HostInfo { displays, audio });
             }
             ControlMsg::DisplayResized { id, width, height } => {

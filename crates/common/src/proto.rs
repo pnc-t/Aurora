@@ -59,6 +59,10 @@ pub enum ControlMsg {
     HostInfo {
         displays: Vec<Display>,
         audio: bool,
+        /// ホストのプライマリ NIC の MAC アドレス。取得失敗時は `None`。クライアントは
+        /// これを host エントリに保存し、WoL 中継 (aurora-wol) への wake 要求に使う。
+        /// host/client 同時更新前提のため bincode タグ互換は割り切って末尾に追加する。
+        mac: Option<[u8; 6]>,
     },
     SelectDisplay {
         id: u32,
@@ -197,4 +201,14 @@ pub enum ControlMsg {
     SetCursorOverlay {
         enabled: bool,
     },
+}
+
+/// WoL 中継デーモン (aurora-wol) との制御メッセージ。Noise ハンドシェイク後の TCP フレームで送受する。
+/// 映像セッションの [`ControlMsg`] とは別チャネル・別プロトコルの独立したメッセージ (混同しないこと)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WolMsg {
+    /// 対象 MAC へのマジックパケット送出要求。
+    Wake { mac: [u8; 6] },
+    /// 送出結果。
+    Ack { ok: bool, message: String },
 }
