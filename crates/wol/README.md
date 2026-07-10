@@ -19,7 +19,29 @@ client (出先の PC) → Tailnet → `aurora-wol` (自宅の raspi 等) → LAN
 - `aurora-wol` を動かす機器と対象 PC が**同一 LAN (同一ブロードキャストドメイン)** に
   いること。ルータを跨いだ WoL は行わない (マジックパケットはブロードキャストのため)。
 
-## ビルド
+## raspi へのインストール (推奨: ワンコマンドデプロイ)
+
+Windows 開発機から raspi へクロスビルド・配備・systemd 化まで 1 コマンドで行える。
+
+前提:
+- raspi: SSH でログイン可能 (鍵認証推奨)、Tailscale 導入済み
+- Windows: Rust toolchain 導入済み (`cargo-zigbuild`/`zig` は無ければスクリプトが導入を試みる)
+
+```powershell
+cd crates/wol
+.\deploy-aurora-wol.ps1 -Target pi@100.x.x.x
+# ポート/sshポートを変える場合
+.\deploy-aurora-wol.ps1 -Target pi@100.x.x.x -Port 7100 -SshPort 22
+```
+
+初回はパスワード入力を求められる (空 Enter で自動生成、生成値はコンソールに表示される)。
+2 回目以降の実行はバイナリ差し替え + サービス再起動のみで、既存パスワードは保持される。
+
+完了後に表示される `ホスト:ポート` と `パスワード` を、client の WoL タブに登録する。
+
+## 代替手順 (raspi 上で直接ビルド / 手動 systemd 化)
+
+上記スクリプトが使えない環境向けの手順。
 
 Raspberry Pi 上で直接ビルドする場合 (Rust toolchain がインストール済み前提):
 
