@@ -227,6 +227,11 @@ export class Input {
     // window レベルで握って preventDefault するとテキスト入力が一切できなくなるため
     // (カスタム fps/Mbps 欄が入力不能だった)、転送も抑止もせず素通しする。
     if (isLocalEditTarget(e.target)) return;
+    // 案A (host IME) では composition 自体は転送しない。IME 確定前の中間キーイベント
+    // (isComposing/keyCode 229) をそのまま送ると host 側で壊れたシーケンスになるため捨てる。
+    // ただし半角/全角トグルはクライアント側 IME に処理され Process/229 として届くことが
+    // 多く、ここで捨てると host の IME を切替できなくなるため免除する。
+    if (isImeIntermediate(e) && !isKanjiToggle(e)) return;
     const vk = vkFromKeyboardEvent(e);
     if (vk == null) return;
     e.preventDefault();
@@ -238,6 +243,7 @@ export class Input {
   }
 
   private onKeyUp(e: KeyboardEvent): void {
+    if (isImeIntermediate(e) && !isKanjiToggle(e)) return;
     const vk = vkFromKeyboardEvent(e);
     if (vk == null) return;
     // 編集要素フォーカス中の keyup は素通し。ただし canvas 上で押下→編集要素へフォーカス移動後に
@@ -324,11 +330,36 @@ function vkFromKeyboardEvent(e: KeyboardEvent): number | null {
     case "Minus": return 0xbd;
     case "Period": return 0xbe;
     case "Slash": return 0xbf;
-    case "Backquote": return 0xc0;
+    case "Backquote": {
+      // JIS 配列の半角/全角キーは code が US と同じ "Backquote" で来るため code だけでは
+      // 区別できない。IME トグル時の key (Process/Zenkaku/Hankaku/Romaji/KanjiMode) で判定し、
+      // 該当すれば VK_KANJI、それ以外 (US 配列の `~) は従来通り VK_OEM_3 とする。
+      if (isKanjiToggle(e)) return 0x19; // VK_KANJI
+      return 0xc0;
+    }
     case "BracketLeft": return 0xdb;
     case "Backslash": return 0xdc;
     case "BracketRight": return 0xdd;
     case "Quote": return 0xde;
+    case "Convert": return 0x1c; // VK_CONVERT (変換)
+    case "NonConvert": return 0x1d; // VK_NONCONVERT (無変換)
+    case "KanaMode": return 0x15; // VK_KANA (ひらがな/カタカナ)
+    // JIS の ¥ は VK_OEM_5 (0xdc)。US の Backslash と同一 VK だが、host 側 IME/キーボード
+    // レイアウトが JIS なら scancode 側で正しく解決されるため VK の重複は問題ない。
+    case "IntlYen": return 0xdc;
+    case "IntlRo": return 0xe2; // VK_OEM_102 (ろ)
     default: return null;
   }
+}
+
+/** IME 処理中の中間キーイベント (composition 中 or keyCode 229) か。 */
+function isImeIntermediate(e: KeyboardEvent): boolean {
+  return e.isComposing || e.keyCode === 229;
+}
+
+/** 半角/全角キー (Backquote と同じ code で来る) を key 値から判別する。 */
+function isKanjiToggle(e: KeyboardEvent): boolean {
+  if (e.code !== "Backquote") return false;
+  const key = e.key;
+  return key === "Process" || key === "Zenkaku" || key === "Hankaku" || key === "Romaji" || key === "KanjiMode";
 }
