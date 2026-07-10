@@ -104,11 +104,7 @@ impl StatsWindow {
         let bitrate_kbps = ((bytes_d as f64) * 8.0 / 1000.0 / secs) as u32;
         let fps = ((frames_d as f64) / secs).round().min(255.0) as u8;
         let expected = video_d + lost_d;
-        let loss_permille = if expected > 0 {
-            ((lost_d * 1000) / expected).min(1000) as u16
-        } else {
-            0
-        };
+        let loss_permille = (lost_d * 1000).checked_div(expected).unwrap_or(0).min(1000) as u16;
         let rtt_us = c.rtt_us.load(Ordering::Relaxed);
 
         self.prev = now;

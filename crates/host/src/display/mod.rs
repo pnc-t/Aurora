@@ -551,16 +551,16 @@ mod imp {
     fn restore_all() -> bool {
         let mut ccd_ok = false;
         if let Some(path) = ccd_topology_file() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Some((paths, modes)) = deserialize_ccd(&bytes) {
-                    match restore_ccd_topology(&paths, &modes) {
-                        Ok(()) => {
-                            ccd_ok = true;
-                            tracing::info!("topology restored via CCD");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "CCD restore failed; trying CDS fallback");
-                        }
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Some((paths, modes)) = deserialize_ccd(&bytes)
+            {
+                match restore_ccd_topology(&paths, &modes) {
+                    Ok(()) => {
+                        ccd_ok = true;
+                        tracing::info!("topology restored via CCD");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "CCD restore failed; trying CDS fallback");
                     }
                 }
             }
@@ -576,10 +576,11 @@ mod imp {
             .map(|t| parse_topology(&t))
             .unwrap_or_default();
         // CCD が失敗したときの一次フォールバック。
-        if !ccd_ok && !states.is_empty() {
-            if let Err(e) = restore_topology(&states) {
-                tracing::warn!(error = %e, "CDS fallback restore failed");
-            }
+        if !ccd_ok
+            && !states.is_empty()
+            && let Err(e) = restore_topology(&states)
+        {
+            tracing::warn!(error = %e, "CDS fallback restore failed");
         }
         // ★安全網: 復元後も保存済み物理が 1 枚でも非アタッチなら強制再アタッチする。CCD restore が
         // Ok を返しても DISPLAY1 が戻らない事例の保険 (物理黒固着を絶対に残さない)。
@@ -1028,10 +1029,10 @@ mod imp {
         let topo = save_topology();
         // 先にディスクへ保存する (クラッシュしても次回起動で復元できるように)。
         // CCD バイナリが本命の復元元、テキストはフォールバック。両方を書く。
-        if let Some((paths, modes)) = save_ccd_topology() {
-            if let Some(path) = ccd_topology_file() {
-                let _ = std::fs::write(&path, serialize_ccd(&paths, &modes));
-            }
+        if let Some((paths, modes)) = save_ccd_topology()
+            && let Some(path) = ccd_topology_file()
+        {
+            let _ = std::fs::write(&path, serialize_ccd(&paths, &modes));
         }
         if let Some(path) = topology_file() {
             let _ = std::fs::write(&path, serialize_topology(&topo));

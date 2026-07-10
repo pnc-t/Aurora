@@ -72,12 +72,13 @@ pub fn spawn() -> (ClipboardHandle, mpsc::UnboundedReceiver<String>) {
                 }
 
                 // 2) ローカル変化のポーリング
-                if let Ok(text) = cb.get_text() {
-                    if text.len() <= MAX_TEXT_BYTES && Some(&text) != last_text.as_ref() {
-                        last_text = Some(text.clone());
-                        if change_tx.send(text).is_err() {
-                            return;
-                        }
+                if let Ok(text) = cb.get_text()
+                    && text.len() <= MAX_TEXT_BYTES
+                    && Some(&text) != last_text.as_ref()
+                {
+                    last_text = Some(text.clone());
+                    if change_tx.send(text).is_err() {
+                        return;
                     }
                 }
 

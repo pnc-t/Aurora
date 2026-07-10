@@ -52,14 +52,14 @@ fn parse_args() -> Result<Args> {
         }
     }
     // 優先順: 引数 > ファイル (どちらも無ければ main() で終了する)。
-    if password.is_none() {
-        if let Some(path) = password_file {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read password file: {}", path.display()))?;
-            let trimmed = raw.trim().to_string();
-            if !trimmed.is_empty() {
-                password = Some(trimmed);
-            }
+    if password.is_none()
+        && let Some(path) = password_file
+    {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read password file: {}", path.display()))?;
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            password = Some(trimmed);
         }
     }
     Ok(Args { port, password })

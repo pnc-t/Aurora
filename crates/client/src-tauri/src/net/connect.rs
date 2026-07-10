@@ -211,10 +211,8 @@ async fn connect_inner(
     // DPAPI 暗号化保存する (無断永続化を避け「今回だけ接続」を可能にする)。失敗してもログ
     // のみで接続は続行する (保存は補助機能)。`save=false` (今回だけ/保存済み即接続/再接続) は
     // 既存の保存値に触れない (= 保存済みなら維持、未保存なら未保存のまま)。
-    if save {
-        if let Err(e) = crate::secret::put(&app, &host, &password) {
-            tracing::warn!(error = %e, "failed to save host password");
-        }
+    if save && let Err(e) = crate::secret::put(&app, &host, &password) {
+        tracing::warn!(error = %e, "failed to save host password");
     }
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、

@@ -98,10 +98,10 @@ impl TrayBus {
                 Some(v.saturating_sub(1))
             })
             .unwrap_or(0);
-        if prev <= 1 {
-            if let Ok(mut p) = self.last_peer.lock() {
-                *p = None;
-            }
+        if prev <= 1
+            && let Ok(mut p) = self.last_peer.lock()
+        {
+            *p = None;
         }
         self.push(TrayEvent::Disconnected(label));
     }
@@ -353,7 +353,7 @@ mod imp {
 
             // トレイアイコン登録。build.rs で exe へ埋め込んだ aurora アイコン (リソース
             // ID = 1) を使う。万一読めなければ標準アプリアイコンへフォールバックする。
-            let hicon = LoadIconW(hinstance, PCWSTR(1 as *const u16))
+            let hicon = LoadIconW(hinstance, PCWSTR(std::ptr::dangling::<u16>()))
                 .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))?;
             let mut nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,

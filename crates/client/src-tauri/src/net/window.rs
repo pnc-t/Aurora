@@ -30,12 +30,11 @@ struct ActivateHostPayload {
 /// それを優先し、無ければ生存している capture 窓を (順序不定で) 1 つ選ぶ。1 つも無ければ
 /// None を返し、呼び出し側が従来どおり新窓を生成する。
 fn route_target(app: &tauri::AppHandle, state: &SessionState) -> Option<String> {
-    if let Ok(g) = state.last_focused_capture.lock() {
-        if let Some(label) = g.as_deref() {
-            if app.get_webview_window(label).is_some() {
-                return Some(label.to_string());
-            }
-        }
+    if let Ok(g) = state.last_focused_capture.lock()
+        && let Some(label) = g.as_deref()
+        && app.get_webview_window(label).is_some()
+    {
+        return Some(label.to_string());
     }
     // フォーカス追跡が無い/死んでいる場合のフォールバック。webview_windows() の順序は
     // HashMap 由来で不定だが、生きている capture 窓のどれかへ合流できれば新窓乱立は防げる。
@@ -68,29 +67,27 @@ pub async fn open_capture_window(
     let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("s{n}");
 
-    if !new_window {
-        if let Some(target_label) = route_target(&app, &state) {
-            state
-                .staging
-                .lock()
-                .await
-                .insert(session_id.clone(), password.clone());
-            let payload = AddTabPayload {
-                session_id: session_id.clone(),
-                host: host.clone(),
-                port,
-                label: label.clone(),
-                save,
-            };
-            if app
-                .emit_to(&target_label, "aurora://add-tab", payload)
-                .is_ok()
-            {
-                return Ok(session_id);
-            }
-            // 窓は生きているが emit できない異常時は、接続不能にしないため新窓生成へフォールバックする。
-            state.staging.lock().await.remove(&session_id);
+    if !new_window && let Some(target_label) = route_target(&app, &state) {
+        state
+            .staging
+            .lock()
+            .await
+            .insert(session_id.clone(), password.clone());
+        let payload = AddTabPayload {
+            session_id: session_id.clone(),
+            host: host.clone(),
+            port,
+            label: label.clone(),
+            save,
+        };
+        if app
+            .emit_to(&target_label, "aurora://add-tab", payload)
+            .is_ok()
+        {
+            return Ok(session_id);
         }
+        // 窓は生きているが emit できない異常時は、接続不能にしないため新窓生成へフォールバックする。
+        state.staging.lock().await.remove(&session_id);
     }
 
     let win_label = format!("capture-{session_id}");
