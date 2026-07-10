@@ -57,16 +57,15 @@ pub fn load_or_create_identity(app: &AppHandle) -> Option<aurora_common::noise::
     }
     let path = identity_path(app)?;
     // 保存済みを読む。復号/パースできればそれを採用。
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Some(id) = decrypt(&bytes).and_then(|p| serde_json::from_slice::<Identity>(&p).ok())
-        {
-            let kp = aurora_common::noise::StaticKeypair {
-                private: id.private,
-                public: id.public,
-            };
-            *cache = Some(kp.clone());
-            return Some(kp);
-        }
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Some(id) = decrypt(&bytes).and_then(|p| serde_json::from_slice::<Identity>(&p).ok())
+    {
+        let kp = aurora_common::noise::StaticKeypair {
+            private: id.private,
+            public: id.public,
+        };
+        *cache = Some(kp.clone());
+        return Some(kp);
     }
     // 未保存 / 復号不能 → 新規生成して保存する。
     let kp = aurora_common::noise::generate_static_keypair().ok()?;
@@ -74,16 +73,16 @@ pub fn load_or_create_identity(app: &AppHandle) -> Option<aurora_common::noise::
         private: kp.private.clone(),
         public: kp.public.clone(),
     };
-    if let Ok(plain) = serde_json::to_vec(&id) {
-        if let Ok(enc) = encrypt(&plain) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // 一時ファイルへ書いてから rename し、並行書き込みでの破損を避ける (atomic 置換)。
-            let tmp = path.with_extension("bin.tmp");
-            if std::fs::write(&tmp, &enc).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+    if let Ok(plain) = serde_json::to_vec(&id)
+        && let Ok(enc) = encrypt(&plain)
+    {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // 一時ファイルへ書いてから rename し、並行書き込みでの破損を避ける (atomic 置換)。
+        let tmp = path.with_extension("bin.tmp");
+        if std::fs::write(&tmp, &enc).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
         }
     }
     *cache = Some(kp.clone());

@@ -356,11 +356,11 @@ pub(crate) async fn udp_reader_loop(
         udp_health.mark_recv(session_start.elapsed().as_millis() as u64);
 
         if tag == STREAM_AUDIO {
-            if let Some(tx) = &audio_tx {
-                if let Ok(pkt) = AudioPacket::decode(body) {
-                    // 再生スレッドへ Opus フレームを渡す (seq は MVP では未使用)
-                    let _ = tx.send(pkt.payload.to_vec());
-                }
+            if let Some(tx) = &audio_tx
+                && let Ok(pkt) = AudioPacket::decode(body)
+            {
+                // 再生スレッドへ Opus フレームを渡す (seq は MVP では未使用)
+                let _ = tx.send(pkt.payload.to_vec());
             }
             continue;
         }

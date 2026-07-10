@@ -68,10 +68,10 @@ fn main() {
                 } else if label.starts_with("capture-") {
                     // 死んだ窓へ以後ルーティングしないよう、追跡していたなら外す。
                     let state = window.app_handle().state::<SessionState>();
-                    if let Ok(mut g) = state.last_focused_capture.lock() {
-                        if g.as_deref() == Some(label.as_str()) {
-                            *g = None;
-                        }
+                    if let Ok(mut g) = state.last_focused_capture.lock()
+                        && g.as_deref() == Some(label.as_str())
+                    {
+                        *g = None;
                     }
                     // 1 capture ウィンドウに複数タブ (セッション) がぶら下がるため、このウィンドウ
                     // を所有ウィンドウとする全セッションをまとめて停止する (タブの取りこぼし防止)。

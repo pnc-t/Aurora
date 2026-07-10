@@ -93,10 +93,8 @@ pub async fn wake_host(
     tracing::info!("wol: noise handshake complete");
 
     // ハンドシェイク成功 = パスワード一致。保存はユーザーが明示的に選んだときだけ。
-    if save_password {
-        if let Err(e) = crate::secret::put(&app, &secret_key, &password) {
-            tracing::warn!(error = %e, "failed to save wol relay password");
-        }
+    if save_password && let Err(e) = crate::secret::put(&app, &secret_key, &password) {
+        tracing::warn!(error = %e, "failed to save wol relay password");
     }
 
     let mut tx_nonce: u64 = 0;

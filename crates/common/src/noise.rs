@@ -68,10 +68,10 @@ pub fn weak_password_reason(password: &str) -> Option<&'static str> {
         return Some("よく使われるパスワードです");
     }
     // 全部同じ文字 (例: "aaaaaaaa")。空文字列は None に落とす。
-    if let Some(first) = password.chars().next() {
-        if password.chars().all(|c| c == first) {
-            return Some("同じ文字の繰り返しです");
-        }
+    if let Some(first) = password.chars().next()
+        && password.chars().all(|c| c == first)
+    {
+        return Some("同じ文字の繰り返しです");
     }
     // 全部数字 (例: 生年月日・連番)。
     if !password.is_empty() && password.chars().all(|c| c.is_ascii_digit()) {

@@ -157,18 +157,18 @@ impl Sink {
     }
     /// 現在の表示先へイベントを送る (未アタッチ = デタッチ中なら捨てる)。
     fn send_event(&self, ev: ClientEvent) {
-        if let Ok(g) = self.event.lock() {
-            if let Some(ch) = g.as_ref() {
-                let _ = ch.send(ev);
-            }
+        if let Ok(g) = self.event.lock()
+            && let Some(ch) = g.as_ref()
+        {
+            let _ = ch.send(ev);
         }
     }
     /// 現在の表示先へ映像フレームを送る (未アタッチなら捨てる。次キーフレームで回復)。
     fn send_video(&self, body: InvokeResponseBody) {
-        if let Ok(g) = self.video.lock() {
-            if let Some(ch) = g.as_ref() {
-                let _ = ch.send(body);
-            }
+        if let Ok(g) = self.video.lock()
+            && let Some(ch) = g.as_ref()
+        {
+            let _ = ch.send(body);
         }
     }
     /// 表示先を差し替える (新ウィンドウのアタッチ)。

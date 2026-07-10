@@ -872,14 +872,14 @@ fn require_password_change_authorization() -> Result<()> {
     }
 
     // 既存パスワードがあるなら、まず現在のパスワードを要求して本人確認する。
-    if let Ok(Some(current)) = security::load_password() {
-        if !current.is_empty() {
-            print!("Enter current Aurora password: ");
-            std::io::stdout().flush().ok();
-            let entered = read_secret_line()?;
-            if entered != current {
-                return Err(anyhow!("current password does not match"));
-            }
+    if let Ok(Some(current)) = security::load_password()
+        && !current.is_empty()
+    {
+        print!("Enter current Aurora password: ");
+        std::io::stdout().flush().ok();
+        let entered = read_secret_line()?;
+        if entered != current {
+            return Err(anyhow!("current password does not match"));
         }
     }
     Ok(())
@@ -1505,16 +1505,15 @@ fn capture_loop(
                     // ホストを丸ごと re-exec する無駄が起きる。利用可能な物理ディスプレイへ
                     // フォールバックして固着を解消する (テイクオーバー中は物理が意図的に消えている
                     // ので対象にしない)。
-                    if !crate::display::is_takeover_active() {
-                        if let Ok(list) = capture::enumerate_displays() {
-                            if !list.is_empty() && !list.iter().any(|d| d.name == cur_name) {
-                                if let Some(first) = list.first() {
-                                    tracing::info!(old = %cur_name, new = %first.name, "capture target vanished; falling back to available display (avoids re-exec)");
-                                    cur_name = first.name.clone();
-                                    first_fail = None;
-                                }
-                            }
-                        }
+                    if !crate::display::is_takeover_active()
+                        && let Ok(list) = capture::enumerate_displays()
+                        && !list.is_empty()
+                        && !list.iter().any(|d| d.name == cur_name)
+                        && let Some(first) = list.first()
+                    {
+                        tracing::info!(old = %cur_name, new = %first.name, "capture target vanished; falling back to available display (avoids re-exec)");
+                        cur_name = first.name.clone();
+                        first_fail = None;
                     }
                     // テイクオーバー中の永続固着の救済 (暗転が治らない問題の本命対策)。re-exec は
                     // 下で抑止される / クライアント切断まで net 側の end_takeover も走らないため、
@@ -1555,14 +1554,13 @@ fn capture_loop(
                 // テイクオーバー中の巻き戻し (物理再アタッチ) はループ先頭の能動チェックで再アサート
                 // するのでここでは扱わない。ここでは解像度変更後に Windows が仮想ディスプレイの GDI 名を
                 // 振り直し cur_name が stale 化する問題のみ救済する (MTT1337 で引き直し、変われば乗換)。
-                if crate::display::is_takeover_active() {
-                    if let Some(v) = crate::display::detect() {
-                        if v.gdi_name != cur_name {
-                            tracing::info!(old = %cur_name, new = %v.gdi_name, "takeover stall: virtual GDI name changed; retargeting capture");
-                            cur_name = v.gdi_name;
-                            first_fail = None;
-                        }
-                    }
+                if crate::display::is_takeover_active()
+                    && let Some(v) = crate::display::detect()
+                    && v.gdi_name != cur_name
+                {
+                    tracing::info!(old = %cur_name, new = %v.gdi_name, "takeover stall: virtual GDI name changed; retargeting capture");
+                    cur_name = v.gdi_name;
+                    first_fail = None;
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 match PlatformCapturer::new_for_name(device.clone(), &cur_name) {

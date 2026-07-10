@@ -395,42 +395,41 @@ unsafe extern "system" fn get_enum_cb(
             let s = unsafe { searchexpression.to_string() }.unwrap_or_default();
             if s.is_empty() { None } else { Some(wide(&s)) }
         };
-        if let Ok(mut map) = provider.enums.lock() {
-            if let Some(sess) = map.get_mut(&key) {
-                sess.entries = entries;
-                sess.index = 0;
-                sess.loaded = true;
-                sess.pattern = pattern;
-            }
+        if let Ok(mut map) = provider.enums.lock()
+            && let Some(sess) = map.get_mut(&key)
+        {
+            sess.entries = entries;
+            sess.index = 0;
+            sess.loaded = true;
+            sess.pattern = pattern;
         }
     }
 
     // --- フェーズ 3: バッファ充填 (ネットワークなし) ---
-    if let Ok(mut map) = provider.enums.lock() {
-        if let Some(sess) = map.get_mut(&key) {
-            while sess.index < sess.entries.len() {
-                let entry = &sess.entries[sess.index];
-                let name_w = wide(&entry.name);
-                if let Some(pat) = &sess.pattern {
-                    // SAFETY: name_w / pat は null 終端の有効な PCWSTR。
-                    let m =
-                        unsafe { PrjFileNameMatch(PCWSTR(name_w.as_ptr()), PCWSTR(pat.as_ptr())) };
-                    if m.0 == 0 {
-                        sess.index += 1;
-                        continue;
-                    }
+    if let Ok(mut map) = provider.enums.lock()
+        && let Some(sess) = map.get_mut(&key)
+    {
+        while sess.index < sess.entries.len() {
+            let entry = &sess.entries[sess.index];
+            let name_w = wide(&entry.name);
+            if let Some(pat) = &sess.pattern {
+                // SAFETY: name_w / pat は null 終端の有効な PCWSTR。
+                let m = unsafe { PrjFileNameMatch(PCWSTR(name_w.as_ptr()), PCWSTR(pat.as_ptr())) };
+                if m.0 == 0 {
+                    sess.index += 1;
+                    continue;
                 }
-                let bi = basic_info(entry);
-                // SAFETY: name_w は有効な PCWSTR、bi は有効、dirhandle は ProjFS 提供。
-                let res = unsafe {
-                    PrjFillDirEntryBuffer(PCWSTR(name_w.as_ptr()), Some(&bi), direntrybufferhandle)
-                };
-                if res.is_err() {
-                    // バッファ満杯。index は進めず次回呼び出しで続きを返す。
-                    break;
-                }
-                sess.index += 1;
             }
+            let bi = basic_info(entry);
+            // SAFETY: name_w は有効な PCWSTR、bi は有効、dirhandle は ProjFS 提供。
+            let res = unsafe {
+                PrjFillDirEntryBuffer(PCWSTR(name_w.as_ptr()), Some(&bi), direntrybufferhandle)
+            };
+            if res.is_err() {
+                // バッファ満杯。index は進めず次回呼び出しで続きを返す。
+                break;
+            }
+            sess.index += 1;
         }
     }
 

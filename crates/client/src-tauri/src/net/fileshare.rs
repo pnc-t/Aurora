@@ -142,7 +142,7 @@ fn list_drives() -> Vec<FsEntry> {
 /// `all` を名前順に整列し `offset` から 1 ページ (最大 `LIST_PAGE` 件) 切り出す。
 fn paginate(mut all: Vec<FsEntry>, offset: u32) -> ListPage {
     // ページ境界の安定のため名前で整列 (host 側でも ProjFS 規約で再整列する)。
-    all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    all.sort_by_key(|a| a.name.to_lowercase());
     let total = all.len();
     let start = (offset as usize).min(total);
     let entries: Vec<FsEntry> = all.into_iter().skip(start).take(LIST_PAGE).collect();

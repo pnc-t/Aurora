@@ -111,10 +111,10 @@ impl FsBridge {
 
     /// net ループが返信受信時に呼ぶ。pending から相関 ID を引いて発火する。
     pub fn complete(&self, req_id: u64, reply: FsReply) {
-        if let Ok(mut map) = self.pending.lock() {
-            if let Some(tx) = map.remove(&req_id) {
-                let _ = tx.send(reply);
-            }
+        if let Ok(mut map) = self.pending.lock()
+            && let Some(tx) = map.remove(&req_id)
+        {
+            let _ = tx.send(reply);
         }
     }
 
@@ -152,12 +152,11 @@ impl FsBridge {
 
     /// 共有ルート相対 `path` のディレクトリ全体を取得する (ページングを集約 + 短期キャッシュ)。
     pub fn list_all(&self, path: &str) -> Result<Vec<FsEntry>, String> {
-        if let Ok(cache) = self.dir_cache.lock() {
-            if let Some((at, entries)) = cache.get(path) {
-                if at.elapsed() < DIR_CACHE_TTL {
-                    return Ok(entries.clone());
-                }
-            }
+        if let Ok(cache) = self.dir_cache.lock()
+            && let Some((at, entries)) = cache.get(path)
+            && at.elapsed() < DIR_CACHE_TTL
+        {
+            return Ok(entries.clone());
         }
 
         let mut all = Vec::new();
