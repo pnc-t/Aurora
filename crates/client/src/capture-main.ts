@@ -38,6 +38,7 @@ import { mountTabs, type TabsHandle } from "./ui/tabs";
 import { openConnectPicker } from "./ui/connect-dialog";
 import { initToast, showToast, type ToastKind } from "./ui/toast";
 import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./ui/stats-overlay";
+import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui/reconnect-badge";
 import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
 import { installWebviewGuard } from "./core/webview-guard";
 import { exitFullscreen, isFullscreen, toggleFullscreen } from "./core/fullscreen";
@@ -54,9 +55,11 @@ const filePanel = document.getElementById("file-panel") as HTMLElement;
 const toastContainer = document.getElementById("toast-container") as HTMLElement;
 const statusEl = document.getElementById("conn-status") as HTMLElement;
 const pickerBackdrop = document.getElementById("picker-backdrop") as HTMLElement;
+const reconnectBadgeEl = document.getElementById("reconnect-badge") as HTMLElement;
 
 initToast(toastContainer);
 initStatsOverlay(statsHud);
+initReconnectBadge(reconnectBadgeEl);
 mountFileTransfer(filePanel);
 
 // --- 設定 (ウィンドウ内の全タブで共有。capture には設定 UI がない) ---
@@ -186,6 +189,12 @@ const host: SessionHost = {
   },
   fileResult: (s, id, ok, message) => {
     if (activeId === s.id) handleFileResult(id, ok, message);
+  },
+  reconnectBadge: (s, text) => {
+    if (activeId === s.id) showReconnectBadge(text);
+  },
+  clearReconnectBadge: (s) => {
+    if (activeId === s.id) hideReconnectBadge();
   },
   refreshTab: (s) => tabs.update(s.id, s.tabLabel, s.tabStatus),
   removed: (s) => removeSession(s),

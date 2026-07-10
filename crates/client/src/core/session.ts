@@ -76,6 +76,10 @@ export interface SessionHost {
   clearStats(s: Session): void;
   /** ダウンロード結果を file パネルへ (アクティブ時のみ)。 */
   fileResult(s: Session, id: number, ok: boolean, message: string): void;
+  /** 静かな再接続中の常駐バッジを表示する (アクティブ時のみ)。最後の映像を隠さない。 */
+  reconnectBadge(s: Session, text: string): void;
+  /** 再接続バッジを消す (アクティブ時のみ)。 */
+  clearReconnectBadge(s: Session): void;
   /** タブの見た目 (ラベル/ドット) を更新するよう orchestrator へ通知。 */
   refreshTab(s: Session): void;
   /** このセッションが恒久終了した (ユーザー切断/接続不正)。タブ除去・最後なら窓を閉じる。 */
@@ -90,9 +94,12 @@ export interface SessionHost {
   persistVideoParams(fps: number, mbps: number): void;
 }
 
-const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+const RECONNECT_DELAYS_MS = [1000, 1000, 1000, 2000, 4000, 8000, 15000];
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_STABLE_MS = 6000;
+/** この試行回数までは全面オーバーレイを出さず、常駐バッジのみで再接続を試みる (最後の映像を
+ *  見せたまま静かに再接続する)。これを超えたら従来どおりの全面オーバーレイへ格上げする。 */
+const QUIET_RECONNECT_ATTEMPTS = 3;
 
 export class Session {
   readonly id: string;
@@ -141,6 +148,8 @@ export class Session {
   private reconnectAttempt = 0;
   private reconnectTimer: number | null = null;
   private stabilizeTimer: number | null = null;
+  // 静かな再接続バッジの直近テキスト ("" = 非表示中)。タブ切替での再同期 (syncSharedUi) に使う。
+  private reconnectBadgeText = "";
 
   // ホスト解像度の自動追従 (RDP 風)。
   private viewportTimer: number | null = null;
@@ -169,7 +178,19 @@ export class Session {
     this.input = new Input({
       sendInput: (ev) => void sendInput(this.id, ev).catch((e) => logger.warn("sendInput failed", e)),
     });
+    // OS の "online" イベント (Wi-Fi→有線切替等でネットワークが復帰した通知) を受けたら、
+    // 再接続待機中ならその場で待機をスキップして即試行する (delay 満了を待たない)。
+    window.addEventListener("online", this.onNetworkOnline);
   }
+
+  /** "online" イベントハンドラ (bound field: destroy 時に同じ参照で removeEventListener する)。 */
+  private onNetworkOnline = (): void => {
+    if (!this.reconnecting || this.reconnectTimer === null) return;
+    logger.info(`network online event; skipping reconnect wait: ${this.entry.host}`);
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    void this.attemptReconnect();
+  };
 
   // ---- ライフサイクル ----
 
@@ -216,6 +237,7 @@ export class Session {
 
   /** タブ除去/窓終了時の資源解放。 */
   destroy(): void {
+    window.removeEventListener("online", this.onNetworkOnline);
     this.cancelReconnect();
     if (this.viewportTimer !== null) {
       clearTimeout(this.viewportTimer);
@@ -254,6 +276,7 @@ export class Session {
    * 世代を進め、デタッチ後に旧 Channel へ遅れて届くイベント/映像を無視する。
    */
   detachForHandoff(): void {
+    window.removeEventListener("online", this.onNetworkOnline);
     this.disconnectHandled = true; // この窓ではもう切断イベントを扱わない
     this.cancelReconnect();
     if (this.viewportTimer !== null) {
@@ -349,6 +372,10 @@ export class Session {
   /** アクティブ化時に共有 UI を自分の状態へ揃える。 */
   syncSharedUi(): void {
     this.host.renderStatus(this);
+    // 静かな再接続バッジは全 Session で 1 つの DOM を共有するため、タブ切替のたびに
+    // 自分の状態 (表示中/非表示) へ揃え直す (他タブのバッジが残留/消失しないようにする)。
+    if (this.reconnectBadgeText) this.host.reconnectBadge(this, this.reconnectBadgeText);
+    else this.host.clearReconnectBadge(this);
     if (!this.connected) return;
     const tb = this.host.toolbar;
     // 別タブで切断が起きて toolbar が connected=false にされていても、健全なタブへ
@@ -527,7 +554,9 @@ export class Session {
 
   private onHostInfo(ev: Extract<ClientEvent, { kind: "host_info" }>): void {
     // markSessionEstablished は reconnecting を落とすので、再接続成立かどうかは先に拾う。
+    // currentDisplay もこの下で上書きされるため、復元用に切断前の選択を先に控える。
     const wasReconnecting = this.reconnecting;
+    const prevDisplay = this.currentDisplay;
     this.markSessionEstablished();
     this.connected = true;
     this.tabStatus = "connected";
@@ -544,6 +573,12 @@ export class Session {
       } else {
         this.host.toast(this, "仮想ディスプレイが見つかりません (ホストに VDD 未導入?)", "error");
       }
+    } else if (wasReconnecting && prevDisplay && !prevDisplay.is_virtual) {
+      // 再接続成立時、切断前に選んでいた物理ディスプレイが既定 (displays[0]) と異なる非デフォルト
+      // 選択なら復元する。仮想ディスプレイのテイクオーバーは上の use_virtual_display 分岐 (常設定
+      // ベース) が独立に担うため、ここは物理の非デフォルト選択のみを対象にする。
+      const restored = ev.displays.find((dd) => dd.id === prevDisplay.id && !dd.is_virtual);
+      if (restored && restored.id !== target?.id) target = restored;
     }
     this.currentDisplay = target ?? null;
     // 仮想ディスプレイ対象時、host はこの直後にテイクオーバー (物理→仮想切替、数秒) を行う。
@@ -674,6 +709,8 @@ export class Session {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.reconnectBadgeText = "";
+    this.host.clearReconnectBadge(this);
   }
 
   private markSessionEstablished(): void {
@@ -687,6 +724,8 @@ export class Session {
       this.stabilizeTimer = null;
       this.reconnectAttempt = 0;
     }, RECONNECT_STABLE_MS);
+    this.reconnectBadgeText = "";
+    this.host.clearReconnectBadge(this);
   }
 
   private startReconnect(): void {
@@ -698,12 +737,29 @@ export class Session {
   private scheduleReconnect(): void {
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     const delay = RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
-    this.setStatus(
-      `再接続待機 ${Math.round(delay / 1000)}s… (試行 ${this.reconnectAttempt + 1})`,
-      "connecting",
-      true,
-    );
+    const nextAttempt = this.reconnectAttempt + 1;
+    const text = `再接続待機 ${Math.round(delay / 1000)}s… (試行 ${nextAttempt})`;
+    this.showReconnectProgress(nextAttempt, text);
     this.reconnectTimer = window.setTimeout(() => void this.attemptReconnect(), delay);
+  }
+
+  /**
+   * 再接続の進行状況を表示する。試行 `QUIET_RECONNECT_ATTEMPTS` 回目までは最後の映像を隠さず
+   * 常駐バッジのみで知らせ (静かな再接続)、それ以降は従来どおりの全面オーバーレイへ格上げする。
+   * タブのドット (`tabStatus`) は常に "connecting" にする (バッジのみの間も実状態を反映する)。
+   */
+  private showReconnectProgress(attempt: number, text: string): void {
+    this.tabStatus = "connecting";
+    this.host.refreshTab(this);
+    if (attempt <= QUIET_RECONNECT_ATTEMPTS) {
+      if (this.status !== "hidden") this.setStatus("", "hidden");
+      this.reconnectBadgeText = text;
+      this.host.reconnectBadge(this, text);
+    } else {
+      this.reconnectBadgeText = "";
+      this.host.clearReconnectBadge(this);
+      this.setStatus(text, "connecting", true);
+    }
   }
 
   private async attemptReconnect(): Promise<void> {
@@ -718,8 +774,12 @@ export class Session {
     }
     this.reconnectAttempt++;
     logger.info(`reconnect attempt ${this.reconnectAttempt}: ${this.entry.host}`);
-    this.setStatus(`再接続中… (試行 ${this.reconnectAttempt})`, "connecting", true);
-    this.host.toast(this, `再接続を試行中… (${this.reconnectAttempt})`);
+    this.showReconnectProgress(this.reconnectAttempt, `再接続中… (試行 ${this.reconnectAttempt})`);
+    // 静かな再接続 (バッジのみ) の間はトーストも出さない。全面オーバーレイへ格上げしてから
+    // トーストで目立たせる (ユーザーが最後の映像を見失っていない前提が崩れたタイミング)。
+    if (this.reconnectAttempt > QUIET_RECONNECT_ATTEMPTS) {
+      this.host.toast(this, `再接続を試行中… (${this.reconnectAttempt})`);
+    }
     try {
       // password=null で保存済み (DPAPI) を使う。再保存不要なので save=false。
       await this.openSession(false);

@@ -113,6 +113,14 @@ pub async fn set_video_paused(
     paused: bool,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
+    // UDP 自己修復ウォッチドッグへ pause 状態を伝える。pause 中の意図的な無受信を
+    // ネットワーク途絶と誤検知しないようにする。
+    {
+        let guard = state.inner.lock().await;
+        if let Some(s) = guard.get(&session_id) {
+            s.udp_health.set_paused(paused);
+        }
+    }
     send_ctrl(&state, &session_id, ControlMsg::SetVideoPaused { paused }).await
 }
 

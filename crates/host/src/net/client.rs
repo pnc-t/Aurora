@@ -42,6 +42,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         conn_id,
         force_frame,
         tray_bus,
+        hello_registry,
     } = args;
     // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
     // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop) で
@@ -194,9 +195,15 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 任意の送信元が AURHELLO を送るだけで映像の宛先を奪える (正規クライアントを締め出す
     // ストリーム乗っ取り DoS)。さらに送信元 IP を詐称した単発 hello で、ホストが高ビットレート
     // 映像を被害者へ流し続けるリフレクション増幅にも悪用できる。bind が 0.0.0.0 で全 NIC
-    // 公開のため Tailnet 外からも到達しうる。IP 一致の要求でこの両方を遮断する。
-    let peer_udp = wait_udp_hello(&udp, peer.ip()).await?;
-    tracing::info!(peer_udp = %peer_udp, "UDP peer registered");
+    // 公開のため Tailnet 外からも到達しうる。IP 一致の要求でこの両方を遮断する
+    // (register_hello は expected_ip = 自分の TCP peer IP でのみ登録する)。
+    let mut hello_rx = register_hello(&hello_registry, peer.ip(), conn_id);
+    let peer_udp_first = wait_udp_hello(&mut hello_rx).await?;
+    tracing::info!(peer_udp = %peer_udp_first, "UDP peer registered");
+    // client 側の UDP 自己修復 (TCP 生存中の UDP 途絶検知 + AURHELLO 再送) に対応するため、
+    // 対向アドレスは固定値ではなく共有可変にする。再送 hello が同じ IP の別ポートから届いたら
+    // (NAT の UDP マッピング変更等) ここを更新し、映像/音声送信が新アドレス宛に切り替わる。
+    let peer_udp = std::sync::Arc::new(std::sync::Mutex::new(peer_udp_first));
     // ここまで来たら TCP 認証 + UDP 対向確定 = 接続確立。映像配信を開始する地点。
     tracing::info!("client connected");
     // tray へ確立を通知する (接続中バルーン + ツールチップ/メニューの「接続中」表示)。以降は
@@ -303,6 +310,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         let enc_tx = enc_tx.clone();
         let video_paused = video_paused.clone();
         let takeover_pending = takeover_pending.clone();
+        let peer_udp = peer_udp.clone();
         let mut nal_brx = nal_brx;
         tokio::spawn(async move {
             let mut seq: u32 = 0;
@@ -361,7 +369,8 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                             return;
                         }
                     };
-                    if let Err(e) = udp.send_to(&dgram, peer_udp).await {
+                    let addr = *peer_udp.lock().expect("peer_udp poisoned");
+                    if let Err(e) = udp.send_to(&dgram, addr).await {
                         tracing::warn!(error = %e, "video UDP send failed; ending video sender");
                         return;
                     }
@@ -753,7 +762,18 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     pkt.encode(&mut framed).context("encode AudioPacket")?;
                     let nonce = NONCE_DOMAIN_AUDIO | au.seq as u64;
                     let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed)?;
-                    udp.send_to(&dgram, peer_udp).await.context("UDP send audio")?;
+                    let addr = *peer_udp.lock().expect("peer_udp poisoned");
+                    udp.send_to(&dgram, addr).await.context("UDP send audio")?;
+                }
+            }
+            // client 側 UDP 自己修復の AURHELLO 再送 (TCP 生存中の UDP 途絶検知への対応)。
+            // 同じ IP からの再送で、NAT の UDP マッピング変更等により対向ポートが変わっていたら
+            // 更新する (変化が無ければ no-op)。
+            Some(new_addr) = hello_rx.recv() => {
+                let mut cur = peer_udp.lock().expect("peer_udp poisoned");
+                if *cur != new_addr {
+                    tracing::info!(old = %*cur, new = %new_addr, "UDP peer re-learned from AURHELLO resend");
+                    *cur = new_addr;
                 }
             }
         }
@@ -765,6 +785,8 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
     // 0) tray へ切断を通知する (切断バルーン + 接続数デクリメント)。確立時の on_connected と対。
     tray_bus.on_disconnected(peer_label);
+    // 0.5) AURHELLO 登録簿から自分の枠を外す (自分の conn_id のときだけ除去)。
+    unregister_hello(&hello_registry, peer.ip(), conn_id);
     // 1) stuck key 防止: 押下中のキー/マウスボタンへ解放イベントを注入する (クライアント毎)。
     let releases = held.release_events();
     if !releases.is_empty() {

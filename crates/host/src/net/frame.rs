@@ -21,34 +21,90 @@ pub(crate) fn encrypt_udp(
     Ok(dgram)
 }
 
-/// クライアントの UDP "AURHELLO" を待ち、対向アドレスを確定する。
+/// AURHELLO (初回 + client 自己修復の再送) を送信元 IP でセッションへ配るための登録簿。
+/// 値は (登録した接続の conn_id, 通知先チャネル)。UDP ソケットは全接続で共有のため、複数の
+/// セッションが個別に `recv_from` すると他セッション宛のパケットを横取りしうる。これを避け、
+/// 受信は [`spawn_hello_dispatcher`] の 1 タスクへ集約し、送信元 IP で該当セッションへ配る。
+pub(crate) type HelloRegistry =
+    Arc<std::sync::Mutex<HashMap<std::net::IpAddr, (u64, mpsc::UnboundedSender<SocketAddr>)>>>;
+
+/// この接続を `expected_ip` の hello 通知先として登録する。同一 IP の別接続 (複数タブ等) が
+/// 後から登録すると上書きされる (共有 UDP ソケットの構造上の既知の制約。既存の初回 hello 待ちも
+/// 同じ IP 曖昧性を持っていた)。
+pub(crate) fn register_hello(
+    registry: &HelloRegistry,
+    expected_ip: std::net::IpAddr,
+    conn_id: u64,
+) -> mpsc::UnboundedReceiver<SocketAddr> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    registry
+        .lock()
+        .expect("hello registry poisoned")
+        .insert(expected_ip, (conn_id, tx));
+    rx
+}
+
+/// セッション終了時に登録を外す。自分の登録 (conn_id が一致) のときだけ除去し、後から
+/// 同じ IP で登録し直した別接続の枠を誤って消さないようにする。
+pub(crate) fn unregister_hello(
+    registry: &HelloRegistry,
+    expected_ip: std::net::IpAddr,
+    conn_id: u64,
+) {
+    let mut g = registry.lock().expect("hello registry poisoned");
+    if g.get(&expected_ip).is_some_and(|(id, _)| *id == conn_id) {
+        g.remove(&expected_ip);
+    }
+}
+
+/// 全クライアント共有の UDP ソケットから "AURHELLO" を集約して読み、送信元 IP で登録済みの
+/// セッションへ配る。bind ごとに 1 つ起動し、rebind (ポート変更) 時は呼び出し側が abort する。
+pub(crate) fn spawn_hello_dispatcher(
+    udp: Arc<UdpSocket>,
+    registry: HelloRegistry,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, src) = match udp.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "UDP recv error (hello dispatcher) ignored");
+                    continue;
+                }
+            };
+            if &buf[..n] != b"AURHELLO" {
+                tracing::debug!(?src, n, "unexpected UDP probe");
+                continue;
+            }
+            let hit = registry
+                .lock()
+                .expect("hello registry poisoned")
+                .get(&src.ip())
+                .map(|(_, tx)| tx.clone());
+            match hit {
+                Some(tx) => {
+                    let _ = tx.send(src);
+                }
+                None => tracing::debug!(?src, "AURHELLO from unregistered source ignored"),
+            }
+        }
+    })
+}
+
+/// クライアントの UDP "AURHELLO" を待ち、対向アドレスを確定する (初回のみ)。
 ///
 /// hello は単発 UDP のためロスしうる。クライアントは映像受信が始まるまで再送するので、
-/// ここでは各受信に上限を設けるだけにし、長時間 hello が来なければ Err を返して
-/// セッションを諦める (無限ブロックで accept ループまで止めない安全弁)。
-///
-/// `expected_ip` はハンドシェイクを完了した TCP ピアの IP。これと一致する送信元からの
-/// hello のみ受理し、別 IP からの hello はストリーム乗っ取り/増幅の試みとして捨てる。
-/// Tailnet / LAN / localhost いずれも client の TCP と UDP は同一インターフェースから
-/// 出るため送信元 IP は一致する (ポートは異なってよい)。
+/// ここでは受信に上限を設けるだけにし、長時間 hello が来なければ Err を返してセッションを
+/// 諦める (無限ブロックで accept ループまで止めない安全弁)。送信元 IP の妥当性は
+/// [`spawn_hello_dispatcher`] が登録簿の IP 一致で担保する (ハンドシェイクを完了した TCP ピアの
+/// IP でのみ登録するため、別 IP からの hello はそもそもこの `rx` に届かない)。
 pub(crate) async fn wait_udp_hello(
-    udp: &UdpSocket,
-    expected_ip: std::net::IpAddr,
+    rx: &mut mpsc::UnboundedReceiver<SocketAddr>,
 ) -> Result<SocketAddr> {
     use std::time::Duration;
-    let mut buf = [0u8; 64];
-    loop {
-        let (n, src) = tokio::time::timeout(Duration::from_secs(30), udp.recv_from(&mut buf))
-            .await
-            .context("timed out waiting for UDP hello")??;
-        if &buf[..n] == b"AURHELLO" {
-            if src.ip() == expected_ip {
-                return Ok(src);
-            }
-            // TCP ピア以外からの hello は乗っ取り/増幅の疑い。受理せず待機を続ける。
-            tracing::warn!(?src, expected = %expected_ip, "rejected UDP hello from unexpected source");
-            continue;
-        }
-        tracing::debug!(?src, n, "unexpected UDP probe");
-    }
+    tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        .await
+        .context("timed out waiting for UDP hello")?
+        .ok_or_else(|| anyhow::anyhow!("hello registry channel closed"))
 }
