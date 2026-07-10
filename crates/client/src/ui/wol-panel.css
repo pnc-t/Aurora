@@ -59,7 +59,9 @@
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-.wol-card .wol-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+/* 編集/⋯/末尾枠の間隔は Hosts (host-card の gap: 14px) と揃える。
+ * WoL は actions を .wol-actions ラッパーに包む都合上ここで明示しないと Hosts とずれる。 */
+.wol-card .wol-actions { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
 
 /* アクションはアイコンのみ。Hosts の host-card .card-btn と同じ体裁に揃える
  * (WoL カードには専用スタイルが無く既定ボタン表示になっていたのを合わせる)。 */
