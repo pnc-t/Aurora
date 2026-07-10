@@ -18,11 +18,33 @@
   padding: 14px 16px; border-radius: 12px;
   background: var(--panel); border: 1px solid var(--panel-border);
 }
+/* Hosts の host-card と同じホバー挙動に揃える。 */
+.wol-card:hover { border-color: var(--card-hover-border); background: var(--raised-faint); }
 
-.wol-card .wol-avatar {
+/* アバター (頭文字 or 画像)。host-card .avatar と同じ体裁。 */
+.wol-card .avatar {
   width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 20px; color: var(--accent); background: var(--raised);
+  font-size: 18px; font-weight: 700; color: #fff;
+}
+.wol-card .avatar.avatar-img { background: var(--control); overflow: hidden; }
+.wol-card .avatar.avatar-img img { width: 100%; height: 100%; object-fit: cover; }
+
+/* 並べ替えグリップ (host-card .grip と同じ)。 */
+.wol-card .grip {
+  display: inline-flex; align-items: center; color: var(--grip);
+  font-size: 18px; cursor: grab; padding: 2px; margin-right: 2px; flex-shrink: 0;
+  touch-action: none;
+}
+.wol-card .grip svg { pointer-events: none; }
+.wol-card .grip:hover { color: var(--fg); }
+.wol-card .grip:active { cursor: grabbing; }
+/* ドラッグ中: 元カードは空きスロット、分身がカーソルに追従 (host-card と同じ)。 */
+.wol-card.drag-placeholder { opacity: 0; }
+.wol-card.drag-clone {
+  position: fixed; z-index: 70; margin: 0; pointer-events: none;
+  box-sizing: border-box; cursor: grabbing; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  border-color: var(--accent);
 }
 
 .wol-card .meta { flex: 1; min-width: 0; }
@@ -32,15 +54,30 @@
 .wol-card .meta .mac {
   font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px;
 }
-.wol-card .meta .relay,
 .wol-card .meta .link {
-  font-size: 12px; color: var(--muted); margin-top: 2px;
+  font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-.wol-card .wol-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-.wol-card .btn-secondary.accent { border-color: var(--accent); color: var(--accent); }
-.wol-card .btn-secondary.accent:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.wol-card .wol-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+
+/* アクションはアイコンのみ。Hosts の host-card .card-btn と同じ体裁に揃える
+ * (WoL カードには専用スタイルが無く既定ボタン表示になっていたのを合わせる)。 */
+.wol-card .card-btn {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 16px; padding: 6px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.wol-card .card-btn:hover { background: var(--menu-hover); color: var(--fg); }
+.wol-card .card-btn.danger { color: var(--danger); }
+.wol-card .card-btn.danger:hover { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
+/* 起こす系は主要アクションなので少し目立たせる。起こして接続 (accent) は稲妻+chevron。 */
+.wol-card .card-btn.wake { color: var(--fg); }
+.wol-card .card-btn.wake.accent { color: var(--accent); }
+.wol-card .card-btn.wake.accent:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.wol-card .card-btn.wake.accent .icon + .icon { margin-left: -3px; } /* 稲妻と chevron を1つの記号のように詰める */
+/* カード操作 (編集/⋯) と起動系アクションの間に薄い区切り。 */
+.wol-card .card-btn.wake-lead { margin-left: 6px; }
 
 /* 起こして接続中の進捗表示 (アクションボタン群と入れ替わりで表示)。
  * display:flex は UA の [hidden]{display:none} より優先されるため、hidden 時を明示的に消す
@@ -52,3 +89,5 @@
 .wol-card .wol-progress[hidden] { display: none; }
 .wol-card .wol-actions[hidden] { display: none; }
 .wol-card .wol-progress-text { white-space: nowrap; }
+/* 「起こす」送信完了フィードバック。 */
+.wol-card .wol-progress-text.done { color: var(--ok); font-weight: 600; }

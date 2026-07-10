@@ -12,6 +12,7 @@ import {
   savedPasswordHosts,
   probeHosts,
   saveWolTarget,
+  setWolTargets,
   wakeHost,
   type HostEntry,
   type WolTarget,
@@ -20,6 +21,7 @@ import { logger } from "../core/log";
 import { showToast } from "./toast";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
+import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
 import "./wol-panel.css";
 
 /** 接続実行コールバック (launcher の onConnect とシグネチャを揃える)。 */
@@ -38,7 +40,9 @@ const DEFAULT_RELAY_PORT = 7100;
 const DEFAULT_HOST_PORT = 7000;
 const MAC_RE = /^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$/;
 const POLL_STEP_MS = 3000;
-const POLL_MAX_MS = 90_000;
+// コールドブート→ログイン→ホスト常駐起動→Tailscale 復帰まで数分かかることがあるため長めに取る
+// (90 秒では起動が間に合わず接続できないことが実機で判明)。
+const POLL_MAX_MS = 240_000;
 
 /** MAC を ":" 区切り大文字へ正規化する。形式不正なら null。 */
 function normalizeMac(raw: string): string | null {
@@ -65,14 +69,18 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       </div>
     </div>
     <div class="wol-list" id="wol-list"></div>
+    <div id="wol-card-menu" class="card-menu"></div>
     <div id="wol-dialog-backdrop"></div>
   `;
 
   const listEl = root.querySelector<HTMLElement>("#wol-list") as HTMLElement;
   const backdrop = root.querySelector<HTMLElement>("#wol-dialog-backdrop") as HTMLElement;
+  const cardMenu = root.querySelector<HTMLElement>("#wol-card-menu") as HTMLElement;
   applyAriaLabels(root);
 
   const activePolls = new Map<string, PollState>();
+  // 現在表示中の並び (ドラッグ並べ替えの基準)。renderTargets で更新する。
+  let currentTargets: WolTarget[] = [];
 
   // --- ダイアログ共通 (追加/編集/削除確認/パスワード入力で使い回す) ---
   let releaseTrap: (() => void) | null = null;
@@ -101,19 +109,44 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       | undefined;
   }
 
-  function showProgress(card: HTMLElement, text: string): void {
+  /** カードのアクション行を進捗表示に差し替える。
+   *  cancel=false でキャンセルボタンを隠す (単発の「起こす」フィードバック用)。
+   *  done=true で完了色 (チェック) にする。 */
+  function showProgress(
+    card: HTMLElement,
+    text: string,
+    opts: { cancel?: boolean; done?: boolean } = {},
+  ): void {
+    const { cancel = true, done = false } = opts;
     const actions = card.querySelector<HTMLElement>(".wol-actions");
     const progress = card.querySelector<HTMLElement>(".wol-progress");
     const label = card.querySelector<HTMLElement>(".wol-progress-text");
+    const cancelBtn = card.querySelector<HTMLElement>(".wol-progress-cancel");
     if (actions) actions.hidden = true;
     if (progress) progress.hidden = false;
-    if (label) label.textContent = text;
+    if (cancelBtn) cancelBtn.hidden = !cancel;
+    if (label) {
+      label.textContent = text;
+      label.classList.toggle("done", done);
+    }
   }
   function hideProgress(card: HTMLElement): void {
     const actions = card.querySelector<HTMLElement>(".wol-actions");
     const progress = card.querySelector<HTMLElement>(".wol-progress");
+    const label = card.querySelector<HTMLElement>(".wol-progress-text");
     if (actions) actions.hidden = false;
     if (progress) progress.hidden = true;
+    if (label) label.classList.remove("done");
+  }
+  /** 「起こす」成功時の一時フィードバック。数秒後、ポーリング中でなければ元へ戻す。 */
+  function flashWakeSent(id: string): void {
+    const card = findCard(id);
+    if (card) showProgress(card, "✓ 起動信号を送信しました", { cancel: false, done: true });
+    window.setTimeout(() => {
+      if (activePolls.has(id)) return; // 起こして接続の進捗を消さない
+      const cur = findCard(id);
+      if (cur) hideProgress(cur);
+    }, 4000);
   }
   function stopPoll(id: string): void {
     const p = activePolls.get(id);
@@ -122,7 +155,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     activePolls.delete(id);
   }
 
-  /** 起こして接続の到達性ポーリングを開始する (3 秒間隔・最大 90 秒)。 */
+  /** 起こして接続の到達性ポーリングを開始する (3 秒間隔・最大 4 分)。 */
   function beginPoll(t: WolTarget, host: string, port: number, card: HTMLElement): void {
     stopPoll(t.id);
     const state: PollState = { intervalId: 0, elapsedMs: 0 };
@@ -180,7 +213,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
         <div class="dlg-status" id="wp-status"></div>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="wp-cancel">cancel</button>
-          <button type="submit" class="btn-primary" id="wp-ok">起こす</button>
+          <button type="submit" class="btn-primary" id="wp-ok">起動</button>
         </div>
       </form>
     `;
@@ -223,23 +256,28 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
           }
           if (okBtn) {
             okBtn.disabled = false;
-            okBtn.textContent = "起こす";
+            okBtn.textContent = "起動";
           }
         });
     });
   }
 
-  /** 「起こす」ボタン。パスワード未保存エラーならダイアログへフォールバックする。 */
-  async function handleWake(t: WolTarget): Promise<void> {
+  /** 「起こす」ボタン。送信中/送信済みをカード上に明示する。
+   *  パスワード未保存エラーならダイアログへフォールバックする。 */
+  async function handleWake(t: WolTarget, card: HTMLElement): Promise<void> {
+    if (activePolls.has(t.id)) return; // 起こして接続の進捗表示中は触らない
+    showProgress(card, "起動信号を送信中…", { cancel: false });
     try {
       await wakeHost(t.relay_host, t.relay_port, null, false, t.mac);
       showToast("マジックパケットを送信しました", "success");
+      flashWakeSent(t.id);
     } catch (err) {
       const msg = String(err);
+      hideProgress(card);
       if (looksLikePasswordError(msg)) {
-        openWakePasswordDialog(t);
+        openWakePasswordDialog(t, () => flashWakeSent(t.id));
       } else {
-        showToast(`起こす操作に失敗しました: ${msg}`, "error");
+        showToast(`起動操作に失敗しました: ${msg}`, "error");
       }
     }
   }
@@ -268,7 +306,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       if (looksLikePasswordError(msg)) {
         openWakePasswordDialog(t, () => beginPoll(t, host, port, card));
       } else {
-        showToast(`起こす操作に失敗しました: ${msg}`, "error");
+        showToast(`起動操作に失敗しました: ${msg}`, "error");
       }
     }
   }
@@ -294,6 +332,93 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     });
   }
 
+  // --- カードの ⋯ メニュー (削除) ---
+  function closeCardMenu(): void {
+    cardMenu.classList.remove("visible");
+    cardMenu.innerHTML = "";
+  }
+  /** ⋯ ボタンの下にメニューを開く (Hosts と同じ挙動)。現状は削除のみ。 */
+  function openCardMenu(anchor: HTMLElement, t: WolTarget): void {
+    cardMenu.innerHTML = `<button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>`;
+    cardMenu.classList.add("visible");
+    // 表示してから幅を測り、ボタン右端に揃えて配置する。
+    const r = anchor.getBoundingClientRect();
+    cardMenu.style.top = `${r.bottom + 4}px`;
+    cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      openConfirmDialog(`「${t.label || t.mac}」を一覧から削除しますか?`, async () => {
+        stopPoll(t.id);
+        await deleteWolTarget(t.id);
+        await refresh();
+      });
+    });
+    applyAriaLabels(cardMenu);
+  }
+  // メニュー外クリック / スクロール / Esc で閉じる。
+  document.addEventListener("click", () => closeCardMenu());
+  listEl.addEventListener("scroll", () => closeCardMenu());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeCardMenu();
+  });
+
+  // --- 並べ替え (grip を掴んでドラッグ、Hosts と同じ pointer 実装) ---
+  /** from の要素を to の位置へ移動し、保存して再描画する。 */
+  function reorder(from: number, to: number): void {
+    if (from === to || from < 0 || to < 0) return;
+    const arr = [...currentTargets];
+    const [moved] = arr.splice(from, 1);
+    arr.splice(to, 0, moved);
+    currentTargets = arr;
+    renderTargets(arr);
+    void setWolTargets(arr).catch((e) => logger.warn("reorder wol targets failed", e));
+  }
+  /** 掴んだカードの分身がカーソルに追従し、元カードは空きスロットとして間を移動する。 */
+  function startDrag(from: number, downEvent: PointerEvent, card: HTMLElement): void {
+    const rect = card.getBoundingClientRect();
+    const offsetY = downEvent.clientY - rect.top;
+    let targetPos = from;
+
+    const clone = card.cloneNode(true) as HTMLElement;
+    clone.classList.add("drag-clone");
+    clone.style.width = `${rect.width}px`;
+    clone.style.left = `${rect.left}px`;
+    clone.style.top = `${rect.top}px`;
+    root.appendChild(clone);
+    card.classList.add("drag-placeholder");
+
+    const onMove = (ev: PointerEvent): void => {
+      const listRect = listEl.getBoundingClientRect();
+      const desiredTop = ev.clientY - offsetY;
+      const maxTop = Math.max(listRect.top, listRect.bottom - rect.height);
+      const top = Math.min(Math.max(desiredTop, listRect.top), maxTop);
+      clone.style.top = `${top}px`;
+      const others = Array.from(listEl.querySelectorAll<HTMLElement>(".wol-card")).filter(
+        (c) => c !== card,
+      );
+      let pos = others.length;
+      for (let i = 0; i < others.length; i++) {
+        const r = others[i].getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) {
+          pos = i;
+          break;
+        }
+      }
+      targetPos = pos;
+      if (pos >= others.length) listEl.appendChild(card);
+      else listEl.insertBefore(card, others[pos]);
+    };
+    const onUp = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      clone.remove();
+      card.classList.remove("drag-placeholder");
+      reorder(from, targetPos);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   /** 追加/編集ダイアログ。target=null で新規。 */
   function openTargetDialog(target: WolTarget | null): void {
     const isAdd = target === null;
@@ -309,13 +434,23 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       backdrop.innerHTML = `
         <form class="dialog" autocomplete="off">
           <h3>${isAdd ? "WoL 先を追加" : "WoL 先を編集"}</h3>
+          <div class="icon-picker">
+            <div class="icon-preview" id="w-icon-preview"></div>
+            <div class="icon-picker-actions">
+              <button type="button" class="btn-secondary" id="w-icon-pick">画像を選択</button>
+              <button type="button" class="btn-ghost" id="w-icon-clear">解除</button>
+            </div>
+            <input type="file" id="w-icon-file" accept="image/*" hidden />
+          </div>
           <label>表示名 (任意)<input id="w-label" type="text" placeholder="home-pc" /></label>
           <label>登録済みホストから選ぶ
             <select id="w-host" class="select-input"><option value="">(紐付けなし・手動)</option></select>
           </label>
           <label>MAC アドレス<input id="w-mac" type="text" placeholder="AA:BB:CC:DD:EE:FF" required /></label>
-          <label>中継先 (raspi) host<input id="w-relay-host" type="text" placeholder="100.x.x.x" required /></label>
-          <label>中継先 port<input id="w-relay-port" type="text" inputmode="numeric" /></label>
+          <div class="dlg-row">
+            <label>中継先 (raspi) host<input id="w-relay-host" type="text" placeholder="100.x.x.x" required /></label>
+            <label class="port">port<input id="w-relay-port" type="text" inputmode="numeric" /></label>
+          </div>
           <div class="dlg-sub">中継先のパスワード (初回のみ・以降は空欄で保存済みを使用)</div>
           <label>password
             <span class="pass-wrap">
@@ -371,6 +506,52 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
         passInput.focus();
       });
 
+      // --- アイコン (画像) 選択 ---
+      // 画像未設定なら label/mac 由来の頭文字アバターをプレビューに出し、選択中は画像を出す。
+      let currentIcon = target?.icon ?? "";
+      const preview = backdrop.querySelector<HTMLElement>("#w-icon-preview");
+      const fileInput = backdrop.querySelector<HTMLInputElement>("#w-icon-file");
+      const clearBtn = backdrop.querySelector<HTMLButtonElement>("#w-icon-clear");
+      function renderIconPreview(): void {
+        if (!preview) return;
+        if (hasImageIcon(currentIcon)) {
+          preview.style.background = "";
+          const img = document.createElement("img");
+          img.src = currentIcon; // 自前生成の data URL
+          img.alt = "";
+          img.draggable = false;
+          preview.replaceChildren(img);
+        } else {
+          const nm = labelInput?.value.trim() || macInput?.value.trim() || "?";
+          preview.style.background = avatarColor(nm);
+          preview.textContent = (nm[0] ?? "?").toUpperCase();
+        }
+        if (clearBtn) clearBtn.style.display = currentIcon ? "" : "none";
+      }
+      renderIconPreview();
+      labelInput?.addEventListener("input", () => {
+        if (!hasImageIcon(currentIcon)) renderIconPreview();
+      });
+      macInput?.addEventListener("input", () => {
+        if (!hasImageIcon(currentIcon)) renderIconPreview();
+      });
+      backdrop.querySelector("#w-icon-pick")?.addEventListener("click", () => fileInput?.click());
+      fileInput?.addEventListener("change", () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = ""; // 同じファイルを選び直しても change が出るようリセット
+        if (!file) return;
+        void imageToIconDataUrl(file)
+          .then((url) => {
+            currentIcon = url;
+            renderIconPreview();
+          })
+          .catch((err) => logger.warn("icon load failed", err));
+      });
+      clearBtn?.addEventListener("click", () => {
+        currentIcon = "";
+        renderIconPreview();
+      });
+
       backdrop.querySelector<HTMLInputElement>("#w-mac")?.focus();
       backdrop.querySelector("#w-cancel")?.addEventListener("click", closeDialog);
       backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
@@ -397,6 +578,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
           relay_port: relayPort,
           host: linked ? linked.host : null,
           port: linked ? linked.port : null,
+          icon: currentIcon || null,
         };
         void (async () => {
           await saveWolTarget(saved);
@@ -407,7 +589,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
               await wakeHost(relayHost, relayPort, password, save, macNorm);
               showToast("マジックパケットを送信しました", "success");
             } catch (err) {
-              showToast(`起こす操作に失敗しました: ${String(err)}`, "error");
+              showToast(`起動操作に失敗しました: ${String(err)}`, "error");
             }
           }
           closeDialog();
@@ -424,6 +606,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   }
 
   function renderTargets(targets: WolTarget[]): void {
+    currentTargets = targets;
     listEl.replaceChildren();
     if (targets.length === 0) {
       const empty = document.createElement("div");
@@ -432,31 +615,53 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       listEl.appendChild(empty);
       return;
     }
-    for (const t of targets) {
+    targets.forEach((t, idx) => {
       const card = document.createElement("div");
       card.className = "wol-card";
       card.dataset.id = t.id;
 
+      // 並べ替えグリップ (Hosts と同じ)。
+      const grip = document.createElement("span");
+      grip.className = "grip";
+      grip.title = "ドラッグで並べ替え";
+      grip.innerHTML = icon("grip");
+      grip.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        closeCardMenu();
+        startDrag(idx, e, card);
+      });
+
+      const name = t.label || t.mac;
+      // 画像アイコンがあれば img、無ければ頭文字 + 自動生成色 (Hosts と共通)。
       const avatar = document.createElement("div");
-      avatar.className = "wol-avatar";
-      avatar.innerHTML = icon("bolt");
+      if (hasImageIcon(t.icon)) {
+        avatar.className = "avatar avatar-img";
+        const img = document.createElement("img");
+        img.src = t.icon; // 自前生成の data URL
+        img.alt = "";
+        img.draggable = false;
+        avatar.appendChild(img);
+      } else {
+        avatar.className = "avatar";
+        avatar.style.background = avatarColor(name);
+        avatar.textContent = (name[0] ?? "?").toUpperCase();
+      }
 
       const meta = document.createElement("div");
       meta.className = "meta";
       const labelEl = document.createElement("div");
       labelEl.className = "label";
-      labelEl.textContent = t.label || t.mac;
+      labelEl.textContent = name;
       const macEl = document.createElement("div");
       macEl.className = "mac";
       macEl.textContent = t.mac;
-      const relayEl = document.createElement("div");
-      relayEl.className = "relay";
-      relayEl.textContent = `中継: ${t.relay_host}:${t.relay_port}`;
-      meta.append(labelEl, macEl, relayEl);
+      meta.append(labelEl, macEl);
+      // 紐付けホストがあれば接続先を控えめに出す (中継先はカードには出さず編集ダイアログで確認)。
       if (t.host) {
         const linkEl = document.createElement("div");
         linkEl.className = "link";
-        linkEl.textContent = `紐付け: ${t.host}:${t.port ?? DEFAULT_HOST_PORT}`;
+        linkEl.textContent = `→ ${t.host}:${t.port ?? DEFAULT_HOST_PORT}`;
         meta.appendChild(linkEl);
       }
 
@@ -477,45 +682,48 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
 
       const actions = document.createElement("div");
       actions.className = "wol-actions";
-      const wakeBtn = document.createElement("button");
-      wakeBtn.type = "button";
-      wakeBtn.className = "btn-secondary";
-      wakeBtn.textContent = "起こす";
-      wakeBtn.addEventListener("click", () => void handleWake(t));
-      actions.appendChild(wakeBtn);
-      if (t.host) {
-        const wakeConnectBtn = document.createElement("button");
-        wakeConnectBtn.type = "button";
-        wakeConnectBtn.className = "btn-secondary accent";
-        wakeConnectBtn.textContent = "起こして接続";
-        wakeConnectBtn.addEventListener("click", () => void handleWakeAndConnect(t, card));
-        actions.appendChild(wakeConnectBtn);
-      }
+      // Hosts のカードと並びを揃える: 左から 編集 / ⋯ メニュー / 主アクション(起動系) を右端に置く
+      // (Hosts は 編集 / ⋯ / chevron=接続 の順。起動して接続 (⚡+chevron) が chevron の相当)。
       const editBtn = document.createElement("button");
+      editBtn.type = "button";
       editBtn.className = "card-btn";
       editBtn.title = "編集";
       editBtn.innerHTML = icon("edit");
       editBtn.addEventListener("click", () => openTargetDialog(t));
-      const delBtn = document.createElement("button");
-      delBtn.className = "card-btn danger";
-      delBtn.title = "削除";
-      delBtn.innerHTML = icon("delete");
-      delBtn.addEventListener("click", () => {
-        openConfirmDialog(`「${t.label || t.mac}」を一覧から削除しますか?`, async () => {
-          stopPoll(t.id);
-          await deleteWolTarget(t.id);
-          await refresh();
-        });
+      const menuBtn = document.createElement("button");
+      menuBtn.type = "button";
+      menuBtn.className = "card-btn";
+      menuBtn.title = "メニュー";
+      menuBtn.innerHTML = icon("more");
+      menuBtn.addEventListener("click", (e) => {
+        e.stopPropagation(); // document の閉じるハンドラより先に開かないようにする
+        openCardMenu(menuBtn, t);
       });
-      actions.append(editBtn, delBtn);
+      // 稲妻 = 起動。稲妻 + chevron = 起動して接続。ラベルは title に残し applyAriaLabels が aria へ写す。
+      const wakeBtn = document.createElement("button");
+      wakeBtn.type = "button";
+      wakeBtn.className = "card-btn wake wake-lead";
+      wakeBtn.title = "起動";
+      wakeBtn.innerHTML = icon("bolt");
+      wakeBtn.addEventListener("click", () => void handleWake(t, card));
+      actions.append(editBtn, menuBtn, wakeBtn);
+      if (t.host) {
+        const wakeConnectBtn = document.createElement("button");
+        wakeConnectBtn.type = "button";
+        wakeConnectBtn.className = "card-btn wake accent";
+        wakeConnectBtn.title = "起動して接続";
+        wakeConnectBtn.innerHTML = icon("bolt") + icon("chevron");
+        wakeConnectBtn.addEventListener("click", () => void handleWakeAndConnect(t, card));
+        actions.append(wakeConnectBtn);
+      }
 
-      card.append(avatar, meta, progress, actions);
+      card.append(grip, avatar, meta, progress, actions);
       listEl.appendChild(card);
 
       // ポーリング継続中に再描画された行 (別カードの追加/削除操作等) は進捗表示を復元する。
       const poll = activePolls.get(t.id);
       if (poll) showProgress(card, `起動待ち… ${Math.round(poll.elapsedMs / 1000)}s`);
-    }
+    });
     applyAriaLabels(listEl);
   }
 
