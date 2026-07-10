@@ -21,3 +21,6 @@ installer/dist/
 # VDD ドライバファイル (build.ps1 がビルド時にコピー、バイナリなので git 管理しない)
 installer/host/vdd/
 
+# フロントの目視確認ハーネス (Tauri なしでブラウザ検証する一時ページ。コミットしない)
+crates/client/src/dev-*.ts
+crates/client/src/dev-*.html
