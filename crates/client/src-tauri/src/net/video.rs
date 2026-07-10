@@ -265,6 +265,7 @@ impl RecvJitterMeter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn udp_reader_loop(
     udp: Arc<UdpSocket>,
     session: Arc<TransportSession>,
@@ -272,6 +273,8 @@ pub(crate) async fn udp_reader_loop(
     audio_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     stats: Arc<StatsCollector>,
     keyframe_tx: mpsc::UnboundedSender<ControlMsg>,
+    session_start: Instant,
+    udp_health: Arc<UdpHealth>,
 ) -> anyhow::Result<()> {
     let mut recv_buf = vec![0u8; 2048];
     let mut plain = Vec::new();
@@ -348,6 +351,9 @@ pub(crate) async fn udp_reader_loop(
             Some(x) => x,
             None => continue,
         };
+
+        // UDP 自己修復ウォッチドッグの基準時刻を更新 (映像/音声どちらの受信でもよい)。
+        udp_health.mark_recv(session_start.elapsed().as_millis() as u64);
 
         if tag == STREAM_AUDIO {
             if let Some(tx) = &audio_tx {

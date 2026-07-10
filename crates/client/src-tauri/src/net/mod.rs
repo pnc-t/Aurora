@@ -190,6 +190,43 @@ pub struct SessionHandle {
     /// webview)。1 ウィンドウに複数タブ (セッション) がぶら下がるため、ウィンドウ破棄時に
     /// このラベルを持つ全セッションをまとめて停止する (タブの取りこぼし防止)。
     pub window_label: String,
+    /// UDP 映像/音声受信の自己修復 (途絶検知 + AURHELLO 再送) に使う共有状態。
+    /// `set_video_paused` が pause フラグを更新し、udp watchdog タスクが無受信を見張る。
+    pub udp_health: Arc<UdpHealth>,
+}
+
+/// UDP 映像/音声受信の自己修復に使う共有状態。TCP は生きている (Pong 到達中) のに UDP だけ
+/// 途絶するケース (NAT の UDP マッピング切替等) を検知し、AURHELLO 再送 + キーフレーム要求で
+/// 回復を試みる。非アクティブタブの意図的な一時停止 (`SetVideoPaused`) 中は無受信が正常なので、
+/// `paused` が立っている間は途絶とみなさない。
+pub(crate) struct UdpHealth {
+    /// 最後に映像/音声パケットを受信した時刻 (session_start からの経過 ms)。
+    last_recv_ms: AtomicU64,
+    /// クライアントが映像を pause 中 (非アクティブタブ) か。
+    paused: std::sync::atomic::AtomicBool,
+}
+
+impl UdpHealth {
+    fn new() -> Self {
+        Self {
+            last_recv_ms: AtomicU64::new(0),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    /// 映像/音声パケットを 1 個受信した (session_start からの経過 ms で記録)。
+    pub(crate) fn mark_recv(&self, now_ms: u64) {
+        self.last_recv_ms.store(now_ms, Ordering::Relaxed);
+    }
+    /// 最後の受信からの経過 (ms)。
+    fn elapsed_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.last_recv_ms.load(Ordering::Relaxed))
+    }
+    pub(crate) fn set_paused(&self, p: bool) {
+        self.paused.store(p, Ordering::Relaxed);
+    }
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
 }
 
 impl SessionHandle {

@@ -44,7 +44,10 @@ pub(crate) use bitrate::BitrateController;
 pub use bitrate::{EncoderCommand, InputCmd};
 pub(crate) use client::handle_client;
 pub(crate) use files::{UploadState, open_upload, stream_file_to_client};
-pub(crate) use frame::{encrypt_udp, wait_udp_hello};
+pub(crate) use frame::{
+    HelloRegistry, encrypt_udp, register_hello, spawn_hello_dispatcher, unregister_hello,
+    wait_udp_hello,
+};
 
 /// 接続ごとの相関 ID 採番カウンタ。ログの `conn` span に載せ、クライアント側の
 /// session_id と peer/時刻で突き合わせて 1 接続を端から端まで追跡できるようにする。
@@ -341,6 +344,8 @@ pub(crate) struct ClientArgs {
     force_frame: Arc<std::sync::atomic::AtomicBool>,
     /// net→tray の実行時ステータス/通知バス ([`ServerConfig`])。
     tray_bus: Arc<crate::tray::TrayBus>,
+    /// AURHELLO (初回 + client 自己修復の再送) を配る登録簿。bind サイクルごとに 1 つ。
+    hello_registry: HelloRegistry,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -472,6 +477,12 @@ pub async fn run_server(
         let (tcp, udp) = bind_listeners(addr).await?;
         tracing::info!(tcp = %addr, udp = %addr, max_clients = MAX_CLIENTS, "host listening");
 
+        // AURHELLO (初回 + client 自己修復の再送) の集約受信タスク。共有 UDP ソケットは bind
+        // ごとに作り直すため、登録簿ごと bind サイクルに閉じる (rebind は接続 0 のときだけ起きる
+        // ので、跨いで引き継ぐ状態は無い)。
+        let hello_registry: HelloRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let hello_task = spawn_hello_dispatcher(udp.clone(), hello_registry.clone());
+
         // 内側ループ: 接続受理。reload が来たら break して外側で貼り直す。ポート変更は接続中
         // (= 接続数 ≥ 1) には tray 側で拒否されるため、reload はセッション間 (idle) でのみ届く。
         loop {
@@ -479,6 +490,7 @@ pub async fn run_server(
                 accepted = tcp.accept() => accepted?,
                 _ = cfg.reload.notified() => {
                     tracing::info!(new_port = cfg.port.load(Ordering::Relaxed), "port change requested; rebinding");
+                    hello_task.abort();
                     break;
                 }
             };
@@ -519,6 +531,7 @@ pub async fn run_server(
                 conn_id,
                 force_frame: cfg.force_frame.clone(),
                 tray_bus: cfg.tray_bus.clone(),
+                hello_registry: hello_registry.clone(),
             };
             // 各接続を独立 task で処理する (await で占有しない = 複数クライアント同時)。
             tokio::spawn(

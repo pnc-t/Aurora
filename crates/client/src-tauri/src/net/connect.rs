@@ -1,6 +1,11 @@
 //! TCP 制御チャネルの確立とループ (connect/handshake, TCP 読み書き, hs_io)。
 use super::*;
 
+/// 「最後に Pong を受信してから何 ms 経ったか」で無言のネットワーク断 (Wi-Fi→有線切替等で
+/// TCP が無言停滞するケース) を検知するまでの猶予。OS の再送タイムアウト (数十秒) を待たず、
+/// 数秒でユーザーへ気付かせて自動再接続へ渡す。
+const PONG_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// ハンドシェイク I/O を `CONNECT_TIMEOUT` で包む。タイムアウト/失敗を String に正規化する。
 async fn hs_io(fut: impl std::future::Future<Output = std::io::Result<()>>) -> Result<(), String> {
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
@@ -209,6 +214,11 @@ async fn connect_inner(
     // 受信品質メトリクス。Ping の基準時刻と共有して RTT を算出する。
     let stats = StatsCollector::new();
     let session_start = Instant::now();
+    // 最後に Pong を受信した時刻 (session_start からの経過 ms)。0 = 未受信 (接続直後扱い)。
+    // watchdog task が定期的にこれを見て、無言のネットワーク断 (PONG_TIMEOUT 超過) を検知する。
+    let last_pong_ms = Arc::new(AtomicU64::new(0));
+    // UDP 映像/音声受信の自己修復に使う共有状態 (途絶検知 + AURHELLO 再送)。
+    let udp_health = Arc::new(UdpHealth::new());
 
     let sink_w = sink.clone();
     let sess_w = session.clone();
@@ -234,6 +244,7 @@ async fn connect_inner(
     // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
+    let last_pong_for_reader = last_pong_ms.clone();
     let reader_task = tokio::spawn(
         async move {
             let res = tcp_reader_loop(
@@ -246,6 +257,7 @@ async fn connect_inner(
                 fs_reply_tx,
                 share_scope_for_reader,
                 pending_for_reader,
+                last_pong_for_reader,
             )
             .await;
             let reason = match res {
@@ -273,10 +285,23 @@ async fn connect_inner(
     let sink_u = sink.clone();
     // ロス検出時にキーフレームを要求して映像を即時回復させるための送信口。
     let keyframe_tx = ctrl_tx.clone();
+    let udp_health_for_reader = udp_health.clone();
+    // AURHELLO 再送 (self-heal watchdog) 用にソケットの clone を先に取っておく (udp 本体は
+    // reader ループへ move する)。
+    let udp_for_resend = udp.clone();
     let udp_task = tokio::spawn(
         async move {
-            if let Err(e) =
-                udp_reader_loop(udp, sess_u, sink_u, audio_tx, stats_for_udp, keyframe_tx).await
+            if let Err(e) = udp_reader_loop(
+                udp,
+                sess_u,
+                sink_u,
+                audio_tx,
+                stats_for_udp,
+                keyframe_tx,
+                session_start,
+                udp_health_for_reader,
+            )
+            .await
             {
                 tracing::warn!(error = %e, "UDP reader ended");
             }
@@ -304,6 +329,56 @@ async fn connect_inner(
             let ts_us = session_start.elapsed().as_micros() as u64;
             if ctrl_for_ping.send(ControlMsg::Ping { ts_us }).is_err() {
                 break;
+            }
+        }
+    });
+
+    // Pong ウォッチドッグ (1 秒間隔)。TCP の read/write エラーだけでは、Wi-Fi→有線切替等で
+    // ソケットが無言停滞するケース (OS の再送タイムアウトまで数十秒かかる) を検知できない。
+    // 最後の Pong 受信から PONG_TIMEOUT を超えたら切断とみなし、既存の Disconnected 経路
+    // (自動再接続) に載せる。
+    let sink_watchdog = sink.clone();
+    let last_pong_for_watchdog = last_pong_ms.clone();
+    let pong_watchdog_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now_ms = session_start.elapsed().as_millis() as u64;
+            let last_ms = last_pong_for_watchdog.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_ms) > PONG_TIMEOUT.as_millis() as u64 {
+                tracing::warn!(
+                    timeout_s = PONG_TIMEOUT.as_secs(),
+                    "no pong received; treating as disconnected (network stall?)"
+                );
+                sink_watchdog.send_event(ClientEvent::Disconnected {
+                    reason: "no pong for 5s (network stall?)".into(),
+                });
+                break;
+            }
+        }
+    });
+
+    // UDP 途絶の自己修復ウォッチドッグ (3 秒間隔)。TCP は生きている (Pong 到達中) のに映像/音声
+    // UDP パケットだけ届かなくなるケース (NAT の UDP マッピング切替等) を検知し、AURHELLO 再送 +
+    // キーフレーム要求で回復を試みる。非アクティブタブの意図的な一時停止 (SetVideoPaused) 中は
+    // 無受信が正常なので発動しない。回復するまでこの間隔で繰り返す。
+    const UDP_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+    let udp_health_for_watchdog = udp_health.clone();
+    let keyframe_tx_for_udp_watchdog = ctrl_tx.clone();
+    let udp_watchdog_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(UDP_STALL_TIMEOUT);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if udp_health_for_watchdog.is_paused() {
+                continue;
+            }
+            let now_ms = session_start.elapsed().as_millis() as u64;
+            if udp_health_for_watchdog.elapsed_ms(now_ms) >= UDP_STALL_TIMEOUT.as_millis() as u64 {
+                tracing::warn!("no UDP video/audio for 3s while TCP alive; resending AURHELLO");
+                let _ = udp_for_resend.send(b"AURHELLO").await;
+                let _ = keyframe_tx_for_udp_watchdog.send(ControlMsg::RequestKeyframe);
             }
         }
     });
@@ -346,12 +421,15 @@ async fn connect_inner(
             ping_task,
             stats_task,
             clip_forward_task,
+            pong_watchdog_task,
+            udp_watchdog_task,
         ],
         clipboard: clip_handle,
         audio: audio_player,
         pending_downloads,
         share_scope,
         window_label: window.label().to_string(),
+        udp_health,
     };
     {
         let mut guard = state.inner.lock().await;
@@ -411,6 +489,7 @@ async fn tcp_reader_loop(
     fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
     share_scope: Arc<Mutex<ShareScope>>,
     pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
+    last_pong_ms: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     let mut plain = Vec::new();
@@ -426,6 +505,8 @@ async fn tcp_reader_loop(
                 let now_us = session_start.elapsed().as_micros() as u64;
                 let rtt_us = now_us.saturating_sub(ts_us);
                 stats.set_rtt_us(rtt_us.min(u32::MAX as u64) as u32);
+                // pong watchdog (無言のネットワーク断検知) の基準時刻を更新する。
+                last_pong_ms.store(now_us / 1000, Ordering::Relaxed);
                 sink.send_event(ClientEvent::Pong {
                     rtt_us: rtt_us as i64,
                 });

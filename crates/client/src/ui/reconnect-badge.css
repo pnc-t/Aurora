@@ -1,0 +1,17 @@
+/* 静かな再接続の常駐バッジ (reconnect-badge.ts)。左下、既定非表示。 */
+
+#reconnect-badge {
+  position: fixed; bottom: 12px; left: 12px; z-index: 30;
+  display: none;
+  padding: 6px 12px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6); color: #fff;
+  border: 1px solid var(--panel-border, rgba(255, 255, 255, 0.2));
+  font: 500 13px system-ui, sans-serif;
+  pointer-events: none;
+}
+#reconnect-badge.visible { display: block; }
+
+/* タブストリップ (不透明・最前面) と重なる配置ではその厚み分だけ逃がす (toast.css と同じパターン)。
+ * フルスクリーン中は帯が消えるので寄せない。 */
+body.tab-bottom:not(.tab-fs) #reconnect-badge { bottom: calc(var(--tabstrip-h, 37px) + 12px); }
+body.tab-left:not(.tab-fs) #reconnect-badge { left: calc(var(--tabstrip-w, 200px) + 12px); }
