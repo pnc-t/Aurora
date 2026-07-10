@@ -870,7 +870,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             </div>
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
-            ${tailBtn}
+            <div class="card-tail">${tailBtn}</div>
           </div>`;
       })
       .join("");

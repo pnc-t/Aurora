@@ -128,11 +128,15 @@
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--accent); font-size: 14px; flex-shrink: 0; opacity: 0.85;
 }
-/* 末尾の chevron は card-btn (切断ボタン) と同じ箱サイズ (20px 字 + 4px padding = 28px) にして、
- * 接続中 (切断ボタン) と非接続 (chevron) で末尾幅を揃える (でないと 編集/⋯ が横にずれる)。 */
+/* 末尾の chevron は card-btn (切断ボタン) と同じ箱サイズ (20px 字 + 4px padding = 28px) にする。 */
 .host-card .chevron {
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--muted); font-size: 20px; padding: 4px;
+}
+/* 末尾アクション枠 (chevron/切断)。WoL の起動系 (最大2個) と同じ固定幅を右寄せで共有し、
+ * 編集/⋯ の位置を両タブ・全カードで揃える。 */
+.host-card .card-tail {
+  flex: 0 0 var(--card-tail-w); display: flex; align-items: center; justify-content: flex-end;
 }
 /* 接続中: 緑ピル + 切断 (danger) ボタン。 */
 .host-card.connected { border-color: color-mix(in srgb, var(--ok) 45%, var(--panel-border)); }
