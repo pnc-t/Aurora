@@ -128,7 +128,12 @@
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--accent); font-size: 14px; flex-shrink: 0; opacity: 0.85;
 }
-.host-card .chevron { display: inline-flex; align-items: center; color: var(--muted); font-size: 20px; margin-left: 2px; }
+/* 末尾の chevron は card-btn (切断ボタン) と同じ箱サイズ (20px 字 + 4px padding = 28px) にして、
+ * 接続中 (切断ボタン) と非接続 (chevron) で末尾幅を揃える (でないと 編集/⋯ が横にずれる)。 */
+.host-card .chevron {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 20px; padding: 4px;
+}
 /* 接続中: 緑ピル + 切断 (danger) ボタン。 */
 .host-card.connected { border-color: color-mix(in srgb, var(--ok) 45%, var(--panel-border)); }
 .host-card .conn-pill {
