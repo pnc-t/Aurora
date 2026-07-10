@@ -22,6 +22,7 @@ import {
   setCursorOverlay,
   setClientViewport,
   setFileSharing,
+  setKeyboardGrab,
   setResolution,
   setVideoParams,
   setVideoPaused,
@@ -196,7 +197,12 @@ export class Session {
   /** タブを非アクティブにする: 入力 detach・映像一時停止。 */
   deactivate(): void {
     this.active = false;
+    // input.detach() は pointerlockchange リスナーを外してから exitPointerLock するため
+    // onCaptureChange(false) (= キーボード占有 OFF) が発火しない。タブ切替でキャプチャ中の
+    // まま次のタブへ移るとキーボード占有が残留するため、ここで明示的に落とす。
+    const wasCaptured = this.input.isCaptured();
     this.input.detach();
+    if (wasCaptured) void setKeyboardGrab(false).catch((e) => logger.warn("setKeyboardGrab failed", e));
     if (this.connected) void setVideoPaused(this.id, true);
   }
 
@@ -298,6 +304,13 @@ export class Session {
     this.input.setCaptureMode(on);
   }
 
+  /** WH_KEYBOARD_LL で奪った OS ショートカット (Win/Alt+Tab 等) をこのセッションへ注入する。 */
+  sendGrabbedKey(vk: number, down: boolean): void {
+    void sendInput(this.id, { Key: { vk, down } }).catch((e) =>
+      logger.warn("sendGrabbedKey failed", e),
+    );
+  }
+
   switchDisplay(d: DisplayDto): void {
     void selectDisplay(this.id, d.id);
     this.currentDisplay = d;
@@ -382,6 +395,9 @@ export class Session {
     // マウスキャプチャ中だけホストにカーソルを映像へ焼き込ませる (絶対座標モードはローカル
     // カーソルを使うので不要・二重表示防止)。ポインタロックの実状態に同期させる。
     void setCursorOverlay(this.id, captured).catch((e) => logger.warn("setCursorOverlay failed", e));
+    // Win/Alt+Tab 等の OS ショートカットがクライアント OS に奪われるとホストへ届かないため、
+    // マウスキャプチャ (ポインタロック) と連動してキーボード占有を切り替える。
+    void setKeyboardGrab(captured).catch((e) => logger.warn("setKeyboardGrab failed", e));
     if (!captured) {
       this.host.toast(this, "マウスキャプチャ OFF");
       return;

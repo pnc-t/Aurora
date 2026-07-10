@@ -9,6 +9,7 @@
 
 mod audio;
 mod config;
+mod keyboard_grab;
 mod log;
 mod net;
 mod secret;
@@ -123,6 +124,7 @@ fn main() {
             net::request_file,
             net::upload_file_from_path,
             net::set_file_sharing,
+            keyboard_grab::set_keyboard_grab,
             config::load_recent_hosts,
             config::save_recent_host,
             config::set_recent_hosts,

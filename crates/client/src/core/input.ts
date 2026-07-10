@@ -37,7 +37,7 @@ export class Input {
   private readonly hContext = (e: Event) => e.preventDefault();
   private readonly hKeyDown = (e: KeyboardEvent) => this.onKeyDown(e);
   private readonly hKeyUp = (e: KeyboardEvent) => this.onKeyUp(e);
-  private readonly hBlur = () => this.releaseAll();
+  private readonly hBlur = () => this.onBlur();
   private readonly hLockChange = () => this.onPointerLockChange();
   private readonly hLockError = () => this.onPointerLockError();
 
@@ -117,6 +117,13 @@ export class Input {
       this.pressedButtons.clear();
     }
     this.onCaptureChange?.(this.captured);
+  }
+
+  /** フォーカス喪失 (Alt+Tab 等) 時の後始末。ポインタロックも明示解除し、pointerlockchange 経由の
+   *  onCaptureChange(false) (= キーボード占有 OFF 含む) を確実に発火させる。 */
+  private onBlur(): void {
+    this.releaseAll();
+    if (document.pointerLockElement) document.exitPointerLock();
   }
 
   private onPointerLockError(): void {
