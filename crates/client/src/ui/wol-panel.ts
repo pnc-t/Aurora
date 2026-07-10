@@ -337,14 +337,23 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     cardMenu.classList.remove("visible");
     cardMenu.innerHTML = "";
   }
-  /** ⋯ ボタンの下にメニューを開く (Hosts と同じ挙動)。現状は削除のみ。 */
+  /** ⋯ ボタンの下にメニューを開く (Hosts と同じ挙動)。
+   *  紐付けありのカードは主アクションが「起動して接続」なので、接続しない「起動のみ」をここに出す。 */
   function openCardMenu(anchor: HTMLElement, t: WolTarget): void {
-    cardMenu.innerHTML = `<button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>`;
+    const wakeOnly = t.host
+      ? `<button class="menu-item" data-m="wake">${icon("bolt")} 起動のみ (接続しない)</button>`
+      : "";
+    cardMenu.innerHTML = `${wakeOnly}<button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>`;
     cardMenu.classList.add("visible");
     // 表示してから幅を測り、ボタン右端に揃えて配置する。
     const r = anchor.getBoundingClientRect();
     cardMenu.style.top = `${r.bottom + 4}px`;
     cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector('[data-m="wake"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      const card = findCard(t.id);
+      if (card) void handleWake(t, card);
+    });
     cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
       closeCardMenu();
       openConfirmDialog(`「${t.label || t.mac}」を一覧から削除しますか?`, async () => {
@@ -682,8 +691,9 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
 
       const actions = document.createElement("div");
       actions.className = "wol-actions";
-      // Hosts のカードと並びを揃える: 左から 編集 / ⋯ メニュー / 主アクション(起動系) を右端に置く
-      // (Hosts は 編集 / ⋯ / chevron=接続 の順。起動して接続 (⚡+chevron) が chevron の相当)。
+      // Hosts のカードと並びを揃える: 左から 編集 / ⋯ メニュー / 主アクション を右端に 1 つ置く
+      // (Hosts は 編集 / ⋯ / chevron=接続)。カードごとに末尾アクションを 1 個に固定することで、
+      // 接続状態や紐付けの有無に関わらず 編集/⋯ の位置が全カード・両タブで揃う。
       const editBtn = document.createElement("button");
       editBtn.type = "button";
       editBtn.className = "card-btn";
@@ -699,23 +709,22 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
         e.stopPropagation(); // document の閉じるハンドラより先に開かないようにする
         openCardMenu(menuBtn, t);
       });
-      // 稲妻 = 起動。稲妻 + chevron = 起動して接続。ラベルは title に残し applyAriaLabels が aria へ写す。
-      const wakeBtn = document.createElement("button");
-      wakeBtn.type = "button";
-      wakeBtn.className = "card-btn wake wake-lead";
-      wakeBtn.title = "起動";
-      wakeBtn.innerHTML = icon("bolt");
-      wakeBtn.addEventListener("click", () => void handleWake(t, card));
-      actions.append(editBtn, menuBtn, wakeBtn);
+      // 主アクション (右端 1 個)。紐付けあり = 起動して接続 (稲妻+chevron)、無し = 起動 (稲妻)。
+      // 紐付けありの「起動のみ (接続しない)」は ⋯ メニューへ回す。
+      const primaryBtn = document.createElement("button");
+      primaryBtn.type = "button";
       if (t.host) {
-        const wakeConnectBtn = document.createElement("button");
-        wakeConnectBtn.type = "button";
-        wakeConnectBtn.className = "card-btn wake accent";
-        wakeConnectBtn.title = "起動して接続";
-        wakeConnectBtn.innerHTML = icon("bolt") + icon("chevron");
-        wakeConnectBtn.addEventListener("click", () => void handleWakeAndConnect(t, card));
-        actions.append(wakeConnectBtn);
+        primaryBtn.className = "card-btn wake wake-lead accent";
+        primaryBtn.title = "起動して接続";
+        primaryBtn.innerHTML = icon("bolt") + icon("chevron");
+        primaryBtn.addEventListener("click", () => void handleWakeAndConnect(t, card));
+      } else {
+        primaryBtn.className = "card-btn wake wake-lead";
+        primaryBtn.title = "起動";
+        primaryBtn.innerHTML = icon("bolt");
+        primaryBtn.addEventListener("click", () => void handleWake(t, card));
       }
+      actions.append(editBtn, menuBtn, primaryBtn);
 
       card.append(grip, avatar, meta, progress, actions);
       listEl.appendChild(card);

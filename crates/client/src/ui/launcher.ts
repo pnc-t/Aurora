@@ -861,11 +861,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
             <div class="avatar-wrap">${avatar}${presence}</div>
             <div class="meta">
-              <div class="label">${escapeHtml(name)}</div>
+              <div class="label-row">
+                <span class="label">${escapeHtml(name)}</span>
+                ${connPill}
+                ${saved}
+              </div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
             </div>
-            ${connPill}
-            ${saved}
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
             ${tailBtn}
