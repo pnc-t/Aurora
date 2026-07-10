@@ -90,6 +90,9 @@ pub struct ServerConfig {
     pub psk: std::sync::Arc<std::sync::Mutex<[u8; 32]>>,
     pub displays: Vec<DisplayInfo>,
     pub audio: bool,
+    /// プライマリ NIC の MAC アドレス (WoL 用)。取得失敗時は `None`。起動時に 1 度だけ取得し
+    /// 全接続へ配る (実行中に変わらない値のため接続毎の再取得はしない)。
+    pub mac: Option<[u8; 6]>,
     /// 適応制御 / エンコーダのビットレート上限 (bps)。`--max-bitrate` 由来。
     pub max_bitrate_bps: u32,
     /// 認証失敗の累計カウンタ (起動以降)。net がハンドシェイク失敗で加算し、tray が
@@ -324,6 +327,9 @@ pub(crate) struct ClientArgs {
     peer: SocketAddr,
     psk: [u8; 32],
     audio: bool,
+    /// プライマリ NIC の MAC アドレス ([`ServerConfig::mac`])。HostInfo に載せてクライアントへ
+    /// 伝える (WoL 中継への登録用)。
+    mac: Option<[u8; 6]>,
     udp: Arc<UdpSocket>,
     enc_tx: mpsc::Sender<EncoderCommand>,
     input_tx: mpsc::Sender<InputCmd>,
@@ -514,6 +520,7 @@ pub async fn run_server(
                 peer,
                 psk,
                 audio: cfg.audio,
+                mac: cfg.mac,
                 udp: udp.clone(),
                 enc_tx: enc_tx.clone(),
                 input_tx: input_tx.clone(),

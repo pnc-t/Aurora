@@ -1,0 +1,54 @@
+/* Wake on LAN パネル (wol-panel.ts)。launcher の「Wake on LAN」タブに埋め込む。
+ * page-head / host-card 相当の共通クラス (.card-btn, .btn-secondary, .empty-hint, .dialog 系)
+ * は launcher.css 側の既存定義を再利用し、ここでは wol 固有のセレクタのみ持つ (重複回避)。 */
+
+.wol-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 6px; }
+
+/* ダイアログ用バックドロップ (launcher.css の #dialog-backdrop と同じ見た目)。#page-wol は
+ * position 指定が無いため fixed で全面に被せ、中央配置する。 */
+#wol-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  display: none; align-items: center; justify-content: center;
+  background: var(--backdrop); backdrop-filter: blur(2px);
+}
+#wol-dialog-backdrop.visible { display: flex; }
+
+.wol-card {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 16px; border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--panel-border);
+}
+
+.wol-card .wol-avatar {
+  width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; color: var(--accent); background: var(--raised);
+}
+
+.wol-card .meta { flex: 1; min-width: 0; }
+.wol-card .meta .label {
+  font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wol-card .meta .mac {
+  font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px;
+}
+.wol-card .meta .relay,
+.wol-card .meta .link {
+  font-size: 12px; color: var(--muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.wol-card .wol-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.wol-card .btn-secondary.accent { border-color: var(--accent); color: var(--accent); }
+.wol-card .btn-secondary.accent:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+
+/* 起こして接続中の進捗表示 (アクションボタン群と入れ替わりで表示)。
+ * display:flex は UA の [hidden]{display:none} より優先されるため、hidden 時を明示的に消す
+ * (でないと非ポーリング時もキャンセルボタンが常時見える)。 */
+.wol-card .wol-progress {
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  font-size: 13px; color: var(--muted);
+}
+.wol-card .wol-progress[hidden] { display: none; }
+.wol-card .wol-actions[hidden] { display: none; }
+.wol-card .wol-progress-text { white-space: nowrap; }

@@ -25,6 +25,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         peer,
         psk,
         audio,
+        mac,
         udp,
         enc_tx,
         input_tx,
@@ -186,7 +187,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                 Some(pd)
             })
             .collect();
-        ControlMsg::HostInfo { displays, audio }
+        ControlMsg::HostInfo {
+            displays,
+            audio,
+            mac,
+        }
     };
     send_ctrl_msg(&mut write_half, &session, &host_info, &mut tcp_tx_nonce).await?;
 

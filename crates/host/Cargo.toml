@@ -36,6 +36,7 @@ snow = { workspace = true }
 rand = "0.8"
 cpal = "0.15"
 opus = "0.3"
+mac_address = "1.1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

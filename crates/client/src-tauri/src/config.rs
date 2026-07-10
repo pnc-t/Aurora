@@ -16,8 +16,11 @@ use tauri::{AppHandle, Manager};
 const MAX_RECENT: usize = 8;
 const HOSTS_FILE: &str = "recent_hosts.json";
 const SETTINGS_FILE: &str = "settings.json";
+const WOL_TARGETS_FILE: &str = "wol_targets.json";
 /// host の既定ポート (host 側 --port の既定と揃える)。
 const DEFAULT_PORT: u16 = 7000;
+/// WoL 中継デーモン (aurora-wol) の既定ポート (host 側 7000 と衝突しないよう別ポート)。
+const DEFAULT_WOL_RELAY_PORT: u16 = 7100;
 
 /// 保存する 1 件の接続先。`label` は一覧での表示名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +41,11 @@ pub struct HostEntry {
     /// ホスト別の設定上書き (無ければグローバル設定に従う)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<HostOverrides>,
+    /// host から HostInfo で通知されたプライマリ NIC の MAC アドレス
+    /// (`"AA:BB:CC:DD:EE:FF"` 形式)。WoL 対象の自動登録に使う。`icon` と同じ
+    /// 「`None`=情報なし (既存値保持)」規約: 接続成立時の自動保存だけがこれを更新する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 /// ホスト別のクライアント設定上書き。未指定 (None) のフィールドはグローバル設定
@@ -200,6 +208,7 @@ pub fn load_recent_hosts(app: AppHandle) -> Result<Vec<HostEntry>, String> {
             port: DEFAULT_PORT,
             icon: None,
             overrides: None,
+            mac: None,
         })
         .collect())
 }
@@ -218,6 +227,7 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         port: entry.port,
         icon: entry.icon,
         overrides: entry.overrides,
+        mac: entry.mac,
     };
 
     let mut hosts = load_recent_hosts(app.clone())?;
@@ -226,12 +236,15 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         .position(|h| h.host.eq_ignore_ascii_case(&entry.host))
     {
         Some(i) => {
-            // capture 側の接続成功時保存は icon/overrides を持たない (None = 情報なし) ため
-            // 既存値を残す (毎接続でアバター画像・ホスト別設定が消えるのを防ぐ)。編集ダイアログは
+            // capture 側の接続成功時保存は icon/overrides/mac を持たない (None = 情報なし) ため
+            // 既存値を残す (毎接続でアバター画像・ホスト別設定・MAC が消えるのを防ぐ)。編集ダイアログは
             // 常に明示値を送る: icon の空文字 = 解除、overrides の空オブジェクト = 「既定に従う」
             // へのリセット (None へ正規化)。
             if entry.icon.is_none() {
                 entry.icon = hosts[i].icon.clone();
+            }
+            if entry.mac.is_none() {
+                entry.mac = hosts[i].mac.clone();
             }
             match entry.overrides.as_ref() {
                 None => entry.overrides = hosts[i].overrides.clone(),
@@ -302,4 +315,77 @@ pub fn save_settings(app: AppHandle, settings: ClientSettings) -> Result<(), Str
     let json =
         serde_json::to_string_pretty(&settings).map_err(|e| format!("設定の直列化に失敗: {e}"))?;
     fs::write(&path, json).map_err(|e| format!("設定の書き込みに失敗: {e}"))
+}
+
+/// WoL (Wake-on-LAN) 中継先の 1 件。`wake_host` (net/wol.rs) が `relay_host:relay_port`
+/// (aurora-wol) へ接続し、`mac` 宛のマジックパケット送出を依頼する。`host`/`port` は
+/// 紐付く登録済みホスト (プローブ/自動接続で使う。任意)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WolTarget {
+    /// 一覧・削除・更新のキー。
+    pub id: String,
+    /// 一覧での表示名。
+    #[serde(default)]
+    pub label: String,
+    /// 対象 PC の MAC アドレス (`"AA:BB:CC:DD:EE:FF"` 形式)。
+    pub mac: String,
+    /// WoL 中継デーモン (aurora-wol) の Tailscale IP / hostname。
+    pub relay_host: String,
+    /// aurora-wol の待受ポート。
+    #[serde(default = "default_wol_relay_port")]
+    pub relay_port: u16,
+    /// 紐付く登録済みホスト (プローブ/自動接続用、任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+fn default_wol_relay_port() -> u16 {
+    DEFAULT_WOL_RELAY_PORT
+}
+
+fn wol_targets_path(app: &AppHandle) -> Result<PathBuf, String> {
+    config_path(app, WOL_TARGETS_FILE)
+}
+
+/// WoL 対象の一覧を読み込む。ファイルが無ければ空。
+#[tauri::command]
+pub fn list_wol_targets(app: AppHandle) -> Result<Vec<WolTarget>, String> {
+    let path = wol_targets_path(&app)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("WoL 対象の読み込みに失敗: {e}")),
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("WoL 対象の解析に失敗: {e}"))
+}
+
+/// WoL 対象を保存する。`id` が一致する既存エントリは置換し、無ければ追加する。
+#[tauri::command]
+pub fn save_wol_target(app: AppHandle, target: WolTarget) -> Result<(), String> {
+    let mut targets = list_wol_targets(app.clone())?;
+    match targets.iter().position(|t| t.id == target.id) {
+        Some(i) => targets[i] = target,
+        None => targets.push(target),
+    }
+    write_wol_targets(&app, &targets)
+}
+
+/// 指定 id の WoL 対象を削除する。
+#[tauri::command]
+pub fn delete_wol_target(app: AppHandle, id: String) -> Result<(), String> {
+    let mut targets = list_wol_targets(app.clone())?;
+    targets.retain(|t| t.id != id);
+    write_wol_targets(&app, &targets)
+}
+
+fn write_wol_targets(app: &AppHandle, targets: &[WolTarget]) -> Result<(), String> {
+    let path = wol_targets_path(app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("config dir 作成に失敗: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(targets)
+        .map_err(|e| format!("WoL 対象の直列化に失敗: {e}"))?;
+    fs::write(&path, json).map_err(|e| format!("WoL 対象の書き込みに失敗: {e}"))
 }

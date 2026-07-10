@@ -980,6 +980,23 @@ fn read_secret_line() -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+/// プライマリ NIC の MAC アドレスを取得する (WoL 用に HostInfo へ載せる)。取得失敗
+/// (複数 NIC・仮想アダプタ環境等) はエラーにせず `None` にフォールバックする (WoL 登録が
+/// できないだけで、映像/操作の本体機能には影響しない)。
+fn primary_mac() -> Option<[u8; 6]> {
+    match mac_address::get_mac_address() {
+        Ok(Some(mac)) => Some(mac.bytes()),
+        Ok(None) => {
+            tracing::warn!("no MAC address found; WoL registration will be unavailable");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read MAC address; WoL registration will be unavailable");
+            None
+        }
+    }
+}
+
 fn run_server(
     perf: bool,
     fps_cap: u32,
@@ -1302,6 +1319,7 @@ fn run_server(
             psk,
             displays,
             audio: audio_enabled,
+            mac: primary_mac(),
             max_bitrate_bps,
             auth_failures,
             devices,
