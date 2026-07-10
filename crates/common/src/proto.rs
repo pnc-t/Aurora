@@ -46,6 +46,15 @@ pub enum InputEvent {
     },
 }
 
+/// 映像コーデック。ネゴシエーション (`SetSupportedCodecs` / `VideoCodecChanged`) で使う。
+/// 優先順位は host 側のネゴロジックで AV1 > HEVC > H264 とする (このファイルには表現しない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
 /// ディレクトリ列挙の 1 エントリ (ProjFS ドライブリダイレクト用)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsEntry {
@@ -200,6 +209,19 @@ pub enum ControlMsg {
     /// 末尾に追加しタグ互換を保つ。
     SetCursorOverlay {
         enabled: bool,
+    },
+    /// クライアント → ホスト。このクライアントが対応する映像コーデックの申告 (接続直後の
+    /// ハンドシェイク完了直後、および手動コーデック切替時の再申告)。host は全クライアントの
+    /// 申告の共通集合と自身の能力から送出コーデックを決める (優先順位 AV1 > HEVC > H264)。
+    /// 末尾に追加しタグ互換を保つ。
+    SetSupportedCodecs {
+        codecs: Vec<VideoCodec>,
+    },
+    /// ホスト → クライアント。送出コーデックの確定/変更通知。エンコーダ作成/再作成の都度、
+    /// 全接続クライアントへ送りキーフレームを強制する。途中参加クライアントには接続確立時
+    /// (HostInfo 送信直後) にも現在値を送る。末尾に追加しタグ互換を保つ。
+    VideoCodecChanged {
+        codec: VideoCodec,
     },
 }
 

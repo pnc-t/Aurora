@@ -81,6 +81,7 @@ function getSettings(): ClientSettings {
       auto_reconnect: true,
       use_virtual_display: false,
       share_files: false,
+      codec: "auto",
     }
   );
 }
@@ -182,7 +183,7 @@ const host: SessionHost = {
     if (activeId === s.id) showToast(text, kind);
   },
   updateStats: (s, ev: StatsEvent) => {
-    if (activeId === s.id) updateStats(ev);
+    if (activeId === s.id) updateStats(ev, s.videoCodec);
   },
   clearStats: (s) => {
     if (activeId === s.id) clearStats();
@@ -215,6 +216,9 @@ void listen<ClientSettings>("aurora://settings-changed", (e) => {
   settings = e.payload;
   tabs.setPosition(e.payload.tab_position);
   toolbar.setPosition(e.payload.toolbar_position);
+  // コーデック設定 (グローバル/ホスト別 override) が変わった可能性があるので、接続中の全
+  // セッションへ再計算させる (変化が無ければ内部で no-op)。
+  for (const s of sessions.values()) void s.refreshCodecFromSettings();
 });
 
 // --- 共有ツールバー (操作は常にアクティブ Session へ) ---

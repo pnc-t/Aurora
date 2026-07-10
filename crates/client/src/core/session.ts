@@ -24,6 +24,7 @@ import {
   setFileSharing,
   setKeyboardGrab,
   setResolution,
+  setSupportedCodecs,
   setVideoParams,
   setVideoPaused,
   type ClientEvent,
@@ -31,11 +32,17 @@ import {
   type DisplayDto,
   type HostEntry,
 } from "./ipc";
+import { probeSupportedCodecs, type CodecId } from "./codec";
 import { Decoder } from "./decoder";
 import { Input } from "./input";
 import { logger } from "./log";
 import type { ToolbarHandle } from "../ui/toolbar";
 import type { ToastKind } from "../ui/toast";
+
+/** 2 つの codec 配列が同じ内容 (順序込み) か。 */
+function sameCodecs(a: CodecId[], b: CodecId[]): boolean {
+  return a.length === b.length && a.every((c, i) => c === b[i]);
+}
 
 export type StatusKind = "connecting" | "error" | "hidden";
 export type StatsEvent = Extract<ClientEvent, { kind: "stats" }>;
@@ -136,6 +143,15 @@ export class Session {
   private videoFps = 60;
   private videoMbps = 15;
   private latestStats: StatsEvent | null = null;
+
+  // 現在の映像コーデック (video_codec_changed で確定)。stats HUD 表示用に公開する。
+  private currentCodec: CodecId = "h264";
+  get videoCodec(): CodecId {
+    return this.currentCodec;
+  }
+  // 直近に申告した (connect_to_host / set_supported_codecs で送った) コーデック集合。
+  // 設定変更時に再計算した集合と比較し、変わっていなければ set_supported_codecs を送らない。
+  private declaredCodecs: CodecId[] = [];
 
   // セッション世代。openSession ごとに進め、遅れて届く旧チャネルのイベントを無視する。
   private sessionGen = 0;
@@ -449,7 +465,38 @@ export class Session {
       use_virtual_display: o.use_virtual_display ?? s.use_virtual_display,
       fps: o.fps ?? s.fps,
       max_mbps: o.max_mbps ?? s.max_mbps,
+      codec: o.codec ?? s.codec,
     };
+  }
+
+  /**
+   * 申告する映像コーデック集合を実効設定から決める。"auto" はプローブで対応する全コーデックを
+   * 優先順で申告する。手動選択がブラウザ非対応なら h264 へ落として警告トーストを出す。
+   */
+  private async decideSupportedCodecs(): Promise<CodecId[]> {
+    const choice = this.effectiveSettings().codec;
+    const supported = await probeSupportedCodecs();
+    if (choice === "auto") return supported.length > 0 ? supported : (["h264"] as CodecId[]);
+    if (supported.includes(choice)) return [choice];
+    this.host.toast(this, `${choice.toUpperCase()} は非対応のため H.264 を使用します`, "error");
+    return ["h264"];
+  }
+
+  /**
+   * 設定変更 (グローバル設定 or ホスト別 override) を受けて申告コーデックを再計算し、接続中かつ
+   * 前回申告と異なる場合だけ `set_supported_codecs` を送る (毎回送ってホストにエンコーダを
+   * 作り直させない)。
+   */
+  async refreshCodecFromSettings(): Promise<void> {
+    if (!this.connected) return;
+    const codecs = await this.decideSupportedCodecs();
+    if (sameCodecs(codecs, this.declaredCodecs)) return;
+    this.declaredCodecs = codecs;
+    try {
+      await setSupportedCodecs(this.id, codecs);
+    } catch (e) {
+      logger.warn("setSupportedCodecs failed", e);
+    }
   }
 
   private toolbarDisplayList(): DisplayDto[] {
@@ -497,7 +544,9 @@ export class Session {
     this.decoder.reset();
     const { event, video } = this.newChannels(gen);
     try {
-      await connectToHost(this.id, this.entry.host, this.entry.port, save, event, video);
+      const codecs = await this.decideSupportedCodecs();
+      this.declaredCodecs = codecs;
+      await connectToHost(this.id, this.entry.host, this.entry.port, save, event, video, codecs);
     } finally {
       this.connectInFlight = false;
     }
@@ -535,6 +584,11 @@ export class Session {
       case "stats":
         this.latestStats = ev;
         this.host.updateStats(this, ev);
+        break;
+      case "video_codec_changed":
+        this.currentCodec = ev.codec;
+        this.decoder.setCodec(ev.codec);
+        logger.info(`video codec changed: ${this.entry.host} -> ${ev.codec}`);
         break;
       case "pong":
         break;

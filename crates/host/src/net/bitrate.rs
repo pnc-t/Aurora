@@ -7,6 +7,10 @@ pub enum EncoderCommand {
     RequestKeyframe,
     /// 適応制御による平均ビットレート変更 (bps)。
     SetBitrate(u32),
+    /// ネゴシエーション結果の送出コーデック変更。encode スレッドがエンコーダを作り直し、
+    /// 実効コーデック (要求どおりか、HW 非対応で H264 へフォールバックしたか) を
+    /// `CodecStatus` で net へ報告する。
+    SetCodec(VideoCodec),
 }
 
 /// 制御ループ → input スレッドへの通知。入力イベントとディスプレイ切替を 1 本にまとめる。

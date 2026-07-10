@@ -25,12 +25,15 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
+    MFT_OUTPUT_STREAM_INFO, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    eAVEncH264VProfile_Base, eAVEncH265VProfile_Main_420_8,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::GUID;
 use windows::core::Interface;
+
+use aurora_common::proto::VideoCodec;
 
 /// MS H.264 Encoder MFT CLSID (CLSID_CMSH264EncoderMFT)。
 /// windows-rs 0.58 では未エクスポートのため手定義。
@@ -306,7 +309,7 @@ impl Inner {
                     }
 
                     // keyframe 判定: NAL ユニットを走査 (Annex-B 想定)
-                    let keyframe = is_keyframe_annexb(&data);
+                    let keyframe = is_keyframe_annexb_h264(&data);
 
                     self.out_queue.push_back(EncodedNal {
                         data,
@@ -570,18 +573,52 @@ impl Drop for Inner {
 // IMFTransform は MTA で COM 初期化されており、別スレッドへの move は安全。
 unsafe impl Send for MfH264Encoder {}
 
+/// コーデックに対応する Media Foundation サブタイプ GUID。
+pub(crate) fn subtype_for(codec: VideoCodec) -> GUID {
+    match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
+        VideoCodec::Hevc => MFVideoFormat_HEVC,
+        VideoCodec::Av1 => MFVideoFormat_AV1,
+    }
+}
+
+/// H.264 用の薄いラッパー (SW エンコーダは H.264 のみ扱うため呼び出し側の diff を減らす)。
 pub(crate) fn make_h264_output_type(width: u32, height: u32, bitrate: u32) -> Result<IMFMediaType> {
+    make_video_output_type(width, height, bitrate, VideoCodec::H264)
+}
+
+/// 指定コーデックの出力メディアタイプを組み立てる。プロファイル属性 (`MF_MT_MPEG2_PROFILE`)
+/// は H264/HEVC のみ意味を持つ。AV1 は Windows の profile 属性の枠組みが異なり MFT 既定に
+/// 委ねるのが安全なため設定しない (CLAUDE.md 指示どおり、非対応属性はエラーにせずログのみ)。
+pub(crate) fn make_video_output_type(
+    width: u32,
+    height: u32,
+    bitrate: u32,
+    codec: VideoCodec,
+) -> Result<IMFMediaType> {
     // SAFETY: all API are OUT/SETTER.
     unsafe {
         let t = MFCreateMediaType().context("MFCreateMediaType (out)")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        t.SetGUID(&MF_MT_SUBTYPE, &subtype_for(codec))?;
         t.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
         t.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
         t.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(FPS, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+        match codec {
+            VideoCodec::H264 => {
+                t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            }
+            VideoCodec::Hevc => {
+                if let Err(e) =
+                    t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
+                {
+                    tracing::debug!(error = %e, "HEVC profile attribute unsupported; continuing without it");
+                }
+            }
+            VideoCodec::Av1 => {}
+        }
         // 色 VUI (matrix / nominal range) はあえて設定しない。MS H.264 エンコーダの
         // 挙動とデコーダ (WebCodecs) の解釈が噛み合わず、付けると色/明るさが破綻する。
         // VUI 無指定のとき WebCodecs は BT.601 limited と解釈するので、GPU 色変換
@@ -608,24 +645,88 @@ pub(crate) fn pack_u64(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
+/// ビットストリームがキーフレームを含むか判定する (コーデック別)。
+pub(crate) fn is_keyframe_bitstream(buf: &[u8], codec: VideoCodec) -> bool {
+    match codec {
+        VideoCodec::H264 => is_keyframe_annexb_h264(buf),
+        VideoCodec::Hevc => is_keyframe_annexb_hevc(buf),
+        VideoCodec::Av1 => is_keyframe_obu_av1(buf),
+    }
+}
+
 /// Annex-B NAL 列を走査して IDR (nal_unit_type=5) を含むか判定。
-pub(crate) fn is_keyframe_annexb(buf: &[u8]) -> bool {
+pub(crate) fn is_keyframe_annexb_h264(buf: &[u8]) -> bool {
+    for_each_annexb_nal(buf, |byte0| (byte0 & 0x1f) == 5)
+}
+
+/// Annex-B NAL 列を走査して IRAP (nal_unit_type 16..=23、BLA/IDR/CRA 等) を含むか判定。
+/// HEVC の NAL ヘッダは 2 バイトで `nal_unit_type = (byte0 >> 1) & 0x3f`。
+pub(crate) fn is_keyframe_annexb_hevc(buf: &[u8]) -> bool {
+    for_each_annexb_nal(buf, |byte0| {
+        let nal_type = (byte0 >> 1) & 0x3f;
+        (16..=23).contains(&nal_type)
+    })
+}
+
+/// Annex-B start code を走査し、各 NAL の先頭バイト (nal_unit_type を含む) を `matcher` に
+/// 渡す共通ヘルパー。抽出式は H264/HEVC で異なるため、抽出は呼び出し側の matcher に委ねる。
+fn for_each_annexb_nal(buf: &[u8], matcher: impl Fn(u8) -> bool) -> bool {
     let mut i = 0;
     while i + 4 < buf.len() {
         let start3 = buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1;
         let start4 = buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1;
         if start3 || start4 {
             let nal_start = i + if start4 { 4 } else { 3 };
-            if nal_start < buf.len() {
-                let nal_type = buf[nal_start] & 0x1f;
-                if nal_type == 5 {
-                    return true;
-                }
+            if nal_start < buf.len() && matcher(buf[nal_start]) {
+                return true;
             }
             i = nal_start;
         } else {
             i += 1;
         }
+    }
+    false
+}
+
+/// AV1 OBU 列にシーケンスヘッダ (obu_type == 1) が含まれるか判定するヒューリスティック。
+/// 低遅延設定 (周期 IDR 抑制) では、キーフレーム強制時にのみエンコーダがシーケンス
+/// ヘッダを再送する運用を前提にした簡易判定 (真の `frame_type` パースは行わない)。
+/// AV1 の実エンコード経路は実機 GPU 依存で未検証のため、この判定はベストエフォート。
+pub(crate) fn is_keyframe_obu_av1(buf: &[u8]) -> bool {
+    const OBU_SEQUENCE_HEADER: u8 = 1;
+    let mut i = 0;
+    while i < buf.len() {
+        let header = buf[i];
+        let obu_type = (header >> 3) & 0x0f;
+        let has_extension = header & 0x04 != 0;
+        let has_size = header & 0x02 != 0;
+        let mut pos = i + 1;
+        if has_extension {
+            pos += 1;
+        }
+        if obu_type == OBU_SEQUENCE_HEADER {
+            return true;
+        }
+        if !has_size || pos >= buf.len() {
+            break; // サイズ不明の OBU はこれ以上安全に走査できない。
+        }
+        // LEB128 可変長サイズを読む。
+        let mut size: u64 = 0;
+        let mut shift = 0u32;
+        let mut leb_len = 0usize;
+        loop {
+            if pos + leb_len >= buf.len() || leb_len >= 8 {
+                return false;
+            }
+            let b = buf[pos + leb_len];
+            size |= ((b & 0x7f) as u64) << shift;
+            leb_len += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        i = pos + leb_len + size as usize;
     }
     false
 }

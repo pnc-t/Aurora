@@ -37,17 +37,18 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnum2, MFVideoFormat_H264,
-    MFVideoFormat_NV12,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnum2, MFVideoFormat_NV12,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{Interface, PWSTR};
 
+use aurora_common::proto::VideoCodec;
+
 use crate::capture::Frame;
 use crate::capture::SharedDevice;
 use crate::encode::mf::{
-    FRAME_DURATION_100NS, configure_low_latency, configure_rate_control, is_keyframe_annexb,
-    make_h264_output_type, make_nv12_input_type, set_vbv_buffer, variant_u32,
+    FRAME_DURATION_100NS, configure_low_latency, configure_rate_control, is_keyframe_bitstream,
+    make_nv12_input_type, make_video_output_type, set_vbv_buffer, subtype_for, variant_u32,
 };
 use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 
@@ -55,7 +56,7 @@ use crate::encode::{DEFAULT_BITRATE_BPS, EncodedNal, VideoEncoder};
 /// キューが空なら待たずに `MF_E_NO_EVENTS_AVAILABLE` を返す。
 const MF_EVENT_FLAG_NO_WAIT: u32 = 0x0000_0001;
 
-pub struct MfHwH264Encoder {
+pub struct MfHwVideoEncoder {
     device: SharedDevice,
     inner: Option<Inner>,
     bitrate: u32,
@@ -68,6 +69,8 @@ pub struct MfHwH264Encoder {
     /// `encode_luid` がキャプチャ共有デバイスと異なる GPU か。true ならクロスアダプタ
     /// (CPU 経由) 入力経路になる。
     cross: bool,
+    /// エンコード中のコーデック (ネゴシエーション結果)。
+    codec: VideoCodec,
 }
 
 struct Inner {
@@ -94,18 +97,26 @@ struct Inner {
     staging: [Option<ID3D11Texture2D>; 2],
     /// 次回 `build_cpu_sample` が使う `staging` の面インデックス (0/1 交互)。
     staging_idx: usize,
+    /// エンコード中のコーデック。process_output のキーフレーム判定・ストリーム変更時の
+    /// 出力タイプ再設定に使う。
+    codec: VideoCodec,
 }
 
-impl MfHwH264Encoder {
-    pub fn new(device: SharedDevice, max_bitrate: u32, encode_luid: Option<LUID>) -> Result<Self> {
+impl MfHwVideoEncoder {
+    pub fn new(
+        device: SharedDevice,
+        max_bitrate: u32,
+        encode_luid: Option<LUID>,
+        codec: VideoCodec,
+    ) -> Result<Self> {
         crate::capture::device::init_thread_com()?;
-        // 起動時に HW H.264 エンコーダの存在を確認する。無ければ Err を返し、呼び出し側
-        // (PlatformEncoder::new) が SW MFT へフォールバックできるようにする。ここで確認
-        // しないと、HW なし環境で push_frame が毎フレーム失敗し続けてフォールバックが
+        // 起動時に HW エンコーダの存在を確認する。無ければ Err を返し、呼び出し側
+        // (encode::create) が SW MFT (H.264 のみ) へフォールバックできるようにする。ここで
+        // 確認しないと、HW なし環境で push_frame が毎フレーム失敗し続けてフォールバックが
         // 発動しない (実 MFT は解像度確定後に Inner::new で改めて構築する)。列挙のみで
         // インスタンス化はしない (エンコーダセッションを二重に確保しないため)。
-        if !hw_h264_encoder_present()? {
-            return Err(anyhow!("no hardware H.264 encoder MFT found"));
+        if !hw_encoder_present(codec)? {
+            return Err(anyhow!("no hardware MFT found for codec {codec:?}"));
         }
         let encode_luid = encode_luid.unwrap_or(device.adapter_luid);
         let cross = encode_luid != device.adapter_luid;
@@ -118,6 +129,7 @@ impl MfHwH264Encoder {
             force_keyframe: true,
             encode_luid,
             cross,
+            codec,
         })
     }
 
@@ -131,7 +143,8 @@ impl MfHwH264Encoder {
                 width,
                 height,
                 bitrate = self.bitrate,
-                "building HW H.264 MFT"
+                codec = ?self.codec,
+                "building HW MFT"
             );
             self.inner = match Inner::new(
                 &self.device,
@@ -141,6 +154,7 @@ impl MfHwH264Encoder {
                 self.max_bitrate,
                 self.encode_luid,
                 self.cross,
+                self.codec,
             ) {
                 Ok(inner) => Some(inner),
                 // dGPU が省電力設定/ドライバ不備等で掴めない環境でも映像を止めないため、
@@ -160,6 +174,7 @@ impl MfHwH264Encoder {
                         self.max_bitrate,
                         self.encode_luid,
                         self.cross,
+                        self.codec,
                     )?)
                 }
                 Err(e) => return Err(e),
@@ -171,6 +186,7 @@ impl MfHwH264Encoder {
 }
 
 impl Inner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &SharedDevice,
         width: u32,
@@ -179,9 +195,10 @@ impl Inner {
         max_bitrate: u32,
         target_luid: LUID,
         cross: bool,
+        codec: VideoCodec,
     ) -> Result<Self> {
-        let (transform, friendly) = enum_hw_encoder(target_luid)?;
-        tracing::info!(encoder = %friendly, cross, "selected HW H.264 MFT");
+        let (transform, friendly) = enum_hw_encoder(target_luid, codec)?;
+        tracing::info!(encoder = %friendly, cross, ?codec, "selected HW MFT");
 
         // async HW MFT を使う前にアンロックする (必須)。
         // SAFETY: transform live。GetAttributes は IMFAttributes を返す。
@@ -207,13 +224,13 @@ impl Inner {
             }
         }
 
-        // 出力 (H.264) → 入力 (NV12) の順に設定する。
-        let out_type = make_h264_output_type(width, height, bitrate)?;
+        // 出力 (映像コーデック) → 入力 (NV12) の順に設定する。
+        let out_type = make_video_output_type(width, height, bitrate, codec)?;
         // SAFETY: transform / type live。
         unsafe {
             transform
                 .SetOutputType(0, &out_type, 0)
-                .context("SetOutputType(H264)")?;
+                .context("SetOutputType(codec)")?;
         }
         let in_type = make_nv12_input_type(width, height)?;
         // SAFETY: as above
@@ -260,6 +277,7 @@ impl Inner {
             cross,
             staging: [None, None],
             staging_idx: 0,
+            codec,
         })
     }
 
@@ -612,7 +630,7 @@ impl Inner {
                     let _ = buf.Unlock();
                 }
 
-                let keyframe = is_keyframe_annexb(&data);
+                let keyframe = is_keyframe_bitstream(&data, self.codec);
                 // 投入時に積んだ frame_id と 1:1 で突き合わせる。キューが空 = 対応が崩れて
                 // いる。frame_id を捏造 (0 等) して送るとクライアントの再組立てが静かに
                 // 狂うため、このサンプルは破棄して警告を残す (次のキーフレームで回復する)。
@@ -635,8 +653,9 @@ impl Inner {
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
                 // SAFETY: pEvents も同様に手動 drop して解放する。
                 unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
-                // 出力ストリーム変更要求: H.264 出力タイプを再設定して次回出力を待つ。
-                let out_type = make_h264_output_type(self.width, self.height, self.bitrate)?;
+                // 出力ストリーム変更要求: 出力タイプを再設定して次回出力を待つ。
+                let out_type =
+                    make_video_output_type(self.width, self.height, self.bitrate, self.codec)?;
                 // SAFETY: transform / type live。
                 unsafe {
                     self.transform
@@ -663,7 +682,7 @@ impl Inner {
     }
 }
 
-impl VideoEncoder for MfHwH264Encoder {
+impl VideoEncoder for MfHwVideoEncoder {
     fn push_frame(&mut self, frame: &Frame) -> Result<()> {
         let fid = self.frame_id;
         self.frame_id = self.frame_id.wrapping_add(1);
@@ -737,15 +756,15 @@ impl Drop for Inner {
     }
 }
 
-// SAFETY: MfHwH264Encoder は encode スレッドでのみ使用される。COM は MTA、共有デバイスは
+// SAFETY: MfHwVideoEncoder は encode スレッドでのみ使用される。COM は MTA、共有デバイスは
 // multithread-protected。別スレッドへの move は安全 (MfH264Encoder と同じ流儀)。
-unsafe impl Send for MfHwH264Encoder {}
+unsafe impl Send for MfHwVideoEncoder {}
 
-/// HW H.264 エンコーダ MFT が 1 つ以上存在するか (インスタンス化せず列挙のみ)。
-fn hw_h264_encoder_present() -> Result<bool> {
+/// 指定コーデックの HW エンコーダ MFT が 1 つ以上存在するか (インスタンス化せず列挙のみ)。
+fn hw_encoder_present(codec: VideoCodec) -> Result<bool> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: subtype_for(codec),
     };
     let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
 
@@ -766,7 +785,44 @@ fn hw_h264_encoder_present() -> Result<bool> {
     Ok(count > 0)
 }
 
-/// HW H.264 エンコーダ MFT を選ぶ。`target_luid` が非ゼロなら **まず同一 GPU の MFT に限定**して
+/// ホストが実際にエンコードできるか (activate + MediaType 設定まで試す、実フレーム投入はしない)。
+/// `encode::probe_encoders` から起動時に 1 度呼ばれ、ネゴシエーションの host 能力を決める。
+pub(crate) fn probe_hw_encoder(
+    device: &SharedDevice,
+    encode_luid: Option<LUID>,
+    codec: VideoCodec,
+) -> bool {
+    let target_luid = encode_luid.unwrap_or(device.adapter_luid);
+    let (transform, friendly) = match enum_hw_encoder(target_luid, codec) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(?codec, error = %e, "codec probe: no activatable HW MFT");
+            return false;
+        }
+    };
+    // ダミー解像度でメディアタイプ設定まで試す (実フレームは投入しない)。
+    let probed: Result<()> = (|| {
+        let out_type = make_video_output_type(1920, 1080, DEFAULT_BITRATE_BPS, codec)?;
+        // SAFETY: transform は直前に activate した live なインスタンス。
+        unsafe { transform.SetOutputType(0, &out_type, 0) }.context("probe SetOutputType")?;
+        let in_type = make_nv12_input_type(1920, 1080)?;
+        // SAFETY: as above
+        unsafe { transform.SetInputType(0, &in_type, 0) }.context("probe SetInputType")?;
+        Ok(())
+    })();
+    match probed {
+        Ok(()) => {
+            tracing::info!(encoder = %friendly, ?codec, "codec supported by HW MFT (probe)");
+            true
+        }
+        Err(e) => {
+            tracing::debug!(encoder = %friendly, ?codec, error = %e, "codec probe failed (SetOutputType/SetInputType)");
+            false
+        }
+    }
+}
+
+/// HW エンコーダ MFT を選ぶ。`target_luid` が非ゼロなら **まず同一 GPU の MFT に限定**して
 /// 列挙する (`MFTEnum2` + `MFT_ENUM_ADAPTER_LUID`)。
 ///
 /// 従来の「列挙順で総当たりして最初に activate できた MFT を無条件に採る」方式は、NVENC 等
@@ -779,10 +835,10 @@ fn hw_h264_encoder_present() -> Result<bool> {
 /// いずれの経路でも `ActivateObject` に失敗する候補が混在するのは想定内 (Optimus ではプロセス
 /// GPU プリファレンス次第で一部ベンダの MFT が掴めない) なので、列挙順に総当たりして最初に
 /// 起動できた MFT を採る。
-fn enum_hw_encoder(target_luid: LUID) -> Result<(IMFTransform, String)> {
+fn enum_hw_encoder(target_luid: LUID, codec: VideoCodec) -> Result<(IMFTransform, String)> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: subtype_for(codec),
     };
     let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
 

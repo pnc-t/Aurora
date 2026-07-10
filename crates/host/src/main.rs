@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use aurora_common::noise::psk_from_password;
+use aurora_common::proto::VideoCodec;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use std::sync::{Arc, Mutex};
@@ -816,7 +817,12 @@ fn dump_h264(n: usize) -> Result<()> {
         .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
     let device = capture::create_shared_device(&primary)?;
     let mut cap = PlatformCapturer::new_primary(device.clone())?;
-    let mut enc = encode::create(device, MAX_BITRATE_BPS, None)?;
+    let (mut enc, _codec) = encode::create(
+        device,
+        MAX_BITRATE_BPS,
+        None,
+        aurora_common::proto::VideoCodec::H264,
+    )?;
     let mut out = std::fs::File::create("out.h264").context("create out.h264")?;
     use std::io::Write;
 
@@ -1284,6 +1290,13 @@ fn run_server(
         height: displays[0].height,
     };
 
+    // host が実際にエンコードできる映像コーデックを起動時に 1 度だけ探索する (ネゴシエーションの
+    // host 側能力)。実フレームは投入せず MFT の activate + MediaType 設定まで試すのみ。
+    let host_codecs = encode::probe_encoders(&device, encode_gpu.as_deref());
+    tracing::info!(?host_codecs, "probed host video codec capability");
+    // encode スレッド → net (非同期側) への実効コーデック報告チャネル。
+    let (codec_status_tx, codec_status_rx) = mpsc::channel::<net::CodecStatus>(4);
+
     // encode スレッド
     std::thread::Builder::new()
         .name("encode".into())
@@ -1296,6 +1309,7 @@ fn run_server(
                 perf,
                 max_bitrate_bps,
                 encode_gpu,
+                codec_status_tx,
             ) {
                 tracing::error!(error = %e, "encode loop ended");
             }
@@ -1325,6 +1339,8 @@ fn run_server(
             devices,
             force_frame,
             tray_bus,
+            host_codecs,
+            codec_status_rx,
         };
         net::run_server(
             cfg,
@@ -1626,6 +1642,99 @@ fn input_loop(mut rx: mpsc::Receiver<InputCmd>, initial_geom: DisplayGeom) -> Re
     Ok(())
 }
 
+/// 受信済み `EncoderCommand` を吸い、keyframe 要求が含まれていたら true を返す。RequestKeyframe
+/// は次の push_frame に効くフラグなので、push の直前に必ず適用する (先頭ドレインだけだと強制
+/// 送出フレームが P フレームになり、参照を持たない新規クライアントが黒画面のまま残る)。
+/// `SetCodec` はここでエンコーダを作り直し、要求どおりだったか (フォールバック発生か) を
+/// `codec_status_tx` 経由で net (非同期側) へ報告する (VideoCodecChanged 配信とネゴシエーション
+/// 状態の是正はそちら側の責務)。
+#[allow(clippy::too_many_arguments)]
+fn drain_cmds(
+    enc: &mut PlatformEncoder,
+    cmd_rx: &mut mpsc::Receiver<EncoderCommand>,
+    current_codec: &mut VideoCodec,
+    device: &capture::SharedDevice,
+    max_bitrate_bps: u32,
+    encode_gpu: Option<&str>,
+    codec_status_tx: &mpsc::Sender<net::CodecStatus>,
+) -> bool {
+    let mut keyframe_requested = false;
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            EncoderCommand::RequestKeyframe => {
+                enc.request_keyframe();
+                keyframe_requested = true;
+            }
+            EncoderCommand::SetBitrate(bps) => {
+                if let Err(e) = enc.set_bitrate(bps) {
+                    tracing::warn!(error = %e, bps, "set_bitrate failed");
+                }
+            }
+            EncoderCommand::SetCodec(requested) => {
+                match encode::create(device.clone(), max_bitrate_bps, encode_gpu, requested) {
+                    Ok((new_enc, effective)) => {
+                        tracing::info!(
+                            ?requested,
+                            ?effective,
+                            "encoder recreated for codec switch"
+                        );
+                        *enc = new_enc;
+                        *current_codec = effective;
+                        // 新エンコーダは初回 keyframe 強制済みだが、送出側の keyframe 待ちとも揃える。
+                        keyframe_requested = true;
+                        let status = if effective == requested {
+                            net::CodecStatus::Active(effective)
+                        } else {
+                            net::CodecStatus::Fallback { failed: requested }
+                        };
+                        let _ = codec_status_tx.blocking_send(status);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?requested, "SetCodec: encoder recreation failed; keeping previous encoder");
+                    }
+                }
+            }
+        }
+    }
+    keyframe_requested
+}
+
+/// 実行時に `push_frame` が失敗した際の動的フォールバック。要求コーデックが H.264 以外なら
+/// (HW MFT が「設定は通るが実出力しない」等の実機事象 — AMD の前科あり) H.264 でエンコーダを
+/// 作り直し、`CodecStatus::Fallback` で net (非同期側) へ報告する。H.264 で失敗した場合は
+/// これ以上落とす先が無いためログのみで継続する (既存挙動)。
+fn fallback_to_h264_on_push_failure(
+    enc: &mut PlatformEncoder,
+    current_codec: &mut VideoCodec,
+    device: &capture::SharedDevice,
+    max_bitrate_bps: u32,
+    encode_gpu: Option<&str>,
+    codec_status_tx: &mpsc::Sender<net::CodecStatus>,
+) {
+    if *current_codec == VideoCodec::H264 {
+        return;
+    }
+    let failed = *current_codec;
+    tracing::warn!(
+        ?failed,
+        "push_frame failed for non-H264 codec; falling back to H.264"
+    );
+    match encode::create(
+        device.clone(),
+        max_bitrate_bps,
+        encode_gpu,
+        VideoCodec::H264,
+    ) {
+        Ok((new_enc, effective)) => {
+            *enc = new_enc;
+            *current_codec = effective;
+            let _ = codec_status_tx.blocking_send(net::CodecStatus::Fallback { failed });
+        }
+        Err(e) => tracing::error!(error = %e, "H.264 fallback encoder creation also failed"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     device: capture::SharedDevice,
     mut frame_rx: mpsc::Receiver<(Instant, Frame)>,
@@ -1634,32 +1743,25 @@ fn encode_loop(
     perf: bool,
     max_bitrate_bps: u32,
     encode_gpu: Option<String>,
+    codec_status_tx: mpsc::Sender<net::CodecStatus>,
 ) -> Result<()> {
-    let mut enc = encode::create(device, max_bitrate_bps, encode_gpu.as_deref())?;
+    // 後続のコーデック切替/フォールバック時の再構築用に device を保持する (最初の create は
+    // 所有権を消費するため clone しておく)。
+    let device_for_recreate = device.clone();
+    // 未接続時 (クライアント申告前) の安全な既定は常に H.264。ネゴシエーションで上位コーデック
+    // が決まったら net から SetCodec が届く。
+    let mut current_codec = VideoCodec::H264;
+    let (mut enc, effective) = encode::create(
+        device,
+        max_bitrate_bps,
+        encode_gpu.as_deref(),
+        current_codec,
+    )?;
+    current_codec = effective;
+    let _ = codec_status_tx.blocking_send(net::CodecStatus::Active(effective));
     let mut meter = perf.then(perf::EncodeMeter::new);
     // 送信バックプレッシャを計測から除くため、NAL を一旦ここへ集めてから送る。
     let mut nals: Vec<EncodedNal> = Vec::new();
-    // 受信済みコマンドを吸い、keyframe 要求が含まれていたら true を返す。RequestKeyframe は
-    // 次の push_frame に効くフラグなので、push の直前に必ず適用する (先頭ドレインだけだと
-    // 強制送出フレームが P フレームになり、参照を持たない新規クライアントが黒画面のまま残る)。
-    let drain_cmds =
-        |enc: &mut PlatformEncoder, cmd_rx: &mut mpsc::Receiver<EncoderCommand>| -> bool {
-            let mut keyframe_requested = false;
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    EncoderCommand::RequestKeyframe => {
-                        enc.request_keyframe();
-                        keyframe_requested = true;
-                    }
-                    EncoderCommand::SetBitrate(bps) => {
-                        if let Err(e) = enc.set_bitrate(bps) {
-                            tracing::warn!(error = %e, bps, "set_bitrate failed");
-                        }
-                    }
-                }
-            }
-            keyframe_requested
-        };
 
     // 直近 push にキーフレーム要求が乗ったか。入力が尽きたあとのフラッシュ判断に使う。
     // 外側ループをまたいで保持する: blocking_recv で待つ前 (先頭ドレイン) に届いた要求も
@@ -1667,7 +1769,15 @@ fn encode_loop(
     // 強制送出フレームと到着順がずれうる)。フラッシュ実施時にクリアする。
     let mut pending_keyframe = false;
     loop {
-        pending_keyframe |= drain_cmds(&mut enc, &mut cmd_rx);
+        pending_keyframe |= drain_cmds(
+            &mut enc,
+            &mut cmd_rx,
+            &mut current_codec,
+            &device_for_recreate,
+            max_bitrate_bps,
+            encode_gpu.as_deref(),
+            &codec_status_tx,
+        );
         // 最初の 1 枚はブロッキングで待つ。
         let mut frame = match frame_rx.blocking_recv() {
             Some(f) => f,
@@ -1676,12 +1786,28 @@ fn encode_loop(
         // この外側反復で keyframe を実際に送出できたか。push 経路で出れば flush は不要。
         let mut keyframe_sent = false;
         loop {
-            pending_keyframe |= drain_cmds(&mut enc, &mut cmd_rx);
+            pending_keyframe |= drain_cmds(
+                &mut enc,
+                &mut cmd_rx,
+                &mut current_codec,
+                &device_for_recreate,
+                max_bitrate_bps,
+                encode_gpu.as_deref(),
+                &codec_status_tx,
+            );
             let t0 = std::time::Instant::now();
             // capture→encode 待ち: フレームが capture チャネルで待たされた時間 (push 直前に測る)。
             let cap_wait_us = frame.0.elapsed().as_micros().min(u32::MAX as u128) as u32;
             if let Err(e) = enc.push_frame(&frame.1) {
                 tracing::warn!(error = %e, "push_frame failed");
+                fallback_to_h264_on_push_failure(
+                    &mut enc,
+                    &mut current_codec,
+                    &device_for_recreate,
+                    max_bitrate_bps,
+                    encode_gpu.as_deref(),
+                    &codec_status_tx,
+                );
             } else {
                 nals.clear();
                 while let Some(nal) = enc.poll_nal()? {
@@ -1740,6 +1866,14 @@ fn encode_loop(
                 pushes += 1;
                 if let Err(e) = enc.push_frame(&frame.1) {
                     tracing::warn!(error = %e, "keyframe flush re-push failed");
+                    fallback_to_h264_on_push_failure(
+                        &mut enc,
+                        &mut current_codec,
+                        &device_for_recreate,
+                        max_bitrate_bps,
+                        encode_gpu.as_deref(),
+                        &codec_status_tx,
+                    );
                     break;
                 }
                 if let Err(e) = enc.flush_pending() {
