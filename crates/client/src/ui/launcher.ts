@@ -174,8 +174,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       <aside class="sidebar">
         <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
         <button class="nav-item" data-page="wol" title="Wake on LAN"><span class="ico">${icon("bolt")}</span></button>
-        <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
         <div class="sidebar-spacer"></div>
+        <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
       </aside>
       <main class="content">
         <section class="page active" id="page-hosts">
