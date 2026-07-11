@@ -37,10 +37,17 @@ import { mountToolbar, type ToolbarHandle } from "./ui/toolbar";
 import { mountTabs, type TabsHandle } from "./ui/tabs";
 import { openConnectPicker } from "./ui/connect-dialog";
 import { initToast, showToast, type ToastKind } from "./ui/toast";
-import { clearStats, initStatsOverlay, toggleStats, updateStats } from "./ui/stats-overlay";
+import {
+  clearStats,
+  initStatsOverlay,
+  setStatsPosition,
+  toggleStats,
+  updateStats,
+} from "./ui/stats-overlay";
 import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui/reconnect-badge";
 import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
 import { installWebviewGuard } from "./core/webview-guard";
+import { applyShortcutBindings } from "./core/shortcuts";
 import { exitFullscreen, isFullscreen, toggleFullscreen } from "./core/fullscreen";
 import { closeWindow, setResizable } from "./ui/window-controls";
 import { installGlobalErrorLogging, logger } from "./core/log";
@@ -82,6 +89,10 @@ function getSettings(): ClientSettings {
       use_virtual_display: false,
       share_files: false,
       codec: "auto",
+      audio_muted: false,
+      grab_keyboard: true,
+      stats_position: "tr",
+      shortcuts: {},
     }
   );
 }
@@ -216,6 +227,10 @@ void listen<ClientSettings>("aurora://settings-changed", (e) => {
   settings = e.payload;
   tabs.setPosition(e.payload.tab_position);
   toolbar.setPosition(e.payload.toolbar_position);
+  setStatsPosition(e.payload.stats_position);
+  // ショートカット割当が変わった可能性があるので判定テーブルとツールバーの表記を更新する。
+  applyShortcutBindings(e.payload.shortcuts);
+  toolbar.refreshShortcutLabels();
   // コーデック設定 (グローバル/ホスト別 override) が変わった可能性があるので、接続中の全
   // セッションへ再計算させる (変化が無ければ内部で no-op)。
   for (const s of sessions.values()) void s.refreshCodecFromSettings();
@@ -556,6 +571,12 @@ void (async () => {
   }
   // タブストリップの配置 (上下左右) を設定から適用する (窓単位・全タブ共有)。
   tabs.setPosition(getSettings().tab_position);
+  setStatsPosition(getSettings().stats_position);
+  // ショートカット割当を判定テーブルへ反映する。トップバーは既に静的ラベルで mount 済み
+  // (Tauri 起動のたびに settings 読み込みが非同期で少し遅れるため) なので、ここで表記を
+  // 最新化する。
+  applyShortcutBindings(getSettings().shortcuts);
+  toolbar.refreshShortcutLabels();
   logger.info(`capture window ready (mode=${adoptId ? "adopt" : "connect"})`);
   if (adoptId) {
     await adoptTab(adoptId, true);

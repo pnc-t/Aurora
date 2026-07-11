@@ -6,6 +6,7 @@
 //! という理由で使わない。**この JSON にはパスワードを入れない**。パスワードは
 //! 別途 `secret.rs` が DPAPI で暗号化して `passwords.bin` に保存する。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -92,6 +93,10 @@ fn default_toolbar_position() -> String {
     "top".to_string()
 }
 
+fn default_stats_position() -> String {
+    "tr".to_string()
+}
+
 /// クライアント側の永続設定。接続後の挙動と UI の既定値。
 /// 各フィールドは `#[serde(default)]` で、項目を増やしても旧 settings.json を読める。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +153,22 @@ pub struct ClientSettings {
     /// (host net.rs の client_trusted ゲート)。中身は接続中のみ要求時に読まれる。
     #[serde(default)]
     pub share_files: bool,
+    /// 接続時に音声をミュートで開始する。ツールバーからいつでも解除できる。
+    #[serde(default)]
+    pub audio_muted: bool,
+    /// マウスキャプチャ中にキーボード占有 (WH_KEYBOARD_LL) を有効にするか。既定 ON (現状踏襲):
+    /// Win キーや Alt+Tab もリモートへ送る。OFF にすると手元の Windows に効く。
+    #[serde(default = "default_true")]
+    pub grab_keyboard: bool,
+    /// 統計 HUD の表示位置 ("tl" | "tr" | "bl" | "br")。
+    #[serde(default = "default_stats_position")]
+    pub stats_position: String,
+    /// ローカル UI ショートカットのユーザー割当。キーは `LocalHotkey` id (TS 側
+    /// `core/shortcuts.ts` の `SHORTCUTS`)、値は `"Ctrl+Alt+KeyF"` 形式のバインディング文字列
+    /// (修飾は Ctrl/Alt/Shift/Meta の固定順 + `KeyboardEvent.code`)。未登録の id は既定
+    /// (Ctrl+Alt+Shift+<code>) を使う。空マップが既定 (= 全操作が既定バインディング)。
+    #[serde(default)]
+    pub shortcuts: HashMap<String, String>,
 }
 
 fn default_fps() -> u32 {
@@ -186,6 +207,10 @@ impl Default for ClientSettings {
             auto_reconnect: true,
             use_virtual_display: false,
             share_files: false,
+            audio_muted: false,
+            grab_keyboard: true,
+            stats_position: default_stats_position(),
+            shortcuts: HashMap::new(),
         }
     }
 }

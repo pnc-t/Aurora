@@ -26,6 +26,7 @@ import {
   type ClientSettings,
   type HostEntry,
   type HostOverrides,
+  type StatsPosition,
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
@@ -41,7 +42,20 @@ import {
 } from "../core/video-presets";
 import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
-import { SHORTCUTS } from "../core/shortcuts";
+import {
+  SHORTCUTS,
+  applyShortcutBindings,
+  bindingFromEvent,
+  bindingLabel,
+  bindingsEqual,
+  defaultBinding,
+  effectiveBinding,
+  formatBinding,
+  isModifierOnlyCode,
+  setRecordingActive,
+  validateBinding,
+  type LocalHotkey,
+} from "../core/shortcuts";
 import { icon } from "./icons";
 import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
 import { mountWolPanel } from "./wol-panel";
@@ -83,6 +97,10 @@ const DEFAULT_SETTINGS: ClientSettings = {
   use_virtual_display: false,
   share_files: false,
   codec: "auto",
+  audio_muted: false,
+  grab_keyboard: true,
+  stats_position: "tr",
+  shortcuts: {},
 };
 
 /** コーデック select の表示ラベル。 */
@@ -133,12 +151,18 @@ function applyTheme(theme: ThemeId, accent: string): void {
 
 export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallback }): LauncherHandle {
   // ショートカット一覧の行は単一定義 (core/shortcuts.ts) から生成する。
-  // label/desc は静的定数なので HTML へ直接埋め込んでよい (ホスト由来データではない)。
+  // desc は静的定数なので HTML へ直接埋め込んでよい (ホスト由来データではない)。
+  // キー表記はボタン化し、クリックで新しい組合せを記録できる (割当は #set-shortcuts 以下で配線)。
   const shortcutRows = SHORTCUTS.map(
     (s) => `
-            <div class="setting-row">
+            <div class="setting-row" data-shortcut-id="${s.id}">
               <div class="s-meta"><div class="s-title">${s.desc}</div></div>
-              <span class="kbd">${s.label}</span>
+              <div class="shortcut-edit">
+                <span class="shortcut-error" data-shortcut-error></span>
+                ${s.id === "toggle-fullscreen" ? `<span class="kbd">F11</span><span class="shortcut-slash">/</span>` : ""}
+                <button type="button" class="kbd kbd-btn" data-shortcut-btn title="クリックしてキーを変更"></button>
+                <button type="button" class="icon-btn shortcut-reset" data-shortcut-reset title="既定に戻す">${icon("refresh")}</button>
+              </div>
             </div>`,
   ).join("");
 
@@ -234,10 +258,25 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <div class="setting-row">
                 <div class="s-meta">
+                  <div class="s-title">キャプチャ中にキーボードを占有</div>
+                  <div class="s-desc">Win キーや Alt+Tab もリモートへ送る。OFF にすると手元の Windows に効く</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-grab-keyboard" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
                   <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
                   <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-group">音声</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">接続時に音声をミュート</div>
+                  <div class="s-desc">接続直後の音声をミュートで始める。ツールバーからいつでも解除できる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-audio-muted" /><span class="slider"></span></label>
               </div>
             </div>
             <div class="settings-sect" data-sect="display">
@@ -272,6 +311,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <option value="bottom">下</option>
                   <option value="left">左</option>
                   <option value="right">右</option>
+                </select>
+              </div>
+              <div class="setting-group">統計 HUD</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">位置</div>
+                  <div class="s-desc">統計 HUD (fps/ビットレート/RTT/loss) を表示する隅</div>
+                </div>
+                <select id="set-stats-pos" class="select-input">
+                  <option value="tl">左上</option>
+                  <option value="tr">右上</option>
+                  <option value="bl">左下</option>
+                  <option value="br">右下</option>
                 </select>
               </div>
               <div class="setting-group">外観・既定値</div>
@@ -320,6 +372,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <span class="kbd">Esc</span>
               </div>
+              <div class="shortcut-note">割り当てたキーはリモート側へ送信されなくなります</div>
               <div class="setting-group">診断</div>
               <div class="setting-row">
                 <div class="s-meta">
@@ -374,6 +427,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
   const codecSelect = $<HTMLSelectElement>("#set-codec");
   const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
+  const audioMutedToggle = $<HTMLInputElement>("#set-audio-muted");
+  const grabKeyboardToggle = $<HTMLInputElement>("#set-grab-keyboard");
+  const statsPosSelect = $<HTMLSelectElement>("#set-stats-pos");
 
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
@@ -412,6 +468,99 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
     void emit("aurora://settings-changed", settings);
   }
+
+  // --- ショートカットの編集 (「その他」タブ) ---
+  // 行ごとに現在のバインディング表記/「既定に戻す」ボタンの表示を最新化する。
+  const shortcutRowEls = new Map<LocalHotkey, HTMLElement>();
+  opts.root.querySelectorAll<HTMLElement>("[data-shortcut-id]").forEach((el) => {
+    const id = el.dataset.shortcutId as LocalHotkey;
+    shortcutRowEls.set(id, el);
+  });
+  function refreshShortcutRow(id: LocalHotkey): void {
+    const row = shortcutRowEls.get(id);
+    if (!row) return;
+    const btn = row.querySelector<HTMLButtonElement>("[data-shortcut-btn]");
+    const resetBtn = row.querySelector<HTMLButtonElement>("[data-shortcut-reset]");
+    const current = effectiveBinding(id, settings.shortcuts);
+    if (btn) btn.textContent = bindingLabel(current);
+    if (resetBtn) {
+      resetBtn.style.display = bindingsEqual(current, defaultBinding(id)) ? "none" : "inline-flex";
+    }
+  }
+  function refreshAllShortcutRows(): void {
+    for (const s of SHORTCUTS) refreshShortcutRow(s.id);
+  }
+  function showShortcutError(id: LocalHotkey, message: string): void {
+    const errEl = shortcutRowEls.get(id)?.querySelector<HTMLElement>("[data-shortcut-error]");
+    if (!errEl) return;
+    errEl.textContent = message;
+    window.setTimeout(() => {
+      if (errEl.textContent === message) errEl.textContent = "";
+    }, 3000);
+  }
+
+  // 記録中の操作 id (null = 記録していない)。同時に 1 つだけ記録できる。
+  let recordingId: LocalHotkey | null = null;
+  function stopRecording(): void {
+    if (!recordingId) return;
+    setRecordingActive(false);
+    recordingId = null;
+    refreshAllShortcutRows();
+  }
+  function startRecording(id: LocalHotkey, btn: HTMLButtonElement): void {
+    stopRecording();
+    recordingId = id;
+    setRecordingActive(true);
+    btn.classList.add("recording");
+    btn.textContent = "キーを押してください…";
+  }
+  for (const s of SHORTCUTS) {
+    const row = shortcutRowEls.get(s.id);
+    const btn = row?.querySelector<HTMLButtonElement>("[data-shortcut-btn]");
+    const resetBtn = row?.querySelector<HTMLButtonElement>("[data-shortcut-reset]");
+    btn?.addEventListener("click", () => startRecording(s.id, btn));
+    resetBtn?.addEventListener("click", () => {
+      if (recordingId === s.id) stopRecording();
+      const rest = { ...settings.shortcuts };
+      delete rest[s.id];
+      settings = { ...settings, shortcuts: rest };
+      applyShortcutBindings(settings.shortcuts);
+      persist();
+      refreshAllShortcutRows();
+    });
+  }
+  // 記録中のキー捕捉。webview-guard の window capture リスナー (F5/F11/devtools 等の抑止) より
+  // 後段の document capture で握るため、記録開始時に setRecordingActive(true) して
+  // webview-guard 側の matchHotkey を無効化し、既存割当と同じキーでも記録側へ届くようにする。
+  // stopPropagation でダイアログの Esc クローズ (line 494 の document keydown) 等とも競合させない。
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (!recordingId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      if (e.code === "Escape") {
+        stopRecording();
+        return;
+      }
+      if (isModifierOnlyCode(e.code)) return; // 修飾キー単体はまだ確定しない
+      const id = recordingId;
+      const binding = bindingFromEvent(e);
+      stopRecording();
+      const err = validateBinding(id, binding, settings.shortcuts);
+      if (err) {
+        showShortcutError(id, err);
+        return;
+      }
+      settings = { ...settings, shortcuts: { ...settings.shortcuts, [id]: formatBinding(binding) } };
+      applyShortcutBindings(settings.shortcuts);
+      persist();
+      refreshAllShortcutRows();
+    },
+    true,
+  );
+  refreshAllShortcutRows();
 
   // --- ページ切替 ---
   opts.root.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((btn) => {
@@ -1054,6 +1203,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, share_files: shareFilesToggle.checked };
     persist();
   });
+  audioMutedToggle?.addEventListener("change", () => {
+    settings = { ...settings, audio_muted: audioMutedToggle.checked };
+    persist();
+  });
+  grabKeyboardToggle?.addEventListener("change", () => {
+    settings = { ...settings, grab_keyboard: grabKeyboardToggle.checked };
+    persist();
+  });
+  statsPosSelect?.addEventListener("change", () => {
+    settings = { ...settings, stats_position: statsPosSelect.value as StatsPosition };
+    persist();
+  });
   codecSelect?.addEventListener("change", () => {
     settings = { ...settings, codec: codecSelect.value as CodecChoice };
     persist();
@@ -1138,9 +1299,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (fpsInput) fpsInput.value = String(settings.fps);
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
+    if (audioMutedToggle) audioMutedToggle.checked = settings.audio_muted;
+    if (grabKeyboardToggle) grabKeyboardToggle.checked = settings.grab_keyboard;
+    if (statsPosSelect) statsPosSelect.value = settings.stats_position;
     syncPresetSelect();
     syncCodecSelect();
     applyTheme(settings.theme, settings.accent_color);
+    applyShortcutBindings(settings.shortcuts);
+    refreshAllShortcutRows();
   }
 
   // 初期ロード: 設定を読み込んでコントロールへ反映。

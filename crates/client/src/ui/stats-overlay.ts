@@ -3,6 +3,7 @@
 
 import "./stats-overlay.css";
 import type { CodecId } from "../core/codec";
+import type { StatsPosition } from "../core/ipc";
 
 type Stats = {
   fps: number;
@@ -24,6 +25,15 @@ let latestCodec: CodecId | null = null;
 
 export function initStatsOverlay(el: HTMLElement): void {
   hudEl = el;
+  // 位置は settings 反映前の既定として右上にしておく (旧来の固定配置と同じ見え方)。
+  el.classList.add("pos-tr");
+}
+
+/** 統計 HUD の表示位置 (画面の隅) を切り替える。mount 時 + 設定変更時に呼ぶ。 */
+export function setStatsPosition(pos: StatsPosition): void {
+  if (!hudEl) return;
+  hudEl.classList.remove("pos-tl", "pos-tr", "pos-bl", "pos-br");
+  hudEl.classList.add(`pos-${pos}`);
 }
 
 export function toggleStats(): void {

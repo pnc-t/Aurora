@@ -439,8 +439,11 @@ export class Session {
     // カーソルを使うので不要・二重表示防止)。ポインタロックの実状態に同期させる。
     void setCursorOverlay(this.id, captured).catch((e) => logger.warn("setCursorOverlay failed", e));
     // Win/Alt+Tab 等の OS ショートカットがクライアント OS に奪われるとホストへ届かないため、
-    // マウスキャプチャ (ポインタロック) と連動してキーボード占有を切り替える。
-    void setKeyboardGrab(captured).catch((e) => logger.warn("setKeyboardGrab failed", e));
+    // マウスキャプチャ (ポインタロック) と連動してキーボード占有を切り替える。設定で OFF にした
+    // 場合は ON 側の呼び出しだけ抑止する (OFF 側は残留防止のため captured の値によらず必ず呼ぶ)。
+    if (!captured || this.effectiveSettings().grab_keyboard) {
+      void setKeyboardGrab(captured).catch((e) => logger.warn("setKeyboardGrab failed", e));
+    }
     if (!captured) {
       this.host.toast(this, "マウスキャプチャ OFF");
       return;
@@ -668,6 +671,11 @@ export class Session {
     if (settings.share_files) {
       void setFileSharing(this.id, true).catch((e) => logger.warn("setFileSharing failed", e));
     }
+    // 接続時に音声をミュートで始める設定なら、ホストへも初期状態として送る (ツールバー表示は
+    // 下の setAudioAvailable(initialMuted) 側で揃える)。
+    if (settings.audio_muted) {
+      void setAudioMuted(this.id, true).catch((e) => logger.warn("setAudioMuted failed", e));
+    }
     // 非アクティブで接続完了したタブは即一時停止する (帯域節約)。
     if (!this.active) void setVideoPaused(this.id, true);
 
@@ -682,7 +690,7 @@ export class Session {
       const tb = this.host.toolbar;
       tb.setPosition(settings.toolbar_position);
       tb.setConnected(true, settings.toolbar_pinned);
-      tb.setAudioAvailable(ev.audio);
+      tb.setAudioAvailable(ev.audio, settings.audio_muted);
       this.host.setResizable(true);
       tb.setDisplays(this.toolbarDisplayList(), target?.id);
       tb.setConnLabel(this.connLabel);

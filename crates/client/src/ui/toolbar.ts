@@ -38,8 +38,11 @@ export type ToolbarHandle = {
   setFileToggled: (on: boolean) => void;
   setFullscreenToggled: (on: boolean) => void;
   setCaptureToggled: (on: boolean) => void;
-  /** ホストが音声対応かをツールバーに伝える (非対応ならミュートボタンを隠す)。 */
-  setAudioAvailable: (available: boolean) => void;
+  /**
+   * ホストが音声対応かをツールバーに伝える (非対応ならミュートボタンを隠す)。
+   * initialMuted で接続直後のミュート初期状態を渡す (settings.audio_muted。既定 false)。
+   */
+  setAudioAvailable: (available: boolean, initialMuted?: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
   /** ツールバーを確実に表示する (脱出時など)。ピン留めして自動格納されないようにする。 */
@@ -48,6 +51,8 @@ export type ToolbarHandle = {
   setPosition: (pos: ToolbarPosition) => void;
   /** 接続状態を反映する。pinnedDefault でこのセッションの初期ピン留めを決める。 */
   setConnected: (connected: boolean, pinnedDefault?: boolean) => void;
+  /** ショートカット割当が変わったとき、ツールチップのキー表記を最新化する。 */
+  refreshShortcutLabels: () => void;
 };
 
 // メニュー内の選択肢 1 行。ラベルはホスト由来文字列 (ディスプレイ名) があり得るため
@@ -396,10 +401,12 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     setCaptureToggled(on: boolean): void {
       captureBtn?.classList.toggle("toggled", on);
     },
-    setAudioAvailable(available: boolean): void {
+    setAudioAvailable(available: boolean, initialMuted = false): void {
       audioAvailable = available;
-      // 新規接続のたびにミュートは解除状態から始める (前セッションの状態を持ち越さない)。
-      muted = false;
+      // 新規接続のたびに設定の初期ミュート状態から始める (前セッションの状態を持ち越さない)。
+      // 実際のミュート適用 (ホストへの set_audio_muted 送出) は session 側が既に行っている
+      // ため、ここは表示 (ボタンの見た目) だけを揃える。
+      muted = initialMuted;
       applyAudioBtn();
     },
     setVideoParams(fps: number, mbps: number): void {
@@ -438,6 +445,15 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       autoHideLocked = false;
       revealed = false;
       applyVisibility();
+    },
+    refreshShortcutLabels(): void {
+      if (fullscreenBtn) fullscreenBtn.title = `フルスクリーン (${shortcutLabel("toggle-fullscreen")})`;
+      if (captureBtn) captureBtn.title = `マウスキャプチャ (${shortcutLabel("toggle-capture")})`;
+      if (statsBtn) statsBtn.title = `統計 HUD (${shortcutLabel("toggle-stats")})`;
+      if (pinBtn) pinBtn.title = `バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}`;
+      if (hideBtn) {
+        hideBtn.title = `バーを隠す (端にカーソルを合わせても出さない) / ${shortcutLabel("toggle-bar")} で再表示`;
+      }
     },
   };
 }
