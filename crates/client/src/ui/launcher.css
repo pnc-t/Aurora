@@ -167,7 +167,16 @@
 .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
 
 /* 設定ページ */
+.settings-tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-shrink: 0; }
+.settings-tab {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 8px;
+}
+.settings-tab:hover { background: var(--raised-faint); color: var(--fg); }
+.settings-tab.active { background: var(--raised); color: var(--fg); }
 .settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 10px; }
+.settings-sect { display: none; flex-direction: column; }
+.settings-sect.active { display: flex; }
 .setting-group {
   font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
   margin: 24px 2px 6px; font-weight: 600;
