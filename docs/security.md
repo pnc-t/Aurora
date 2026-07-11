@@ -105,14 +105,44 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 `--clear-password` を実行できてしまいます。これを塞ぐため、パスワードの変更/削除は
 トレイ UI・CLI の**両方**に対称のガードを入れています:
 
-1. クライアント接続中は変更を**拒否**する (単一接続ガードの状態をプロセス間共有)。
+1. クライアント接続中は変更を**拒否**する (接続中だけ生存する名前付きイベント
+   `Local\AuroraSessionActive` を各接続の `ActiveGuard` が保持し、トレイと CLI が
+   `net::is_active()` で別プロセスからも確認する。`crates/host/src/net/session.rs`)。
 2. 既存パスワードがある場合は、**現在のパスワード**を要求して照合してから変更する。
+
+## WoL 中継 (aurora-wol) の露出面
+
+Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別プロセス
+**`aurora-wol`** (`crates/wol`、raspi 等での運用を想定) が担います。host 本体とは
+別バイナリ・別ポート (既定 7100) ですが、Tailnet に露出するため脅威モデルに含めます。
+
+- **認証**: host への接続と同じ **Noise `XXpsk3`** ハンドシェイクを使い、PSK も同じ
+  `psk_from_password` (Argon2id) で導出します。中継用パスワードは host の接続パスワードとは
+  **別の値**として運用でき、host/client 間の鍵と混用しません (`crates/wol/src/main.rs`,
+  `crates/client/src-tauri/src/net/wol.rs`)。
+- **パスワードの保存場所が host と非対称**: client 側 (中継先パスワードのキャッシュ) は
+  host 接続用パスワードと同じく DPAPI で暗号化して保存します。一方 **raspi 側は非 Windows
+  で DPAPI が使えないため平文ファイル (`password.txt` 等) で保管**します。ファイル権限を
+  `chmod 600` にする運用が前提で、これが破られる (raspi への侵入等) と中継パスワードが漏れます。
+- **影響範囲は起動のみ**: wake 要求 (`WolMsg::Wake { mac }`) が認証を通ると、
+  `aurora-wol` は指定 MAC 宛にマジックパケットを LAN ブロードキャストして対象 PC を
+  起動させます。それ以上の操作 (画面・入力・ファイル等) はできません。host への実際の
+  リモート操作には、別途 host 自身のパスワード/Noise ハンドシェイクを通す必要があります。
+- **MAC アドレスの開示範囲**: host は `HostInfo` メッセージでプライマリ NIC の MAC を
+  client へ渡します (`crates/common/src/proto.rs`)。これは**映像セッションが確立した後**
+  (=host のパスワード認証を通過した接続) にのみ流れるため、未認証の相手には開示されません。
+  client はこれを host エントリに保存し、WoL タブの wake 要求に使います。
+- **認証前の無応答接続対策**: 接続ごとに独立タスクで処理し (accept ループは塞がない)、
+  ハンドシェイク I/O は 10 秒、ハンドシェイク〜Wake〜Ack の 1 接続全体は 15 秒で
+  タイムアウトさせて切断します。1 接続 = 1 Wake 要求 = 即切断の軽量ラウンドトリップです。
 
 ## ログ
 
 暗号化キー・パスワードはログに出しません。保存済みパスワードを使う場合も値は表示せず、
-"(from secure store)" とだけ記録します。ホストのファイルログは
-`%LOCALAPPDATA%\Aurora\host.log` (約 5MiB で簡易ローテーション)。
+"(from secure store)" とだけ記録します。ファイルログは host/client/aurora-wol とも
+`crates/common/src/logging.rs` に集約した共通初期化で、`%LOCALAPPDATA%\Aurora\logs\`
+(非 Windows は `~/.local/share/Aurora/logs`) に `host.<日付>.log` / `client.<日付>.log` /
+`wol.<日付>.log` を日次ローテーション + 7 世代保持で残します。
 
 ## 脅威モデル (何を守り、何を守らないか)
 
@@ -126,6 +156,9 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 - LAN/インターネットへの不用意な露出 (既定 Tailscale-only bind)。
 - パスワード漏洩時の任意端末からの接続 (任意の 2 要素目=デバイスピン留めを有効化した場合のみ。
   既定無効)。
+- WoL 中継 (`aurora-wol`) への到達も Noise `XXpsk3` + Argon2id 導出 PSK で認証 (host と同じ
+  仕組み)。ただし中継パスワードの保存先は運用機器 (raspi 等) 側で DPAPI 相当の保護がない
+  (下記「WoL 中継 (aurora-wol) の露出面」参照)。
 
 **守らない/前提に委ねるもの**
 - **ネットワーク到達制御は Tailscale に委譲**。Tailnet への参加可否・ACL は Tailscale 側で
@@ -136,10 +169,11 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 
 ## 既知の制約
 
-- **認証前 DoS (単一クライアントモデル)**: 接続受理は直列で、1 接続がハンドシェイク完了まで
-  占有します。攻撃者が接続して放置するとハンドシェイクタイムアウト (10 秒) の間、正規ユーザーが
-  待たされます。繰り返せば実質的な締め出しになり得ます。Tailnet 内の信頼を前提に許容しています
-  (ネットワーク到達制御は Tailscale 側 ACL に委譲)。
+- **認証前 DoS (接続枠の占有)**: 接続は受理ごとに独立タスクで処理しますが、同時接続数は
+  `MAX_CLIENTS` (=4) のセマフォで制限し、超過分は受理直後に切断します。攻撃者が未認証の
+  接続を 4 本張って放置すると、ハンドシェイクタイムアウト (10 秒) で枠が解放されるまでの間、
+  正規ユーザーの接続が弾かれます。繰り返せば実質的な締め出しになり得ます。Tailnet 内の
+  信頼を前提に許容しています (ネットワーク到達制御は Tailscale 側 ACL に委譲)。
 - **UDP 音声のリプレイ**: 音声パケットの `seq` は欠落検出のみで、厳密な anti-replay は
   していません。経路上の攻撃者は音声データグラムを再送できます (映像はフレーム再構成と seq
   連続性で実質無害化)。Tailscale 下層 (WireGuard) が経路上の攻撃者をほぼ排除するため実害は
@@ -157,11 +191,15 @@ nonce 衝突とクロスチャネル注入を防ぎます。
 |------|------|
 | Noise ハンドシェイク・transport・nonce ドメイン | `crates/common/src/noise.rs` |
 | PSK 導出 (Argon2id) | `crates/common/src/noise.rs` (`psk_from_password`) |
-| パスワードの DPAPI 保存 | `crates/host/src/secret.rs` |
-| 単一接続ガード | `crates/host/src/conn.rs` |
-| bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_spec`) → `crates/host/src/net.rs` (`resolve_bind_ip`, bind 時に Tailscale IP を待つ) |
+| パスワードの DPAPI 保存 | `crates/host/src/security/secret.rs` |
+| 同時接続数の上限 (`MAX_CLIENTS`=4, セマフォ) | `crates/host/src/net/mod.rs` |
+| 接続中ガード (名前付きイベント `Local\AuroraSessionActive`) | `crates/host/src/net/session.rs` |
+| bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_spec`) → `crates/host/src/net/mod.rs` (`resolve_bind_ip`, bind 時に Tailscale IP を待つ) |
 | パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray.rs` |
-| パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net.rs` |
-| デバイスピン留め (静的鍵許可リスト) | `crates/host/src/devices.rs` / `crates/host/src/net.rs` / `crates/host/src/tray.rs` |
+| パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net/auth.rs` (`AuthThrottle`) |
+| デバイスピン留め (静的鍵許可リスト) | `crates/host/src/security/devices.rs` / `crates/host/src/net/client.rs` (`remote_static` 照合) / `crates/host/src/tray.rs` |
 | クライアント永続 ID 鍵 (静的鍵) | `crates/common/src/noise.rs` (`generate_static_keypair`/`remote_static`) / `crates/client/src-tauri/src/secret.rs` |
 | 受信ファイル名サニタイズ | `crates/common/src/fsname.rs` |
+| WoL 中継デーモン (Noise ハンドシェイク・マジックパケット送出) | `crates/wol/src/main.rs` |
+| WoL 中継への wake 要求 (client 側) | `crates/client/src-tauri/src/net/wol.rs` |
+| `HostInfo` の MAC 開示 | `crates/common/src/proto.rs` (`ControlMsg::HostInfo`) |

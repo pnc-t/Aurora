@@ -48,7 +48,8 @@ host が起動していて、パスワードが事前に分かっている** 必
   Tailscale を自動接続に、PC を WoL 対応に
         ↓
 [出先]
-  WoL で自宅 PC を起こす → Tailscale 接続 → ログオン時タスクで host 起動
+  client の WoL タブで自宅 PC を起こす（aurora-wol 中継、任意）
+        → Tailscale 接続 → ログオン時タスクで host 起動
         ↓
   client 起動 → 100.x.x.x:<port> + 既知のパスワードを入力 → 接続
 ```
@@ -114,7 +115,7 @@ tailscale ip -4       # 自宅 PC の 100.x.x.x を控える（client で使う�
 
 Tailscale はサービスとして常駐し、起動時に自動で tailnet へ参加する。
 
-### 5. （任意）Wake-on-LAN を Raspberry Pi 中継で構成する
+### 5. （任意）Wake-on-LAN を aurora-wol 中継で構成する
 
 外出先から自宅 PC の電源を入れたい場合のみ（常時オン運用なら不要）。
 
@@ -123,15 +124,18 @@ Tailscale はサービスとして常駐し、起動時に自動で tailnet へ�
 > 加えて寝ている自宅 PC は Tailscale に乗っていない。よって自宅 LAN 上に
 > **常時起動 + Tailscale 常駐の中継役**を 1 台置き、出先からそこへ Tailscale で
 > 入ってマジックパケットを LAN へ送る。Raspberry Pi は低消費電力で最適。
+> 中継デーモン本体はリポジトリ同梱の **`aurora-wol`**（`crates/wol`）で、client の
+> WoL タブから Noise XX-PSK で認証して wake 要求を送る。
 >
 > ```
-> [出先PC] --Tailscale(L3)--> [Raspberry Pi] --LANブロードキャスト--> [寝てる自宅PC]
+> [出先PC(client)] --Tailscale(L3)--> [aurora-wol on Raspberry Pi] --LANブロードキャスト--> [寝てる自宅PC]
 > ```
+
+詳細な前提・実行方法・systemd 化は [`crates/wol/README.md`](../crates/wol/README.md) が
+一次情報。ここでは全体フローのみ示す。
 
 #### 5-1. 自宅 PC 側（起こされる側）の設定
 
-- **MAC アドレスを控える**: 自宅 PC で `getmac /v`（または `ipconfig /all` の物理アドレス）。
-  WoL に使うのは host が待ち受ける有線/無線 NIC のもの。
 - **BIOS/UEFI** で Wake-on-LAN（"Power On by PCI-E" 等）を有効化。
 - **NIC ドライバ**: デバイスマネージャ → ネットワークアダプタ → プロパティ
   - 「電源の管理」→「このデバイスで…スタンバイ状態を解除」「Magic Packet でのみ…」を有効
@@ -140,72 +144,56 @@ Tailscale はサービスとして常駐し、起動時に自動で tailnet へ�
   ```powershell
   powercfg /h off
   ```
+- MAC アドレスは手動で控える必要はない。host が `HostInfo` でプライマリ NIC の MAC を
+  client へ渡すため、client 側で一度接続していれば WoL タブの追加ダイアログが自動入力する
+  （手動入力する場合は `getmac /v` で確認）。
 
 > S3（スリープ）/S4（休止）からの復帰が最も安定。運用は **「スリープ + WoL」** 推奨。
 
-#### 5-2. Raspberry Pi 側（中継役）の設定
+#### 5-2. Raspberry Pi 側（中継役）に aurora-wol をデプロイする
 
-Pi は自宅 PC と**同じ LAN（同一サブネット）**に接続しておく（有線が確実）。
+Pi は自宅 PC と**同じ LAN（同一サブネット）**に接続し、Tailscale 導入・SSH 接続可能な
+状態にしておく（有線が確実）。Windows 開発機からワンコマンドでビルド・配備・systemd 化
+できる:
 
-```bash
-# 1. Tailscale を入れて tailnet に参加（常駐する）
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --ssh          # --ssh で tailnet 内から鍵管理なしに SSH 可能
-
-# 2. マジックパケット送出ツール
-sudo apt update && sudo apt install -y wakeonlan
-
-# 3. 動作テスト（自宅 PC をスリープさせてから）
-wakeonlan AA:BB:CC:DD:EE:FF      # ← 自宅 PC の MAC
+```powershell
+cd crates/wol
+.\deploy-aurora-wol.ps1 -Target pi@100.x.x.x
+# ポートを変える場合
+.\deploy-aurora-wol.ps1 -Target pi@100.x.x.x -Port 7100
 ```
 
-控えておく値: `tailscale ip -4`（Pi の 100.x.x.x）または MagicDNS 名（例 `raspberrypi`）。
+初回はパスワード入力を求められる（空 Enter で自動生成）。完了後に表示される
+`ホスト:ポート`（Pi の Tailscale IP + 既定 7100）と**パスワード**を控える
+（host の接続パスワードとは別物）。2 回目以降の実行はバイナリ差し替え + サービス
+再起動のみで、既存パスワードは保持される。スクリプトが使えない環境向けの手動手順
+（直接ビルド・手動 systemd ユニット作成）は README を参照。
 
-#### 5-3. 出先から起こす
+#### 5-3. client の WoL タブに登録する
 
-出先 PC（Tailscale 接続済み）から、Pi へ SSH してコマンドを 1 発打つだけ:
+1. client を起動し、サイドバーの **Wake on LAN** タブを開く
+2. 右上の ＋ で WoL 先を追加
+   - 「登録済みホストから選ぶ」で自宅 PC の host エントリを選ぶと、MAC が自動入力される
+     （host から取得済みの MAC。未接続なら手動で `AA:BB:CC:DD:EE:FF` 形式で入力）
+   - 中継先（raspi）host/port と、5-2 で控えたパスワードを入力して保存
+     （パスワードは以後 DPAPI 暗号保存され、次回以降は空欄で使い回せる）
 
-```bash
-ssh pi@raspberrypi 'wakeonlan AA:BB:CC:DD:EE:FF'
-```
+#### 5-4. 出先から起こす
 
-毎回 MAC を打ちたくなければ、Pi に下記ヘルパーを置いておくと「起こして host が
-上がるまで待つ」までやってくれる（`~/wake-home.sh`）:
-
-```bash
-#!/usr/bin/env bash
-# 自宅 PC を WoL で起こし、host のポートが開くまで待つ。
-MAC="AA:BB:CC:DD:EE:FF"      # 自宅 PC の MAC
-HOST="100.x.x.x"            # 自宅 PC の Tailscale IP
-PORT="${1:-7000}"          # host の --port（既定 7000）
-
-echo "sending magic packet to $MAC ..."
-wakeonlan "$MAC"
-echo -n "waiting for $HOST:$PORT "
-until nc -z -w1 "$HOST" "$PORT" 2>/dev/null; do
-  echo -n "."
-  sleep 2
-done
-echo " up!"
-```
-
-```bash
-chmod +x ~/wake-home.sh
-# 出先からは:
-ssh pi@raspberrypi '~/wake-home.sh 8000'   # 引数は host の --port
-```
-
-> WoL のマジックパケット送出自体は本アプリの管轄外（中継役 = Raspberry Pi の役割）。
-> 上のスクリプトはあくまで運用例。
+WoL タブのカードにある操作:
+- **起動**（雷アイコン）: マジックパケットを送るだけ
+- **起動して接続**（雷 + chevron、host エントリと紐付けている場合のみ表示）: マジック
+  パケット送出後、host のポートが開くまで到達性を自動でポーリングし、開いたらそのまま接続する
+  （事前に一度そのホストへ手動接続してパスワードを保存しておく必要がある）
 
 ---
 
 ## 出先からの接続
 
-1. （PC が落ちているなら）Pi 経由で WoL を送って自宅 PC を起こす
-   （例: `ssh pi@raspberrypi '~/wake-home.sh 8000'`）
+1. （PC が落ちているなら）client の WoL タブから「起動」または「起動して接続」を実行し、
+   自宅 PC を起こす（手順 5 参照。常時オン運用なら不要）
 2. 自宅 PC がログオンすると host が自動起動し、保存済みパスワードで待ち受ける
-3. 出先の PC で client を起動
+3. 出先の PC で client を起動（「起動して接続」を使った場合はこの後の操作は不要）
 4. 接続先に `100.x.x.x:<port>`、パスワードに手順 2 で設定した値を入力して接続
 
 ---
@@ -218,5 +206,6 @@ ssh pi@raspberrypi '~/wake-home.sh 8000'   # 引数は host の --port
 | パスワードが通らない | `--set-password` をタスクと同じユーザーで（昇格せず）実行したか。`%LOCALAPPDATA%\Aurora\password.bin` があるか。client 側の入力値と一致しているか |
 | タスクは動くが映像が来ない | ログオンセッションがアクティブか（ロック画面のみでは DXGI が止まる構成あり）。GPU ドライバ |
 | `--install` が失敗する | 管理者権限で実行しているか（`/RL HIGHEST` 登録のため） |
-| WoL で起きない | Pi と自宅 PC が同一サブネットか。MAC が正しいか。高速スタートアップ無効化したか。S5 不可なら S3/S4（スリープ/休止）で運用 |
+| WoL で起きない | Pi（aurora-wol）と自宅 PC が同一サブネットか。MAC が正しいか。高速スタートアップ無効化したか。S5 不可なら S3/S4（スリープ/休止）で運用 |
+| WoL タブで「保存済みパスワードがありません」と出る | 中継先（raspi）のパスワード未保存。表示されるダイアログでパスワードを入力（`deploy-aurora-wol.ps1` 実行時に控えた値）|
 | 自動ログオンしたい | 無人運用で「ログオン時」を満たすには自動ログオン設定が要る（セキュリティと要相談） |

@@ -6,15 +6,18 @@ Aurora は既存リモートデスクトップ (RDP/VNC/SPICE) に追従せず�
 | チャネル | トランスポート | 用途 | シリアライズ |
 |------|------|------|------|
 | 制御 | TCP (順序保証) | 入力・クリップボード・ファイル・統計・各種 RPC | `bincode` |
-| 映像/音声 | UDP (低遅延・ロス許容) | H.264 NALU フラグメント / Opus フレーム | 生バイト |
+| 映像/音声 | UDP (低遅延・ロス許容) | H.264/HEVC/AV1 映像フラグメント (コーデックネゴシエーション) / Opus フレーム | 生バイト |
 
 どちらのチャネルも単一の Noise セッション鍵で暗号化します (詳細は [security.md](security.md))。
 **制御チャネルに映像を流さない / 映像チャネルに制御メッセージを流さない**ことが
 遅延予算の前提です。
 
 定義の出どころ:
-- 制御メッセージ … `crates/common/src/proto.rs`
-- UDP フレーミング … `crates/common/src/framing.rs`
+- 制御メッセージ (`ControlMsg` / `WolMsg`) … `crates/common/src/proto.rs`
+- UDP 映像/音声フレーミング + TCP 制御フレーミング (`read_tcp_frame`/`write_tcp_frame`、
+  `send_ctrl_msg`/`decode_ctrl_msg`、`send_wol_msg`/`decode_wol_msg`) … `crates/common/src/framing.rs`
+  (host/client 双方が同じ実装を使う。片側だけ変えるとワイヤ互換が静かに壊れるため、
+  この 1 箇所に集約されている)
 - 暗号ラッパー・nonce ドメイン … `crates/common/src/noise.rs`
 
 ## 接続シーケンス
@@ -34,7 +37,9 @@ client (initiator)                        host (responder)
 - ハンドシェイクは Noise の `XXpsk3` パターン (3 メッセージ往復)。各ステップには
   **10 秒のタイムアウト**があり、無応答接続を掴み続けません。
 - ハンドシェイク成立後、ホストは最初に `HostInfo` (ディスプレイ一覧・音声有無) を送ります。
-- ホストは同時に**1 接続だけ**受理します (単一接続ガード)。
+- ホストは同時に**最大 4 接続** (`MAX_CLIENTS`) を受理します (セマフォで制限)。上限到達時の
+  新規接続は受理直後 (ハンドシェイク前) に切断されます。共有 capture/encode の出力を全接続へ
+  ファンアウトするマルチクライアントモデルです。
 
 ## 制御チャネル (TCP)
 
@@ -45,7 +50,7 @@ client (initiator)                        host (responder)
 ### セッション/映像制御
 | メッセージ | 向き | 意味 |
 |------|------|------|
-| `HostInfo { displays, audio }` | H→C | 接続直後のホスト情報。各 `Display` は `id/width/height/name` に加え、仮想ディスプレイ (IDD/MttVDD) か否かの `is_virtual` を持つ |
+| `HostInfo { displays, audio, mac }` | H→C | 接続直後のホスト情報。各 `Display` は `id/width/height/name` に加え、仮想ディスプレイ (IDD/MttVDD) か否かの `is_virtual` を持つ。`mac` はホストのプライマリ NIC の MAC アドレス (取得失敗時は `None`)。クライアントは host エントリに保存し、WoL 中継 (`aurora-wol`) への wake 要求に使う |
 | `SelectDisplay { id }` | C→H | キャプチャ対象ディスプレイの切替 |
 | `SetVideoParams { fps, max_bitrate_bps }` | C→H | 送出 fps 上限・ビットレート上限の実行時変更 (0 = 無制限) |
 | `SetResolution { max_height }` | C→H | 送出映像の最大高さ (px)。ホストが GPU で縮小 (アスペクト比維持) し帯域・負荷を下げる。0 = キャプチャ解像度のまま |
@@ -54,6 +59,8 @@ client (initiator)                        host (responder)
 | `SetVideoPaused { paused }` | C→H | 映像送出の一時停止/再開。マルチタブで非アクティブタブの帯域を止める。再開時は `RequestKeyframe` で復帰 |
 | `SetAudioMuted { muted }` | C→H | 音声送出のミュート切替。ミュート中はホストが音声 UDP を送らない |
 | `SetCursorOverlay { enabled }` | C→H | 映像へのカーソル合成 ON/OFF。DXGI はカーソルを含めないため、マウスキャプチャ (ポインタロック) 中だけ ON にして焼き込ませる |
+| `SetSupportedCodecs { codecs }` | C→H | クライアントが対応する映像コーデックの申告 (`VideoCodec`: H264/Hevc/Av1)。接続直後のハンドシェイク完了直後と、手動コーデック切替時に再申告する。ホストは全クライアント申告の共通集合と自身の能力から送出コーデックを決める (優先順位 AV1 > HEVC > H264、共有エンコーダのため 1 クライアントでも非対応なら選べない) |
+| `VideoCodecChanged { codec }` | H→C | 送出コーデックの確定/変更通知。エンコーダの (再) 作成の都度、全クライアントへ送りキーフレームを強制する。途中参加クライアントには `HostInfo` 送信直後にも現在値を送る |
 | `RequestKeyframe` | C→H | キーフレーム (IDR) 要求。ロス回復用 |
 | `Ping { ts_us }` / `Pong { ts_us }` | 双方向 | RTT 計測 |
 | `Stats { bitrate_kbps, fps, rtt_us, loss_permille }` | 双方向 | 適応ビットレート制御の入力 |
@@ -80,6 +87,22 @@ client (initiator)                        host (responder)
 | `FsRead { req_id, path, offset, length }` / `FsReadReply { req_id, data, error }` | H→C / C→H | ファイル読み取り (空 `data` かつ `error=None` で EOF) |
 | `FsCreate` / `FsWrite` / `FsDelete` / `FsRename` | H→C | ホスト Explorer 側の変更をクライアントへ書き戻す (一方向・応答なし) |
 
+### WoL 中継 (`WolMsg`、ControlMsg とは別プロトコル)
+
+映像セッションを持たない別クレート `crates/wol` (`aurora-wol`。自宅 LAN の Raspberry Pi 等で
+常駐) を起こすための独立したメッセージです。`ControlMsg` とは**別チャネル・別プロトコル**で、
+1 接続 = 1 Wake 要求 = 即切断という軽量なラウンドトリップです。ワイヤ形式 (bincode →
+CTRL ドメイン nonce で Noise 暗号化 → u16 長さ prefix フレーム) は `ControlMsg` と同じ実装
+(`framing.rs` の `send_wol_msg`/`decode_wol_msg`) を共有しますが、混同しないよう型を分けています。
+
+| メッセージ | 向き | 意味 |
+|------|------|------|
+| `Wake { mac }` | C→W | 対象 MAC アドレスへのマジックパケット送出要求 |
+| `Ack { ok, message }` | W→C | 送出結果 |
+
+接続シーケンスは host と同じ Noise `XXpsk3` (3 メッセージ往復) です。クライアントは
+`HostInfo.mac` で保存した MAC を使って `aurora-wol` へ接続し `Wake` を送ります。
+
 > プロトコル型を変更するときは **host/client 双方の互換性**を確認してください。`bincode` は
 > enum のバリアント順 (タグ) に依存するため、新バリアントは**末尾に追加**します
 > (`proto.rs` の `MouseMoveRelative` / `SetVideoParams` がその例)。
@@ -105,7 +128,10 @@ net 層が 1 データグラムに付けるオーバーヘッドを含めた全�
 
 ### 映像パケット (framed payload, ヘッダ 7B)
 
-H.264 NALU を MTU に収まるフラグメントへ分割して送ります。
+現在ネゴシエーション済みのコーデック (H.264 / HEVC / AV1) のビットストリームを MTU に収まる
+フラグメントへ分割して送ります。H.264/HEVC は Annex-B (`00 00 00 01` start code 区切りの
+NALU 列)、AV1 は OBU (Open Bitstream Unit) 列です。ヘッダ形式・フラグメント方式はコーデックに
+依らず共通です。
 
 ```
 [ seq 4B (BE) ][ flags 1B ][ frame_id 2B (BE) ][ payload (NALU fragment) ]
@@ -125,8 +151,32 @@ H.264 NALU を MTU に収まるフラグメントへ分割して送ります。
 1 パケット = 1 Opus フレーム (20ms)。Opus フレームは MTU 内に収まるため分割しません。
 `seq` は欠落検出用です。
 
+## コーデックネゴシエーション
+
+- クライアントは起動時に `crates/client/src/core/codec.ts` の `probeSupportedCodecs()` で
+  `VideoDecoder.isConfigSupported` を使い、実際にデコード可能なコーデックを優先順 (AV1 >
+  HEVC > H264) でプローブし、`SetSupportedCodecs` で申告します。
+- ホストは起動時に `crates/host/src/encode/mod.rs` の `probe_encoders` で実エンコード可否を
+  1 度だけプローブします (H.264 は SW MFT フォールバックが必ずあるため常に含む)。
+- 送出コーデックの決定は `crates/host/src/net/codec.rs` の `negotiate_codec` (純関数) が、
+  host 能力と全クライアント申告の共通集合から優先順位で選びます。単一エンコーダを全クライアント
+  で共有するため、1 クライアントでも対応しないコーデックは選べません。
+- 実行時にエンコーダが要求コーデックで失敗した場合は H.264 へ動的フォールバックし、
+  `host_codecs` からそのコーデックを外して再ネゴシエーションします (単調に縮むため必ず収束)。
+
 ## デコーダ初期化メモ (クライアント)
 
-WebCodecs の H.264 デコードは `avc1.*` プロファイル文字列が必須です。エンコーダ出力の
-SPS/PPS から構築します (`crates/client/src/core/decoder.ts` が参照点)。Tauri の WebView は
-すべて WebCodecs 対応のため、H.264 デコードのフォールバックは持ちません。
+WebCodecs はコーデックごとに異なる codec 文字列が必要です (`crates/client/src/core/decoder.ts`
+が参照点)。
+
+- **H.264**: `avc1.*` 形式。エンコーダ出力の SPS (`profile_idc`/`constraint_set_flags`/
+  `level_idc`) から構築します (`codecStringFromH264Sps`)。SPS 未着時はキーフレームを要求して待ちます。
+- **HEVC**: `hvc1.*` 形式。SPS (nal_type 33) の `profile_tier_level` 先頭固定部だけを読む
+  最小パーサ (`codecStringFromHevcSps`) で構築します。パース失敗時は汎用文字列
+  (`hvc1.1.6.L120.b0`) にフォールバックし、H.264 と異なり再要求ループには入りません。
+- **AV1**: `av01.*` 形式。OBU 列から sequence header OBU (obu_type=1) を探し、AV1 仕様
+  5.5.1 に沿った最小パーサ (`parseAv1SequenceHeader`) で `profile`/`level`/`tier`/`bitDepth`
+  を読んで構築します。パース失敗時は汎用文字列 (`av01.0.08M.08`) にフォールバックします。
+
+Tauri の WebView はすべて WebCodecs 対応のため、いずれのコーデックもフォールバックデコーダ
+(ソフトウェア実装の自前デコード等) は持ちません。

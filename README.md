@@ -65,10 +65,11 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 
 - **低遅延**: 1080p / 60fps を目標に、GPU ハードウェアエンコード + WebCodecs GPU デコードで End-to-End 体感遅延 < 50ms (Tailnet 直結時) を狙う設計
 - **軽量**: ホスト CPU 使用率 < 15% (GPU エンコード前提)、クライアント UI は Vanilla TypeScript でバンドル軽量
-- **ゼロコピー映像パイプライン**: DXGI Desktop Duplication → Media Foundation H.264 を GPU 上で完結 (CPU コピーを避ける)
+- **ゼロコピー映像パイプライン**: DXGI Desktop Duplication → Media Foundation を GPU 上で完結 (CPU コピーを避ける)
+- **コーデックネゴシエーション**: クライアントとホスト双方の対応状況から H.264 / HEVC / AV1 を自動選択 (優先度 AV1 > HEVC > H.264)
 - **役割分離プロトコル**: 制御は TCP、映像/音声は UDP。遅延予算のために独自プロトコルで設計
 - **エンドツーエンド暗号化**: Noise XX-PSK ハンドシェイク。PSK はパスワードから Argon2id で導出
-- **付加機能**: マウス/キー入力注入、クリップボード同期、音声 (Opus)、ファイル転送、ProjFS によるドライブ投影、画質プリセット、解像度追従 (RDP 風) と仮想ディスプレイ、マルチタブ接続、自動再接続
+- **付加機能**: マウス/キー入力注入 (IME 日本語入力・キーボード占有対応)、クリップボード同期、音声 (Opus)、ファイル転送、ProjFS によるドライブ投影、画質プリセット、解像度追従 (RDP 風) と仮想ディスプレイ、マルチタブ接続、ネットワーク切替時のシームレス再接続、Wake-on-LAN によるリモート起動、クライアント設定ページ
 
 ---
 
@@ -96,7 +97,7 @@ crates/
 | 言語 / ランタイム | Rust 2024 edition / `tokio` |
 | クライアント GUI | Tauri v2 + Vanilla TypeScript + Vite (フレームワーク非採用) |
 | 画面キャプチャ | DXGI Desktop Duplication (Windows) |
-| 映像コーデック | H.264 ハードウェアエンコード (Media Foundation) / デコードは WebCodecs `VideoDecoder` (GPU) |
+| 映像コーデック | H.264 / HEVC / AV1 ハードウェアエンコード (Media Foundation、ネゴシエーションで自動選択) / デコードは WebCodecs `VideoDecoder` (GPU) |
 | 音声 | `cpal` (loopback) + Opus (20ms frame) |
 | 暗号化 | `snow` (Noise XX-PSK) + `argon2` (PSK 導出) |
 | シリアライズ | `bincode` (制御) + 生バイト (映像) |
@@ -151,6 +152,7 @@ cargo tauri build        # crates/client/src-tauri から実行
 | `--install` / `--uninstall` | ログオン時自動起動タスクの登録 / 解除 |
 | `--fps N` | 送出 fps 上限 (0 = 無制限) |
 | `--max-bitrate N` | ビットレート上限 (Mbps、0 = 無制限) |
+| `--encode-gpu NAME` | エンコードに使う GPU を名前の部分一致で指定 (ハイブリッド GPU ノート向け)。`auto` で既定 (キャプチャと同一 GPU) に戻す |
 | `--log-level LEVEL` | ログレベル (`RUST_LOG` でも指定可、例 `aurora=debug`) |
 
 ---
