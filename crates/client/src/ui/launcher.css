@@ -166,14 +166,25 @@
 }
 .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
 
-/* 設定ページ */
-.settings-tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-shrink: 0; }
-.settings-tab {
-  background: transparent; border: none; color: var(--muted); cursor: pointer;
-  font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 8px;
+/* 設定ページ: 間延び防止のため 1 カラムに幅上限を設ける */
+#page-settings { max-width: 760px; }
+/* タブバー: 下線インジケータ型。ピル背景は廃止し、選択中タブの下にアクセント色の下線を出す。
+ * 下線はタブバー全幅の区切り線に重ねる (区切り線は擬似要素、下線は各タブの ::after)。 */
+.settings-tabs {
+  display: flex; gap: 4px; margin-bottom: 16px; flex-shrink: 0;
+  border-bottom: 1px solid var(--panel-border);
 }
-.settings-tab:hover { background: var(--raised-faint); color: var(--fg); }
-.settings-tab.active { background: var(--raised); color: var(--fg); }
+.settings-tab {
+  position: relative;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; font-weight: 600; padding: 10px 14px; margin-bottom: -1px;
+}
+.settings-tab:hover { color: var(--fg); }
+.settings-tab.active { color: var(--fg); }
+.settings-tab.active::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  background: var(--accent); border-radius: 2px 2px 0 0;
+}
 .settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 10px; }
 .settings-sect { display: none; flex-direction: column; }
 .settings-sect.active { display: flex; }
@@ -182,6 +193,14 @@
   margin: 24px 2px 6px; font-weight: 600;
 }
 .setting-group:first-child { margin-top: 4px; }
+/* 設定カード: グループ見出し直下の設定行をまとめて 1 枚のカードに囲う (Windows 11 設定風)。
+ * 行間の区切りはカード内側の細線にし、ページ全幅の border-bottom はカード内スタイルへ置き換える。 */
+.setting-card {
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
+  padding: 0 14px; overflow: hidden;
+}
+.setting-card .setting-row { border-bottom: 1px solid var(--panel-border); padding: 14px 2px; }
+.setting-card .setting-row:last-child { border-bottom: none; }
 .color-input {
   width: 42px; height: 28px; padding: 0; border: 1px solid var(--panel-border);
   border-radius: 6px; background: var(--control); cursor: pointer; flex-shrink: 0;
@@ -231,7 +250,7 @@ input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; marg
 input[type="number"] { -moz-appearance: textfield; }
 .setting-row {
   display: flex; align-items: center; gap: 16px;
-  padding: 16px 2px; border-bottom: 1px solid var(--panel-border);
+  padding: 16px 2px;
 }
 .setting-row .s-meta { flex: 1; }
 .setting-row .s-title { font-size: 14px; }
