@@ -15,11 +15,13 @@
 }
 
 /* サイドバー: アイコンのみの細いレール (ブランド非表示。上端はタイトルバー分あける)。
- * 各項目の名称はボタンの title 属性 (ホバー) で表示する。 */
+ * 各項目の名称はボタンの title 属性 (ホバー) で表示する。
+ * 下 padding はステータスバー (absolute 全幅 26px) の高さ分を含めて確保し、
+ * 最下部の設定アイコンがバーの裏に隠れないようにする。 */
 .sidebar {
   width: 60px; flex-shrink: 0;
   display: flex; flex-direction: column; align-items: center;
-  padding: 42px 8px 14px; gap: 6px;
+  padding: 42px 8px 40px; gap: 6px;
   background: var(--sidebar); border-right: 1px solid var(--panel-border);
 }
 .nav-item {
