@@ -2,7 +2,9 @@
  * page-head / host-card 相当の共通クラス (.card-btn, .btn-secondary, .empty-hint, .dialog 系)
  * は launcher.css 側の既存定義を再利用し、ここでは wol 固有のセレクタのみ持つ (重複回避)。 */
 
-.wol-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 6px; }
+/* scrollbar-gutter で常時バー分の溝を確保し、出現/非表示でカード幅が変わらないようにする。
+ * padding-right はその溝込みで content の右余白 (26px) と揃うよう補正 (24 + 8 = 32 = 6 + 26)。 */
+.wol-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; scrollbar-gutter: stable; }
 
 /* ダイアログ用バックドロップ (launcher.css の #dialog-backdrop と同じ見た目)。#page-wol は
  * position 指定が無いため fixed で全面に被せ、中央配置する。 */

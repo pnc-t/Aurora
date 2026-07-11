@@ -47,10 +47,12 @@
 .statusbar.connected .sb-text { color: var(--fg); }
 
 /* コンテンツ領域 (下端は status bar 分だけ余白を足し、末尾要素が隠れないようにする) */
-.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 26px 36px; overflow: hidden; }
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 0 36px 26px; overflow: hidden; }
 .page { display: none; flex-direction: column; min-height: 0; flex: 1; }
 .page.active { display: flex; }
-.page-head { display: flex; align-items: center; margin-bottom: 16px; }
+/* スクロールバー分の溝は各スクロールコンテナ側で確保するため、見出し行は content の
+ * 右 padding が 0 になった分をここで補って右端の余白を維持する。 */
+.page-head { display: flex; align-items: center; margin-bottom: 16px; padding-right: 26px; }
 .page-head h2 { margin: 0; font-size: 22px; font-weight: 700; }
 .page-head .actions { margin-left: auto; display: flex; gap: 8px; }
 .icon-btn {
@@ -64,29 +66,37 @@
 .icon-btn.spinning .icon { animation: icon-spin 0.7s linear infinite; }
 @keyframes icon-spin { to { transform: rotate(360deg); } }
 
-/* スリムなスクロールバー (ダークテーマ用、OS 標準の太いバーを置換) */
-.host-list, .settings-body, .content {
+/* スリムなスクロールバー (ダークテーマ用、OS 標準の太いバーを置換)。
+ * .wol-list も含める: 外すと既定幅 (~15px) の溝が scrollbar-gutter で確保され、カード位置が他ページとずれる。 */
+.host-list, .wol-list, .settings-body, .content {
   scrollbar-width: thin;                       /* Firefox 系 */
   scrollbar-color: var(--track) transparent;
 }
 .host-list::-webkit-scrollbar,
+.wol-list::-webkit-scrollbar,
 .settings-body::-webkit-scrollbar,
 .content::-webkit-scrollbar { width: 8px; height: 8px; }
 .host-list::-webkit-scrollbar-track,
+.wol-list::-webkit-scrollbar-track,
 .settings-body::-webkit-scrollbar-track,
 .content::-webkit-scrollbar-track { background: transparent; }
 .host-list::-webkit-scrollbar-thumb,
+.wol-list::-webkit-scrollbar-thumb,
 .settings-body::-webkit-scrollbar-thumb,
 .content::-webkit-scrollbar-thumb {
   background: var(--track); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box;
 }
 .host-list:hover::-webkit-scrollbar-thumb,
+.wol-list:hover::-webkit-scrollbar-thumb,
 .settings-body:hover::-webkit-scrollbar-thumb { background: var(--track-hover); background-clip: padding-box; }
 .host-list::-webkit-scrollbar-thumb:hover,
+.wol-list::-webkit-scrollbar-thumb:hover,
 .settings-body::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
 
 /* ホスト一覧 */
-.host-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 6px; }
+/* scrollbar-gutter で常時バー分の溝を確保し、出現/非表示でカード幅が変わらないようにする。
+ * padding-right はその溝込みで content の右余白 (26px) と揃うよう補正 (24 + 8 = 32 = 6 + 26)。 */
+.host-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; scrollbar-gutter: stable; }
 .host-card {
   display: flex; align-items: center; gap: 14px;
   padding: 14px 16px; border-radius: 12px;
@@ -166,13 +176,15 @@
 }
 .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
 
-/* 設定ページ: 間延び防止のため 1 カラムに幅上限を設ける */
-#page-settings { max-width: 760px; }
+/* 設定ページ: 間延び防止のため 1 カラムに幅上限を設ける。スクロールバーは画面右端に
+ * 出したいので #page-settings 全体ではなく、幅を持つ内側の要素 (タブバー/各セクション)
+ * 側に max-width を付ける (settings-body 自体は右端まで広げてバーを寄せる)。 */
 /* タブバー: 下線インジケータ型。ピル背景は廃止し、選択中タブの下にアクセント色の下線を出す。
  * 下線はタブバー全幅の区切り線に重ねる (区切り線は擬似要素、下線は各タブの ::after)。 */
 .settings-tabs {
   display: flex; gap: 4px; margin-bottom: 16px; flex-shrink: 0;
   border-bottom: 1px solid var(--panel-border);
+  max-width: 760px;
 }
 .settings-tab {
   position: relative;
@@ -185,8 +197,10 @@
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
   background: var(--accent); border-radius: 2px 2px 0 0;
 }
-.settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 10px; }
-.settings-sect { display: none; flex-direction: column; }
+/* scrollbar-gutter で溝を常時確保し、バー出現時にカードが縮むのを防ぐ。
+ * padding-right は溝込みで content の右余白 (26px) と揃うよう補正 (18 + 8 = 26)。 */
+.settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 18px; scrollbar-gutter: stable; }
+.settings-sect { display: none; flex-direction: column; max-width: 760px; }
 .settings-sect.active { display: flex; }
 .setting-group {
   font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
