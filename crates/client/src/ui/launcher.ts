@@ -167,158 +167,169 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <section class="page" id="page-wol"></section>
         <section class="page" id="page-settings">
           <div class="page-head"><h2>Settings</h2></div>
+          <div class="settings-tabs">
+            <button type="button" class="settings-tab active" data-sect="av">映像・接続</button>
+            <button type="button" class="settings-tab" data-sect="display">表示</button>
+            <button type="button" class="settings-tab" data-sect="other">その他</button>
+          </div>
           <div class="settings-body">
-            <div class="setting-group">映像 (接続時にホストへ適用)</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">画質プリセット</div>
-                <div class="s-desc">fps とビットレートをまとめて設定。手動で変えるとカスタムになる</div>
+            <div class="settings-sect active" data-sect="av">
+              <div class="setting-group">映像 (接続時にホストへ適用)</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">画質プリセット</div>
+                  <div class="s-desc">fps とビットレートをまとめて設定。手動で変えるとカスタムになる</div>
+                </div>
+                <select id="set-preset" class="select-input">${presetOptionsHtml()}</select>
               </div>
-              <select id="set-preset" class="select-input">${presetOptionsHtml()}</select>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">送出 fps 上限</div>
+                  <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
+                </div>
+                <input type="text" inputmode="numeric" id="set-fps" class="num-input" />
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">ビットレート上限 (Mbps)</div>
+                  <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
+                </div>
+                <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">映像コーデック</div>
+                  <div class="s-desc">自動はホストと対応コーデックを相談して選ぶ。手動でこの端末が非対応のものを選ぶと H.264 にフォールバックする</div>
+                </div>
+                <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
+              </div>
+              <div class="setting-group">接続</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">切断時に自動で再接続</div>
+                  <div class="s-desc">通信断などで切れたとき、間隔を空けて自動的に接続し直す</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-reconnect" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">接続時に自動フルスクリーン</div>
+                  <div class="s-desc">接続が成立したら全画面表示にする</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-fullscreen" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">統計 HUD を表示</div>
+                  <div class="s-desc">接続時に fps / ビットレート / RTT / loss を右上に表示</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-stats" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">マウスキャプチャを自動で有効化</div>
+                  <div class="s-desc">接続時にポインタロック (相対マウス) を有効化。Esc で解除</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-capture" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
+                  <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
+              </div>
             </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">送出 fps 上限</div>
-                <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
+            <div class="settings-sect" data-sect="display">
+              <div class="setting-group">ツールバー</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">配置</div>
+                  <div class="s-desc">操作バーを画面のどの端に置くか。左右に置くと縦並びのサイドバーになる</div>
+                </div>
+                <select id="set-tb-position" class="select-input">
+                  <option value="top">上</option>
+                  <option value="bottom">下</option>
+                  <option value="left">左</option>
+                  <option value="right">右</option>
+                </select>
               </div>
-              <input type="text" inputmode="numeric" id="set-fps" class="num-input" />
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">最初からピン留め (常時表示)</div>
+                  <div class="s-desc">OFF だと接続時は格納され、配置した端にカーソルを合わせると出てくる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-group">タブ</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">配置</div>
+                  <div class="s-desc">接続先タブを画面のどの端に置くか。左右に置くと縦並びのサイドタブになる</div>
+                </div>
+                <select id="set-tab-position" class="select-input">
+                  <option value="top">上</option>
+                  <option value="bottom">下</option>
+                  <option value="left">左</option>
+                  <option value="right">右</option>
+                </select>
+              </div>
+              <div class="setting-group">外観・既定値</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">テーマ</div>
+                  <div class="s-desc">配色。auto は OS のダーク/ライト設定に追従。legacy はグレーのクラシック調</div>
+                </div>
+                <select id="set-theme" class="select-input">
+                  <option value="auto">システム連動</option>
+                  <option value="dark">ダーク</option>
+                  <option value="light">ライト</option>
+                  <option value="legacy">レガシー</option>
+                </select>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">アクセントカラー</div>
+                  <div class="s-desc">ボタンや選択中の表示に使う色</div>
+                </div>
+                <input type="color" id="set-accent" class="color-input" />
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">新規ホストの既定ポート</div>
+                  <div class="s-desc">「＋追加」ダイアログの port 欄の初期値</div>
+                </div>
+                <input type="text" inputmode="numeric" id="set-port" class="num-input" />
+              </div>
             </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">ビットレート上限 (Mbps)</div>
-                <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
+            <div class="settings-sect" data-sect="other">
+              <div class="setting-group">ファイル共有</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">この PC をドライブとして共有</div>
+                  <div class="s-desc">接続中、<b>この PC の This PC 全体 (全ドライブ)</b> がホスト側に仮想ドライブとして現れ、ホストの Explorer から閲覧・コピー・書き込みできる。安全のため、ホストに<b>登録済みの端末</b>のときだけドライブが出る</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-share-files" /><span class="slider"></span></label>
               </div>
-              <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">映像コーデック</div>
-                <div class="s-desc">自動はホストと対応コーデックを相談して選ぶ。手動でこの端末が非対応のものを選ぶと H.264 にフォールバックする</div>
+              <div class="setting-group">ショートカット (接続中のローカル操作)</div>
+              ${shortcutRows}
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">マウスキャプチャ解除</div>
+                  <div class="s-desc">キャプチャ中にポインタロックを抜ける</div>
+                </div>
+                <span class="kbd">Esc</span>
               </div>
-              <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
-            </div>
-            <div class="setting-group">接続</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">切断時に自動で再接続</div>
-                <div class="s-desc">通信断などで切れたとき、間隔を空けて自動的に接続し直す</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-reconnect" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">接続時に自動フルスクリーン</div>
-                <div class="s-desc">接続が成立したら全画面表示にする</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-fullscreen" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">統計 HUD を表示</div>
-                <div class="s-desc">接続時に fps / ビットレート / RTT / loss を右上に表示</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-stats" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">マウスキャプチャを自動で有効化</div>
-                <div class="s-desc">接続時にポインタロック (相対マウス) を有効化。Esc で解除</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-capture" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
-                <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-group">ツールバー</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">配置</div>
-                <div class="s-desc">操作バーを画面のどの端に置くか。左右に置くと縦並びのサイドバーになる</div>
-              </div>
-              <select id="set-tb-position" class="select-input">
-                <option value="top">上</option>
-                <option value="bottom">下</option>
-                <option value="left">左</option>
-                <option value="right">右</option>
-              </select>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">最初からピン留め (常時表示)</div>
-                <div class="s-desc">OFF だと接続時は格納され、配置した端にカーソルを合わせると出てくる</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-group">タブ</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">配置</div>
-                <div class="s-desc">接続先タブを画面のどの端に置くか。左右に置くと縦並びのサイドタブになる</div>
-              </div>
-              <select id="set-tab-position" class="select-input">
-                <option value="top">上</option>
-                <option value="bottom">下</option>
-                <option value="left">左</option>
-                <option value="right">右</option>
-              </select>
-            </div>
-            <div class="setting-group">外観・既定値</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">テーマ</div>
-                <div class="s-desc">配色。auto は OS のダーク/ライト設定に追従。legacy はグレーのクラシック調</div>
-              </div>
-              <select id="set-theme" class="select-input">
-                <option value="auto">システム連動</option>
-                <option value="dark">ダーク</option>
-                <option value="light">ライト</option>
-                <option value="legacy">レガシー</option>
-              </select>
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">アクセントカラー</div>
-                <div class="s-desc">ボタンや選択中の表示に使う色</div>
-              </div>
-              <input type="color" id="set-accent" class="color-input" />
-            </div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">新規ホストの既定ポート</div>
-                <div class="s-desc">「＋追加」ダイアログの port 欄の初期値</div>
-              </div>
-              <input type="text" inputmode="numeric" id="set-port" class="num-input" />
-            </div>
-            <div class="setting-group">ショートカット (接続中のローカル操作)</div>
-            ${shortcutRows}
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">マウスキャプチャ解除</div>
-                <div class="s-desc">キャプチャ中にポインタロックを抜ける</div>
-              </div>
-              <span class="kbd">Esc</span>
-            </div>
-            <div class="setting-group">ファイル共有</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">この PC をドライブとして共有</div>
-                <div class="s-desc">接続中、<b>この PC の This PC 全体 (全ドライブ)</b> がホスト側に仮想ドライブとして現れ、ホストの Explorer から閲覧・コピー・書き込みできる。安全のため、ホストに<b>登録済みの端末</b>のときだけドライブが出る</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="set-share-files" /><span class="slider"></span></label>
-            </div>
-            <div class="setting-group">診断</div>
-            <div class="setting-row">
-              <div class="s-meta">
-                <div class="s-title">ログ</div>
-                <div class="s-desc">不具合の調査用。フォルダを開くか、まとめて ZIP に書き出して共有できる</div>
-              </div>
-              <div class="s-actions">
-                <button class="btn-secondary" id="open-logs">フォルダを開く</button>
-                <button class="btn-secondary" id="export-logs">ZIP 出力</button>
+              <div class="setting-group">診断</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">ログ</div>
+                  <div class="s-desc">不具合の調査用。フォルダを開くか、まとめて ZIP に書き出して共有できる</div>
+                </div>
+                <div class="s-actions">
+                  <button class="btn-secondary" id="open-logs">フォルダを開く</button>
+                  <button class="btn-secondary" id="export-logs">ZIP 出力</button>
+                </div>
               </div>
             </div>
           </div>
@@ -410,6 +421,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       opts.root.querySelectorAll(".page").forEach((p) => {
         p.classList.toggle("active", p.id === `page-${page}`);
       });
+    });
+  });
+
+  // --- Settings サブタブ切替 ---
+  opts.root.querySelectorAll<HTMLButtonElement>(".settings-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const sect = btn.dataset.sect;
+      opts.root.querySelectorAll(".settings-tab").forEach((b) => b.classList.toggle("active", b === btn));
+      opts.root.querySelectorAll(".settings-sect").forEach((s) => {
+        s.classList.toggle("active", (s as HTMLElement).dataset.sect === sect);
+      });
+      // スクロール位置は settings-body 共有のため、前タブの位置を引き継ぐと途中から表示される。
+      opts.root.querySelector(".settings-body")?.scrollTo({ top: 0 });
     });
   });
 
