@@ -26,6 +26,7 @@ import {
   type ClientSettings,
   type HostEntry,
   type HostOverrides,
+  type StatsPosition,
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
@@ -83,6 +84,9 @@ const DEFAULT_SETTINGS: ClientSettings = {
   use_virtual_display: false,
   share_files: false,
   codec: "auto",
+  audio_muted: false,
+  grab_keyboard: true,
+  stats_position: "tr",
 };
 
 /** コーデック select の表示ラベル。 */
@@ -234,10 +238,25 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               <div class="setting-row">
                 <div class="s-meta">
+                  <div class="s-title">キャプチャ中にキーボードを占有</div>
+                  <div class="s-desc">Win キーや Alt+Tab もリモートへ送る。OFF にすると手元の Windows に効く</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-grab-keyboard" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
                   <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
                   <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-group">音声</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">接続時に音声をミュート</div>
+                  <div class="s-desc">接続直後の音声をミュートで始める。ツールバーからいつでも解除できる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-audio-muted" /><span class="slider"></span></label>
               </div>
             </div>
             <div class="settings-sect" data-sect="display">
@@ -272,6 +291,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <option value="bottom">下</option>
                   <option value="left">左</option>
                   <option value="right">右</option>
+                </select>
+              </div>
+              <div class="setting-group">統計 HUD</div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">位置</div>
+                  <div class="s-desc">統計 HUD (fps/ビットレート/RTT/loss) を表示する隅</div>
+                </div>
+                <select id="set-stats-pos" class="select-input">
+                  <option value="tl">左上</option>
+                  <option value="tr">右上</option>
+                  <option value="bl">左下</option>
+                  <option value="br">右下</option>
                 </select>
               </div>
               <div class="setting-group">外観・既定値</div>
@@ -374,6 +406,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
   const codecSelect = $<HTMLSelectElement>("#set-codec");
   const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
+  const audioMutedToggle = $<HTMLInputElement>("#set-audio-muted");
+  const grabKeyboardToggle = $<HTMLInputElement>("#set-grab-keyboard");
+  const statsPosSelect = $<HTMLSelectElement>("#set-stats-pos");
 
   const winControls = $("#win-controls");
   if (winControls) mountWindowControls(winControls);
@@ -1054,6 +1089,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, share_files: shareFilesToggle.checked };
     persist();
   });
+  audioMutedToggle?.addEventListener("change", () => {
+    settings = { ...settings, audio_muted: audioMutedToggle.checked };
+    persist();
+  });
+  grabKeyboardToggle?.addEventListener("change", () => {
+    settings = { ...settings, grab_keyboard: grabKeyboardToggle.checked };
+    persist();
+  });
+  statsPosSelect?.addEventListener("change", () => {
+    settings = { ...settings, stats_position: statsPosSelect.value as StatsPosition };
+    persist();
+  });
   codecSelect?.addEventListener("change", () => {
     settings = { ...settings, codec: codecSelect.value as CodecChoice };
     persist();
@@ -1138,6 +1185,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (fpsInput) fpsInput.value = String(settings.fps);
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
+    if (audioMutedToggle) audioMutedToggle.checked = settings.audio_muted;
+    if (grabKeyboardToggle) grabKeyboardToggle.checked = settings.grab_keyboard;
+    if (statsPosSelect) statsPosSelect.value = settings.stats_position;
     syncPresetSelect();
     syncCodecSelect();
     applyTheme(settings.theme, settings.accent_color);

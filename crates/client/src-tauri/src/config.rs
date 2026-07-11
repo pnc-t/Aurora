@@ -92,6 +92,10 @@ fn default_toolbar_position() -> String {
     "top".to_string()
 }
 
+fn default_stats_position() -> String {
+    "tr".to_string()
+}
+
 /// クライアント側の永続設定。接続後の挙動と UI の既定値。
 /// 各フィールドは `#[serde(default)]` で、項目を増やしても旧 settings.json を読める。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +152,16 @@ pub struct ClientSettings {
     /// (host net.rs の client_trusted ゲート)。中身は接続中のみ要求時に読まれる。
     #[serde(default)]
     pub share_files: bool,
+    /// 接続時に音声をミュートで開始する。ツールバーからいつでも解除できる。
+    #[serde(default)]
+    pub audio_muted: bool,
+    /// マウスキャプチャ中にキーボード占有 (WH_KEYBOARD_LL) を有効にするか。既定 ON (現状踏襲):
+    /// Win キーや Alt+Tab もリモートへ送る。OFF にすると手元の Windows に効く。
+    #[serde(default = "default_true")]
+    pub grab_keyboard: bool,
+    /// 統計 HUD の表示位置 ("tl" | "tr" | "bl" | "br")。
+    #[serde(default = "default_stats_position")]
+    pub stats_position: String,
 }
 
 fn default_fps() -> u32 {
@@ -186,6 +200,9 @@ impl Default for ClientSettings {
             auto_reconnect: true,
             use_virtual_display: false,
             share_files: false,
+            audio_muted: false,
+            grab_keyboard: true,
+            stats_position: default_stats_position(),
         }
     }
 }

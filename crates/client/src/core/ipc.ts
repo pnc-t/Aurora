@@ -410,6 +410,9 @@ export type ThemeId = "auto" | "dark" | "light" | "legacy";
 /** ツールバーの配置。left/right では縦並びのサイドバーになる。 */
 export type ToolbarPosition = "top" | "bottom" | "left" | "right";
 
+/** 統計 HUD の表示位置 (画面の隅)。 */
+export type StatsPosition = "tl" | "tr" | "bl" | "br";
+
 /** クライアント設定 (Rust 側 config::ClientSettings と対応)。 */
 export type ClientSettings = {
   default_fullscreen: boolean;
@@ -428,6 +431,12 @@ export type ClientSettings = {
   share_files: boolean;
   /** 映像コーデック ("auto" はプローブで対応する全コーデックを申告する)。 */
   codec: CodecChoice;
+  /** 接続時に音声をミュートで開始する。 */
+  audio_muted: boolean;
+  /** マウスキャプチャ中にキーボード占有 (WH_KEYBOARD_LL) を有効にするか。 */
+  grab_keyboard: boolean;
+  /** 統計 HUD の表示位置。 */
+  stats_position: StatsPosition;
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */
