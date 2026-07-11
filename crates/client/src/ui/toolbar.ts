@@ -51,6 +51,8 @@ export type ToolbarHandle = {
   setPosition: (pos: ToolbarPosition) => void;
   /** 接続状態を反映する。pinnedDefault でこのセッションの初期ピン留めを決める。 */
   setConnected: (connected: boolean, pinnedDefault?: boolean) => void;
+  /** ショートカット割当が変わったとき、ツールチップのキー表記を最新化する。 */
+  refreshShortcutLabels: () => void;
 };
 
 // メニュー内の選択肢 1 行。ラベルはホスト由来文字列 (ディスプレイ名) があり得るため
@@ -443,6 +445,15 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       autoHideLocked = false;
       revealed = false;
       applyVisibility();
+    },
+    refreshShortcutLabels(): void {
+      if (fullscreenBtn) fullscreenBtn.title = `フルスクリーン (${shortcutLabel("toggle-fullscreen")})`;
+      if (captureBtn) captureBtn.title = `マウスキャプチャ (${shortcutLabel("toggle-capture")})`;
+      if (statsBtn) statsBtn.title = `統計 HUD (${shortcutLabel("toggle-stats")})`;
+      if (pinBtn) pinBtn.title = `バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}`;
+      if (hideBtn) {
+        hideBtn.title = `バーを隠す (端にカーソルを合わせても出さない) / ${shortcutLabel("toggle-bar")} で再表示`;
+      }
     },
   };
 }

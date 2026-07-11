@@ -6,6 +6,7 @@
 //! という理由で使わない。**この JSON にはパスワードを入れない**。パスワードは
 //! 別途 `secret.rs` が DPAPI で暗号化して `passwords.bin` に保存する。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -162,6 +163,12 @@ pub struct ClientSettings {
     /// 統計 HUD の表示位置 ("tl" | "tr" | "bl" | "br")。
     #[serde(default = "default_stats_position")]
     pub stats_position: String,
+    /// ローカル UI ショートカットのユーザー割当。キーは `LocalHotkey` id (TS 側
+    /// `core/shortcuts.ts` の `SHORTCUTS`)、値は `"Ctrl+Alt+KeyF"` 形式のバインディング文字列
+    /// (修飾は Ctrl/Alt/Shift/Meta の固定順 + `KeyboardEvent.code`)。未登録の id は既定
+    /// (Ctrl+Alt+Shift+<code>) を使う。空マップが既定 (= 全操作が既定バインディング)。
+    #[serde(default)]
+    pub shortcuts: HashMap<String, String>,
 }
 
 fn default_fps() -> u32 {
@@ -203,6 +210,7 @@ impl Default for ClientSettings {
             audio_muted: false,
             grab_keyboard: true,
             stats_position: default_stats_position(),
+            shortcuts: HashMap::new(),
         }
     }
 }

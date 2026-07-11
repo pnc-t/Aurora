@@ -437,6 +437,9 @@ export type ClientSettings = {
   grab_keyboard: boolean;
   /** 統計 HUD の表示位置。 */
   stats_position: StatsPosition;
+  /** ローカル UI ショートカットのユーザー割当 (LocalHotkey id → "Ctrl+Alt+KeyF" 形式)。
+   *  未登録の id は既定バインディングを使う。 */
+  shortcuts: Record<string, string>;
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */
