@@ -174,8 +174,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       <aside class="sidebar">
         <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
         <button class="nav-item" data-page="wol" title="Wake on LAN"><span class="ico">${icon("bolt")}</span></button>
-        <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
         <div class="sidebar-spacer"></div>
+        <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
       </aside>
       <main class="content">
         <section class="page active" id="page-hosts">
@@ -199,6 +199,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           <div class="settings-body">
             <div class="settings-sect active" data-sect="av">
               <div class="setting-group">映像 (接続時にホストへ適用)</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">画質プリセット</div>
@@ -227,7 +228,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
               </div>
+              </div>
               <div class="setting-group">接続</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">切断時に自動で再接続</div>
@@ -270,7 +273,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
               </div>
+              </div>
               <div class="setting-group">音声</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">接続時に音声をミュート</div>
@@ -278,9 +283,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <label class="switch"><input type="checkbox" id="set-audio-muted" /><span class="slider"></span></label>
               </div>
+              </div>
             </div>
             <div class="settings-sect" data-sect="display">
               <div class="setting-group">ツールバー</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">配置</div>
@@ -300,7 +307,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
               </div>
+              </div>
               <div class="setting-group">タブ</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">配置</div>
@@ -313,7 +322,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <option value="right">右</option>
                 </select>
               </div>
+              </div>
               <div class="setting-group">統計 HUD</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">位置</div>
@@ -326,7 +337,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <option value="br">右下</option>
                 </select>
               </div>
+              </div>
               <div class="setting-group">外観・既定値</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">テーマ</div>
@@ -353,9 +366,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <input type="text" inputmode="numeric" id="set-port" class="num-input" />
               </div>
+              </div>
             </div>
             <div class="settings-sect" data-sect="other">
               <div class="setting-group">ファイル共有</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">この PC をドライブとして共有</div>
@@ -363,7 +378,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <label class="switch"><input type="checkbox" id="set-share-files" /><span class="slider"></span></label>
               </div>
+              </div>
               <div class="setting-group">ショートカット (接続中のローカル操作)</div>
+              <div class="setting-card">
               ${shortcutRows}
               <div class="setting-row">
                 <div class="s-meta">
@@ -372,8 +389,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 </div>
                 <span class="kbd">Esc</span>
               </div>
+              </div>
               <div class="shortcut-note">割り当てたキーはリモート側へ送信されなくなります</div>
               <div class="setting-group">診断</div>
+              <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">ログ</div>
@@ -383,6 +402,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <button class="btn-secondary" id="open-logs">フォルダを開く</button>
                   <button class="btn-secondary" id="export-logs">ZIP 出力</button>
                 </div>
+              </div>
               </div>
             </div>
           </div>
