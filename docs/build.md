@@ -49,11 +49,16 @@ cargo run -p aurora-host -- --set-password
 | `--install` / `--uninstall` | ログオン時自動起動タスク "Aurora Host" の登録 / 解除 (`--install` は他の引数をタスクへ転送) |
 | `--fps N` | 送出 fps 上限 (0 = 無制限) |
 | `--max-bitrate N` | ビットレート上限 (Mbps、0 = 無制限) |
+| `--encode-gpu NAME` | エンコードに使う GPU を名前の部分一致で指定 (ハイブリッド GPU ノートでキャプチャ/エンコード GPU がずれる場合に使う)。`auto` で保存値を消し既定 (キャプチャと同一 GPU) に戻す。明示指定は永続化される |
+| `--align-vdd` | 仮想ディスプレイ (VDD) の描画 GPU をキャプチャ GPU に一致させ、必要ならデバイスを再起動して終了する。インストーラが VDD 登録直後に呼ぶワンショットコマンド (通常は手動実行不要) |
 | `--perf` | エンコード遅延・ソースビットレートを 1 秒窓で info ログに出す |
 | `--log-level LEVEL` | ログレベル (`debug` 等、または `aurora=debug,snow=warn` の完全指定)。`RUST_LOG` でも可 |
 
+診断用の追加オプションとして `--list-displays` (DXGI アダプタ/出力の列挙) もあります。
+
 > ログは既定で `aurora=info`。優先順位は `--log-level` > `RUST_LOG` > 既定。トレイ常駐
-> (コンソールなし) では `%LOCALAPPDATA%\Aurora\host.log` に書きます。
+> (コンソールなし) では `%LOCALAPPDATA%\Aurora\logs\host.<日付>.log` に日次ローテ
+> (7 世代保持) で書きます。
 
 ## クライアント (操作する側)
 
@@ -78,6 +83,18 @@ pushd crates/client/src-tauri; cargo tauri build; popd
 pnpm install      # 初回 or 依存追加後
 pnpm dev          # Vite 単体起動 (Tauri なし)
 pnpm build
+```
+
+## Wake-on-LAN リレー (aurora-wol)
+
+出先から自宅 PC の電源を入れたい場合は、自宅 LAN の常時稼働機 (Raspberry Pi 等) で
+`crates/wol` (`aurora-wol`) を常駐させます。ビルド・デプロイ・運用の詳細は
+[`crates/wol/README.md`](../crates/wol/README.md) を参照してください。
+
+```powershell
+# Windows 開発機から raspi へワンコマンドでクロスビルド・配備・systemd 化
+cd crates/wol
+.\deploy-aurora-wol.ps1 -Target pi@100.x.x.x
 ```
 
 ## 配布インストーラ
