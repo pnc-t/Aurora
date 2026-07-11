@@ -135,6 +135,7 @@ fn main() {
             config::save_settings,
             config::list_wol_targets,
             config::save_wol_target,
+            config::set_wol_targets,
             config::delete_wol_target,
             secret::saved_password_hosts,
             secret::delete_host_password,

@@ -367,6 +367,7 @@ export type WolTarget = {
   relay_port: number;
   host?: string | null;
   port?: number | null;
+  icon?: string | null;
 };
 
 /** 保存済み WoL ターゲット一覧を読み込む。 */
@@ -377,6 +378,11 @@ export async function listWolTargets(): Promise<WolTarget[]> {
 /** WoL ターゲットを保存する (id で重複排除・更新)。 */
 export async function saveWolTarget(target: WolTarget): Promise<void> {
   await invoke("save_wol_target", { target });
+}
+
+/** WoL ターゲット一覧を丸ごと保存する (並べ替えの永続化用)。 */
+export async function setWolTargets(targets: WolTarget[]): Promise<void> {
+  await invoke("set_wol_targets", { targets });
 }
 
 /** 指定 id の WoL ターゲットを削除する。 */

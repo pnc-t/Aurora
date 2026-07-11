@@ -43,6 +43,7 @@ import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { SHORTCUTS } from "../core/shortcuts";
 import { icon } from "./icons";
+import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
 import { mountWolPanel } from "./wol-panel";
 import "./launcher.css";
 
@@ -107,42 +108,6 @@ function codecOptionsHtml(includeDefault: boolean): string {
     items.push(`<option value="${c}"${ok ? "" : " disabled"}>${CODEC_LABELS[c]}${ok ? "" : " (非対応)"}</option>`);
   });
   return items.join("");
-}
-
-/** ラベル/host から決定的に色を作りアバター背景に使う。
- *  白いイニシャル文字とのコントラストを確保するため明度は低め (38%) に固定する
- *  (黄/緑系の hue でも白文字が読める)。 */
-function avatarColor(seed: string): string {
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) % 360;
-  return `hsl(${h}, 52%, 38%)`;
-}
-
-/** 設定 JSON に埋め込む小さなアバター。選択画像を中央クロップで 64px 正方の PNG data URL にする。
- *  ファイルコピー/asset protocol を使わず data URL でそのまま保存・描画できるため軽い。 */
-async function imageToIconDataUrl(file: File): Promise<string> {
-  const SIZE = 64;
-  const bitmap = await createImageBitmap(file);
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = SIZE;
-    canvas.height = SIZE;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("canvas 2d がありません");
-    // アスペクト比維持で正方形へ中央クロップ。
-    const side = Math.min(bitmap.width, bitmap.height);
-    const sx = (bitmap.width - side) / 2;
-    const sy = (bitmap.height - side) / 2;
-    ctx.drawImage(bitmap, sx, sy, side, side, 0, 0, SIZE, SIZE);
-    return canvas.toDataURL("image/png");
-  } finally {
-    bitmap.close();
-  }
-}
-
-/** data URL の画像アバターか判定する (描画分岐・保存値の検証に使う)。 */
-function hasImageIcon(icon: string | null | undefined): icon is string {
-  return !!icon && icon.startsWith("data:image/");
 }
 
 function escapeHtml(s: string): string {
@@ -769,22 +734,32 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 到達性プローブ結果 (host 小文字 → online)。未判定はドット非表示。
   const probeMap = new Map<string, boolean>();
   let probing = false;
-  /** 未接続の保存ホストへ並列 TCP プローブし、結果をカードのドットへ反映する。 */
+  const refreshBtn = $("#probe-refresh");
+  /** 未接続の保存ホストへ並列 TCP プローブし、結果をカードのドットへ反映する。
+   *  更新ボタンのアイコンを回して「更新している」ことを見せる (最低 500ms は回す)。 */
   async function runProbe(): Promise<void> {
     if (probing) return;
     const targets = currentHosts
       .filter((h) => !isConnected(h.host))
       .map((h) => ({ host: h.host, port: h.port }));
-    if (targets.length === 0) return;
     probing = true;
+    refreshBtn?.classList.add("spinning");
+    const started = Date.now();
     try {
-      const results = await probeHosts(targets);
-      for (const r of results) probeMap.set(r.host.trim().toLowerCase(), r.online);
-      renderHosts(currentHosts);
+      if (targets.length > 0) {
+        const results = await probeHosts(targets);
+        for (const r of results) probeMap.set(r.host.trim().toLowerCase(), r.online);
+        renderHosts(currentHosts);
+      }
     } catch (e) {
       logger.warn("probe hosts failed", e);
     } finally {
-      probing = false;
+      // 一瞬で終わると「押しても何も起きない」感になるため、最低 500ms は回転を見せる。
+      const wait = Math.max(0, 500 - (Date.now() - started));
+      window.setTimeout(() => {
+        refreshBtn?.classList.remove("spinning");
+        probing = false;
+      }, wait);
     }
   }
 
@@ -886,14 +861,16 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
             <div class="avatar-wrap">${avatar}${presence}</div>
             <div class="meta">
-              <div class="label">${escapeHtml(name)}</div>
+              <div class="label-row">
+                <span class="label">${escapeHtml(name)}</span>
+                ${connPill}
+                ${saved}
+              </div>
               <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
             </div>
-            ${connPill}
-            ${saved}
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
-            ${tailBtn}
+            <div class="card-tail">${tailBtn}</div>
           </div>`;
       })
       .join("");

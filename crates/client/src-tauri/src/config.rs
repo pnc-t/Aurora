@@ -355,6 +355,9 @@ pub struct WolTarget {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// カードのアバター画像 (data URL、任意)。未設定なら頭文字アバターを描く。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 fn default_wol_relay_port() -> u16 {
@@ -385,6 +388,12 @@ pub fn save_wol_target(app: AppHandle, target: WolTarget) -> Result<(), String> 
         Some(i) => targets[i] = target,
         None => targets.push(target),
     }
+    write_wol_targets(&app, &targets)
+}
+
+/// WoL 対象一覧を丸ごと差し替える (並べ替えの保存用)。
+#[tauri::command]
+pub fn set_wol_targets(app: AppHandle, targets: Vec<WolTarget>) -> Result<(), String> {
     write_wol_targets(&app, &targets)
 }
 
