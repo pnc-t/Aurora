@@ -13,6 +13,22 @@ async fn hs_io(fut: impl std::future::Future<Output = std::io::Result<()>>) -> R
         .map_err(|_| "handshake timed out".to_string())?
         .map_err(err)
 }
+
+/// ハンドシェイク段階 (TCP 接続後) の失敗をユーザー向け日本語へ正規化する。プロトコル上、
+/// パスワード不一致とデバイスピン留め未承認はクライアント側から区別できない (どちらも
+/// ハンドシェイク後の読み取り/復号失敗になる) ため、両者をまとめた文言に丸め、技術詳細は
+/// tracing にだけ残す。端末ID (fp) を併記し、host 側トレイの承認 UI と照合できるようにする。
+fn hs_fail<E: std::fmt::Display>(fp: Option<&str>, e: E) -> String {
+    tracing::debug!(error = %e, "handshake failed");
+    match fp {
+        Some(fp) => {
+            format!(
+                "パスワードが違うか、ホスト側でこの端末が承認されていません (この端末の端末ID: {fp})"
+            )
+        }
+        None => "パスワードが違うか、ホスト側でこの端末が承認されていません".to_string(),
+    }
+}
 /// 指定セッションの制御チャネルへ 1 メッセージ送る共通処理。未知 id は拒否する。
 pub(crate) async fn send_ctrl(
     state: &SessionState,
@@ -160,16 +176,22 @@ async fn connect_inner(
     let target = format!("{host}:{port}");
     let tcp_addr: SocketAddr = tokio::net::lookup_host(&target)
         .await
-        .map_err(|e| format!("resolve {host}: {e}"))?
+        .map_err(|e| {
+            tracing::debug!(error = %e, "dns resolve failed");
+            format!("ホスト名を解決できません: {host}")
+        })?
         .next()
-        .ok_or_else(|| format!("no address for {host}"))?;
+        .ok_or_else(|| format!("ホスト名を解決できません: {host}"))?;
     let udp_addr = tcp_addr;
 
     tracing::info!(%tcp_addr, "connecting");
     let mut tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp_addr))
         .await
-        .map_err(|_| "TCP connect timed out".to_string())?
-        .map_err(|e| format!("TCP connect: {e}"))?;
+        .map_err(|_| {
+            "接続がタイムアウトしました (ホストが起動していないか、ネットワークに到達できません)"
+                .to_string()
+        })?
+        .map_err(|e| format!("ホストに接続できません: {e}"))?;
     tcp.set_nodelay(true).ok();
 
     let psk = psk_from_password(&password);
@@ -178,6 +200,9 @@ async fn connect_inner(
     // 識別できるよう、毎回同じ静的公開鍵で接続する。取得失敗時は None=従来の使い捨て鍵。
     let identity = crate::secret::load_or_create_identity(&app);
     let identity_priv = identity.as_ref().map(|id| id.private.as_slice());
+    // 端末ID (フィンガープリント)。ハンドシェイク以降の失敗メッセージに併記し、ユーザーが
+    // ホスト側トレイの承認 UI と照合できるようにする (下の hs_fail 参照)。
+    let fp = identity.as_ref().map(|id| device_fingerprint(&id.public));
 
     // --- Noise XX-PSK initiator ---
     // ハンドシェイク I/O には全てタイムアウトを設ける。これが無いと、ポートは開いているが
@@ -188,23 +213,31 @@ async fn connect_inner(
     let mut tmp = Vec::new();
     // -> e
     let mut out_msg = Vec::new();
-    hs.write_msg(&[], &mut out_msg).map_err(err)?;
-    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
+    hs.write_msg(&[], &mut out_msg)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
     // <- e, ee, s, es
-    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
-    hs.read_msg(&buf, &mut tmp).map_err(err)?;
+    hs_io(read_tcp_frame(&mut tcp, &mut buf))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    hs.read_msg(&buf, &mut tmp)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
     // -> s, se, psk
     // 最終メッセージの (暗号化済み) payload にこの端末名 (PC 名) を載せる。host はデバイス
     // ピン留め登録時にこれを表示ラベルにし、トレイの一覧で「どの PC を登録したか」を判別できる。
     // 名前は機密ではないが平文露出も避けたいので、payload (XXpsk3 の 3 通目は暗号化される) で渡す。
     hs.write_msg(local_device_name().as_bytes(), &mut out_msg)
-        .map_err(err)?;
-    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
 
     // snow の StatelessTransportState は encrypt/decrypt とも &self なので、
     // 複数タスク (writer/reader/udp) 間の共有は Arc だけで足り Mutex は不要。
     // 映像 UDP のパケット毎 decrypt が TCP 制御とロック競合しなくなる。
-    let session = Arc::new(hs.into_transport().map_err(err)?);
+    let session = Arc::new(hs.into_transport().map_err(|e| hs_fail(fp.as_deref(), e))?);
     tracing::info!("noise handshake complete");
 
     // ハンドシェイク成功 = PSK (パスワード) 一致。ユーザーが「保存する」を選んだときだけ
@@ -217,11 +250,13 @@ async fn connect_inner(
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
     // 以降の TCP 受信は reader ループが nonce 1 から続ける。
-    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
+    hs_io(read_tcp_frame(&mut tcp, &mut buf))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
     let mut plain = Vec::new();
     let mut hostinfo_rx_nonce: u64 = 0;
-    let host_info =
-        decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain).map_err(err)?;
+    let host_info = decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
 
     // 映像/イベントの表示先を差し替え可能 sink にまとめる。以降タスクへはこの sink を
     // clone して渡し、タブのウィンドウ移動 (attach/detach) で表示先だけ付け替えられるようにする。
@@ -285,7 +320,7 @@ async fn connect_inner(
         async move {
             let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
             sink_w.send_event(ClientEvent::Disconnected {
-                reason: "writer closed".into(),
+                reason: "接続が閉じられました".into(),
             });
         }
         .instrument(tracing::Span::current()),
@@ -321,7 +356,7 @@ async fn connect_inner(
             .await;
             let reason = match res {
                 Ok(()) => "server closed".to_string(),
-                Err(e) => format!("read error: {e}"),
+                Err(e) => format!("接続が切断されました: {e}"),
             };
             tracing::info!(%reason, "session closed (tcp reader)");
             sink_r.send_event(ClientEvent::Disconnected { reason });
@@ -411,7 +446,7 @@ async fn connect_inner(
                     "no pong received; treating as disconnected (network stall?)"
                 );
                 sink_watchdog.send_event(ClientEvent::Disconnected {
-                    reason: "no pong for 5s (network stall?)".into(),
+                    reason: "ホストから応答がありません (ネットワーク断?)".into(),
                 });
                 break;
             }

@@ -396,8 +396,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
-                  <div class="s-title">この端末の識別子</div>
-                  <div class="s-desc">ホストのデバイスピン留めで承認するとき、ホスト側に表示される指紋とこの値が一致することを確認してください</div>
+                  <div class="s-title">この端末の端末ID</div>
+                  <div class="s-desc">ホストのデバイスピン留めで承認するとき、ホスト側に表示される端末IDとこの値が一致することを確認してください</div>
                 </div>
                 <span id="device-fingerprint" class="s-desc" style="font-family:monospace">…</span>
               </div>

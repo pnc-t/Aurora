@@ -19,7 +19,7 @@ use aurora_common::framing::{
 };
 use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO, TransportSession,
-    psk_from_password,
+    device_fingerprint, psk_from_password,
 };
 use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent, VideoCodec};
 use serde::Serialize;
