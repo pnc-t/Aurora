@@ -89,6 +89,14 @@ pub fn load_or_create_identity(app: &AppHandle) -> Option<aurora_common::noise::
     Some(kp)
 }
 
+/// この端末の identity 公開鍵のフィンガープリント (host のデバイスピン留め承認時に、host 側
+/// トレイ表示と照合するための短い識別子)。identity が取れなければエラー。
+#[tauri::command]
+pub fn my_device_fingerprint(app: AppHandle) -> Result<String, String> {
+    let id = load_or_create_identity(&app).ok_or("端末IDを取得できません")?;
+    Ok(aurora_common::noise::device_fingerprint(&id.public))
+}
+
 fn store_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
         .path()
