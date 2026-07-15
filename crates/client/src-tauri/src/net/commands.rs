@@ -95,6 +95,21 @@ pub async fn set_video_params(
     .await
 }
 
+/// クリップボード同期のセッション毎トグル (ツールバーから呼ぶ)。OFF の間は reader ループが
+/// リモートの変更を適用せず、clip_forward タスクがローカル変化を送らない (ネットワークは
+/// 継続したままの一時停止。切断・再接続は不要)。
+#[tauri::command]
+pub async fn set_clipboard_sync(
+    session_id: String,
+    enabled: bool,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.get(&session_id).ok_or("unknown session")?;
+    s.clipboard_sync.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
 /// 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。
 #[tauri::command]
 pub async fn set_audio_muted(

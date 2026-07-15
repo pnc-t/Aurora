@@ -343,6 +343,14 @@ async fn connect_inner(
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
+    // クリップボード同期の可否ゲート。設定の初期値をここで直接反映する (TS 側の後追い適用に
+    // 依存すると、起動直後の数回分がレースで漏れうるため Rust 側で初期化する)。設定読み込み
+    // 失敗時は安全側の既定 (ON) にする。
+    let clipboard_sync = Arc::new(AtomicBool::new(
+        crate::config::load_settings(app.clone())
+            .map(|s| s.clipboard_sync)
+            .unwrap_or(true),
+    ));
 
     // 受信品質メトリクス。Ping の基準時刻と共有して RTT を算出する。
     let stats = StatsCollector::new();
@@ -378,6 +386,7 @@ async fn connect_inner(
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
     let last_pong_for_reader = last_pong_ms.clone();
+    let clipboard_sync_for_reader = clipboard_sync.clone();
     let reader_task = tokio::spawn(
         async move {
             let res = tcp_reader_loop(
@@ -391,6 +400,7 @@ async fn connect_inner(
                 share_scope_for_reader,
                 pending_for_reader,
                 last_pong_for_reader,
+                clipboard_sync_for_reader,
             )
             .await;
             let reason = match res {
@@ -442,10 +452,14 @@ async fn connect_inner(
         .instrument(tracing::Span::current()),
     );
 
-    // クリップボード変化 → ControlMsg::Clipboard 送信
+    // クリップボード変化 → ControlMsg::Clipboard 送信 (OFF 中はローカル変化を送らない)
     let ctrl_for_clip = ctrl_tx.clone();
+    let clipboard_sync_for_forward = clipboard_sync.clone();
     let clip_forward_task = tokio::spawn(async move {
         while let Some(text) = clip_change_rx.recv().await {
+            if !clipboard_sync_for_forward.load(Ordering::Relaxed) {
+                continue;
+            }
             if ctrl_for_clip.send(ControlMsg::Clipboard { text }).is_err() {
                 break;
             }
@@ -563,6 +577,7 @@ async fn connect_inner(
         share_scope,
         window_label: window.label().to_string(),
         udp_health,
+        clipboard_sync,
     };
     {
         let mut guard = state.inner.lock().await;
@@ -623,6 +638,7 @@ async fn tcp_reader_loop(
     share_scope: Arc<Mutex<ShareScope>>,
     pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
     last_pong_ms: Arc<AtomicU64>,
+    clipboard_sync: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     let mut plain = Vec::new();
@@ -662,7 +678,11 @@ async fn tcp_reader_loop(
                 });
             }
             ControlMsg::Clipboard { text } => {
-                if clip_apply_tx.send(text).is_err() {
+                // OFF 中はリモートの変更を適用しない (トグルはセッション単位の一時停止であり、
+                // クリップボード内容自体はログに出さない)。
+                if !clipboard_sync.load(Ordering::Relaxed) {
+                    tracing::debug!("clipboard sync disabled; ignoring remote update");
+                } else if clip_apply_tx.send(text).is_err() {
                     tracing::debug!("clipboard apply channel closed");
                 }
             }

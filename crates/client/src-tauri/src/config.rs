@@ -173,6 +173,10 @@ pub struct ClientSettings {
     /// (Ctrl+Alt+Shift+<code>) を使う。空マップが既定 (= 全操作が既定バインディング)。
     #[serde(default)]
     pub shortcuts: HashMap<String, String>,
+    /// クリップボード同期を行うか。既定 ON。接続時にセッションのゲート初期値として使われ、
+    /// 以後はツールバーのトグル (`set_clipboard_sync`) がセッション単位で切り替える。
+    #[serde(default = "default_true")]
+    pub clipboard_sync: bool,
 }
 
 fn default_fps() -> u32 {
@@ -215,6 +219,7 @@ impl Default for ClientSettings {
             grab_keyboard: true,
             stats_position: default_stats_position(),
             shortcuts: HashMap::new(),
+            clipboard_sync: true,
         }
     }
 }

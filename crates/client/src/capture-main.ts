@@ -93,6 +93,7 @@ function getSettings(): ClientSettings {
       grab_keyboard: true,
       stats_position: "tr",
       shortcuts: {},
+      clipboard_sync: true,
     }
   );
 }

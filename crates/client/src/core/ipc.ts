@@ -283,6 +283,11 @@ export async function setAudioMuted(sessionId: string, muted: boolean): Promise<
   await invoke("set_audio_muted", { sessionId, muted });
 }
 
+/** クリップボード同期のセッション毎トグル (OFF 中は送受信とも一時停止)。 */
+export async function setClipboardSync(sessionId: string, enabled: boolean): Promise<void> {
+  await invoke("set_clipboard_sync", { sessionId, enabled });
+}
+
 /**
  * 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
  * 再開時は別途 requestKeyframe で映像を復帰させる。
@@ -448,6 +453,8 @@ export type ClientSettings = {
   /** ローカル UI ショートカットのユーザー割当 (LocalHotkey id → "Ctrl+Alt+KeyF" 形式)。
    *  未登録の id は既定バインディングを使う。 */
   shortcuts: Record<string, string>;
+  /** クリップボード同期を行うか。接続時のセッションゲート初期値になる。 */
+  clipboard_sync: boolean;
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */

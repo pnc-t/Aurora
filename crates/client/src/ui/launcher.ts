@@ -102,6 +102,7 @@ const DEFAULT_SETTINGS: ClientSettings = {
   grab_keyboard: true,
   stats_position: "tr",
   shortcuts: {},
+  clipboard_sync: true,
 };
 
 /** コーデック select の表示ラベル。 */
