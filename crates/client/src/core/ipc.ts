@@ -457,6 +457,31 @@ export type ClientSettings = {
   clipboard_sync: boolean;
 };
 
+/** ClientSettings の既定値。設定未保存時のフォールバックや capture 窓の未読込中フォールバックで使う
+ *  (host/client 双方に散らばっていた複製を一元化。§A-12)。 */
+export const DEFAULT_SETTINGS: ClientSettings = {
+  default_fullscreen: false,
+  show_stats: false,
+  default_capture: false,
+  default_port: 7000,
+  toolbar_pinned: false,
+  toolbar_position: "top",
+  tab_position: "top",
+  accent_color: "#3a82f7",
+  theme: "dark",
+  fps: 60,
+  max_mbps: 8,
+  auto_reconnect: true,
+  use_virtual_display: false,
+  share_files: false,
+  codec: "auto",
+  audio_muted: false,
+  grab_keyboard: true,
+  stats_position: "tr",
+  shortcuts: {},
+  clipboard_sync: true,
+};
+
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */
 export async function loadRecentHosts(): Promise<HostEntry[]> {
   return await invoke<HostEntry[]>("load_recent_hosts");

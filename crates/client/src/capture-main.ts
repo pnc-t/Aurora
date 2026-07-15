@@ -11,6 +11,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
+  DEFAULT_SETTINGS,
   findCaptureWindowAt,
   handoffSessionToWindow,
   initPerfFlag,
@@ -72,30 +73,7 @@ mountFileTransfer(filePanel);
 // --- 設定 (ウィンドウ内の全タブで共有。capture には設定 UI がない) ---
 let settings: ClientSettings | null = null;
 function getSettings(): ClientSettings {
-  return (
-    settings ?? {
-      default_fullscreen: false,
-      show_stats: false,
-      default_capture: false,
-      default_port: 7000,
-      toolbar_pinned: false,
-      toolbar_position: "top",
-      tab_position: "top",
-      accent_color: "#3a82f7",
-      theme: "dark",
-      fps: 60,
-      max_mbps: 8,
-      auto_reconnect: true,
-      use_virtual_display: false,
-      share_files: false,
-      codec: "auto",
-      audio_muted: false,
-      grab_keyboard: true,
-      stats_position: "tr",
-      shortcuts: {},
-      clipboard_sync: true,
-    }
-  );
+  return settings ?? DEFAULT_SETTINGS;
 }
 
 // --- セッション管理 ---

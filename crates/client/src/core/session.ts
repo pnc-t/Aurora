@@ -27,6 +27,7 @@ import {
   setSupportedCodecs,
   setVideoParams,
   setVideoPaused,
+  DEFAULT_SETTINGS,
   type ClientEvent,
   type ClientSettings,
   type DisplayDto,
@@ -140,8 +141,9 @@ export class Session {
   // toolbar 再同期用に保持する接続情報。
   private connLabel = "";
   private audioAvailable = false;
-  private videoFps = 60;
-  private videoMbps = 15;
+  // effectiveSettings で接続時に上書きされるが、初期値も既定設定 (core/ipc.ts) に揃えておく。
+  private videoFps = DEFAULT_SETTINGS.fps;
+  private videoMbps = DEFAULT_SETTINGS.max_mbps;
   private latestStats: StatsEvent | null = null;
 
   // 現在の映像コーデック (video_codec_changed で確定)。stats HUD 表示用に公開する。
