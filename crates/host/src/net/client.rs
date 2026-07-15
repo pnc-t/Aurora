@@ -39,6 +39,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         throttle,
         devices,
         shared,
+        session_sem,
         registry,
         conn_id,
         force_frame,
@@ -121,6 +122,16 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
     // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
+    // 認証成功。ここで初めて「確立済みセッション枠」(MAX_CLIENTS) を確保する。認証前
+    // (ハンドシェイク中・失敗のバックオフ sleep 中) はこの scarce な枠に触れないため、未認証接続が
+    // 正規セッションの枠を食い潰す DoS を防げる。枠が満杯なら認証済みでも丁寧に断る。
+    let _session_permit = match session_sem.try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(peer = %peer, max_clients = super::MAX_CLIENTS, "session slots full; rejecting after successful handshake");
+            return Err(anyhow::anyhow!("session slots full"));
+        }
+    };
     // tray のツールチップ/バルーン通知に出す表示ラベル (端末名 or peer IP)。確立と切断で同じ
     // ラベルを使い、通知の対を揃える。
     let peer_label = display_label(&device_name, peer.ip());
