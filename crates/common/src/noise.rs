@@ -298,6 +298,18 @@ impl TransportSession {
     }
 }
 
+/// クライアント静的公開鍵から、オーナーが目視照合するための短い識別子を作る。host のペアリング
+/// 承認 UI と client の自端末表示が**同じ値**を出す必要があるため common に置く。X25519 公開鍵は
+/// 一様乱数なので先頭 8 バイトを 4 桁ずつ hex 表記する ("xxxx-xxxx-xxxx-xxxx"、64bit で目視照合に十分)。
+pub fn device_fingerprint(pubkey: &[u8]) -> String {
+    let hex: String = pubkey.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +422,14 @@ mod tests {
         // 長いパスフレーズ (文字種が単一でも 12 文字以上なら許容)。
         assert!(weak_password_reason("correcthorsebatterystaple").is_none());
         assert!(weak_password_reason("correct-horse-battery-staple").is_none());
+    }
+
+    #[test]
+    fn device_fingerprint_formats_and_is_stable() {
+        let key = [0xabu8, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xff, 0xff];
+        let fp = device_fingerprint(&key);
+        assert_eq!(fp, "abcd-ef01-2345-6789");
+        // 同じ鍵なら常に同じ値 (host/client 双方が同じ表示になる必要がある)。
+        assert_eq!(fp, device_fingerprint(&key));
     }
 }
