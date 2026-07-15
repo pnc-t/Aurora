@@ -113,11 +113,25 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // PSK 漏洩でも「登録した端末の秘密鍵」を持たない相手を弾く。判定は record_success の前に
     // 行い、拒否はバックオフを伸ばす (= 履歴を消さない) ことで未許可端末の連投も減速させる。
     let admit = devices.admit(remote_key.as_deref(), Some(device_name.as_str()));
-    if let crate::security::Admit::Rejected = &admit {
-        let delay = throttle.record_failure(peer.ip());
-        tracing::warn!(peer = %peer, delay_ms = delay.as_millis() as u64, "device not in allowlist; rejecting (device pinning)");
-        tokio::time::sleep(delay).await;
-        return Err(anyhow::anyhow!("device not in allowlist"));
+    match &admit {
+        crate::security::Admit::Rejected => {
+            // PSK は正しいが登録外。送信元 IP 単位の指数バックオフで未登録端末の連投も減速。
+            let delay = throttle.record_failure(peer.ip());
+            tracing::warn!(peer = %peer, delay_ms = delay.as_millis() as u64, "device not in allowlist; rejecting (device pinning)");
+            tokio::time::sleep(delay).await;
+            return Err(anyhow::anyhow!("device not in allowlist"));
+        }
+        crate::security::Admit::PendingApproval => {
+            // 承認待ち: この接続は登録もアクセスも与えず切断する。オーナーがトレイで指紋を照合して
+            // 承認すれば、その端末は次回接続で Trusted になる (レースで攻撃者が割り込んでも指紋不一致で
+            // 弾ける)。指紋+端末名を tray へ通知して承認 UI で照合できるようにする。throttle は掛けない
+            // (正規端末の再接続を遅らせない。保留リストの上限管理は devices 側)。
+            let fp = aurora_common::noise::device_fingerprint(remote_key.as_deref().unwrap_or(&[]));
+            tracing::info!(peer = %peer, fingerprint = %fp, "device pending owner approval (pairing)");
+            tray_bus.on_pending_device(fp, display_label(&device_name, peer.ip()));
+            return Err(anyhow::anyhow!("device pending owner approval"));
+        }
+        _ => {}
     }
     // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
     // ユーザーを罰しない)。
@@ -135,10 +149,6 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // tray のツールチップ/バルーン通知に出す表示ラベル (端末名 or peer IP)。確立と切断で同じ
     // ラベルを使い、通知の対を揃える。
     let peer_label = display_label(&device_name, peer.ip());
-    if let crate::security::Admit::Enrolled = &admit {
-        tracing::info!(peer = %peer, name = %device_name, "device pinning: enrolled this device via pairing window");
-        tray_bus.on_enrolled(peer_label.clone());
-    }
     tracing::info!(peer = %peer, "noise handshake complete");
 
     // 映像 UDP 送信を専用タスクへ分離するため session を Arc 共有する。StatelessTransportState は

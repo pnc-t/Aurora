@@ -5,9 +5,12 @@
 //! 照合する (= 2 要素目)。許可リストは公開鍵のみで非機密のため平文保存
 //! (`%LOCALAPPDATA%\Aurora\trusted_devices.txt`、1 行 = `<hex公開鍵> <ラベル>`)。
 //!
-//! 既定は**無効** (opt-in)。有効時は許可リストに無い鍵を拒否し、登録は**ペアリング窓**で行う:
-//! オーナーがトレイで「次の接続を登録」を押した 1 回だけ、次に PSK 認証を通した端末を信頼登録
-//! する。パスワード漏洩時に攻撃者が勝手に登録される窓を、owner が能動的に開いた瞬間に限定する。
+//! 既定は**無効** (opt-in)。有効時は許可リストに無い鍵を拒否し、登録は**ペアリング窓 + オーナー
+//! 承認**の 2 段階で行う: オーナーがトレイで窓を開くと、その間に PSK 認証を通った未知端末は
+//! **自動登録されず承認待ちに入る**。オーナーはトレイでその端末のフィンガープリント
+//! (`aurora_common::noise::device_fingerprint`) を、端末側に表示された値と目視照合した上で承認する。
+//! PSK を持つ攻撃者が窓の開いた瞬間にレースで割り込んでも、フィンガープリント不一致でオーナーが
+//! 弾ける (窓が開いた瞬間の自動登録だと、レースを制した攻撃者がそのまま恒久登録されてしまう)。
 //!
 //! 非 Windows は永続化未対応 (Windows 優先方針): 一覧は空・無効・保存は no-op。
 
@@ -20,16 +23,26 @@ pub struct TrustedDevice {
     pub label: String,
 }
 
+/// ペアリング窓中に現れた未知端末で、まだオーナー承認を得ていないもの。
+struct PendingDevice {
+    pubkey: Vec<u8>,
+    label: String,
+}
+
+/// 承認待ちリストの上限。オーナーが放置している間に大量の接続試行で溢れないための保険。
+const MAX_PENDING: usize = 8;
+
 /// ピン留め判定の結果 (ログ・分岐用)。
 pub enum Admit {
     /// ピン留め無効 (従来どおり PSK のみで許可)。
     Disabled,
     /// 許可リスト登録済みの端末。
     Trusted,
-    /// ペアリング窓中の未知端末を新規登録して許可した。
-    Enrolled,
     /// 未許可 (未知の鍵 / 鍵を観測できず)。拒否する。
     Rejected,
+    /// ペアリング窓中の未知端末を承認待ちに記録した。接続はこの回は拒否し、オーナーが
+    /// フィンガープリント照合の上で承認したら次回接続で Trusted になる。
+    PendingApproval,
 }
 
 /// 実行時のピン留め状態。net (接続受理) と tray (操作) で `Arc` 共有する。
@@ -37,15 +50,18 @@ pub struct DeviceGuard {
     enabled: AtomicBool,
     pairing: AtomicBool,
     trusted: Mutex<Vec<TrustedDevice>>,
+    pending: Mutex<Vec<PendingDevice>>,
 }
 
 impl DeviceGuard {
-    /// 永続状態 (有効フラグ・許可リスト) を読み込んで構築する。ペアリング窓は常に閉じた状態で開始。
+    /// 永続状態 (有効フラグ・許可リスト) を読み込んで構築する。ペアリング窓・承認待ちリストは
+    /// 常に空の状態で開始 (プロセスをまたいで持ち越さない)。
     pub fn load() -> Self {
         Self {
             enabled: AtomicBool::new(load_enabled()),
             pairing: AtomicBool::new(false),
             trusted: Mutex::new(load_trusted()),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
@@ -53,7 +69,7 @@ impl DeviceGuard {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// ピン留めの有効/無効を切り替えて永続化する。無効化時はペアリング窓も閉じる。
+    /// ピン留めの有効/無効を切り替えて永続化する。無効化時はペアリング窓・承認待ちも閉じる。
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
         if let Err(e) = save_enabled(on) {
@@ -61,17 +77,20 @@ impl DeviceGuard {
         }
         if !on {
             self.pairing.store(false, Ordering::Relaxed);
+            self.clear_pending();
         }
     }
 
-    /// 次の 1 接続だけ未知端末の登録を許す「ペアリング窓」を開く。
+    /// 次に PSK 認証を通る未知端末を承認待ちに記録できる「ペアリング窓」を開く。
     pub fn arm_pairing(&self) {
         self.pairing.store(true, Ordering::Relaxed);
     }
 
-    /// 開いているペアリング窓を閉じる (登録せずに取り消す)。
+    /// 開いているペアリング窓を閉じる (承認せずに取り消す)。承認待ちに溜まっていた記録も破棄する
+    /// (窓を閉じた = オーナーがこの回の登録意図を取り下げたとみなす)。
     pub fn disarm_pairing(&self) {
         self.pairing.store(false, Ordering::Relaxed);
+        self.clear_pending();
     }
 
     pub fn pairing_armed(&self) -> bool {
@@ -109,6 +128,66 @@ impl DeviceGuard {
         }
     }
 
+    /// 承認待ちの端末一覧を (公開鍵, フィンガープリント, ラベル) で返す (トレイ表示順 = 保持順)。
+    /// 公開鍵も返すのは、承認時に index ではなく**鍵で対象を確定**するため
+    /// ([`Self::approve_pending`] の TOCTOU 対策)。
+    pub fn pending_devices(&self) -> Vec<(Vec<u8>, String, String)> {
+        self.pending
+            .lock()
+            .map(|p| {
+                p.iter()
+                    .map(|d| {
+                        (
+                            d.pubkey.clone(),
+                            aurora_common::noise::device_fingerprint(&d.pubkey),
+                            d.label.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 指定した**公開鍵**の承認待ち端末を許可リストへ昇格して永続化する。承認は 1 回の判断につき
+    /// 1 台に限定する意図で、承認待ちリスト全体を消去しペアリング窓も閉じる (他の保留分は
+    /// オーナーが個別に再度ペアリング窓を開いて照合させる)。移した端末のラベルを返す
+    /// (該当鍵が承認待ちに無ければ `None`)。
+    ///
+    /// **index ではなく鍵で対象を確定する**のは、トレイの承認ダイアログ (モーダルで tray スレッドを
+    /// 数秒ブロックする) 表示中に、別接続 (tokio 側の `admit`) が承認待ちリストを変化させ得るため。
+    /// index 指定だと、表示中に上限超過の evict でリストがずれ、オーナーが指紋照合したのとは別の
+    /// (攻撃者の) 端末を承認してしまう TOCTOU が生じる。鍵で照合すれば、evict 済みなら `None` に
+    /// fail-safe し、見た端末とは別物を登録しない。
+    pub fn approve_pending(&self, pubkey: &[u8]) -> Option<String> {
+        let mut pending = self.pending.lock().ok()?;
+        let pos = pending.iter().position(|d| d.pubkey == pubkey)?;
+        let approved = pending.remove(pos);
+        pending.clear();
+        drop(pending);
+        self.pairing.store(false, Ordering::Relaxed);
+
+        let label = approved.label.clone();
+        let Ok(mut trusted) = self.trusted.lock() else {
+            return None;
+        };
+        trusted.push(TrustedDevice {
+            label: approved.label,
+            pubkey: approved.pubkey,
+        });
+        if let Err(e) = save_trusted(&trusted) {
+            // 承認は成立したがディスクに残らなかった = 再起動で信頼が消える。要警告。
+            tracing::warn!(error = %e, "failed to persist approved device");
+        }
+        Some(label)
+    }
+
+    /// 承認待ちリストを空にする (窓を閉じる/無効化する経路から使う)。
+    pub fn clear_pending(&self) {
+        if let Ok(mut p) = self.pending.lock() {
+            p.clear();
+        }
+    }
+
     /// 接続レベルのピン留め有効/無効に**関係なく**、鍵が許可リストに登録済みかを返す。
     /// 仮想ディスプレイ (RDP 風テイクオーバー) のような特権機能を「ホストに登録済みの端末だけ」に
     /// 限定するゲートに使う。未登録端末は通常接続 (物理キャプチャ) はできても仮想は使えない。
@@ -123,10 +202,11 @@ impl DeviceGuard {
     }
 
     /// クライアント公開鍵 (ハンドシェイクの `remote_static`) を判定する。ペアリング窓が開いて
-    /// いれば未知鍵をここで登録して消費する (1 回限り)。`Admit` で結果を返す。
+    /// いれば未知鍵を**自動登録せず**承認待ちリストに記録する (窓は消費しない。オーナーが
+    /// [`Self::approve_pending_at`] で明示承認するまで登録されない)。`Admit` で結果を返す。
     ///
-    /// `name` はクライアントが申告した端末名 (PC 名)。登録時の表示ラベルに使い、トレイの一覧で
-    /// 「どの PC を登録したか」を判別できるようにする。クライアント任意の値なのでサニタイズ・
+    /// `name` はクライアントが申告した端末名 (PC 名)。承認待ち表示・登録時の表示ラベルに使い、
+    /// トレイの一覧で「どの PC か」を判別できるようにする。クライアント任意の値なのでサニタイズ・
     /// 長さ制限する (机上のラベル用途のみ。認証は公開鍵で行い名前は信頼しない)。空/無効なら
     /// 従来の `device-xxxx` (公開鍵 hex) にフォールバックする。
     pub fn admit(&self, key: Option<&[u8]>, name: Option<&str>) -> Admit {
@@ -136,26 +216,34 @@ impl DeviceGuard {
         let Some(key) = key else {
             return Admit::Rejected;
         };
-        let Ok(mut trusted) = self.trusted.lock() else {
+        let Ok(trusted) = self.trusted.lock() else {
             return Admit::Rejected;
         };
         if trusted.iter().any(|d| d.pubkey == key) {
             return Admit::Trusted;
         }
-        // ペアリング窓が開いていれば、この未知端末を 1 台だけ登録して窓を閉じる。
-        if self.pairing.swap(false, Ordering::Relaxed) {
+        drop(trusted);
+        // ペアリング窓が開いていれば、この未知端末を承認待ちに記録する。窓は消費しない
+        // (オーナーが承認するまで開いたまま。攻撃者がレースで割り込んでも自動登録されない)。
+        if self.pairing.load(Ordering::Relaxed) {
+            let Ok(mut pending) = self.pending.lock() else {
+                return Admit::Rejected;
+            };
             let label = name
                 .and_then(sanitize_label)
                 .unwrap_or_else(|| default_label(key));
-            trusted.push(TrustedDevice {
-                label,
-                pubkey: key.to_vec(),
-            });
-            if let Err(e) = save_trusted(&trusted) {
-                // 登録は成功したがディスクに残らなかった = 再起動で信頼が消える。要警告。
-                tracing::warn!(error = %e, "failed to persist newly enrolled device");
+            if let Some(existing) = pending.iter_mut().find(|d| d.pubkey == key) {
+                existing.label = label;
+            } else {
+                if pending.len() >= MAX_PENDING {
+                    pending.remove(0);
+                }
+                pending.push(PendingDevice {
+                    pubkey: key.to_vec(),
+                    label,
+                });
             }
-            return Admit::Enrolled;
+            return Admit::PendingApproval;
         }
         Admit::Rejected
     }
@@ -354,19 +442,30 @@ mod tests {
     }
 
     #[test]
-    fn enroll_with_empty_name_falls_back_to_default_label() {
+    fn pending_with_empty_name_falls_back_to_default_label() {
         let g = DeviceGuard {
             enabled: AtomicBool::new(true),
             pairing: AtomicBool::new(false),
             trusted: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         };
         g.arm_pairing();
-        // 旧クライアント (端末名なし) は既定ラベル device-xxxx に落ちる。
+        // 旧クライアント (端末名なし) は既定ラベル device-xxxx に落ちる。承認待ちに記録されるのみで
+        // まだ登録されない。
         assert!(matches!(
             g.admit(Some(&[0xab, 0xcd, 0xef, 0x01]), Some("")),
-            Admit::Enrolled
+            Admit::PendingApproval
         ));
-        assert_eq!(g.labels(), vec!["device-abcdef01".to_string()]);
+        assert!(g.labels().is_empty());
+        let pending = g.pending_devices();
+        assert_eq!(pending.len(), 1);
+        // (公開鍵, フィンガープリント, ラベル)。
+        assert_eq!(pending[0].0, vec![0xab, 0xcd, 0xef, 0x01]);
+        assert_eq!(
+            pending[0].1,
+            aurora_common::noise::device_fingerprint(&[0xab, 0xcd, 0xef, 0x01])
+        );
+        assert_eq!(pending[0].2, "device-abcdef01");
     }
 
     #[test]
@@ -375,17 +474,19 @@ mod tests {
             enabled: AtomicBool::new(false),
             pairing: AtomicBool::new(false),
             trusted: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         };
         assert!(matches!(g.admit(Some(&[1, 2, 3]), None), Admit::Disabled));
         assert!(matches!(g.admit(None, None), Admit::Disabled));
     }
 
     #[test]
-    fn admit_enforces_and_pairs() {
+    fn admit_enforces_pending_and_approval() {
         let g = DeviceGuard {
             enabled: AtomicBool::new(true),
             pairing: AtomicBool::new(false),
             trusted: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         };
         // 有効・未登録・ペアリング窓なし → 拒否。鍵なしも拒否。
         assert!(matches!(
@@ -394,26 +495,50 @@ mod tests {
         ));
         assert!(matches!(g.admit(None, None), Admit::Rejected));
 
-        // ペアリング窓を開くと次の 1 台を登録して許可。窓は消費される。
+        // ペアリング窓を開くと、未知端末は自動登録されず承認待ちになる。窓は消費されない。
         // 申告された端末名がラベルになる (どの PC かを判別できる)。
         g.arm_pairing();
         assert!(matches!(
             g.admit(Some(&[9, 9, 9, 9]), Some("My-Laptop")),
-            Admit::Enrolled
+            Admit::PendingApproval
         ));
-        assert!(matches!(g.admit(Some(&[9, 9, 9, 9]), None), Admit::Trusted));
-        assert!(!g.pairing_armed());
-        assert_eq!(g.labels(), vec!["My-Laptop".to_string()]);
+        assert!(g.pairing_armed());
+        assert!(g.labels().is_empty());
+        let pending = g.pending_devices();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].2, "My-Laptop"); // (公開鍵, フィンガープリント, ラベル)
 
-        // 別の未知端末は窓が閉じているので拒否。
+        // オーナーが承認するまでは Trusted にならない (再接続してもまだ PendingApproval)。
+        assert!(matches!(
+            g.admit(Some(&[9, 9, 9, 9]), Some("My-Laptop")),
+            Admit::PendingApproval
+        ));
+
+        // オーナーが承認 (鍵で確定) すると許可リストへ昇格し、承認待ちは空になり、窓も閉じる。
+        let approved = g.approve_pending(&[9, 9, 9, 9]);
+        assert_eq!(approved, Some("My-Laptop".to_string()));
+        assert!(!g.pairing_armed());
+        assert!(g.pending_devices().is_empty());
+        assert_eq!(g.labels(), vec!["My-Laptop".to_string()]);
+        assert!(matches!(g.admit(Some(&[9, 9, 9, 9]), None), Admit::Trusted));
+
+        // 窓が閉じている未知端末は拒否のまま。
         assert!(matches!(g.admit(Some(&[7, 7]), None), Admit::Rejected));
         assert_eq!(g.labels().len(), 1);
 
-        // disarm でペアリング窓を閉じられる。
+        // disarm でペアリング窓を閉じられる (承認待ちも破棄される)。
         g.arm_pairing();
+        assert!(matches!(
+            g.admit(Some(&[5, 5]), None),
+            Admit::PendingApproval
+        ));
         assert!(g.pairing_armed());
         g.disarm_pairing();
         assert!(!g.pairing_armed());
+        assert!(g.pending_devices().is_empty());
+
+        // approve_pending は承認待ちに無い鍵なら None (evict 済み等に fail-safe)。
+        assert!(g.approve_pending(&[0xde, 0xad]).is_none());
 
         // remove で個別削除できる。
         assert!(g.remove(0).is_some());
