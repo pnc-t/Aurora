@@ -28,12 +28,14 @@ Aurora は自宅 PC の画面・入力をネットワーク越しに開放する
 |------|------|
 | ハンドシェイク | Noise `XXpsk3` (`Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`) |
 | 共通鍵暗号 | ChaCha20-Poly1305 (AEAD) |
-| PSK 導出 | パスワード → Argon2id (m=19 MiB, t=2, p=1, 出力 32B) + 固定アプリソルト |
+| PSK 導出 | パスワード → Argon2id (m=64 MiB, t=3, p=1, 出力 32B) + 固定アプリソルト |
 
 - 接続パスワードは host/client が**各自で独立に**同じ PSK を導出します。ソルトを通信で
   交換できないため固定ソルトですが、Argon2id のメモリ硬度により、弱いパスワードに対する
   オフライン総当たりコストを単一ハッシュより桁違いに高めています。
-- パスワードは設定時に**最低 8 文字**を強制します (`MIN_PASSWORD_LEN`、CLI・トレイ両方)。
+- パスワードは設定時に**最低 12 文字**を強制します (`MIN_PASSWORD_LEN`、CLI・トレイ両方)。
+  単一要素認証 (パスワードのみ) を踏まえ、オフライン辞書攻撃への耐性を底上げするため 8 → 12 に
+  引き上げています。
   加えて、よくある弱いパスワード・数字のみ・文字種が少なく短いものは設定時に**ソフト警告**を
   出し (`weak_password_reason`、強制はしない)、強いパスフレーズ候補を提示します
   (`suggest_passphrase`)。CLI `--set-password` とトレイのダイアログで同じ判定を使い、設定
@@ -132,9 +134,17 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
   client へ渡します (`crates/common/src/proto.rs`)。これは**映像セッションが確立した後**
   (=host のパスワード認証を通過した接続) にのみ流れるため、未認証の相手には開示されません。
   client はこれを host エントリに保存し、WoL タブの wake 要求に使います。
-- **認証前の無応答接続対策**: 接続ごとに独立タスクで処理し (accept ループは塞がない)、
-  ハンドシェイク I/O は 10 秒、ハンドシェイク〜Wake〜Ack の 1 接続全体は 15 秒で
-  タイムアウトさせて切断します。1 接続 = 1 Wake 要求 = 即切断の軽量ラウンドトリップです。
+- **総当たり・DoS 対策 (host と対称化)**: 接続ごとに独立タスクで処理し (accept ループは
+  塞がない)、ハンドシェイク I/O は 10 秒、ハンドシェイク〜Wake〜Ack の 1 接続全体は 15 秒で
+  タイムアウトさせて切断します。加えて host と同じ**送信元 IP 単位の指数バックオフ**
+  (1→最大 30 秒、`WolThrottle`) をハンドシェイク失敗時に挟み、**同時接続数を上限
+  (`MAX_WOL_CLIENTS`=8) のセマフォで制限**してコネクションフラッドを抑えます。1 接続 =
+  1 Wake 要求 = 即切断の軽量ラウンドトリップです。
+- **bind も host と対称に Tailscale-only 既定**: 以前は `0.0.0.0` (全 NIC) 固定で自宅 LAN
+  全体へ露出していましたが、既定を Tailscale IPv4 の自動解決 (`--bind` で上書き可) に改めました。
+  Tailscale が取れなければ loopback に fail-closed し、明示公開は `--bind <ip>` (全 NIC なら
+  `--bind 0.0.0.0`) でオプトインします。raspi が tailscaled より先に起動しても IP が出るまで
+  待ってから bind します。
 
 ## ログ
 
@@ -169,11 +179,14 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
 
 ## 既知の制約
 
-- **認証前 DoS (接続枠の占有)**: 接続は受理ごとに独立タスクで処理しますが、同時接続数は
-  `MAX_CLIENTS` (=4) のセマフォで制限し、超過分は受理直後に切断します。攻撃者が未認証の
-  接続を 4 本張って放置すると、ハンドシェイクタイムアウト (10 秒) で枠が解放されるまでの間、
-  正規ユーザーの接続が弾かれます。繰り返せば実質的な締め出しになり得ます。Tailnet 内の
-  信頼を前提に許容しています (ネットワーク到達制御は Tailscale 側 ACL に委譲)。
+- **認証前 DoS (接続枠の占有)**: 接続は受理ごとに独立タスクで処理し、同時接続を **2 段の
+  セマフォ**で制限します。認証前のハンドシェイク枠 (`PREAUTH_SLOTS`=32) と、認証を通した
+  確立済みセッション枠 (`MAX_CLIENTS`=4) を分離し、**セッション枠は Noise + デバイス認証を
+  通過してから確保**します。これにより未認証の stall 接続や総当たり失敗のバックオフ待ちが、
+  正規セッション用の scarce な 4 枠を食い潰せません (以前は単一セマフォで、失敗時のバックオフ
+  sleep 中も枠を握り続けたため、認証前接続だけで正規ユーザーを締め出せました)。ハンドシェイク
+  枠 (32) の飽和は依然あり得ますが、より大きく取っており、Tailnet 内の信頼を前提に許容します
+  (到達制御は Tailscale 側 ACL に委譲)。
 - **UDP 音声のリプレイ**: 音声パケットの `seq` は欠落検出のみで、厳密な anti-replay は
   していません。経路上の攻撃者は音声データグラムを再送できます (映像はフレーム再構成と seq
   連続性で実質無害化)。Tailscale 下層 (WireGuard) が経路上の攻撃者をほぼ排除するため実害は
@@ -192,11 +205,11 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
 | Noise ハンドシェイク・transport・nonce ドメイン | `crates/common/src/noise.rs` |
 | PSK 導出 (Argon2id) | `crates/common/src/noise.rs` (`psk_from_password`) |
 | パスワードの DPAPI 保存 | `crates/host/src/security/secret.rs` |
-| 同時接続数の上限 (`MAX_CLIENTS`=4, セマフォ) | `crates/host/src/net/mod.rs` |
+| 同時接続数の上限 (2 段セマフォ: ハンドシェイク枠 `PREAUTH_SLOTS`=32 + 確立セッション枠 `MAX_CLIENTS`=4) | `crates/host/src/net/mod.rs` |
 | 接続中ガード (名前付きイベント `Local\AuroraSessionActive`) | `crates/host/src/net/session.rs` |
 | bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_spec`) → `crates/host/src/net/mod.rs` (`resolve_bind_ip`, bind 時に Tailscale IP を待つ) |
 | パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray.rs` |
-| パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net/auth.rs` (`AuthThrottle`) |
+| パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net/auth.rs` (`AuthThrottle`) / `crates/wol/src/main.rs` (`WolThrottle`) |
 | デバイスピン留め (静的鍵許可リスト) | `crates/host/src/security/devices.rs` / `crates/host/src/net/client.rs` (`remote_static` 照合) / `crates/host/src/tray.rs` |
 | クライアント永続 ID 鍵 (静的鍵) | `crates/common/src/noise.rs` (`generate_static_keypair`/`remote_static`) / `crates/client/src-tauri/src/secret.rs` |
 | 受信ファイル名サニタイズ | `crates/common/src/fsname.rs` |
