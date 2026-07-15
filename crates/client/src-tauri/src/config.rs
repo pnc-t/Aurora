@@ -47,6 +47,10 @@ pub struct HostEntry {
     /// 「`None`=情報なし (既存値保持)」規約: 接続成立時の自動保存だけがこれを更新する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// 最後に接続成功した日時 (unix 秒)。`icon`/`mac` と同じ「`None`=情報なし (既存値保持)」
+    /// 規約: ハンドシェイク成功時 (HostInfo 受信) の自動更新だけがこれを書き換える。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected: Option<u64>,
 }
 
 /// ホスト別のクライアント設定上書き。未指定 (None) のフィールドはグローバル設定
@@ -250,6 +254,7 @@ pub fn load_recent_hosts(app: AppHandle) -> Result<Vec<HostEntry>, String> {
             icon: None,
             overrides: None,
             mac: None,
+            last_connected: None,
         })
         .collect())
 }
@@ -269,6 +274,7 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         icon: entry.icon,
         overrides: entry.overrides,
         mac: entry.mac,
+        last_connected: entry.last_connected,
     };
 
     let mut hosts = load_recent_hosts(app.clone())?;
@@ -277,15 +283,18 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         .position(|h| h.host.eq_ignore_ascii_case(&entry.host))
     {
         Some(i) => {
-            // capture 側の接続成功時保存は icon/overrides/mac を持たない (None = 情報なし) ため
-            // 既存値を残す (毎接続でアバター画像・ホスト別設定・MAC が消えるのを防ぐ)。編集ダイアログは
-            // 常に明示値を送る: icon の空文字 = 解除、overrides の空オブジェクト = 「既定に従う」
-            // へのリセット (None へ正規化)。
+            // capture 側の接続成功時保存は icon/overrides/mac/last_connected を持たない
+            // (None = 情報なし) ため既存値を残す (毎接続でアバター画像・ホスト別設定・MAC・
+            // 最終接続日時が消えるのを防ぐ)。編集ダイアログは常に明示値を送る: icon の空文字 = 解除、
+            // overrides の空オブジェクト = 「既定に従う」へのリセット (None へ正規化)。
             if entry.icon.is_none() {
                 entry.icon = hosts[i].icon.clone();
             }
             if entry.mac.is_none() {
                 entry.mac = hosts[i].mac.clone();
+            }
+            if entry.last_connected.is_none() {
+                entry.last_connected = hosts[i].last_connected;
             }
             match entry.overrides.as_ref() {
                 None => entry.overrides = hosts[i].overrides.clone(),

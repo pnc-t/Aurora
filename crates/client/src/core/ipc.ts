@@ -362,6 +362,8 @@ export type HostEntry = {
   /** Wake on LAN 用 MAC アドレス (接続時に Rust が自動保存する)。icon と同じ
    *  None(null/undefined)=「情報なし」で既存値を保持、空文字=明示解除の規約。 */
   mac?: string | null;
+  /** 最後に接続成功した日時 (unix 秒)。icon/mac と同じ「未指定=情報なし・既存値保持」の規約。 */
+  last_connected?: number;
 };
 
 /** WoL 中継先ターゲット (Rust 側 WolTarget と対応)。 */

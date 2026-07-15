@@ -125,6 +125,7 @@ async fn save_host_mac(app: &tauri::AppHandle, host: &str, mac: Option<[u8; 6]>)
             icon: None,
             overrides: None,
             mac: Some(format_mac(mac)),
+            last_connected: None,
         };
         crate::config::save_recent_host(app, entry)
     })
@@ -132,6 +133,43 @@ async fn save_host_mac(app: &tauri::AppHandle, host: &str, mac: Option<[u8; 6]>)
     match res {
         Ok(Err(e)) => tracing::warn!(error = %e, "failed to save host MAC"),
         Err(e) => tracing::warn!(error = %e, "save host MAC task failed"),
+        Ok(Ok(())) => {}
+    }
+}
+
+/// HostInfo 受信 (= ハンドシェイク成功) の日時を `recent_hosts` の該当 host エントリへ記録する
+/// (launcher の「最終接続」表示用)。`save_host_mac` と同じ「未登録なら何もしない・None=情報
+/// なしで既存値保持」の経路 (load→更新→save)。保存失敗はログのみ (補助情報のため接続を止めない)。
+async fn save_host_last_connected(app: &tauri::AppHandle, host: &str) {
+    let app = app.clone();
+    let host = host.to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // load/save_recent_hosts は同期ファイル I/O のため tokio タスク内から直接呼ばない。
+    let res = tokio::task::spawn_blocking(move || {
+        let Ok(hosts) = crate::config::load_recent_hosts(app.clone()) else {
+            return Ok(());
+        };
+        let Some(existing) = hosts.iter().find(|h| h.host.eq_ignore_ascii_case(&host)) else {
+            return Ok(());
+        };
+        let entry = crate::config::HostEntry {
+            label: existing.label.clone(),
+            host,
+            port: existing.port,
+            icon: None,
+            overrides: None,
+            mac: None,
+            last_connected: Some(now),
+        };
+        crate::config::save_recent_host(app, entry)
+    })
+    .await;
+    match res {
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to save host last_connected"),
+        Err(e) => tracing::warn!(error = %e, "save host last_connected task failed"),
         Ok(Ok(())) => {}
     }
 }
@@ -274,6 +312,7 @@ async fn connect_inner(
             mac,
         } => {
             save_host_mac(&app, &host, mac).await;
+            save_host_last_connected(&app, &host).await;
             (displays, audio)
         }
         other => return Err(format!("expected HostInfo, got {other:?}")),
