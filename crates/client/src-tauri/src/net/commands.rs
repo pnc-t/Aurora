@@ -223,11 +223,12 @@ pub async fn upload_file_from_path(
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     const CHUNK: usize = 32 * 1024;
-    // file_tx を clone してロックは send の await を跨がない。
-    let file_tx = {
+    // file_tx/sink を clone してロックは send の await を跨がない。sink は進捗 (FileProgress)
+    // emit 用。
+    let (file_tx, sink) = {
         let guard = state.inner.lock().await;
         let s = guard.get(&session_id).ok_or("unknown session")?;
-        s.file_tx.clone()
+        (s.file_tx.clone(), s.sink.clone())
     };
     let name = Path::new(&path)
         .file_name()
@@ -251,6 +252,8 @@ pub async fn upload_file_from_path(
         .map_err(|_| "file channel closed".to_string())?;
     let mut offset: u64 = 0;
     let mut buf = vec![0u8; CHUNK];
+    // 進捗 emit は download 側 (net/connect.rs) と対称に 100ms 以上間隔を空けて間引く。
+    let mut last_progress: Option<Instant> = None;
     loop {
         let n = file
             .read(&mut buf)
@@ -267,6 +270,20 @@ pub async fn upload_file_from_path(
             .await
             .map_err(|_| "file channel closed".to_string())?;
         offset += n as u64;
+        let now = Instant::now();
+        let should_emit = last
+            || match last_progress {
+                Some(t) => now.duration_since(t) >= Duration::from_millis(100),
+                None => true,
+            };
+        if should_emit {
+            last_progress = Some(now);
+            sink.send_event(ClientEvent::FileProgress {
+                id,
+                done: offset,
+                total: size,
+            });
+        }
         if last {
             break;
         }

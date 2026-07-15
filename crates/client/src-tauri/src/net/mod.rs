@@ -98,6 +98,13 @@ pub enum ClientEvent {
         ok: bool,
         message: String,
     },
+    /// ファイル転送 (アップロード/ダウンロード) の進捗。転送 id ごとに 100ms 以上間隔を空けて
+    /// emit する (毎チャンク emit すると Tauri IPC が高頻度になり映像の遅延予算を食うため)。
+    FileProgress {
+        id: u32,
+        done: u64,
+        total: u64,
+    },
     Disconnected {
         reason: String,
     },

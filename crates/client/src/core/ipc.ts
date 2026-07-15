@@ -28,6 +28,7 @@ export type ClientEvent =
   | { kind: "pong"; rtt_us: number }
   | { kind: "stats"; bitrate_kbps: number; fps: number; rtt_us: number; loss_permille: number }
   | { kind: "file_result"; id: number; ok: boolean; message: string }
+  | { kind: "file_progress"; id: number; done: number; total: number }
   | { kind: "video_codec_changed"; codec: CodecId }
   | { kind: "disconnected"; reason: string };
 

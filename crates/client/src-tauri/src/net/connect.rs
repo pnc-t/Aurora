@@ -650,6 +650,7 @@ async fn tcp_reader_loop(
                                 written: 0,
                                 total: size,
                                 path,
+                                last_progress: None,
                             });
                         }
                         Err(e) => {
@@ -724,6 +725,22 @@ async fn tcp_reader_loop(
                         download = None;
                     } else {
                         d.written += data.len() as u64;
+                        // 進捗 emit は転送ごとに 100ms 以上間隔を空ける (最終チャンクは必ず emit)。
+                        // チャンク毎に emit すると Tauri IPC (JSON) が高頻度になり映像の遅延予算を食う。
+                        let now = Instant::now();
+                        let should_emit = last
+                            || match d.last_progress {
+                                Some(t) => now.duration_since(t) >= Duration::from_millis(100),
+                                None => true,
+                            };
+                        if should_emit {
+                            d.last_progress = Some(now);
+                            sink.send_event(ClientEvent::FileProgress {
+                                id,
+                                done: d.written,
+                                total: d.total,
+                            });
+                        }
                         if last {
                             let (written, path) = (d.written, d.path.clone());
                             let res = d.file.flush().await;

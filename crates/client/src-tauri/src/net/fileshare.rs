@@ -10,6 +10,9 @@ pub(crate) struct DownloadState {
     /// (悪意あるホストが告知より多く送ってディスクを埋めるのを防ぐ)。
     pub(crate) total: u64,
     pub(crate) path: String,
+    /// 直近の FileProgress emit 時刻。チャンク毎の emit は Tauri IPC (JSON) コストが高いため、
+    /// 転送 id ごとに 100ms 以上間隔を空けて間引く (最終チャンクは間引かず必ず emit する)。
+    pub(crate) last_progress: Option<Instant>,
 }
 
 /// `%USERPROFILE%\Aurora\downloads` 配下に保存先ファイルを作る。ディレクトリ解決・
