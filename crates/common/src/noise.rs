@@ -18,10 +18,11 @@ pub const NOISE_PARAMS: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 /// 接続パスワードの最低長 (文字数)。
 ///
 /// XX-PSK は接続を試みた相手にハンドシェイク転写を渡すため、弱いパスワードは Argon2id を
-/// 通してもオフライン辞書攻撃で破られうる。空・極短パスワードを設定段階で禁止し、オン/
-/// オフライン双方の総当たり探索空間を最低限確保する。host の `--set-password` と tray の
-/// パスワード変更ダイアログの両方で強制すること (設定経路を対称に硬化する)。
-pub const MIN_PASSWORD_LEN: usize = 8;
+/// 通してもオフライン辞書攻撃で破られうる。単一要素認証 (パスワードのみ) であることを踏まえ、
+/// 8 文字では総当たり探索空間が不十分と判断し 12 文字に引き上げてオフライン耐性を底上げする。
+/// host の `--set-password` と tray のパスワード変更ダイアログの両方で強制すること (設定経路
+/// を対称に硬化する)。
+pub const MIN_PASSWORD_LEN: usize = 12;
 
 /// 最低長は満たすが弱いことが多い代表的パスワード (小文字化して比較)。網羅的辞書ではなく、
 /// 設定時にソフト警告を出すための代表例。
@@ -124,19 +125,25 @@ pub enum NoiseError {
 ///
 /// PSK は host/client が共有パスワードから **各自で独立に同じ値を計算**する必要があるため、
 /// ソルトを通信で交換できない。よって固定ソルトを使う (パスワードストレージではなく
-/// 共有鍵導出なので、毎回ユニークなソルトは要件ではない)。Argon2id のメモリ硬度により、
-/// 固定ソルトでもオフライン総当たりコストは blake2s 単発より桁違いに高い。
+/// 共有鍵導出なので、毎回ユニークなソルトは要件ではない)。Argon2id のメモリ硬度
+/// (m=64MiB, t=3, p=1) により、固定ソルトでもオフライン総当たりコストは blake2s 単発より
+/// 桁違いに高い。
 const PSK_SALT: &[u8] = b"aurora-noise-psk-v1";
 
 /// 接続パスワードから PSK (32B) を導出する。
 ///
-/// Argon2id (メモリ硬 KDF) + 固定アプリソルト。弱いパスワードに対するオフライン総当たり
-/// 耐性を、単一ハッシュ (旧 blake2s) より大幅に高める。host/client で同一関数を使うため
-/// 導出値は常に一致する。パラメータを変えると PSK が変わり旧クライアントと非互換になる点に注意。
+/// Argon2id (メモリ硬 KDF、m=64MiB/t=3/p=1) + 固定アプリソルト。弱いパスワードに対する
+/// オフライン総当たり耐性を、単一ハッシュ (旧 blake2s) より大幅に高める。PSK 導出は 1 接続に
+/// つき 1 回のみのため、このコストは遅延予算に影響しない。host/client で同一関数を使うため
+/// 導出値は常に一致する。
+///
+/// **注意 (ワイヤ互換)**: このパラメータを変えると同じパスワードから導出される PSK が変わる
+/// ため、host・client・aurora-wol を**すべて同一バージョンでリビルド**しないとハンドシェイクが
+/// 一致しなくなる (旧バイナリとの混在運用不可)。
 pub fn psk_from_password(password: &str) -> [u8; 32] {
     use argon2::{Algorithm, Argon2, Params, Version};
-    // OWASP 推奨水準 (m=19 MiB, t=2, p=1)。出力長 32B。
-    let params = Params::new(19 * 1024, 2, 1, Some(32)).expect("valid argon2 params");
+    // OWASP 最低ラインから引き上げ: m=64MiB, t=3, p=1。出力長 32B。
+    let params = Params::new(64 * 1024, 3, 1, Some(32)).expect("valid argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
     argon2

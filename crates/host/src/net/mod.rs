@@ -269,6 +269,12 @@ async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>
 /// 帯域/CPU の暴走と接続枠 DoS を抑えるよう少数に固定する。超過接続は受理直後に丁寧に閉じる。
 const MAX_CLIENTS: usize = 4;
 
+/// 認証前 (Noise ハンドシェイク中) の同時接続の上限。確立済みセッション枠 (MAX_CLIENTS) とは
+/// 別枠で、これより大きく取る。未認証の stall 接続や総当たり失敗のバックオフ待ちがこの枠を
+/// 占有しても、認証を通した正規クライアントの scarce な MAX_CLIENTS 枠には touch させない
+/// (認証前 DoS がセッション枠を食い潰すのを防ぐ 2 段構え)。
+const PREAUTH_SLOTS: usize = 32;
+
 /// 映像 broadcast のリング容量。遅いクライアントが溢れたら Lagged で検知してキーフレーム要求で
 /// 復帰する (フレームは Arc 共有なのでバッファ自体は安価)。fan-out の drain 速度差を吸収できる
 /// 程度に取る。
@@ -367,6 +373,9 @@ pub(crate) struct ClientArgs {
     throttle: Arc<AuthThrottle>,
     devices: Arc<crate::security::DeviceGuard>,
     shared: Arc<tokio::sync::Mutex<SharedControl>>,
+    /// 認証成功後に確立済みセッション枠を取得するためのセマフォ (MAX_CLIENTS)。handle_client が
+    /// 認証を通してから acquire する (認証前接続はこの枠に触れない)。
+    session_sem: Arc<tokio::sync::Semaphore>,
     registry: Registry,
     conn_id: u64,
     /// 接続/キーフレーム要求時に capture へ現在の画面の強制送出を促す共有フラグ ([`ServerConfig`])。
@@ -552,8 +561,9 @@ pub async fn run_server(
         });
     }
 
-    // 同時接続数を MAX_CLIENTS に制限するセマフォ。permit を各 task が握り、切断で解放する。
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+    // 認証前ハンドシェイク枠 (大きめ) と確立済みセッション枠 (MAX_CLIENTS) を分離する。
+    let handshake_sem = Arc::new(tokio::sync::Semaphore::new(PREAUTH_SLOTS));
+    let session_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
 
     // 外側ループ: 現在のポートで TCP/UDP を bind する。tray でポートが変わると reload 通知で
     // 内側の accept ループを抜け、ここへ戻って貼り直す (古いソケットは drop で解放)。
@@ -584,12 +594,12 @@ pub async fn run_server(
                     break;
                 }
             };
-            // 接続上限。超過は受理直後に丁寧に閉じる (ハンドシェイク前)。permit は task の寿命と
-            // ともに保持し、切断で解放される。
-            let permit = match sem.clone().try_acquire_owned() {
+            // ハンドシェイク枠の上限。超過は受理直後に丁寧に閉じる (ハンドシェイク前)。permit は
+            // task の寿命とともに保持し、切断で解放される。
+            let handshake_permit = match handshake_sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!(%peer, max_clients = MAX_CLIENTS, "client limit reached; rejecting connection");
+                    tracing::warn!(%peer, preauth_slots = PREAUTH_SLOTS, "handshake slots exhausted; rejecting connection");
                     drop(stream);
                     continue;
                 }
@@ -618,6 +628,7 @@ pub async fn run_server(
                 throttle: throttle.clone(),
                 devices: cfg.devices.clone(),
                 shared: shared.clone(),
+                session_sem: session_sem.clone(),
                 registry: registry.clone(),
                 conn_id,
                 force_frame: cfg.force_frame.clone(),
@@ -627,8 +638,8 @@ pub async fn run_server(
             // 各接続を独立 task で処理する (await で占有しない = 複数クライアント同時)。
             tokio::spawn(
                 async move {
-                    // permit を task 寿命まで保持 (drop で接続枠を解放)。
-                    let _permit = permit;
+                    // ハンドシェイク枠を task 寿命まで保持 (drop で接続枠を解放)。
+                    let _handshake_permit = handshake_permit;
                     tracing::info!("TCP client connected");
                     match handle_client(stream, args).await {
                         Ok(()) => tracing::info!("client disconnected"),
