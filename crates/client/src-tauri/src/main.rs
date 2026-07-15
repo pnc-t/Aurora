@@ -139,6 +139,7 @@ fn main() {
             config::delete_wol_target,
             secret::saved_password_hosts,
             secret::delete_host_password,
+            secret::my_device_fingerprint,
             log::frontend_log,
             log::perf_enabled,
             log::open_logs_folder,

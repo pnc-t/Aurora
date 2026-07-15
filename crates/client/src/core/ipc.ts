@@ -203,6 +203,11 @@ export async function deleteHostPassword(host: string): Promise<void> {
   await invoke("delete_host_password", { host });
 }
 
+/** この端末の識別子 (フィンガープリント)。host のデバイスピン留め承認時に照合する。 */
+export async function myDeviceFingerprint(): Promise<string> {
+  return await invoke<string>("my_device_fingerprint");
+}
+
 export async function disconnect(sessionId: string): Promise<void> {
   await invoke("disconnect", { sessionId });
 }

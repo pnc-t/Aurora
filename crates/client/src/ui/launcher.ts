@@ -23,6 +23,7 @@ import {
   saveSettings,
   openLogsFolder,
   exportLogsZip,
+  myDeviceFingerprint,
   type ClientSettings,
   type HostEntry,
   type HostOverrides,
@@ -391,6 +392,16 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               </div>
               </div>
               <div class="shortcut-note">割り当てたキーはリモート側へ送信されなくなります</div>
+              <div class="setting-group">端末情報</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">この端末の識別子</div>
+                  <div class="s-desc">ホストのデバイスピン留めで承認するとき、ホスト側に表示される指紋とこの値が一致することを確認してください</div>
+                </div>
+                <span id="device-fingerprint" class="s-desc" style="font-family:monospace">…</span>
+              </div>
+              </div>
               <div class="setting-group">診断</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -461,6 +472,20 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   // ナビ (Hosts/Settings) や ＋追加 などアイコンのみボタンに aria-label を補う。
   applyAriaLabels(opts.root);
+
+  // 端末情報: この端末の識別子 (フィンガープリント)。host のデバイスピン留め承認時に
+  // host トレイ表示と照合するための読み取り専用表示。
+  const fingerprintEl = $("#device-fingerprint");
+  if (fingerprintEl) {
+    myDeviceFingerprint()
+      .then((fp) => {
+        fingerprintEl.textContent = fp;
+      })
+      .catch((e) => {
+        logger.warn("device fingerprint fetch failed", e);
+        fingerprintEl.textContent = "取得できませんでした";
+      });
+  }
 
   // 診断: ログフォルダを開く / ログを ZIP 出力。
   $("#open-logs")?.addEventListener("click", () => {

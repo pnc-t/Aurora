@@ -36,8 +36,8 @@ pub enum TrayEvent {
     Connected(String),
     /// クライアント切断。
     Disconnected(String),
-    /// デバイスピン留めのペアリングで新規端末を信頼登録した。
-    Enrolled(String),
+    /// ペアリング窓中に未知端末が接続し承認待ちになった (指紋 + 端末名)。
+    PendingDevice { fingerprint: String, label: String },
 }
 
 /// 最大保持イベント数。あふれたら古いものを捨てる (常駐 UI なので無限に溜めない)。
@@ -106,9 +106,9 @@ impl TrayBus {
         self.push(TrayEvent::Disconnected(label));
     }
 
-    /// ペアリングでの新規端末登録を記録する。
-    pub fn on_enrolled(&self, label: String) {
-        self.push(TrayEvent::Enrolled(label));
+    /// ペアリング窓中に未知端末が接続し承認待ちになったことを記録する (net が呼ぶ)。
+    pub fn on_pending_device(&self, fingerprint: String, label: String) {
+        self.push(TrayEvent::PendingDevice { fingerprint, label });
     }
 
     /// 溜まった通知イベントを取り出す (tray の `WM_TIMER` が呼ぶ)。
@@ -216,6 +216,11 @@ mod imp {
     const ID_DEVICE_BASE: usize = 2000;
     /// リスト表示する登録端末の上限 (ID 空間を有界にする。通常これを超える端末は持たない)。
     const MAX_DEVICE_ITEMS: usize = 64;
+    /// 承認待ちデバイスリストの各項目 ID のベース (`ID_PENDING_BASE + index`)。クリックで承認する。
+    const ID_PENDING_BASE: usize = 3000;
+    /// リスト表示する承認待ちデバイスの上限 (devices 側の保留上限 MAX_PENDING と揃える必要はないが
+    /// ID 空間を有界にする)。
+    const MAX_PENDING_ITEMS: usize = 8;
     /// 変更ダイアログ内コントロール ID。
     const ID_EDIT_CUR: i32 = 100;
     const ID_EDIT: i32 = 101;
@@ -448,6 +453,12 @@ mod imp {
                         c if (ID_DEVICE_BASE..ID_DEVICE_BASE + MAX_DEVICE_ITEMS).contains(&c) => {
                             remove_device(hwnd, c - ID_DEVICE_BASE);
                         }
+                        // 承認待ちデバイスリストの項目: その端末を承認する。
+                        c if (ID_PENDING_BASE..ID_PENDING_BASE + MAX_PENDING_ITEMS)
+                            .contains(&c) =>
+                        {
+                            approve_pending(hwnd, c - ID_PENDING_BASE);
+                        }
                         _ => {}
                     }
                     LRESULT(0)
@@ -497,10 +508,12 @@ mod imp {
                     &format!("端末「{label}」が切断しました"),
                     false,
                 ),
-                TrayEvent::Enrolled(label) => balloon(
+                TrayEvent::PendingDevice { fingerprint, label } => balloon(
                     hwnd,
                     "Aurora Host",
-                    &format!("端末「{label}」を登録しました (デバイスピン留め)"),
+                    &format!(
+                        "承認待ちのデバイスが接続しました\n端末: {label}\n指紋: {fingerprint}\nトレイメニューで指紋を照合して承認してください。"
+                    ),
                     false,
                 ),
             }
@@ -683,6 +696,27 @@ mod imp {
                     });
                     let _ = AppendMenuW(menu, MF_STRING, ID_PIN_PAIR, PCWSTR(pair.as_ptr()));
                     _keep.push(pair);
+
+                    // ペアリング窓が開いている間、承認待ち端末をインライン項目として列挙する
+                    // (指紋を接続元端末の表示値と照合して承認する入口)。
+                    if armed {
+                        let pending = state.devices.pending_devices();
+                        if !pending.is_empty() {
+                            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                            for (i, (_pubkey, fp, label)) in
+                                pending.iter().take(MAX_PENDING_ITEMS).enumerate()
+                            {
+                                let item = to_wide(&format!("承認: {fp} ({label})"));
+                                let _ = AppendMenuW(
+                                    menu,
+                                    MF_STRING,
+                                    ID_PENDING_BASE + i,
+                                    PCWSTR(item.as_ptr()),
+                                );
+                                _keep.push(item);
+                            }
+                        }
+                    }
 
                     // 登録済みデバイスをサブメニューに列挙する (各項目クリックでその端末を削除)。
                     let labels = state.devices.labels();
@@ -936,7 +970,7 @@ mod imp {
         state.devices.arm_pairing();
         message_box(
             hwnd,
-            "ペアリング窓を開きました。\n登録したい端末から今すぐ 1 回接続してください\n(次に認証を通した 1 台が信頼登録され、窓は閉じます)。\n登録しない場合はメニューから取り消せます。",
+            "ペアリング窓を開きました。\n登録したい端末から接続してください。\n接続すると、その端末の指紋がこのメニューの「承認: ...」項目に表示されます。\n端末側に表示された指紋と一致することを確認して承認してください。\n(一致しない項目は承認しないでください。別端末の可能性があります)",
             "Aurora Host",
         );
     }
@@ -987,6 +1021,57 @@ mod imp {
             None => message_box(
                 hwnd,
                 "削除できませんでした (一覧が変わった可能性)。",
+                "Aurora Host",
+            ),
+        }
+    }
+
+    /// 承認待ちリストの `index` 番目を信頼登録する (確認付き)。**接続中拒否ガードは付けない**:
+    /// 承認待ち端末は既に拒否済みで接続中ではないのが通常であり、`is_active()` ガードを付けると
+    /// 再試行中の is_active フラップで承認できなくなる (remove_device/toggle_pairing とは異なる方針)。
+    /// 承認は許可リストへの追加という安全側の操作でもある。
+    fn approve_pending(hwnd: HWND, index: usize) {
+        // SAFETY: wnd_state は hwnd の GWLP_USERDATA を読む。run が Box::into_raw でセットした生存中の WndState。
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        // クリック時点のスナップショットから対象の**公開鍵**を控える。以降の承認はこの鍵で確定し、
+        // 確認ダイアログ (モーダル) 表示中に別接続が承認待ちリストを変化させても、オーナーが指紋
+        // 照合した端末とは別物を登録しない (TOCTOU 対策。approve_pending 側の doc 参照)。
+        let Some((pubkey, fp, label)) = state.devices.pending_devices().into_iter().nth(index)
+        else {
+            message_box(
+                hwnd,
+                "承認できませんでした (一覧が変わった可能性)。",
+                "Aurora Host",
+            );
+            return;
+        };
+        let text = to_wide(&format!(
+            "この端末を信頼登録しますか?\n\n端末名: {label}\n指紋: {fp}\n\n登録したい端末の画面に表示された指紋とこの値が一致することを必ず確認してください。一致しない場合は承認しないでください (別端末が割り込んでいる可能性があります)。"
+        ));
+        let caption = to_wide("Aurora Host");
+        // SAFETY: text/caption は NUL 終端の UTF-16 で、呼び出し中は生存している。
+        let r = unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(caption.as_ptr()),
+                MB_YESNO | MB_ICONWARNING,
+            )
+        };
+        if r != IDYES {
+            return;
+        }
+        match state.devices.approve_pending(&pubkey) {
+            Some(label) => message_box(
+                hwnd,
+                &format!("「{label}」を信頼登録しました。"),
+                "Aurora Host",
+            ),
+            None => message_box(
+                hwnd,
+                "承認に失敗しました (一覧が変わった可能性)。",
                 "Aurora Host",
             ),
         }
