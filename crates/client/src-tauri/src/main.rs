@@ -118,6 +118,7 @@ fn main() {
             net::set_video_params,
             net::set_supported_codecs,
             net::set_audio_muted,
+            net::set_clipboard_sync,
             net::set_video_paused,
             net::set_cursor_overlay,
             net::set_resolution,

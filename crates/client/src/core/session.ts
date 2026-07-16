@@ -19,6 +19,7 @@ import {
   sendInput,
   setActiveSession,
   setAudioMuted,
+  setClipboardSync,
   setCursorOverlay,
   setClientViewport,
   setFileSharing,
@@ -27,6 +28,7 @@ import {
   setSupportedCodecs,
   setVideoParams,
   setVideoPaused,
+  DEFAULT_SETTINGS,
   type ClientEvent,
   type ClientSettings,
   type DisplayDto,
@@ -83,6 +85,8 @@ export interface SessionHost {
   clearStats(s: Session): void;
   /** ダウンロード結果を file パネルへ (アクティブ時のみ)。 */
   fileResult(s: Session, id: number, ok: boolean, message: string): void;
+  /** ファイル転送の進捗を file パネルへ (アクティブ時のみ)。done/total はバイト数。 */
+  fileProgress(s: Session, id: number, done: number, total: number): void;
   /** 静かな再接続中の常駐バッジを表示する (アクティブ時のみ)。最後の映像を隠さない。 */
   reconnectBadge(s: Session, text: string): void;
   /** 再接続バッジを消す (アクティブ時のみ)。 */
@@ -140,8 +144,9 @@ export class Session {
   // toolbar 再同期用に保持する接続情報。
   private connLabel = "";
   private audioAvailable = false;
-  private videoFps = 60;
-  private videoMbps = 15;
+  // effectiveSettings で接続時に上書きされるが、初期値も既定設定 (core/ipc.ts) に揃えておく。
+  private videoFps = DEFAULT_SETTINGS.fps;
+  private videoMbps = DEFAULT_SETTINGS.max_mbps;
   private latestStats: StatsEvent | null = null;
 
   // 現在の映像コーデック (video_codec_changed で確定)。stats HUD 表示用に公開する。
@@ -380,9 +385,52 @@ export class Session {
     this.host.toast(this, muted ? "音声ミュート" : "音声ミュート解除");
   }
 
+  // クリップボード同期のセッション毎の現在値。Rust 側ゲートは接続時に設定値で初期化される
+  // ため、ここも接続時 (onHostInfo) に同じ設定値へ揃え、以後はツールバートグルが更新する。
+  private clipboardSync = DEFAULT_SETTINGS.clipboard_sync;
+  get clipboardSyncEnabled(): boolean {
+    return this.clipboardSync;
+  }
+  setClipboardSyncEnabled(enabled: boolean): void {
+    this.clipboardSync = enabled;
+    void setClipboardSync(this.id, enabled).catch((e) => logger.warn("setClipboardSync failed", e));
+    this.host.toast(this, enabled ? "クリップボード同期を再開" : "クリップボード同期を停止");
+  }
+
   /** 窓リサイズ (アクティブ Session のみ orchestrator が呼ぶ)。 */
   onWindowResize(): void {
     if (this.connected) this.scheduleSendViewport();
+  }
+
+  /**
+   * エラー画面の「再接続」ボタン / タブメニューの再接続。自動再接続の打ち切り後でも
+   * 試行カウンタをリセットして即時にやり直す (待機バックオフは挟まない)。
+   */
+  manualReconnect(): void {
+    if (this.connected) return;
+    logger.info(`manual reconnect: ${this.entry.host}`);
+    this.cancelReconnect();
+    this.reconnecting = true;
+    void this.attemptReconnect();
+  }
+
+  /**
+   * 設定保存 (`aurora://settings-changed`) を受けて fps/ビットレート上限を接続中のホストへ
+   * 即時反映する (A-3: 再接続不要で効かせる)。ホスト別オーバーライドが付くフィールドは
+   * 対象外にする: オーバーライドは接続毎の固定値で、グローバル変更に追従させると
+   * ツールバーで変えた直後の persist で値が巻き戻る。差分が無ければ何も送らない。
+   */
+  refreshVideoParamsFromSettings(): void {
+    if (!this.connected) return;
+    const g = this.host.getSettings();
+    const o = this.entry.overrides;
+    const fps = o?.fps != null ? this.videoFps : g.fps;
+    const mbps = o?.max_mbps != null ? this.videoMbps : g.max_mbps;
+    if (fps === this.videoFps && mbps === this.videoMbps) return;
+    this.videoFps = fps;
+    this.videoMbps = mbps;
+    void setVideoParams(this.id, fps, mbps * 1_000_000);
+    if (this.active) this.host.toolbar.setVideoParams(fps, mbps);
   }
 
   /** アクティブ化時に共有 UI を自分の状態へ揃える。 */
@@ -400,6 +448,7 @@ export class Session {
     tb.setDisplays(this.toolbarDisplayList(), this.currentDisplay?.id);
     tb.setConnLabel(this.connLabel);
     tb.setAudioAvailable(this.audioAvailable);
+    tb.setClipboardSyncState(this.clipboardSync);
     tb.setVideoParams(this.videoFps, this.videoMbps);
     tb.setCaptureToggled(this.input.isCaptured());
     if (this.latestStats) this.host.updateStats(this, this.latestStats);
@@ -595,6 +644,9 @@ export class Session {
         break;
       case "pong":
         break;
+      case "file_progress":
+        this.host.fileProgress(this, ev.id, ev.done, ev.total);
+        break;
       case "file_result":
         this.host.fileResult(this, ev.id, ev.ok, ev.message);
         this.host.toast(
@@ -620,6 +672,8 @@ export class Session {
     if (this.entry.host) void saveRecentHost(this.entry);
     const settings = this.effectiveSettings();
     this.audioAvailable = ev.audio;
+    // Rust 側ゲートは接続時に設定値で初期化済み。UI 側の現在値も同じ出所へ揃える。
+    this.clipboardSync = settings.clipboard_sync;
     this.currentDisplays = ev.displays;
 
     let target = ev.displays[0];
@@ -691,6 +745,7 @@ export class Session {
       tb.setPosition(settings.toolbar_position);
       tb.setConnected(true, settings.toolbar_pinned);
       tb.setAudioAvailable(ev.audio, settings.audio_muted);
+      tb.setClipboardSyncState(this.clipboardSync);
       this.host.setResizable(true);
       tb.setDisplays(this.toolbarDisplayList(), target?.id);
       tb.setConnLabel(this.connLabel);

@@ -39,7 +39,8 @@ export type IconName =
   | "resolution"
   | "key"
   | "check"
-  | "bolt";
+  | "bolt"
+  | "clipboard";
 
 // viewBox 0 0 24 24 の path/shape 部分のみ (共通の <svg> ラッパーは icon() で付与)。
 const PATHS: Record<IconName, string> = {
@@ -72,6 +73,7 @@ const PATHS: Record<IconName, string> = {
   key: `<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2M16 7l3 3"/>`,
   check: `<path d="M20 6L9 17l-5-5"/>`,
   bolt: `<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>`,
+  clipboard: `<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
 };
 
 // assets/icons/ 配下の画像を URL として一括取り込み (ビルド時に解決)。

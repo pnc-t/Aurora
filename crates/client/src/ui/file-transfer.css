@@ -21,3 +21,16 @@ body.tab-right:not(.tab-fs) #file-panel { right: calc(var(--tabstrip-w, 200px) +
 #file-panel button:disabled { opacity: 0.5; cursor: default; }
 #file-panel .progress { font-family: monospace; font-size: 11px; color: var(--muted); min-width: 64px; text-align: right; }
 #file-panel .hint { font-size: 12px; color: var(--muted); }
+
+/* 転送進捗バー (FileProgress で伸びる)。 */
+#file-panel .transfer-bar {
+  flex: 1; height: 6px; border-radius: 3px;
+  background: var(--control); border: 1px solid var(--panel-border);
+  overflow: hidden;
+}
+#file-panel .transfer-bar-fill {
+  height: 100%; width: 0;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+#file-panel .transfer-bar-row[hidden] { display: none; }

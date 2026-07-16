@@ -13,6 +13,22 @@ async fn hs_io(fut: impl std::future::Future<Output = std::io::Result<()>>) -> R
         .map_err(|_| "handshake timed out".to_string())?
         .map_err(err)
 }
+
+/// ハンドシェイク段階 (TCP 接続後) の失敗をユーザー向け日本語へ正規化する。プロトコル上、
+/// パスワード不一致とデバイスピン留め未承認はクライアント側から区別できない (どちらも
+/// ハンドシェイク後の読み取り/復号失敗になる) ため、両者をまとめた文言に丸め、技術詳細は
+/// tracing にだけ残す。端末ID (fp) を併記し、host 側トレイの承認 UI と照合できるようにする。
+fn hs_fail<E: std::fmt::Display>(fp: Option<&str>, e: E) -> String {
+    tracing::debug!(error = %e, "handshake failed");
+    match fp {
+        Some(fp) => {
+            format!(
+                "パスワードが違うか、ホスト側でこの端末が承認されていません (この端末の端末ID: {fp})"
+            )
+        }
+        None => "パスワードが違うか、ホスト側でこの端末が承認されていません".to_string(),
+    }
+}
 /// 指定セッションの制御チャネルへ 1 メッセージ送る共通処理。未知 id は拒否する。
 pub(crate) async fn send_ctrl(
     state: &SessionState,
@@ -109,6 +125,7 @@ async fn save_host_mac(app: &tauri::AppHandle, host: &str, mac: Option<[u8; 6]>)
             icon: None,
             overrides: None,
             mac: Some(format_mac(mac)),
+            last_connected: None,
         };
         crate::config::save_recent_host(app, entry)
     })
@@ -116,6 +133,43 @@ async fn save_host_mac(app: &tauri::AppHandle, host: &str, mac: Option<[u8; 6]>)
     match res {
         Ok(Err(e)) => tracing::warn!(error = %e, "failed to save host MAC"),
         Err(e) => tracing::warn!(error = %e, "save host MAC task failed"),
+        Ok(Ok(())) => {}
+    }
+}
+
+/// HostInfo 受信 (= ハンドシェイク成功) の日時を `recent_hosts` の該当 host エントリへ記録する
+/// (launcher の「最終接続」表示用)。`save_host_mac` と同じ「未登録なら何もしない・None=情報
+/// なしで既存値保持」の経路 (load→更新→save)。保存失敗はログのみ (補助情報のため接続を止めない)。
+async fn save_host_last_connected(app: &tauri::AppHandle, host: &str) {
+    let app = app.clone();
+    let host = host.to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // load/save_recent_hosts は同期ファイル I/O のため tokio タスク内から直接呼ばない。
+    let res = tokio::task::spawn_blocking(move || {
+        let Ok(hosts) = crate::config::load_recent_hosts(app.clone()) else {
+            return Ok(());
+        };
+        let Some(existing) = hosts.iter().find(|h| h.host.eq_ignore_ascii_case(&host)) else {
+            return Ok(());
+        };
+        let entry = crate::config::HostEntry {
+            label: existing.label.clone(),
+            host,
+            port: existing.port,
+            icon: None,
+            overrides: None,
+            mac: None,
+            last_connected: Some(now),
+        };
+        crate::config::save_recent_host(app, entry)
+    })
+    .await;
+    match res {
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to save host last_connected"),
+        Err(e) => tracing::warn!(error = %e, "save host last_connected task failed"),
         Ok(Ok(())) => {}
     }
 }
@@ -160,16 +214,22 @@ async fn connect_inner(
     let target = format!("{host}:{port}");
     let tcp_addr: SocketAddr = tokio::net::lookup_host(&target)
         .await
-        .map_err(|e| format!("resolve {host}: {e}"))?
+        .map_err(|e| {
+            tracing::debug!(error = %e, "dns resolve failed");
+            format!("ホスト名を解決できません: {host}")
+        })?
         .next()
-        .ok_or_else(|| format!("no address for {host}"))?;
+        .ok_or_else(|| format!("ホスト名を解決できません: {host}"))?;
     let udp_addr = tcp_addr;
 
     tracing::info!(%tcp_addr, "connecting");
     let mut tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp_addr))
         .await
-        .map_err(|_| "TCP connect timed out".to_string())?
-        .map_err(|e| format!("TCP connect: {e}"))?;
+        .map_err(|_| {
+            "接続がタイムアウトしました (ホストが起動していないか、ネットワークに到達できません)"
+                .to_string()
+        })?
+        .map_err(|e| format!("ホストに接続できません: {e}"))?;
     tcp.set_nodelay(true).ok();
 
     let psk = psk_from_password(&password);
@@ -178,6 +238,9 @@ async fn connect_inner(
     // 識別できるよう、毎回同じ静的公開鍵で接続する。取得失敗時は None=従来の使い捨て鍵。
     let identity = crate::secret::load_or_create_identity(&app);
     let identity_priv = identity.as_ref().map(|id| id.private.as_slice());
+    // 端末ID (フィンガープリント)。ハンドシェイク以降の失敗メッセージに併記し、ユーザーが
+    // ホスト側トレイの承認 UI と照合できるようにする (下の hs_fail 参照)。
+    let fp = identity.as_ref().map(|id| device_fingerprint(&id.public));
 
     // --- Noise XX-PSK initiator ---
     // ハンドシェイク I/O には全てタイムアウトを設ける。これが無いと、ポートは開いているが
@@ -188,23 +251,31 @@ async fn connect_inner(
     let mut tmp = Vec::new();
     // -> e
     let mut out_msg = Vec::new();
-    hs.write_msg(&[], &mut out_msg).map_err(err)?;
-    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
+    hs.write_msg(&[], &mut out_msg)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
     // <- e, ee, s, es
-    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
-    hs.read_msg(&buf, &mut tmp).map_err(err)?;
+    hs_io(read_tcp_frame(&mut tcp, &mut buf))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    hs.read_msg(&buf, &mut tmp)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
     // -> s, se, psk
     // 最終メッセージの (暗号化済み) payload にこの端末名 (PC 名) を載せる。host はデバイス
     // ピン留め登録時にこれを表示ラベルにし、トレイの一覧で「どの PC を登録したか」を判別できる。
     // 名前は機密ではないが平文露出も避けたいので、payload (XXpsk3 の 3 通目は暗号化される) で渡す。
     hs.write_msg(local_device_name().as_bytes(), &mut out_msg)
-        .map_err(err)?;
-    hs_io(write_tcp_frame(&mut tcp, &out_msg)).await?;
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    hs_io(write_tcp_frame(&mut tcp, &out_msg))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
 
     // snow の StatelessTransportState は encrypt/decrypt とも &self なので、
     // 複数タスク (writer/reader/udp) 間の共有は Arc だけで足り Mutex は不要。
     // 映像 UDP のパケット毎 decrypt が TCP 制御とロック競合しなくなる。
-    let session = Arc::new(hs.into_transport().map_err(err)?);
+    let session = Arc::new(hs.into_transport().map_err(|e| hs_fail(fp.as_deref(), e))?);
     tracing::info!("noise handshake complete");
 
     // ハンドシェイク成功 = PSK (パスワード) 一致。ユーザーが「保存する」を選んだときだけ
@@ -217,11 +288,13 @@ async fn connect_inner(
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
     // 以降の TCP 受信は reader ループが nonce 1 から続ける。
-    hs_io(read_tcp_frame(&mut tcp, &mut buf)).await?;
+    hs_io(read_tcp_frame(&mut tcp, &mut buf))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
     let mut plain = Vec::new();
     let mut hostinfo_rx_nonce: u64 = 0;
-    let host_info =
-        decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain).map_err(err)?;
+    let host_info = decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
 
     // 映像/イベントの表示先を差し替え可能 sink にまとめる。以降タスクへはこの sink を
     // clone して渡し、タブのウィンドウ移動 (attach/detach) で表示先だけ付け替えられるようにする。
@@ -239,6 +312,7 @@ async fn connect_inner(
             mac,
         } => {
             save_host_mac(&app, &host, mac).await;
+            save_host_last_connected(&app, &host).await;
             (displays, audio)
         }
         other => return Err(format!("expected HostInfo, got {other:?}")),
@@ -269,6 +343,14 @@ async fn connect_inner(
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
+    // クリップボード同期の可否ゲート。設定の初期値をここで直接反映する (TS 側の後追い適用に
+    // 依存すると、起動直後の数回分がレースで漏れうるため Rust 側で初期化する)。設定読み込み
+    // 失敗時は安全側の既定 (ON) にする。
+    let clipboard_sync = Arc::new(AtomicBool::new(
+        crate::config::load_settings(app.clone())
+            .map(|s| s.clipboard_sync)
+            .unwrap_or(true),
+    ));
 
     // 受信品質メトリクス。Ping の基準時刻と共有して RTT を算出する。
     let stats = StatsCollector::new();
@@ -285,7 +367,7 @@ async fn connect_inner(
         async move {
             let _ = tcp_writer_loop(write_half, sess_w, ctrl_rx, file_rx).await;
             sink_w.send_event(ClientEvent::Disconnected {
-                reason: "writer closed".into(),
+                reason: "接続が閉じられました".into(),
             });
         }
         .instrument(tracing::Span::current()),
@@ -304,6 +386,7 @@ async fn connect_inner(
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
     let last_pong_for_reader = last_pong_ms.clone();
+    let clipboard_sync_for_reader = clipboard_sync.clone();
     let reader_task = tokio::spawn(
         async move {
             let res = tcp_reader_loop(
@@ -317,11 +400,12 @@ async fn connect_inner(
                 share_scope_for_reader,
                 pending_for_reader,
                 last_pong_for_reader,
+                clipboard_sync_for_reader,
             )
             .await;
             let reason = match res {
-                Ok(()) => "server closed".to_string(),
-                Err(e) => format!("read error: {e}"),
+                Ok(()) => "ホスト側で接続が終了しました".to_string(),
+                Err(e) => format!("接続が切断されました: {e}"),
             };
             tracing::info!(%reason, "session closed (tcp reader)");
             sink_r.send_event(ClientEvent::Disconnected { reason });
@@ -368,10 +452,14 @@ async fn connect_inner(
         .instrument(tracing::Span::current()),
     );
 
-    // クリップボード変化 → ControlMsg::Clipboard 送信
+    // クリップボード変化 → ControlMsg::Clipboard 送信 (OFF 中はローカル変化を送らない)
     let ctrl_for_clip = ctrl_tx.clone();
+    let clipboard_sync_for_forward = clipboard_sync.clone();
     let clip_forward_task = tokio::spawn(async move {
         while let Some(text) = clip_change_rx.recv().await {
+            if !clipboard_sync_for_forward.load(Ordering::Relaxed) {
+                continue;
+            }
             if ctrl_for_clip.send(ControlMsg::Clipboard { text }).is_err() {
                 break;
             }
@@ -411,7 +499,7 @@ async fn connect_inner(
                     "no pong received; treating as disconnected (network stall?)"
                 );
                 sink_watchdog.send_event(ClientEvent::Disconnected {
-                    reason: "no pong for 5s (network stall?)".into(),
+                    reason: "ホストから応答がありません (ネットワーク断?)".into(),
                 });
                 break;
             }
@@ -489,6 +577,7 @@ async fn connect_inner(
         share_scope,
         window_label: window.label().to_string(),
         udp_health,
+        clipboard_sync,
     };
     {
         let mut guard = state.inner.lock().await;
@@ -549,6 +638,7 @@ async fn tcp_reader_loop(
     share_scope: Arc<Mutex<ShareScope>>,
     pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
     last_pong_ms: Arc<AtomicU64>,
+    clipboard_sync: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     let mut plain = Vec::new();
@@ -588,7 +678,11 @@ async fn tcp_reader_loop(
                 });
             }
             ControlMsg::Clipboard { text } => {
-                if clip_apply_tx.send(text).is_err() {
+                // OFF 中はリモートの変更を適用しない (トグルはセッション単位の一時停止であり、
+                // クリップボード内容自体はログに出さない)。
+                if !clipboard_sync.load(Ordering::Relaxed) {
+                    tracing::debug!("clipboard sync disabled; ignoring remote update");
+                } else if clip_apply_tx.send(text).is_err() {
                     tracing::debug!("clipboard apply channel closed");
                 }
             }
@@ -615,6 +709,7 @@ async fn tcp_reader_loop(
                                 written: 0,
                                 total: size,
                                 path,
+                                last_progress: None,
                             });
                         }
                         Err(e) => {
@@ -689,6 +784,22 @@ async fn tcp_reader_loop(
                         download = None;
                     } else {
                         d.written += data.len() as u64;
+                        // 進捗 emit は転送ごとに 100ms 以上間隔を空ける (最終チャンクは必ず emit)。
+                        // チャンク毎に emit すると Tauri IPC (JSON) が高頻度になり映像の遅延予算を食う。
+                        let now = Instant::now();
+                        let should_emit = last
+                            || match d.last_progress {
+                                Some(t) => now.duration_since(t) >= Duration::from_millis(100),
+                                None => true,
+                            };
+                        if should_emit {
+                            d.last_progress = Some(now);
+                            sink.send_event(ClientEvent::FileProgress {
+                                id,
+                                done: d.written,
+                                total: d.total,
+                            });
+                        }
                         if last {
                             let (written, path) = (d.written, d.path.clone());
                             let res = d.file.flush().await;

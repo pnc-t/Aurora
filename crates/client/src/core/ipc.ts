@@ -28,6 +28,7 @@ export type ClientEvent =
   | { kind: "pong"; rtt_us: number }
   | { kind: "stats"; bitrate_kbps: number; fps: number; rtt_us: number; loss_permille: number }
   | { kind: "file_result"; id: number; ok: boolean; message: string }
+  | { kind: "file_progress"; id: number; done: number; total: number }
   | { kind: "video_codec_changed"; codec: CodecId }
   | { kind: "disconnected"; reason: string };
 
@@ -282,6 +283,11 @@ export async function setAudioMuted(sessionId: string, muted: boolean): Promise<
   await invoke("set_audio_muted", { sessionId, muted });
 }
 
+/** クリップボード同期のセッション毎トグル (OFF 中は送受信とも一時停止)。 */
+export async function setClipboardSync(sessionId: string, enabled: boolean): Promise<void> {
+  await invoke("set_clipboard_sync", { sessionId, enabled });
+}
+
 /**
  * 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
  * 再開時は別途 requestKeyframe で映像を復帰させる。
@@ -361,6 +367,8 @@ export type HostEntry = {
   /** Wake on LAN 用 MAC アドレス (接続時に Rust が自動保存する)。icon と同じ
    *  None(null/undefined)=「情報なし」で既存値を保持、空文字=明示解除の規約。 */
   mac?: string | null;
+  /** 最後に接続成功した日時 (unix 秒)。icon/mac と同じ「未指定=情報なし・既存値保持」の規約。 */
+  last_connected?: number;
 };
 
 /** WoL 中継先ターゲット (Rust 側 WolTarget と対応)。 */
@@ -445,6 +453,33 @@ export type ClientSettings = {
   /** ローカル UI ショートカットのユーザー割当 (LocalHotkey id → "Ctrl+Alt+KeyF" 形式)。
    *  未登録の id は既定バインディングを使う。 */
   shortcuts: Record<string, string>;
+  /** クリップボード同期を行うか。接続時のセッションゲート初期値になる。 */
+  clipboard_sync: boolean;
+};
+
+/** ClientSettings の既定値。設定未保存時のフォールバックや capture 窓の未読込中フォールバックで使う
+ *  (host/client 双方に散らばっていた複製を一元化。§A-12)。 */
+export const DEFAULT_SETTINGS: ClientSettings = {
+  default_fullscreen: false,
+  show_stats: false,
+  default_capture: false,
+  default_port: 7000,
+  toolbar_pinned: false,
+  toolbar_position: "top",
+  tab_position: "top",
+  accent_color: "#3a82f7",
+  theme: "dark",
+  fps: 60,
+  max_mbps: 8,
+  auto_reconnect: true,
+  use_virtual_display: false,
+  share_files: false,
+  codec: "auto",
+  audio_muted: false,
+  grab_keyboard: true,
+  stats_position: "tr",
+  shortcuts: {},
+  clipboard_sync: true,
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */

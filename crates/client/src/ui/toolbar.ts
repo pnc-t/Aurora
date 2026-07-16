@@ -11,9 +11,9 @@
 
 import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
 import { CUSTOM_PRESET_ID, VIDEO_PRESETS, matchPreset } from "../core/video-presets";
-import { mountWindowControls } from "./window-controls";
 import { applyAriaLabels } from "../core/a11y";
 import { shortcutLabel } from "../core/shortcuts";
+import { showToast } from "./toast";
 import { icon } from "./icons";
 import "./toolbar.css";
 
@@ -26,6 +26,8 @@ type ToolbarOpts = {
   onToggleFullscreen: () => void;
   onToggleCapture: () => void;
   onToggleMute: (muted: boolean) => void;
+  /** クリップボード同期のセッション毎トグル (enabled = 同期する)。 */
+  onToggleClipboard: (enabled: boolean) => void;
   onSetVideoParams: (fps: number, mbps: number) => void;
   /** 送出する映像の最大高さ (0 = フル解像度)。 */
   onSetResolution: (maxHeight: number) => void;
@@ -43,6 +45,8 @@ export type ToolbarHandle = {
    * initialMuted で接続直後のミュート初期状態を渡す (settings.audio_muted。既定 false)。
    */
   setAudioAvailable: (available: boolean, initialMuted?: boolean) => void;
+  /** クリップボード同期トグルの表示状態をセッションの現在値へ揃える (タブ切替/接続時)。 */
+  setClipboardSyncState: (enabled: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
   toggleBar: () => void;
   /** ツールバーを確実に表示する (脱出時など)。ピン留めして自動格納されないようにする。 */
@@ -87,6 +91,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
         <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
         <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (${shortcutLabel("toggle-stats")})">${icon("stats")}</button>
         <button type="button" id="tb-audio" class="tb-btn" title="音声ミュート">${icon("volume")}</button>
+        <button type="button" id="tb-clipboard" class="tb-btn" title="クリップボード同期を停止">${icon("clipboard")}</button>
       </div>
       <div id="display-wrap" class="tb-popgroup" data-pop="display" title="表示するディスプレイ" data-tauri-drag-region>
         <button type="button" class="tb-btn tb-pop-trigger" id="tb-display-trigger" title="ディスプレイ">${icon("display")}</button>
@@ -110,17 +115,13 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       <span class="tb-sep" data-tauri-drag-region></span>
       <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}">${icon("pin")}</button>
       <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / ${shortcutLabel("toggle-bar")} で再表示">${icon("eye-off")}</button>
-      <span id="tb-winctl" class="window-controls"></span>
     </div>
   `;
   // 注: 以前は帯 (#topbar) 全体を data-tauri-drag-region にしていたが、全幅の帯がポインタを
   // 食い、上端でリモート操作ができず (クリックがウィンドウ移動になる) という不具合になった。
   // 帯は CSS で pointer-events:none にして素通しさせ、ドラッグ移動はピル (.tb-pill 内の
   // data-tauri-drag-region 余白) でのみ行う。よってここで #topbar には付けない。
-
-  // フレームレスのため接続中もウィンドウ操作 (min/close) をバーに持つ。
-  const winctl = opts.topbar.querySelector<HTMLElement>("#tb-winctl");
-  if (winctl) mountWindowControls(winctl);
+  // ウィンドウ操作 (最小化/閉じる) はタブバーの右クリックメニューへ移した (B-6)。
 
   // アイコンのみのボタン群に aria-label を補う (SR 読み上げ用)。
   applyAriaLabels(opts.topbar);
@@ -131,6 +132,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const filesBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-files");
   const statsBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-stats");
   const audioBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-audio");
+  const clipboardBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-clipboard");
   const captureBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-capture");
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
   const pinBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-pin");
@@ -245,6 +247,15 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   let audioAvailable = false;
   // ミュートボタンは既定で非表示。host_info で音声対応が分かったら出す。
   if (audioBtn) audioBtn.style.display = "none";
+
+  // クリップボード同期のセッション毎トグル。toggled = 停止中 (ミュートボタンと同じ「OFF を強調」)。
+  let clipboardEnabled = true;
+  function applyClipboardBtn(): void {
+    if (!clipboardBtn) return;
+    clipboardBtn.classList.toggle("toggled", !clipboardEnabled);
+    clipboardBtn.title = clipboardEnabled ? "クリップボード同期を停止" : "クリップボード同期を再開";
+    clipboardBtn.setAttribute("aria-label", clipboardBtn.title);
+  }
 
   function applyAudioBtn(): void {
     if (!audioBtn) return;
@@ -361,10 +372,20 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     applyAudioBtn();
     opts.onToggleMute(muted);
   });
+  clipboardBtn?.addEventListener("click", () => {
+    clipboardEnabled = !clipboardEnabled;
+    applyClipboardBtn();
+    opts.onToggleClipboard(clipboardEnabled);
+  });
   captureBtn?.addEventListener("click", () => opts.onToggleCapture());
   fullscreenBtn?.addEventListener("click", () => opts.onToggleFullscreen());
   pinBtn?.addEventListener("click", () => setPinned(!pinned));
-  hideBtn?.addEventListener("click", () => setAutoHideLocked(!autoHideLocked));
+  hideBtn?.addEventListener("click", () => {
+    const willHide = !autoHideLocked;
+    setAutoHideLocked(willHide);
+    // 隠した直後は再表示手段が分かりにくいので、キー割当を案内する (B-4)。
+    if (willHide) showToast(`再表示: ${shortcutLabel("toggle-bar")}`);
+  });
 
   return {
     setConnLabel(text: string): void {
@@ -408,6 +429,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       // ため、ここは表示 (ボタンの見た目) だけを揃える。
       muted = initialMuted;
       applyAudioBtn();
+    },
+    setClipboardSyncState(enabled: boolean): void {
+      clipboardEnabled = enabled;
+      applyClipboardBtn();
     },
     setVideoParams(fps: number, mbps: number): void {
       if (fpsInput) fpsInput.value = String(fps);

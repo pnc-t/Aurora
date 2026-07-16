@@ -4,7 +4,7 @@
 // リモートデスクトップでは、接続中のキー入力は input.ts がホストへ転送するため、
 // ここでは preventDefault のみ行い stopPropagation はしない (転送を妨げない)。
 
-import { matchHotkey, type LocalHotkey } from "./shortcuts";
+import { matchHotkey, matchTabJump, type LocalHotkey } from "./shortcuts";
 
 // 後方互換のため型を re-export (キー定義の正本は core/shortcuts.ts)。
 export type { LocalHotkey };
@@ -16,6 +16,8 @@ export function installWebviewGuard(
   onHotkey?: (hotkey: LocalHotkey) => void,
   // 脱出した (= マウス解放/全画面解除した) なら true。何もしなければ false で Esc はホストへ通す。
   onEscapeBreakout?: () => boolean,
+  // タブ直接ジャンプ (Ctrl+Alt+Shift+1〜9 固定)。n は 1 始まりのタブ番号。
+  onTabJump?: (n: number) => void,
 ): void {
   // 右クリックメニュー無効化。
   window.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -44,6 +46,16 @@ export function installWebviewGuard(
         e.stopImmediatePropagation();
         onHotkey?.(hotkey);
         return;
+      }
+      // タブ直接ジャンプ (固定バインディング)。ホットキー同様ホストへは転送しない。
+      if (onTabJump) {
+        const n = matchTabJump(e);
+        if (n !== null) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          onTabJump(n);
+          return;
+        }
       }
       // Esc 2 連打 = ローカル「脱出」(マウス解放 + 全画面解除)。フルスクリーン中は
       // keyboard lock で Esc がホストへ転送され、ブラウザの「Esc で解除」も奪われるため、

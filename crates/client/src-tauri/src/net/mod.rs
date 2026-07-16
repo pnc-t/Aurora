@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aurora_common::clipboard::{self, ClipboardHandle};
@@ -19,7 +19,7 @@ use aurora_common::framing::{
 };
 use aurora_common::noise::{
     HandshakeState, NONCE_DOMAIN_AUDIO, NONCE_DOMAIN_MASK, NONCE_DOMAIN_VIDEO, TransportSession,
-    psk_from_password,
+    device_fingerprint, psk_from_password,
 };
 use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent, VideoCodec};
 use serde::Serialize;
@@ -97,6 +97,13 @@ pub enum ClientEvent {
         id: u32,
         ok: bool,
         message: String,
+    },
+    /// ファイル転送 (アップロード/ダウンロード) の進捗。転送 id ごとに 100ms 以上間隔を空けて
+    /// emit する (毎チャンク emit すると Tauri IPC が高頻度になり映像の遅延予算を食うため)。
+    FileProgress {
+        id: u32,
+        done: u64,
+        total: u64,
     },
     Disconnected {
         reason: String,
@@ -227,6 +234,10 @@ pub struct SessionHandle {
     /// UDP 映像/音声受信の自己修復 (途絶検知 + AURHELLO 再送) に使う共有状態。
     /// `set_video_paused` が pause フラグを更新し、udp watchdog タスクが無受信を見張る。
     pub udp_health: Arc<UdpHealth>,
+    /// クリップボード同期の可否ゲート。接続直後に設定 (`ClientSettings::clipboard_sync`) の
+    /// 値で初期化し、`set_clipboard_sync` (ツールバートグル) が実行時に切り替える。OFF 中は
+    /// reader ループがリモート変更を適用せず、clip_forward タスクがローカル変化を送らない。
+    pub clipboard_sync: Arc<AtomicBool>,
 }
 
 /// UDP 映像/音声受信の自己修復に使う共有状態。TCP は生きている (Pong 到達中) のに UDP だけ

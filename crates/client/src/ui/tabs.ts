@@ -11,12 +11,22 @@ import "./tabs.css";
 type TabsOpts = {
   /** タブ選択 (アクティブ切替)。 */
   onSelect: (id: string) => void;
-  /** タブを閉じる (× / 中クリック)。 */
+  /** タブを閉じる (× / 中クリック / メニュー)。 */
   onClose: (id: string) => void;
   /** 「+」で新規接続を追加。 */
   onAdd: () => void;
   /** タブをウィンドウ外へドラッグして離した (別ウィンドウへ分割)。座標は画面 px。 */
   onDetach: (id: string, screenX: number, screenY: number) => void;
+  /** タブメニュー「他のタブを閉じる」。 */
+  onCloseOthers: (id: string) => void;
+  /** タブメニュー「新しいウィンドウへ移動」(接続確立済みのタブのみ表示)。 */
+  onMoveToNewWindow: (id: string) => void;
+  /** タブメニュー「再接続」(エラー状態のタブのみ表示)。 */
+  onReconnect: (id: string) => void;
+  /** 隙間メニュー「最小化」。 */
+  onMinimizeWindow: () => void;
+  /** 隙間メニュー「ウィンドウを閉じる」。複数タブ時の確認は orchestrator 側で行う。 */
+  onCloseWindow: () => void;
 };
 
 export type TabsHandle = {
@@ -56,9 +66,96 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
   container.querySelector<HTMLButtonElement>("#tab-add")?.addEventListener("click", () => opts.onAdd());
   applyAriaLabels(container); // 「+」など アイコンのみボタンに aria-label を補う
 
+  // タブ列はタブパターンとして SR / キーボードで辿れるようにする (A-9)。
+  list?.setAttribute("role", "tablist");
+
   // id → タブ要素。
   const tabs = new Map<string, HTMLElement>();
+  // id → 接続状態 (右クリックメニューの「再接続」表示判定に使う)。
+  const statuses = new Map<string, TabStatus>();
   let activeId: string | null = null;
+
+  // --- 右クリックメニュー (タブ上 / 隙間で内容を出し分ける) ---
+  const ctxMenu = document.createElement("div");
+  ctxMenu.className = "tab-ctx-menu";
+  document.body.appendChild(ctxMenu);
+
+  function closeCtxMenu(): void {
+    ctxMenu.classList.remove("visible");
+    ctxMenu.replaceChildren();
+  }
+  document.addEventListener("pointerdown", (e) => {
+    if (!(e.target as HTMLElement).closest(".tab-ctx-menu")) closeCtxMenu();
+  });
+  ctxMenu.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      closeCtxMenu();
+      return;
+    }
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(ctxMenu.querySelectorAll<HTMLButtonElement>(".tab-ctx-item"));
+    if (items.length === 0) return;
+    e.preventDefault();
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = e.key === "ArrowDown" ? (idx + 1) % items.length : (idx - 1 + items.length) % items.length;
+    items[next]?.focus();
+  });
+
+  type CtxItem = { label: string; iconName: Parameters<typeof icon>[0]; danger?: boolean; act: () => void };
+
+  function openCtxMenu(x: number, y: number, items: CtxItem[]): void {
+    ctxMenu.replaceChildren(
+      ...items.map((it) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `tab-ctx-item${it.danger ? " danger" : ""}`;
+        btn.innerHTML = icon(it.iconName); // 固定 SVG のみ。ラベルは下で textContent
+        btn.appendChild(document.createTextNode(` ${it.label}`));
+        btn.addEventListener("click", () => {
+          closeCtxMenu();
+          it.act();
+        });
+        return btn;
+      }),
+    );
+    ctxMenu.classList.add("visible");
+    // 表示してから実寸を測り、ウィンドウ外へはみ出さないよう位置を丸める。
+    const r = ctxMenu.getBoundingClientRect();
+    ctxMenu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - r.width - 4))}px`;
+    ctxMenu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - r.height - 4))}px`;
+    ctxMenu.querySelector<HTMLButtonElement>(".tab-ctx-item")?.focus();
+  }
+
+  function openTabCtxMenu(id: string, x: number, y: number): void {
+    const items: CtxItem[] = [{ label: "タブを閉じる", iconName: "close", act: () => opts.onClose(id) }];
+    if (tabs.size > 1) {
+      items.push({ label: "他のタブを閉じる", iconName: "close", act: () => opts.onCloseOthers(id) });
+    }
+    // 移譲は接続確立済みのタブだけ意味を持つ (connecting/エラー中は表示状態が定まらない)。
+    if (statuses.get(id) === "connected" && tabs.size > 1) {
+      items.push({ label: "新しいウィンドウへ移動", iconName: "display", act: () => opts.onMoveToNewWindow(id) });
+    }
+    if (statuses.get(id) === "error") {
+      items.push({ label: "再接続", iconName: "refresh", act: () => opts.onReconnect(id) });
+    }
+    openCtxMenu(x, y, items);
+  }
+
+  function openGapCtxMenu(x: number, y: number): void {
+    openCtxMenu(x, y, [
+      { label: "新しいタブ", iconName: "add", act: () => opts.onAdd() },
+      { label: "最小化", iconName: "minimize", act: () => opts.onMinimizeWindow() },
+      { label: "ウィンドウを閉じる", iconName: "close", danger: true, act: () => opts.onCloseWindow() },
+    ]);
+  }
+
+  // タブ以外の場所 (隙間/「+」の余白など) の右クリック = ウィンドウ操作メニュー。
+  // タブ上の右クリックは makeTab 側のリスナーが stopPropagation で先取りする。
+  strip?.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openGapCtxMenu(e.clientX, e.clientY);
+  });
 
   // フルスクリーン中はストリップを完全に隠す (端ホバーでも出さない)。ツールバーピルと違い、
   // タブは没入時に不要なため一時表示もしない。
@@ -105,10 +202,21 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     applyPosition();
   });
 
+  /** タブ列の中で focus を隣へ移す (A-9: 矢印キーでフォーカス移動、Enter/Space で選択)。 */
+  function focusSiblingTab(from: HTMLElement, dir: 1 | -1): void {
+    const els = Array.from(list?.querySelectorAll<HTMLElement>(".tab") ?? []);
+    const idx = els.indexOf(from);
+    if (idx < 0 || els.length === 0) return;
+    els[(idx + dir + els.length) % els.length]?.focus();
+  }
+
   function makeTab(id: string, label: string, status: TabStatus): HTMLElement {
     const el = document.createElement("div");
     el.className = "tab";
     el.dataset.id = id;
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", "false");
+    el.tabIndex = -1; // roving tabindex: アクティブタブだけ 0 (setActive で付替え)
 
     const dot = document.createElement("span");
     dot.className = `tab-dot ${status}`;
@@ -144,6 +252,25 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
       if ((e.target as HTMLElement).closest(".tab-close")) return; // × は閉じる
       e.preventDefault();
       startTabDrag(id, e, el);
+    });
+    // 右クリック: タブ操作メニュー (strip の隙間メニューより先に握る)。
+    el.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openTabCtxMenu(id, e.clientX, e.clientY);
+    });
+    // キーボード操作 (A-9): ←→/↑↓ で隣のタブへフォーカス、Enter/Space で選択。
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        e.preventDefault();
+        focusSiblingTab(el, 1);
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+        e.preventDefault();
+        focusSiblingTab(el, -1);
+      } else if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        opts.onSelect(id);
+      }
     });
     return el;
   }
@@ -212,6 +339,7 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
       if (tabs.has(id)) return;
       const el = makeTab(id, label, status);
       tabs.set(id, el);
+      statuses.set(id, status);
       list?.appendChild(el);
     },
     remove(id): void {
@@ -220,9 +348,11 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
         el.remove();
         tabs.delete(id);
       }
+      statuses.delete(id);
       if (activeId === id) activeId = null;
     },
     update(id, label, status): void {
+      statuses.set(id, status);
       const el = tabs.get(id);
       if (!el) return;
       const name = el.querySelector<HTMLElement>(".tab-label");
@@ -232,7 +362,12 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     },
     setActive(id): void {
       activeId = id;
-      tabs.forEach((el, key) => el.classList.toggle("active", key === id));
+      tabs.forEach((el, key) => {
+        const isActive = key === id;
+        el.classList.toggle("active", isActive);
+        el.setAttribute("aria-selected", String(isActive));
+        el.tabIndex = isActive ? 0 : -1;
+      });
     },
     count(): number {
       return tabs.size;

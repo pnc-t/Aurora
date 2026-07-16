@@ -11,6 +11,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
+  DEFAULT_SETTINGS,
   findCaptureWindowAt,
   handoffSessionToWindow,
   initPerfFlag,
@@ -26,13 +27,7 @@ import {
   type DisplayDto,
   type HostEntry,
 } from "./core/ipc";
-import {
-  Session,
-  type SessionHost,
-  type SessionSnapshot,
-  type StatsEvent,
-  type StatusKind,
-} from "./core/session";
+import { Session, type SessionHost, type SessionSnapshot, type StatsEvent } from "./core/session";
 import { mountToolbar, type ToolbarHandle } from "./ui/toolbar";
 import { mountTabs, type TabsHandle } from "./ui/tabs";
 import { openConnectPicker } from "./ui/connect-dialog";
@@ -45,11 +40,17 @@ import {
   updateStats,
 } from "./ui/stats-overlay";
 import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui/reconnect-badge";
-import { handleFileResult, mountFileTransfer } from "./ui/file-transfer";
+import { handleFileProgress, handleFileResult, mountFileTransfer } from "./ui/file-transfer";
+import {
+  initCaptureOverlay,
+  openConfirmOverlay,
+  renderStatusOverlay,
+  showDropHint,
+} from "./ui/capture-overlay";
 import { installWebviewGuard } from "./core/webview-guard";
 import { applyShortcutBindings } from "./core/shortcuts";
 import { exitFullscreen, isFullscreen, toggleFullscreen } from "./core/fullscreen";
-import { closeWindow, setResizable } from "./ui/window-controls";
+import { closeWindow, minimizeWindow, setResizable } from "./ui/window-controls";
 import { installGlobalErrorLogging, logger } from "./core/log";
 
 // 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
@@ -68,33 +69,12 @@ initToast(toastContainer);
 initStatsOverlay(statsHud);
 initReconnectBadge(reconnectBadgeEl);
 mountFileTransfer(filePanel);
+initCaptureOverlay(statusEl);
 
 // --- 設定 (ウィンドウ内の全タブで共有。capture には設定 UI がない) ---
 let settings: ClientSettings | null = null;
 function getSettings(): ClientSettings {
-  return (
-    settings ?? {
-      default_fullscreen: false,
-      show_stats: false,
-      default_capture: false,
-      default_port: 7000,
-      toolbar_pinned: false,
-      toolbar_position: "top",
-      tab_position: "top",
-      accent_color: "#3a82f7",
-      theme: "dark",
-      fps: 60,
-      max_mbps: 8,
-      auto_reconnect: true,
-      use_virtual_display: false,
-      share_files: false,
-      codec: "auto",
-      audio_muted: false,
-      grab_keyboard: true,
-      stats_position: "tr",
-      shortcuts: {},
-    }
-  );
+  return settings ?? DEFAULT_SETTINGS;
 }
 
 // --- セッション管理 ---
@@ -128,56 +108,6 @@ function removeSession(s: Session): void {
   }
 }
 
-// --- 中央ステータスオーバーレイ (アクティブ Session の状態を描画) ---
-// reason は host 由来を含みうるので textContent で組む (XSS 注意)。
-function renderStatusOverlay(kind: StatusKind, text: string, showClose: boolean): void {
-  if (kind === "hidden") {
-    statusEl.style.display = "none";
-    statusEl.replaceChildren();
-    return;
-  }
-  Object.assign(statusEl.style, {
-    position: "fixed",
-    inset: "0",
-    display: "grid",
-    placeItems: "center",
-    font: "500 15px system-ui, sans-serif",
-    color: "#fff",
-    background: "rgba(14,16,22,0.92)",
-    zIndex: "5000",
-  });
-  const card = document.createElement("div");
-  Object.assign(card.style, {
-    display: "grid",
-    gap: "14px",
-    justifyItems: "center",
-    padding: "24px 28px",
-    maxWidth: "70vw",
-    textAlign: "center",
-  });
-  const msg = document.createElement("div");
-  msg.textContent = text;
-  if (kind === "error") msg.style.color = "#ff8b8b";
-  card.appendChild(msg);
-  if (showClose) {
-    const btn = document.createElement("button");
-    // connecting 中 (準備中/再接続中含む) はキャンセル操作、error 後は文字通り閉じる操作として文言を出し分ける。
-    btn.textContent = kind === "error" ? "閉じる" : "キャンセル";
-    Object.assign(btn.style, {
-      padding: "8px 18px",
-      borderRadius: "8px",
-      border: "1px solid rgba(255,255,255,0.25)",
-      background: "rgba(255,255,255,0.08)",
-      color: "#fff",
-      cursor: "pointer",
-    });
-    // 切断後のエラー画面の「閉じる」は当該タブを閉じる (= 最後なら窓も閉じる)。
-    btn.addEventListener("click", () => active()?.closeByUser());
-    card.appendChild(btn);
-  }
-  statusEl.replaceChildren(card);
-}
-
 // --- Session ↔ 共有 UI の窓口 ---
 const host: SessionHost = {
   canvas,
@@ -188,7 +118,12 @@ const host: SessionHost = {
   isActive: (s) => activeId === s.id,
   renderStatus: (s) => {
     if (activeId !== s.id) return;
-    renderStatusOverlay(s.status, s.statusText, s.statusShowClose);
+    renderStatusOverlay(s.status, s.statusText, {
+      // 切断後のエラー画面の「閉じる」/接続中の「キャンセル」は当該タブを閉じる (= 最後なら窓も閉じる)。
+      onClose: s.statusShowClose ? () => s.closeByUser() : undefined,
+      // エラー画面では再試行カウンタをリセットして即やり直せる「再接続」を出す (B-1)。
+      onReconnect: s.status === "error" ? () => s.manualReconnect() : undefined,
+    });
   },
   toast: (s, text, kind?: ToastKind) => {
     if (activeId === s.id) showToast(text, kind);
@@ -201,6 +136,9 @@ const host: SessionHost = {
   },
   fileResult: (s, id, ok, message) => {
     if (activeId === s.id) handleFileResult(id, ok, message);
+  },
+  fileProgress: (s, id, done, total) => {
+    if (activeId === s.id) handleFileProgress(id, done, total);
   },
   reconnectBadge: (s, text) => {
     if (activeId === s.id) showReconnectBadge(text);
@@ -234,6 +172,8 @@ void listen<ClientSettings>("aurora://settings-changed", (e) => {
   // コーデック設定 (グローバル/ホスト別 override) が変わった可能性があるので、接続中の全
   // セッションへ再計算させる (変化が無ければ内部で no-op)。
   for (const s of sessions.values()) void s.refreshCodecFromSettings();
+  // fps/ビットレート上限も再接続を待たず接続中の全セッションへ反映する (A-3、差分時のみ送出)。
+  for (const s of sessions.values()) s.refreshVideoParamsFromSettings();
 });
 
 // --- 共有ツールバー (操作は常にアクティブ Session へ) ---
@@ -269,6 +209,7 @@ const toolbar: ToolbarHandle = mountToolbar({
     if (s) s.setCaptureMode(!s.isCaptured());
   },
   onToggleMute: (muted) => active()?.setAudioMuted(muted),
+  onToggleClipboard: (enabled) => active()?.setClipboardSyncEnabled(enabled),
   onSetVideoParams: (fps, mbps) => active()?.setVideoParams(fps, mbps),
   onSetResolution: (maxHeight) => active()?.setResolution(maxHeight),
 });
@@ -279,7 +220,56 @@ const tabs: TabsHandle = mountTabs(tabbar, {
   onClose: (id) => sessions.get(id)?.closeByUser(),
   onAdd: () => openAddTab(),
   onDetach: (id, sx, sy) => void splitTab(id, sx, sy),
+  onCloseOthers: (id) => {
+    for (const s of [...sessions.values()]) if (s.id !== id) s.closeByUser();
+  },
+  onMoveToNewWindow: (id) => void moveTabToNewWindow(id),
+  onReconnect: (id) => sessions.get(id)?.manualReconnect(),
+  onMinimizeWindow: () => void minimizeWindow(),
+  onCloseWindow: () => void closeWindow(), // 複数タブ時の確認は onCloseRequested が一元的に出す
 });
+
+// --- ウィンドウを閉じる確認 (複数タブ時のみ)。OS の閉じる操作・メニュー経由の close() を
+// どちらもここで受けるため、確認ダイアログはこの 1 箇所に集約される。 ---
+void getCurrentWindow().onCloseRequested((e) => {
+  if (sessions.size <= 1) return; // 単独タブはそのまま閉じる (セッションは Rust 側が破棄する)
+  e.preventDefault();
+  openConfirmOverlay(`${sessions.size} 件の接続を閉じてウィンドウを終了します。`, "すべて閉じる", () => {
+    // 各タブを正規の手順で閉じる (最後の removeSession が窓を閉じる)。
+    for (const s of [...sessions.values()]) s.closeByUser();
+  });
+});
+
+// --- タブ切替ショートカット (Ctrl+Alt+Shift+←/→ と 1〜9 直接ジャンプ) ---
+function orderedSessionIds(): string[] {
+  return [...sessions.keys()];
+}
+function cycleTab(dir: 1 | -1): void {
+  const ids = orderedSessionIds();
+  if (ids.length < 2 || !activeId) return;
+  const idx = ids.indexOf(activeId);
+  setActive(ids[(idx + dir + ids.length) % ids.length]);
+}
+function jumpToTab(n: number): void {
+  const ids = orderedSessionIds();
+  const id = ids[n - 1];
+  if (id) setActive(id);
+}
+
+// --- タブメニューの「新しいウィンドウへ移動」: 合流判定なしで常に新窓を作る ---
+async function moveTabToNewWindow(id: string): Promise<void> {
+  const s = sessions.get(id);
+  if (!s || !s.isConnected) return;
+  try {
+    // 現在窓から少しずらした位置に出す (どこへ出たか見失わないように)。
+    await openSessionWindow(id, JSON.stringify(s.snapshot()), window.screenX + 80, window.screenY + 80);
+  } catch (e) {
+    showToast(`ウィンドウへの移動に失敗: ${String(e)}`, "error");
+    return;
+  }
+  s.detachForHandoff();
+  removeSession(s);
+}
 
 // --- タブをウィンドウ外へドラッグ: 別ウィンドウへ分割 (networking 無停止で移譲) ---
 async function splitTab(id: string, screenX: number, screenY: number): Promise<void> {
@@ -387,9 +377,14 @@ installWebviewGuard(
     } else if (hotkey === "toggle-capture") {
       const s = active();
       if (s) s.setCaptureMode(!s.isCaptured());
+    } else if (hotkey === "tab-prev") {
+      cycleTab(-1);
+    } else if (hotkey === "tab-next") {
+      cycleTab(1);
     }
   },
   breakout,
+  jumpToTab,
 );
 
 // --- ランチャーからの host 単位の切断要求 ---
@@ -466,29 +461,6 @@ void getCurrentWebviewWindow().listen<{ vk: number; down: boolean }>("grabbed-ke
 });
 
 // --- キャプチャ画面へのファイル D&D アップロード (client → host、アクティブ Session 宛) ---
-let dropHint: HTMLElement | null = null;
-function showDropHint(on: boolean): void {
-  if (!dropHint) {
-    dropHint = document.createElement("div");
-    dropHint.id = "drop-hint";
-    dropHint.textContent = "ドロップしてホストへ転送";
-    Object.assign(dropHint.style, {
-      position: "fixed",
-      inset: "0",
-      display: "none",
-      placeItems: "center",
-      font: "600 18px system-ui, sans-serif",
-      color: "#fff",
-      background: "rgba(18,20,26,0.55)",
-      border: "3px dashed rgba(255,255,255,0.65)",
-      zIndex: "9999",
-      pointerEvents: "none",
-    });
-    document.body.appendChild(dropHint);
-  }
-  dropHint.style.display = on ? "grid" : "none";
-}
-
 let nextUploadId = Date.now() >>> 0;
 async function uploadDroppedPaths(paths: string[]): Promise<void> {
   for (const path of paths) {
@@ -531,7 +503,8 @@ async function adoptTab(id: string, initial: boolean): Promise<void> {
     snap = JSON.parse(json) as SessionSnapshot;
   } catch (e) {
     const msg = `タブの引き継ぎに失敗しました: ${String(e)}`;
-    if (initial) renderStatusOverlay("error", msg, true);
+    // セッション未成立のエラーなので、閉じる = 窓ごと終了。
+    if (initial) renderStatusOverlay("error", msg, { onClose: () => void closeWindow() });
     else showToast(msg, "error");
     return;
   }
@@ -541,7 +514,7 @@ async function adoptTab(id: string, initial: boolean): Promise<void> {
     await s.adoptFrom(snap);
   } catch (e) {
     const msg = `アタッチに失敗しました: ${String(e)}`;
-    if (initial) renderStatusOverlay("error", msg, true);
+    if (initial) renderStatusOverlay("error", msg, { onClose: () => void closeWindow() });
     else showToast(msg, "error");
     return;
   }
@@ -592,10 +565,12 @@ void (async () => {
   };
   const initialSave = params.get("save") === "1";
   if (!initialId || !initialEntry.host || !initialEntry.port) {
-    renderStatusOverlay("error", "接続情報が不正です", true);
+    renderStatusOverlay("error", "接続情報が不正です", { onClose: () => void closeWindow() });
     return;
   }
-  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, true);
+  renderStatusOverlay("connecting", `connecting to ${initialEntry.host}…`, {
+    onClose: () => active()?.closeByUser(),
+  });
   try {
     await addSession(initialId, initialEntry, initialSave, /*activate=*/ true);
     // 接続時の自動フルスクリーン (窓単位、最初のタブのみで判断)。
@@ -605,6 +580,13 @@ void (async () => {
       toolbar.setStatsToggled(true);
     }
   } catch (e) {
-    renderStatusOverlay("error", `接続に失敗しました: ${String(e)}`, true);
+    renderStatusOverlay("error", `接続に失敗しました: ${String(e)}`, {
+      onClose: () => {
+        const s = sessions.get(initialId);
+        if (s) s.closeByUser();
+        else void closeWindow();
+      },
+      onReconnect: () => sessions.get(initialId)?.manualReconnect(),
+    });
   }
 })();
