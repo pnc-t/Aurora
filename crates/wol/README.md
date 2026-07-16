@@ -19,9 +19,17 @@ client (出先の PC) → Tailnet → `aurora-wol` (自宅の raspi 等) → LAN
 - `aurora-wol` を動かす機器と対象 PC が**同一 LAN (同一ブロードキャストドメイン)** に
   いること。ルータを跨いだ WoL は行わない (マジックパケットはブロードキャストのため)。
 
-## raspi へのインストール (推奨: ワンコマンドデプロイ)
+## raspi へのインストール
 
-Windows 開発機から raspi へクロスビルド・配備・systemd 化まで 1 コマンドで行える。
+インストール方式は 2 通りある。どちらも最終的にはリモート (raspi) 上で
+`aurora-wol install` が実行され、バイナリ配置・パスワード解決・systemd 常駐化・
+稼働確認・client 登録情報の表示までを行う。
+
+### 方式 A (開発機からワンコマンド、推奨)
+
+Windows 開発機から raspi へクロスビルド・配備・`install` 実行まで 1 コマンドで行える。
+スクリプトはクロスビルド + scp + リモート `install` 実行の薄いラッパーで、
+パスワード保持/生成・systemd 化・稼働確認のロジックは持たない。
 
 前提:
 - raspi: SSH でログイン可能 (鍵認証推奨)、Tailscale 導入済み
@@ -39,9 +47,40 @@ cd crates/wol
 
 完了後に表示される `ホスト:ポート` と `パスワード` を、client の WoL タブに登録する。
 
-## 代替手順 (raspi 上で直接ビルド / 手動 systemd 化)
+### 方式 B (Pi 単体で完結)
 
-上記スクリプトが使えない環境向けの手順。
+バイナリを 1 ファイル raspi に持ち込めば (scp / USB / 別途ダウンロードなど手段は問わない)、
+それだけでインストールできる。
+
+```bash
+sudo ./aurora-wol install            # 対話でパスワード設定 (空 Enter で自動生成)
+sudo ./aurora-wol install --port 7100 --password 'your-strong-passphrase'
+```
+
+`install` が行うこと:
+- 自分自身を `/usr/local/bin/aurora-wol` へ配置
+- パスワードの解決 (`--password` 指定で上書き / 未指定かつ既存があれば保持 / どちらもなければ対話入力・自動生成)
+- systemd unit の書き込み・有効化・再起動・稼働確認
+- client の WoL タブに登録する `ホスト:ポート` と (新規設定時のみ) パスワードの表示
+
+## アップデート
+
+新しいバイナリで `sudo ./aurora-wol.new install` を再実行するだけでよい。既存パスワードは
+保持され、client 側の再登録は不要。方式 A の再実行も内部的には同じ動きになる。
+
+重要な注意: host/client と暗号パラメータを共有しているため、ワイヤ非互換の変更
+(例: 2026-07 の KDF 強化) を跨ぐ更新では host/client/wol を同じリビジョンで揃えること。
+
+## アンインストール
+
+```bash
+sudo aurora-wol uninstall            # パスワードは残す
+sudo aurora-wol uninstall --purge    # パスワードも削除
+```
+
+## 代替手順 (raspi 上で直接ビルド)
+
+方式 A のスクリプトが使えない環境向けの手順。
 
 Raspberry Pi 上で直接ビルドする場合 (Rust toolchain がインストール済み前提):
 
@@ -60,10 +99,16 @@ cross build --release --target aarch64-unknown-linux-gnu -p aurora-wol
 
 Windows 上でもそのままビルド・実行できる (OS 依存 API を使っていないため)。
 
+ビルド後は `sudo ./target/release/aurora-wol install` で常駐化できる。手動で unit を
+書きたい場合は、install が書く unit は `/etc/systemd/system/aurora-wol.service` に
+あるので必要ならそれを編集すればよい。
+
 ## 実行
 
+通常は `install` で常駐化するため、直接実行は動作確認用。
+
 ```bash
-./aurora-wol --port 7100 --password-file /etc/aurora-wol/password.txt
+./aurora-wol --port 7100 --password-file /etc/aurora-wol/password
 ```
 
 - `--port <N>`: 待受ポート (既定 7100。host の 7000 と衝突しないよう別ポート)。
@@ -72,42 +117,12 @@ Windows 上でもそのままビルド・実行できる (OS 依存 API を使�
   (raspi は非 Windows で DPAPI が使えないため平文ファイル保管)。
 - パスワード未指定はエラー終了する。
 
-**`password.txt` は必ず `chmod 600` にすること** (所有者以外の読み取りを禁止する)。
+**`password` は必ず `chmod 600` にすること** (所有者以外の読み取りを禁止する)。
 
 ```bash
 sudo mkdir -p /etc/aurora-wol
-echo -n 'your-strong-passphrase' | sudo tee /etc/aurora-wol/password.txt
-sudo chmod 600 /etc/aurora-wol/password.txt
-```
-
-## systemd ユニット例
-
-`/etc/systemd/system/aurora-wol.service`:
-
-```ini
-[Unit]
-Description=Aurora WoL relay
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/aurora-wol --port 7100 --password-file /etc/aurora-wol/password.txt
-Restart=on-failure
-RestartSec=5
-User=aurora-wol
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo useradd --system --no-create-home aurora-wol
-sudo cp target/release/aurora-wol /usr/local/bin/aurora-wol
-sudo systemctl daemon-reload
-sudo systemctl enable --now aurora-wol
-sudo journalctl -u aurora-wol -f
+echo -n 'your-strong-passphrase' | sudo tee /etc/aurora-wol/password
+sudo chmod 600 /etc/aurora-wol/password
 ```
 
 ## ログ
