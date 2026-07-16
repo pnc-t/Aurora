@@ -404,7 +404,7 @@ async fn connect_inner(
             )
             .await;
             let reason = match res {
-                Ok(()) => "server closed".to_string(),
+                Ok(()) => "ホスト側で接続が終了しました".to_string(),
                 Err(e) => format!("接続が切断されました: {e}"),
             };
             tracing::info!(%reason, "session closed (tcp reader)");

@@ -9,7 +9,13 @@
 // 加えて F11 単独をフルスクリーンの別キーとして扱う (matchHotkey で特例、変更不可)。
 
 /** ローカルホットキーの種別。 */
-export type LocalHotkey = "toggle-stats" | "toggle-bar" | "toggle-fullscreen" | "toggle-capture";
+export type LocalHotkey =
+  | "toggle-stats"
+  | "toggle-bar"
+  | "toggle-fullscreen"
+  | "toggle-capture"
+  | "tab-prev"
+  | "tab-next";
 
 export interface ShortcutDef {
   id: LocalHotkey;
@@ -24,7 +30,19 @@ export const SHORTCUTS: ShortcutDef[] = [
   { id: "toggle-bar", code: "KeyB", desc: "ツールバー表示 / 格納" },
   { id: "toggle-capture", code: "KeyM", desc: "マウスキャプチャ切替" },
   { id: "toggle-stats", code: "KeyS", desc: "統計 HUD 表示 / 非表示" },
+  { id: "tab-prev", code: "ArrowLeft", desc: "前のタブへ" },
+  { id: "tab-next", code: "ArrowRight", desc: "次のタブへ" },
 ];
+
+/**
+ * タブ直接ジャンプ (Ctrl+Alt+Shift+1〜9、変更不可) の判定。該当すれば 1 始まりのタブ番号。
+ * 設定可能な SHORTCUTS とは別枠の固定バインディングのため、validateBinding でも予約扱いにする。
+ */
+export function matchTabJump(e: KeyboardEvent): number | null {
+  if (!e.ctrlKey || !e.altKey || !e.shiftKey || e.metaKey) return null;
+  const m = /^Digit([1-9])$/.exec(e.code);
+  return m ? Number(m[1]) : null;
+}
 
 /** 修飾キー + KeyboardEvent.code の組合せ。 */
 export interface KeyBinding {
@@ -108,7 +126,13 @@ export function formatBinding(b: KeyBinding): string {
 function codeToDisplay(code: string): string {
   if (code.startsWith("Key") && code.length === 4) return code.slice(3);
   if (code.startsWith("Digit") && code.length === 6) return code.slice(5);
-  return code;
+  const arrows: Record<string, string> = {
+    ArrowLeft: "←",
+    ArrowRight: "→",
+    ArrowUp: "↑",
+    ArrowDown: "↓",
+  };
+  return arrows[code] ?? code;
 }
 
 /** バインディングの表示用キー表記 (例: "Ctrl+Alt+F")。 */
@@ -144,6 +168,9 @@ export function validateBinding(
   }
   if (binding.code === "F11") return "F11 は使用できません (フルスクリーン専用)";
   if (binding.code === "Escape") return "Esc は使用できません (マウスキャプチャ解除専用)";
+  if (binding.ctrl && binding.alt && binding.shift && /^Digit[1-9]$/.test(binding.code)) {
+    return "Ctrl+Alt+Shift+1〜9 はタブ切替に予約されています";
+  }
   for (const other of SHORTCUTS) {
     if (other.id === id) continue;
     if (bindingsEqual(effectiveBinding(other.id, map), binding)) {
