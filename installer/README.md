@@ -1,15 +1,16 @@
 # 配布インストーラ
 
-Aurora は配布物が 2 つに分かれる。生成物はどちらも **`installer\dist\`** に集約する。
+Aurora は配布物が 3 つに分かれる。生成物はすべて **`installer\dist\`** に集約する。
 
 | 配布物 | 中身 | インストーラ | 生成方法 |
 |--------|------|--------------|----------|
 | **client** | Tauri アプリ (`aurora-client`) | NSIS (per-user) | `cargo tauri build` |
 | **host** | 素のバイナリ (`aurora-host`) | NSIS (per-user) | `installer\host\build.ps1` |
+| **wol** | raspi 向け静的バイナリ (`aurora-wol`) | 不要 (`install` サブコマンド内蔵) | `cargo zigbuild` (build-all 内) |
 
 ## 一括ビルド (推奨)
 
-両方を生成して `installer\dist\` にまとめる:
+すべて生成して `installer\dist\` にまとめる:
 
 ```powershell
 .\installer\build-all.ps1
@@ -18,6 +19,7 @@ Aurora は配布物が 2 つに分かれる。生成物はどちらも **`instal
 出力:
 - `installer\dist\Aurora_0.1.0_x64-setup.exe` (client)
 - `installer\dist\aurora-host-setup-0.1.0.exe` (host)
+- `installer\dist\aurora-wol-0.1.0-aarch64` (wol / raspi 用)
 
 個別に作る場合は以下の各節を参照 (出力先は同じ `installer\dist\`)。
 
@@ -99,3 +101,22 @@ ProjFS (`Client-ProjFS`) は他用途でも使う共有システム機能のた�
 ```powershell
 Disable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 ```
+
+---
+
+## wol (raspi 向け静的バイナリ)
+
+Windows インストーラは作らない。`aurora-wol-<ver>-aarch64` は musl 静的リンクの
+単一 Linux バイナリで、インストーラ相当の処理 (`install` / `uninstall` サブコマンド)
+を内蔵している。raspi へ 1 ファイル持ち込んで:
+
+```bash
+sudo ./aurora-wol-0.1.0-aarch64 install
+```
+
+するだけで systemd 常駐化まで完結する (ファイル名は任意。install が
+`/usr/local/bin/aurora-wol` へ配置する)。詳細は `crates/wol/README.md` の方式 B を参照。
+開発機から直接入れる場合は `crates\wol\deploy-aurora-wol.ps1` (方式 A) のほうが早い。
+
+前提ツール: cargo-zigbuild + zig (`cargo install cargo-zigbuild` /
+`winget install zig.zig`。`deploy-aurora-wol.ps1` を一度使っていれば導入済み)。

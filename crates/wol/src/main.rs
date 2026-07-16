@@ -17,6 +17,11 @@ use aurora_common::noise::{HandshakeState, psk_from_password};
 use aurora_common::proto::WolMsg;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+// バイナリ内蔵インストーラ。raspi 常駐化を 1 バイナリで完結させるため、OS 分岐は
+// このディスパッチ 1 箇所に閉じ、実装は install.rs へモジュール単位で切り出す。
+#[cfg(target_os = "linux")]
+mod install;
+
 /// host (7000) と衝突しない既定ポート。
 const DEFAULT_PORT: u16 = 7100;
 /// ハンドシェイクの各 I/O タイムアウト。host の `HANDSHAKE_TIMEOUT` と同じ理由
@@ -81,6 +86,22 @@ fn parse_args() -> Result<Args> {
 }
 
 fn main() -> Result<()> {
+    // install/uninstall はユーザー対話の CLI ツールであり、常駐サーバの起動経路
+    // (ログ初期化・パスワード必須化) とは別物のため、最初に分岐して素通しする。
+    if let Some(subcmd) = std::env::args().nth(1)
+        && (subcmd == "install" || subcmd == "uninstall")
+    {
+        #[cfg(target_os = "linux")]
+        {
+            return install::run(&subcmd, std::env::args().skip(2));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = subcmd;
+            bail!("install/uninstall は Linux (systemd) 専用です");
+        }
+    }
+
     let args = parse_args()?;
 
     // raspi 常駐前提でコンソール接続を仮定せず、host/client と同じ集約ログ初期化を使う
@@ -111,8 +132,8 @@ fn main() -> Result<()> {
     rt.block_on(run_server(args.bind, args.port, psk))
 }
 
-/// `tailscale ip -4` を実行して tailnet IPv4 を取得する。CLI 不在・非ゼロ終了・パース失敗は None。
-async fn tailscale_ip() -> Option<IpAddr> {
+/// `tailscale ip -4` のコマンドを構築する (サーバ側 async とインストーラ側 sync で共有)。
+pub(crate) fn tailscale_ip_cmd() -> std::process::Command {
     let mut cmd = std::process::Command::new("tailscale");
     cmd.args(["ip", "-4"]);
     #[cfg(windows)]
@@ -121,15 +142,28 @@ async fn tailscale_ip() -> Option<IpAddr> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = tokio::process::Command::from(cmd).output().await.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
+    cmd
+}
+
+/// `tailscale ip -4` の標準出力から最初の IPv4 行を取り出す。
+pub(crate) fn parse_tailscale_ip(text: &str) -> Option<IpAddr> {
     text.lines()
         .map(str::trim)
         .find_map(|l| l.parse::<Ipv4Addr>().ok())
         .map(IpAddr::V4)
+}
+
+/// `tailscale ip -4` を実行して tailnet IPv4 を取得する。CLI 不在・非ゼロ終了・パース失敗は None。
+async fn tailscale_ip() -> Option<IpAddr> {
+    let out = tokio::process::Command::from(tailscale_ip_cmd())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    parse_tailscale_ip(&text)
 }
 
 /// bind 時に実効待受 IP を解決する。`--bind` 明示ならそれを、未指定なら Tailscale IP を待つ。
