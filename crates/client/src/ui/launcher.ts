@@ -13,6 +13,7 @@ import {
   disconnectHost,
   deleteRecentHost,
   deleteHostPassword,
+  DEFAULT_SETTINGS,
   focusHostWindow,
   loadRecentHosts,
   loadSettings,
@@ -31,6 +32,7 @@ import {
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
+import { getVersion } from "@tauri-apps/api/app";
 import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
 import { logger } from "../core/log";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -81,30 +83,6 @@ export type LauncherHandle = {
   getSettings: () => ClientSettings;
 };
 
-const DEFAULT_PORT = 7000;
-const DEFAULT_SETTINGS: ClientSettings = {
-  default_fullscreen: false,
-  show_stats: false,
-  default_capture: false,
-  default_port: DEFAULT_PORT,
-  toolbar_pinned: false,
-  toolbar_position: "top",
-  tab_position: "top",
-  accent_color: "#3a82f7",
-  theme: "dark",
-  fps: 60,
-  max_mbps: 8,
-  auto_reconnect: true,
-  use_virtual_display: false,
-  share_files: false,
-  codec: "auto",
-  audio_muted: false,
-  grab_keyboard: true,
-  stats_position: "tr",
-  shortcuts: {},
-  clipboard_sync: true,
-};
-
 /** コーデック select の表示ラベル。 */
 const CODEC_LABELS: Record<Exclude<CodecChoice, "auto">, string> = {
   h264: "H.264",
@@ -135,6 +113,39 @@ function escapeHtml(s: string): string {
     /[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c,
   );
+}
+
+/** 数値入力の検証結果。ok なら value がそのまま使える整数。 */
+type NumValidation = { ok: true; value: number } | { ok: false; message: string };
+
+/** fps 上限: 0 以上の整数 (0 = 無制限)。 */
+function validateFps(raw: string): NumValidation {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) return { ok: false, message: "0 以上の整数を入れてください" };
+  return { ok: true, value: n };
+}
+/** ビットレート上限 (Mbps): 1 以上の整数。 */
+function validateMbps(raw: string): NumValidation {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return { ok: false, message: "1 以上の整数を入れてください" };
+  return { ok: true, value: n };
+}
+/** ポート番号: 1〜65535 の整数。 */
+function validatePort(raw: string): NumValidation {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    return { ok: false, message: "1〜65535 の数値を入れてください" };
+  }
+  return { ok: true, value: n };
+}
+
+/** 数秒だけ表示して自動で消える行内エラー (既存の .shortcut-error 体裁を流用)。 */
+function flashInlineError(el: HTMLElement | null, message: string): void {
+  if (!el) return;
+  el.textContent = message;
+  window.setTimeout(() => {
+    if (el.textContent === message) el.textContent = "";
+  }, 3000);
 }
 
 /** アクセント色を CSS 変数へ反映する (全 UI へ波及)。 */
@@ -214,6 +225,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <div class="s-title">送出 fps 上限</div>
                   <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
                 </div>
+                <span class="shortcut-error" data-num-error="fps"></span>
                 <input type="text" inputmode="numeric" id="set-fps" class="num-input" />
               </div>
               <div class="setting-row">
@@ -221,6 +233,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <div class="s-title">ビットレート上限 (Mbps)</div>
                   <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
                 </div>
+                <span class="shortcut-error" data-num-error="mbps"></span>
                 <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
               </div>
               <div class="setting-row">
@@ -274,6 +287,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">クリップボードを同期</div>
+                  <div class="s-desc">この端末とホストの間でコピーした内容を相互に同期する。接続中はツールバーからも切り替えできる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-clipboard-sync" /><span class="slider"></span></label>
               </div>
               </div>
               <div class="setting-group">音声</div>
@@ -366,6 +386,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <div class="s-title">新規ホストの既定ポート</div>
                   <div class="s-desc">「＋追加」ダイアログの port 欄の初期値</div>
                 </div>
+                <span class="shortcut-error" data-num-error="port"></span>
                 <input type="text" inputmode="numeric" id="set-port" class="num-input" />
               </div>
               </div>
@@ -415,6 +436,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                   <button class="btn-secondary" id="export-logs">ZIP 出力</button>
                 </div>
               </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">バージョン</div>
+                </div>
+                <span id="app-version" class="s-desc">…</span>
+              </div>
               </div>
             </div>
           </div>
@@ -461,6 +488,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
   const audioMutedToggle = $<HTMLInputElement>("#set-audio-muted");
   const grabKeyboardToggle = $<HTMLInputElement>("#set-grab-keyboard");
+  const clipboardSyncToggle = $<HTMLInputElement>("#set-clipboard-sync");
   const statsPosSelect = $<HTMLSelectElement>("#set-stats-pos");
 
   const winControls = $("#win-controls");
@@ -473,6 +501,24 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   // ナビ (Hosts/Settings) や ＋追加 などアイコンのみボタンに aria-label を補う。
   applyAriaLabels(opts.root);
+  /**
+   * `.setting-row` のコントロール (input/select) に同じ行の `.s-title` を aria-labelledby で
+   * 紐付ける (A-8)。id はコントロール自身の id から導出するため、id を持たない行 (ショートカット
+   * 編集ボタン等、input/select を持たない行) は対象外。ホスト編集ダイアログ等の label で包まれた
+   * コントロールは元々名前が付いているため、この関数は呼ばない (対象は設定ページのみ)。
+   */
+  function linkSettingRowLabels(root: ParentNode): void {
+    root.querySelectorAll<HTMLElement>(".setting-row").forEach((row) => {
+      const titleEl = row.querySelector<HTMLElement>(".s-title");
+      const control = row.querySelector<HTMLElement>("input, select");
+      if (!titleEl || !control || !control.id) return;
+      const titleId = `${control.id}-label`;
+      titleEl.id = titleId;
+      control.setAttribute("aria-labelledby", titleId);
+    });
+  }
+  // 設定ページの各行: コントロールへ同じ行のタイトルを aria-labelledby で紐付ける。
+  linkSettingRowLabels(opts.root);
 
   // 端末情報: この端末の識別子 (フィンガープリント)。host のデバイスピン留め承認時に
   // host トレイ表示と照合するための読み取り専用表示。
@@ -485,6 +531,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       .catch((e) => {
         logger.warn("device fingerprint fetch failed", e);
         fingerprintEl.textContent = "取得できませんでした";
+      });
+  }
+
+  // 診断: アプリのバージョン表示。
+  const versionEl = $("#app-version");
+  if (versionEl) {
+    void getVersion()
+      .then((v) => {
+        versionEl.textContent = v;
+      })
+      .catch((e) => {
+        logger.warn("app version fetch failed", e);
+        versionEl.textContent = "取得できませんでした";
       });
   }
 
@@ -668,6 +727,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       </div>
     `;
     openBackdrop();
+    // 誤 Enter で削除確定にならないよう、既定フォーカスは cancel 側へ置く (A-6)。
+    backdrop.querySelector<HTMLButtonElement>("#c-cancel")?.focus();
     backdrop.querySelector("#c-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector("#c-ok")?.addEventListener("click", () => {
       void onConfirm().finally(closeDialog);
@@ -675,13 +736,30 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   }
 
   // --- カードの ⋯ メニュー ---
+  // 開いているメニューのアンカー (⋯ ボタン)。同じボタンの再クリックで閉じるトグル判定に使う。
+  let cardMenuAnchor: HTMLElement | null = null;
   function closeCardMenu(): void {
     cardMenu.classList.remove("visible");
     cardMenu.innerHTML = "";
+    cardMenuAnchor = null;
   }
+  // メニュー表示中は ↑↓ で項目間フォーカスを移動する (Esc/外クリックは既存の document リスナーで閉じる)。
+  cardMenu.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(cardMenu.querySelectorAll<HTMLButtonElement>(".menu-item"));
+    if (items.length === 0) return;
+    e.preventDefault();
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = e.key === "ArrowDown" ? (idx + 1) % items.length : (idx - 1 + items.length) % items.length;
+    items[next]?.focus();
+  });
   /** ⋯ ボタン (anchor) の下にメニューを開く (編集は直接ボタンへ移した)。
-   *  パスワード保存済みなら「忘れる」項目も出す。 */
+   *  パスワード保存済みなら「忘れる」項目も出す。同じ anchor での再呼び出しはトグルで閉じる。 */
   function openCardMenu(anchor: HTMLElement, entry: HostEntry): void {
+    if (cardMenuAnchor === anchor) {
+      closeCardMenu();
+      return;
+    }
     const newWinItem = isConnected(entry.host)
       ? `<button class="menu-item" data-m="newwin">${icon("add")} 新しいウィンドウで接続</button>`
       : "";
@@ -694,10 +772,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       <button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>
     `;
     cardMenu.classList.add("visible");
+    cardMenuAnchor = anchor;
     // 表示してから幅を測り、ボタン右端に揃えて配置する。
     const r = anchor.getBoundingClientRect();
     cardMenu.style.top = `${r.bottom + 4}px`;
     cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector<HTMLButtonElement>(".menu-item")?.focus();
     cardMenu.querySelector('[data-m="newwin"]')?.addEventListener("click", () => {
       closeCardMenu();
       if (hasSaved(entry.host)) {
@@ -709,7 +789,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
           .catch((e) => {
             logger.warn("open new window failed", e);
             updateStatusBar();
-            openConnectDialog(entry, true);
+            openConnectDialog(entry, true, String(e));
           });
       } else {
         openConnectDialog(entry, true);
@@ -769,7 +849,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         </div>
         <label>表示名 (任意)<input id="h-label" type="text" value="${escapeHtml(e.label)}" placeholder="home-pc" /></label>
         <label>host (Tailscale IP / hostname)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
-        <label>port<input id="h-port" type="text" inputmode="numeric" value="${e.port}" /></label>
+        <label>port
+          <input id="h-port" type="text" inputmode="numeric" value="${e.port}" />
+          <span class="shortcut-error" data-h-port-error></span>
+        </label>
         <div class="dlg-sub">このホストだけの設定 (既定を上書き)</div>
         <label>仮想ディスプレイ
           <select id="h-virtual" class="select-input">
@@ -851,8 +934,15 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       ev.preventDefault();
       const host = backdrop.querySelector<HTMLInputElement>("#h-host")?.value.trim() ?? "";
       const label = backdrop.querySelector<HTMLInputElement>("#h-label")?.value.trim() ?? "";
-      const port = Number(backdrop.querySelector<HTMLInputElement>("#h-port")?.value) || DEFAULT_PORT;
       if (!host) return;
+      // port 不正値 (u16 範囲外など) を無言で既定値へ丸めず、submit を中断してエラーを出す
+      // (以前は解析失敗が握り潰され「add が無反応」に見えるバグがあった)。
+      const portV = validatePort(backdrop.querySelector<HTMLInputElement>("#h-port")?.value ?? "");
+      if (!portV.ok) {
+        flashInlineError(backdrop.querySelector<HTMLElement>("[data-h-port-error]"), portV.message);
+        return;
+      }
+      const port = portV.value;
       const ov: HostOverrides = {};
       if (virtualSel?.value === "on") ov.use_virtual_display = true;
       else if (virtualSel?.value === "off") ov.use_virtual_display = false;
@@ -884,8 +974,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     });
   }
 
-  /** 接続ダイアログ (パスワードのみ)。カード押下から呼ぶ。newWindow は接続中ホストへの追加窓接続時に true。 */
-  function openConnectDialog(entry: HostEntry, newWindow = false): void {
+  /**
+   * 接続ダイアログ (パスワードのみ)。カード押下から呼ぶ。newWindow は接続中ホストへの追加窓接続時に true。
+   * initialError は保存済みパスワードでの即接続が失敗した直後のフォールバック表示用 (A-2)。
+   * Rust から返る日本語エラー文字列をそのまま textContent へ入れる (innerHTML には流さない)。
+   */
+  function openConnectDialog(entry: HostEntry, newWindow = false, initialError?: string): void {
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
         <h3>${escapeHtml(entry.label || entry.host)}</h3>
@@ -908,6 +1002,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     const passInput = backdrop.querySelector<HTMLInputElement>("#d-pass");
     const okBtn = backdrop.querySelector<HTMLButtonElement>("#d-ok");
     const statusEl = backdrop.querySelector<HTMLElement>("#d-status");
+    if (initialError && statusEl) {
+      statusEl.textContent = `保存済みパスワードで接続できませんでした: ${initialError}`;
+      statusEl.classList.add("error");
+    }
     const eyeBtn = backdrop.querySelector<HTMLButtonElement>("#d-eye");
     eyeBtn?.addEventListener("click", () => {
       if (!passInput) return;
@@ -1047,6 +1145,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     window.addEventListener("pointerup", onUp);
   }
 
+  /** 最終接続日時 (unix 秒) を「たった今/N分前/N時間前/N日前」に整形する。 */
+  function formatRelativeConnected(unixSec: number): string {
+    const diffSec = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+    if (diffSec < 60) return "たった今";
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}分前`;
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return `${diffHour}時間前`;
+    const diffDay = Math.floor(diffHour / 24);
+    return `${diffDay}日前`;
+  }
+
   function renderHosts(hosts: HostEntry[]): void {
     currentHosts = hosts;
     if (hosts.length === 0) {
@@ -1085,7 +1195,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
                 ${connPill}
                 ${saved}
               </div>
-              <div class="addr">${escapeHtml(h.host)}:${h.port}</div>
+              <div class="addr">${escapeHtml(h.host)}:${h.port}${
+                h.last_connected != null
+                  ? `<span class="last-connected"> · ${formatRelativeConnected(h.last_connected)}</span>`
+                  : ""
+              }</div>
             </div>
             <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
             <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
@@ -1139,7 +1253,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
             .catch((e) => {
               logger.warn("open capture window failed", e);
               updateStatusBar();
-              openConnectDialog(entry);
+              openConnectDialog(entry, false, String(e));
             });
         } else {
           openConnectDialog(hosts[idx]);
@@ -1202,9 +1316,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     settings = { ...settings, toolbar_pinned: tbPinnedToggle.checked };
     persist();
   });
+  // ドラッグ中の input では保存/全窓ブロードキャストを連打しない。プレビューのみ即時反映し、
+  // 保存は指を離した (色を確定した) change で 1 回だけ行う (A-7)。
   accentInput?.addEventListener("input", () => {
-    settings = { ...settings, accent_color: accentInput.value };
     applyAccent(accentInput.value);
+  });
+  accentInput?.addEventListener("change", () => {
+    settings = { ...settings, accent_color: accentInput.value };
     persist();
   });
   themeSelect?.addEventListener("change", () => {
@@ -1213,10 +1331,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     applyTheme(theme, settings.accent_color);
     persist();
   });
+  const portError = $<HTMLElement>('[data-num-error="port"]');
+  const fpsError = $<HTMLElement>('[data-num-error="fps"]');
+  const mbpsError = $<HTMLElement>('[data-num-error="mbps"]');
   portInput?.addEventListener("change", () => {
-    const port = Number(portInput.value) || DEFAULT_PORT;
-    settings = { ...settings, default_port: port };
-    portInput.value = String(port);
+    const v = validatePort(portInput.value);
+    if (!v.ok) {
+      flashInlineError(portError, v.message);
+      portInput.value = String(settings.default_port); // 不正値は保存せず直前の値へ戻す
+      return;
+    }
+    settings = { ...settings, default_port: v.value };
+    portInput.value = String(v.value);
     persist();
   });
   /** fps/mbps の現在値からプリセット選択を一致させる (手動値なら「カスタム」)。 */
@@ -1232,16 +1358,26 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     persist();
   });
   fpsInput?.addEventListener("change", () => {
-    const fps = Math.max(0, Math.floor(Number(fpsInput.value) || 0));
-    settings = { ...settings, fps };
-    fpsInput.value = String(fps);
+    const v = validateFps(fpsInput.value);
+    if (!v.ok) {
+      flashInlineError(fpsError, v.message);
+      fpsInput.value = String(settings.fps);
+      return;
+    }
+    settings = { ...settings, fps: v.value };
+    fpsInput.value = String(v.value);
     syncPresetSelect();
     persist();
   });
   mbpsInput?.addEventListener("change", () => {
-    const mbps = Math.max(1, Math.floor(Number(mbpsInput.value) || 1));
-    settings = { ...settings, max_mbps: mbps };
-    mbpsInput.value = String(mbps);
+    const v = validateMbps(mbpsInput.value);
+    if (!v.ok) {
+      flashInlineError(mbpsError, v.message);
+      mbpsInput.value = String(settings.max_mbps);
+      return;
+    }
+    settings = { ...settings, max_mbps: v.value };
+    mbpsInput.value = String(v.value);
     syncPresetSelect();
     persist();
   });
@@ -1255,6 +1391,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   });
   grabKeyboardToggle?.addEventListener("change", () => {
     settings = { ...settings, grab_keyboard: grabKeyboardToggle.checked };
+    persist();
+  });
+  clipboardSyncToggle?.addEventListener("change", () => {
+    settings = { ...settings, clipboard_sync: clipboardSyncToggle.checked };
     persist();
   });
   statsPosSelect?.addEventListener("change", () => {
@@ -1347,6 +1487,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
     if (audioMutedToggle) audioMutedToggle.checked = settings.audio_muted;
     if (grabKeyboardToggle) grabKeyboardToggle.checked = settings.grab_keyboard;
+    if (clipboardSyncToggle) clipboardSyncToggle.checked = settings.clipboard_sync;
     if (statsPosSelect) statsPosSelect.value = settings.stats_position;
     syncPresetSelect();
     syncCodecSelect();

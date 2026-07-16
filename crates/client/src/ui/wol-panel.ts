@@ -333,14 +333,33 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   }
 
   // --- カードの ⋯ メニュー (削除) ---
+  // 開いているメニューのアンカー (⋯ ボタン)。同じボタンの再クリックで閉じるトグル判定に使う。
+  let cardMenuAnchor: HTMLElement | null = null;
   function closeCardMenu(): void {
     cardMenu.classList.remove("visible");
     cardMenu.innerHTML = "";
+    cardMenuAnchor = null;
   }
-  /** ⋯ ボタンの下にメニューを開く (Hosts と同じ挙動)。現状は削除のみ。 */
+  // メニュー表示中は ↑↓ で項目間フォーカスを移動する (Hosts と同じ挙動)。
+  cardMenu.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(cardMenu.querySelectorAll<HTMLButtonElement>(".menu-item"));
+    if (items.length === 0) return;
+    e.preventDefault();
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = e.key === "ArrowDown" ? (idx + 1) % items.length : (idx - 1 + items.length) % items.length;
+    items[next]?.focus();
+  });
+  /** ⋯ ボタンの下にメニューを開く (Hosts と同じ挙動)。現状は削除のみ。同じ anchor での
+   *  再呼び出しはトグルで閉じる。 */
   function openCardMenu(anchor: HTMLElement, t: WolTarget): void {
+    if (cardMenuAnchor === anchor) {
+      closeCardMenu();
+      return;
+    }
     cardMenu.innerHTML = `<button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>`;
     cardMenu.classList.add("visible");
+    cardMenuAnchor = anchor;
     // 表示してから幅を測り、ボタン右端に揃えて配置する。
     const r = anchor.getBoundingClientRect();
     cardMenu.style.top = `${r.bottom + 4}px`;
@@ -354,6 +373,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       });
     });
     applyAriaLabels(cardMenu);
+    cardMenu.querySelector<HTMLButtonElement>(".menu-item")?.focus();
   }
   // メニュー外クリック / スクロール / Esc で閉じる。
   document.addEventListener("click", () => closeCardMenu());
