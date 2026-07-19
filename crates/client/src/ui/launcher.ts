@@ -1169,9 +1169,10 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         const initial = escapeHtml((name[0] ?? "?").toUpperCase());
         const connected = isConnected(h.host);
         // 画像アイコンがあれば img、無ければ頭文字 + 自動生成色。data URL は自前生成
-        // (canvas.toDataURL) のみで base64 文字種なので属性を破れない。
+        // (canvas.toDataURL) のみだが、icon の出所が増えても属性注入にならないよう
+        // 埋め込み時にエスケープする (正規の base64 data URL はエスケープで不変)。
         const avatar = hasImageIcon(h.icon)
-          ? `<div class="avatar avatar-img"><img src="${h.icon}" alt="" draggable="false" /></div>`
+          ? `<div class="avatar avatar-img"><img src="${escapeHtml(h.icon)}" alt="" draggable="false" /></div>`
           : `<div class="avatar" style="background:${avatarColor(name)}">${initial}</div>`;
         // 接続中は緑扱い。プローブ未判定はドットを出さない。
         const online = connected ? true : probeMap.get(h.host.trim().toLowerCase());
