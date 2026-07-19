@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use aurora_common::framing::{decode_wol_msg, read_tcp_frame, send_wol_msg, write_tcp_frame};
-use aurora_common::noise::{HandshakeState, psk_from_password};
+use aurora_common::noise::{
+    HandshakeState, MIN_PASSWORD_LEN, psk_from_password, weak_password_reason,
+};
 use aurora_common::proto::WolMsg;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -120,6 +122,18 @@ fn main() -> Result<()> {
         );
         std::process::exit(2);
     };
+    // host の設定経路 (--set-password / tray) や install コマンドと対称に、常駐起動経路
+    // (--password / --password-file 直接指定) でも最低長を強制する
+    // (直接指定だけ弱いパスワードで露出するのを防ぐ)。
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        eprintln!(
+            "error: password must be at least {MIN_PASSWORD_LEN} characters (same policy as aurora-host / `install` command)"
+        );
+        std::process::exit(2);
+    }
+    if let Some(reason) = weak_password_reason(&password) {
+        tracing::warn!(%reason, "weak connection password; consider a stronger one");
+    }
     let psk = psk_from_password(&password);
 
     tracing::info!(
