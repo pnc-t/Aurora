@@ -39,6 +39,14 @@ pub fn open_logs_folder() -> Result<(), String> {
     reveal(&dir)
 }
 
+/// PowerShell の単一引用符文字列へ埋め込むパスのエスケープ (`'` → `''`)。
+/// パスは %LOCALAPPDATA% 由来でユーザー名を含み、Windows はアポストロフィ入りの
+/// アカウント名 (例: O'Brien) を許すため、素の埋め込みではスクリプトが壊れる。
+#[cfg(windows)]
+fn ps_squote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// ログ一式 (`logs\*.log`) を 1 つの ZIP にまとめて書き出し、生成先パスを返す。
 /// 出力先は logs の親 (`%LOCALAPPDATA%\Aurora`) で、書き出し後にそのフォルダを開く。
 /// クライアント機にあるのは client ログ (フロント転送含む) で、host ログは別マシンにある
@@ -59,8 +67,8 @@ pub fn export_logs_zip() -> Result<String, String> {
              $dst = Join-Path '{out}' \"aurora-logs-$ts.zip\"; \
              Compress-Archive -Path (Join-Path '{logs}' '*') -DestinationPath $dst -Force; \
              Write-Output $dst",
-            out = out_dir.display(),
-            logs = dir.display(),
+            out = ps_squote(&out_dir.display().to_string()),
+            logs = ps_squote(&dir.display().to_string()),
         );
         let output = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -96,5 +104,20 @@ fn reveal(dir: &std::path::Path) -> Result<(), String> {
     {
         let _ = dir;
         Err("この OS では未対応です".into())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::ps_squote;
+
+    #[test]
+    fn ps_squote_doubles_single_quotes() {
+        // 通常パスは不変、アポストロフィ入りユーザー名は '' に二重化される。
+        assert_eq!(
+            ps_squote(r"C:\Users\alice\AppData"),
+            r"C:\Users\alice\AppData"
+        );
+        assert_eq!(ps_squote(r"C:\Users\O'Brien"), r"C:\Users\O''Brien");
     }
 }
