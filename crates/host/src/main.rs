@@ -1050,7 +1050,7 @@ fn run_server(
         Ok(_) => {
             let generated: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
-                .take(10)
+                .take(16)
                 .map(char::from)
                 .collect();
             println!("password: {generated}");
@@ -1071,7 +1071,7 @@ fn run_server(
             tracing::warn!(error = %e, "could not load stored password; using a random one");
             let generated: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
-                .take(10)
+                .take(16)
                 .map(char::from)
                 .collect();
             println!("password: {generated}");
