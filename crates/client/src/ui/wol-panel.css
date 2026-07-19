@@ -50,6 +50,8 @@
 }
 
 .wol-card .meta { flex: 1; min-width: 0; }
+/* ラベル + 保存バッジの行 (Hosts の label-row と同配置。バッジは base.css の .saved-badge)。 */
+.wol-card .meta .label-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .wol-card .meta .label {
   font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
