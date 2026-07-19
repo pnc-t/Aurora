@@ -57,9 +57,14 @@ sudo ./aurora-wol install            # 対話でパスワード設定 (空 Enter
 sudo ./aurora-wol install --port 7100 --password 'your-strong-passphrase'
 ```
 
+注意: `--password` はコマンドライン引数のため `ps` によるプロセス一覧やシェル履歴に
+残ってしまう。通常は引数を付けずに実行し、対話プロンプト (空 Enter で自動生成) を
+使うことを推奨する。
+
 `install` が行うこと:
 - 自分自身を `/usr/local/bin/aurora-wol` へ配置
 - パスワードの解決 (`--password` 指定で上書き / 未指定かつ既存があれば保持 / どちらもなければ対話入力・自動生成)
+- 専用サービスユーザー `aurora-wol` の作成と、そのユーザーでの systemd 常駐 (sandbox 付き)
 - systemd unit の書き込み・有効化・再起動・稼働確認
 - client の WoL タブに登録する `ホスト:ポート` と (新規設定時のみ) パスワードの表示
 
@@ -77,6 +82,9 @@ sudo ./aurora-wol install --port 7100 --password 'your-strong-passphrase'
 sudo aurora-wol uninstall            # パスワードは残す
 sudo aurora-wol uninstall --purge    # パスワードも削除
 ```
+
+`--purge` はパスワードに加えて状態ディレクトリ (`/var/lib/aurora-wol`、ログ含む) と
+サービスユーザー `aurora-wol` も削除する。
 
 ## 代替手順 (raspi 上で直接ビルド)
 
@@ -125,9 +133,15 @@ echo -n 'your-strong-passphrase' | sudo tee /etc/aurora-wol/password
 sudo chmod 600 /etc/aurora-wol/password
 ```
 
+`install` 経由であれば所有はサービスユーザー `aurora-wol`、権限は 0400 に自動設定される。
+
 ## ログ
 
 host/client と同じ `aurora_common::logging` を使い、`%LOCALAPPDATA%\Aurora\logs`
 (非 Windows は `~/.local/share/Aurora/logs`) に `wol.<日付>.log` を日次ローテ
 (7 世代) + 非ブロッキングで残す。加えて起動時から stdout にも出す (systemd の
 journal で追える)。
+
+`install` で常駐化した場合、unit は `HOME=/var/lib/aurora-wol` で動くため、ログは
+`/var/lib/aurora-wol/.local/share/Aurora/logs` に残る。直接実行時は従来どおり
+`~/.local/share/Aurora/logs` (実行ユーザーのホーム配下) になる。
