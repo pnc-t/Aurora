@@ -231,6 +231,10 @@ const tabs: TabsHandle = mountTabs(tabbar, {
 
 // --- ウィンドウを閉じる確認 (複数タブ時のみ)。OS の閉じる操作・メニュー経由の close() を
 // どちらもここで受けるため、確認ダイアログはこの 1 箇所に集約される。 ---
+// 注意: onCloseRequested リスナーを 1 つでも登録すると、Tauri v2 は close の最終実行を JS へ
+// 移し、preventDefault しない場合に JS API 内部が destroy() を呼ぶ。そのため capabilities に
+// `core:window:allow-destroy` が必須 (無いと全クローズが ACL 拒否で窓が閉じなくなる。
+// ブラウザハーネスでは ACL が効かず検出できない — 2026-07-19 実機で発覚)。
 void getCurrentWindow().onCloseRequested((e) => {
   if (sessions.size <= 1) return; // 単独タブはそのまま閉じる (セッションは Rust 側が破棄する)
   e.preventDefault();
