@@ -6,6 +6,7 @@
 // textContent / DOM API で描画する (XSS 注意、CLAUDE.md 規約)。
 
 import {
+  deleteHostPassword,
   deleteWolTarget,
   listWolTargets,
   loadRecentHosts,
@@ -51,6 +52,11 @@ function normalizeMac(raw: string): string | null {
   return s.replace(/-/g, ":").toUpperCase();
 }
 
+/** 中継先パスワードの secret キー (Rust 側 wol_secret_key + key() の正規化と一致させる)。 */
+function relaySecretKey(relayHost: string, relayPort: number): string {
+  return `wol:${relayHost}:${relayPort}`.trim().toLowerCase();
+}
+
 /** Rust から返るエラーメッセージが「中継先パスワード未保存」を示すかのヒューリスティック判定。
  *  IPC 契約上エラーはただの String なので、キーワード一致で判定する。 */
 function looksLikePasswordError(message: string): boolean {
@@ -81,6 +87,8 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   const activePolls = new Map<string, PollState>();
   // 現在表示中の並び (ドラッグ並べ替えの基準)。renderTargets で更新する。
   let currentTargets: WolTarget[] = [];
+  // 中継先パスワードが保存済みの secret キー (relaySecretKey 形式)。refresh で更新する。
+  let savedKeys = new Set<string>();
 
   // --- ダイアログ共通 (追加/編集/削除確認/パスワード入力で使い回す) ---
   let releaseTrap: (() => void) | null = null;
@@ -357,13 +365,23 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       closeCardMenu();
       return;
     }
-    cardMenu.innerHTML = `<button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>`;
+    const saved = savedKeys.has(relaySecretKey(t.relay_host, t.relay_port));
+    const forgetItem = saved
+      ? `<button class="menu-item" data-m="forget">${icon("key")} パスワードを忘れる</button>`
+      : "";
+    cardMenu.innerHTML = `${forgetItem}<button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>`;
     cardMenu.classList.add("visible");
     cardMenuAnchor = anchor;
     // 表示してから幅を測り、ボタン右端に揃えて配置する。
     const r = anchor.getBoundingClientRect();
     cardMenu.style.top = `${r.bottom + 4}px`;
     cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector('[data-m="forget"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      void deleteHostPassword(relaySecretKey(t.relay_host, t.relay_port))
+        .then(() => refresh())
+        .catch((e) => logger.warn("forget wol relay password failed", e));
+    });
     cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
       closeCardMenu();
       openConfirmDialog(`「${t.label || t.mac}」を一覧から削除しますか?`, async () => {
@@ -471,7 +489,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
             <label>中継先 (raspi) host<input id="w-relay-host" type="text" placeholder="100.x.x.x" required /></label>
             <label class="port">port<input id="w-relay-port" type="text" inputmode="numeric" /></label>
           </div>
-          <div class="dlg-sub">中継先のパスワード (初回のみ・以降は空欄で保存済みを使用)</div>
+          <div class="dlg-sub" id="w-pass-sub">中継先のパスワード (初回のみ・以降は空欄で保存済みを使用)</div>
           <label>password
             <span class="pass-wrap">
               <input id="w-pass" type="password" />
@@ -496,6 +514,18 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       const passInput = backdrop.querySelector<HTMLInputElement>("#w-pass");
       const eyeBtn = backdrop.querySelector<HTMLButtonElement>("#w-eye");
       const statusEl = backdrop.querySelector<HTMLElement>("#w-status");
+      const passSub = backdrop.querySelector<HTMLElement>("#w-pass-sub");
+
+      // relay host/port の入力値に応じて、保存済みかどうかの文言を出し分ける。
+      function updatePassHint(): void {
+        if (!passSub) return;
+        const key = relaySecretKey(relayHostInput?.value.trim() ?? "", Number(relayPortInput?.value) || DEFAULT_RELAY_PORT);
+        passSub.textContent = savedKeys.has(key)
+          ? "中継先のパスワード (保存済み。変更する場合のみ入力)"
+          : "中継先のパスワード (未保存。起動時に入力を求めます)";
+      }
+      relayHostInput?.addEventListener("input", updatePassHint);
+      relayPortInput?.addEventListener("input", updatePassHint);
 
       // ホスト由来文字列 (label/host) は option の value/textContent に DOM API で入れる。
       for (const h of hosts) {
@@ -510,6 +540,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       if (relayHostInput) relayHostInput.value = target?.relay_host ?? "";
       if (relayPortInput) relayPortInput.value = String(target?.relay_port ?? DEFAULT_RELAY_PORT);
       if (linkedNow?.mac && macInput && !macInput.value) macInput.value = linkedNow.mac;
+      updatePassHint(); // relay host/port の初期値セット後に呼ぶ (先だと "" 扱いで未保存誤判定になる)
 
       hostSelect?.addEventListener("change", () => {
         const linked = hosts.find((h) => h.host === hostSelect.value);
@@ -673,10 +704,20 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       const labelEl = document.createElement("div");
       labelEl.className = "label";
       labelEl.textContent = name;
+      const labelRow = document.createElement("div");
+      labelRow.className = "label-row";
+      labelRow.appendChild(labelEl);
+      if (savedKeys.has(relaySecretKey(t.relay_host, t.relay_port))) {
+        const badge = document.createElement("span");
+        badge.className = "saved-badge";
+        badge.title = "中継先パスワード保存済み";
+        badge.innerHTML = icon("key"); // 固定 SVG のみなので innerHTML で可
+        labelRow.appendChild(badge);
+      }
       const macEl = document.createElement("div");
       macEl.className = "mac";
       macEl.textContent = t.mac;
-      meta.append(labelEl, macEl);
+      meta.append(labelRow, macEl);
       // 紐付けホストがあれば接続先を控えめに出す (中継先はカードには出さず編集ダイアログで確認)。
       if (t.host) {
         const linkEl = document.createElement("div");
@@ -756,7 +797,14 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
 
   async function refresh(): Promise<void> {
     try {
-      renderTargets(await listWolTargets());
+      const targets = await listWolTargets();
+      try {
+        savedKeys = new Set((await savedPasswordHosts()).map((h) => h.trim().toLowerCase()));
+      } catch (e) {
+        savedKeys = new Set();
+        logger.warn("load saved password hosts failed", e);
+      }
+      renderTargets(targets);
     } catch (e) {
       logger.warn("load wol targets failed", e);
     }

@@ -193,3 +193,9 @@ button { font: inherit; }
 .launcher svg.icon, #topbar svg.icon { display: block; }
 /* 画像アイコン (assets/icons の png/jpg 等): 1em の正方形に収める */
 .icon-img { width: 1em; height: 1em; object-fit: contain; display: block; }
+
+/* パスワード保存済みカードの鍵マーク。アクセント色で控えめに示す (Hosts=即接続 / WoL=中継先保存済み)。 */
+.saved-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent); font-size: 14px; flex-shrink: 0; opacity: 0.85;
+}
