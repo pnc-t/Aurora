@@ -89,9 +89,15 @@ export async function stageSession(password: string | null): Promise<string> {
   return await invoke<string>("stage_session", { password });
 }
 
+/** `connect_to_host` の結果。承認待ちはエラーではなく待機画面として扱う (host 側デバイスピン留め)。 */
+export type ConnectOutcome =
+  | { status: "connected" }
+  | { status: "pending_approval"; fingerprint: string };
+
 /**
  * セッションを開く。password はもう渡さない (Rust が staging / 保存済み DPAPI から解決する)。
  * 所有ウィンドウの紐付けは Rust 側が呼び出し webview から取得する。
+ * host のデバイスピン留めペアリング窓中は承認待ちとして成功で返る (`pending_approval`)。
  */
 export async function connectToHost(
   sessionId: string,
@@ -101,8 +107,8 @@ export async function connectToHost(
   eventChannel: Channel<ClientEvent>,
   videoChannel: Channel<ArrayBuffer>,
   supportedCodecs: CodecId[],
-): Promise<void> {
-  await invoke("connect_to_host", {
+): Promise<ConnectOutcome> {
+  return await invoke<ConnectOutcome>("connect_to_host", {
     sessionId,
     host,
     port,

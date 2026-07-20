@@ -41,7 +41,7 @@ export function renderStatusOverlay(kind: StatusKind, text: string, actions: Sta
   }
   const card = document.createElement("div");
   card.className = "conn-card";
-  if (kind === "connecting") {
+  if (kind === "connecting" || kind === "pending") {
     const spinner = document.createElement("div");
     spinner.className = "conn-spinner";
     card.appendChild(spinner);

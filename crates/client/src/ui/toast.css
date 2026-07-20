@@ -11,14 +11,16 @@
 body.tab-bottom:not(.tab-fs) #toast-container { bottom: calc(var(--tabstrip-h, 37px) + 12px); }
 body.tab-right:not(.tab-fs) #toast-container { right: calc(var(--tabstrip-w, 200px) + 12px); }
 .toast {
-  padding: 8px 14px; border-radius: 8px; max-width: 360px;
+  padding: 8px 14px; border-radius: 6px; max-width: 360px;
   background: var(--toast-bg); color: var(--fg);
-  border: 1px solid var(--panel-border); font-size: 13px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 13px;
+  /* 枠で囲わず、下端の色帯(box-shadow の下線)だけで種別を示す文字中心の見た目。
+   * info は帯なし = 透明 (幅ズレを防ぐため常に同じ box-shadow 構文を敷いておく)。 */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), inset 0 -2px 0 0 transparent;
   opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;
   /* コンテナは素通し (pointer-events:none) だが、各トーストはクリックで消せるよう拾う。 */
   pointer-events: auto; cursor: pointer;
 }
 .toast.show { opacity: 1; transform: translateY(0); }
-.toast.error { border-color: var(--danger); }
-.toast.success { border-color: var(--ok); }
+.toast.error { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), inset 0 -2px 0 0 var(--danger); }
+.toast.success { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), inset 0 -2px 0 0 var(--ok); }

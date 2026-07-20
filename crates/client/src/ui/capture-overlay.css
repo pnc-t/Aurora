@@ -24,10 +24,23 @@
   padding: 24px 28px;
   max-width: 70vw;
   text-align: center;
+  /* 背景の全画面ぼかしに文字とボタンが浮くだけだったので、枠付きの中央カードにして
+   * 何の画面か (接続中/エラー/確認) を視覚的に区切る。 */
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.conn-msg {
+  /* 承認待ち等の複数行文言 (\n 区切り) を改行表示する。 */
+  white-space: pre-line;
 }
 
 .conn-msg.error {
-  color: var(--danger-fg);
+  /* エラーでも赤字にしない (深刻に見せすぎない穏当なトーン)。ボタン・スピナーの
+   * 有無だけで状態を示す。 */
+  color: var(--fg);
 }
 
 .conn-actions {

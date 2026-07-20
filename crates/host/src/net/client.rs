@@ -129,6 +129,17 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
             let fp = aurora_common::noise::device_fingerprint(remote_key.as_deref().unwrap_or(&[]));
             tracing::info!(peer = %peer, fingerprint = %fp, "device pending owner approval (pairing)");
             tray_bus.on_pending_device(fp, display_label(&device_name, peer.ip()));
+            // 承認待ちを client が「パスワード誤り」と区別できるよう、暗号化セッション上で 1 度だけ合図を
+            // 送る(nonce 0 = このセッション最初の CTRL フレーム。client は最初のフレームを nonce 0 で読む)。
+            // ベストエフォート: 送信失敗しても従来どおり切断する(切断挙動・throttle 無し・tray 通知は不変)。
+            let mut tx_nonce = 0u64;
+            let _ = send_ctrl_msg(
+                &mut stream,
+                &session,
+                &ControlMsg::PendingApproval,
+                &mut tx_nonce,
+            )
+            .await;
             return Err(anyhow::anyhow!("device pending owner approval"));
         }
         _ => {}

@@ -29,6 +29,16 @@ fn hs_fail<E: std::fmt::Display>(fp: Option<&str>, e: E) -> String {
         None => "パスワードが違うか、ホスト側でこの端末が承認されていません".to_string(),
     }
 }
+/// `connect_to_host` の成功結果。通常接続 (`Connected`) と、デバイスピン留めの承認待ち
+/// (`PendingApproval`) を区別してフロントへ返す。フロントは承認待ちを「エラー」ではなく
+/// 待機状態として扱い、自動再接続する。`fingerprint` はこの端末自身の ID(照合表示用)。
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ConnectOutcome {
+    Connected,
+    PendingApproval { fingerprint: String },
+}
+
 /// 指定セッションの制御チャネルへ 1 メッセージ送る共通処理。未知 id は拒否する。
 pub(crate) async fn send_ctrl(
     state: &SessionState,
@@ -63,7 +73,7 @@ pub async fn connect_to_host(
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
-) -> Result<(), String> {
+) -> Result<ConnectOutcome, String> {
     let r = connect_inner(
         app,
         window,
@@ -191,7 +201,7 @@ async fn connect_inner(
     event_channel: Channel<ClientEvent>,
     video_channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, SessionState>,
-) -> Result<(), String> {
+) -> Result<ConnectOutcome, String> {
     // 接続資格情報は staging マップ (open_capture_window が積む) から取り出す。平文を
     // ウィンドウ URL に載せないための受け渡し。再接続は staging が空なので None 扱いになり、
     // 下の分岐で保存済みパスワード (DPAPI) を使う。
@@ -295,6 +305,15 @@ async fn connect_inner(
     let mut hostinfo_rx_nonce: u64 = 0;
     let host_info = decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain)
         .map_err(|e| hs_fail(fp.as_deref(), e))?;
+
+    // 承認待ちは接続確立ではないので、sink 生成・Connected 通知の前に早期 return する
+    // (Connected イベントを先に飛ばすと client 側で承認待ち画面と handshake 表示がちらつく)。
+    if let ControlMsg::PendingApproval = host_info {
+        tracing::info!("host reports device pending owner approval");
+        return Ok(ConnectOutcome::PendingApproval {
+            fingerprint: fp.clone().unwrap_or_default(),
+        });
+    }
 
     // 映像/イベントの表示先を差し替え可能 sink にまとめる。以降タスクへはこの sink を
     // clone して渡し、タブのウィンドウ移動 (attach/detach) で表示先だけ付け替えられるようにする。
@@ -602,7 +621,7 @@ async fn connect_inner(
     emit_connections(&app, &state).await;
     // 接続確立完了 (host 側「client connected」と対)。span に session/host/port が乗る。
     tracing::info!("connected");
-    Ok(())
+    Ok(ConnectOutcome::Connected)
 }
 // -------- internal loops --------
 

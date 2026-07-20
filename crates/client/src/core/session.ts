@@ -46,7 +46,7 @@ function sameCodecs(a: CodecId[], b: CodecId[]): boolean {
   return a.length === b.length && a.every((c, i) => c === b[i]);
 }
 
-export type StatusKind = "connecting" | "error" | "hidden";
+export type StatusKind = "connecting" | "pending" | "error" | "hidden";
 export type StatsEvent = Extract<ClientEvent, { kind: "stats" }>;
 
 /** タブの接続状態 (タブのドット色に使う)。 */
@@ -111,6 +111,9 @@ const RECONNECT_STABLE_MS = 6000;
 /** この試行回数までは全面オーバーレイを出さず、常駐バッジのみで再接続を試みる (最後の映像を
  *  見せたまま静かに再接続する)。これを超えたら従来どおりの全面オーバーレイへ格上げする。 */
 const QUIET_RECONNECT_ATTEMPTS = 3;
+/** デバイスピン留め承認待ちの固定リトライ間隔。承認/拒否まで host 側で待たされる想定なので
+ *  自動再接続のバックオフ (RECONNECT_DELAYS_MS) とは別系統にする。 */
+const PENDING_RETRY_MS = 3000;
 
 export class Session {
   readonly id: string;
@@ -181,6 +184,10 @@ export class Session {
   // 固まった物理側の映像を隠すためオーバーレイを維持する)。
   private preparingVirtual = false;
   private prepareTimer: number | null = null;
+
+  // デバイスピン留め承認待ち (host のペアリング窓中)。承認/拒否/窓終了まで固定間隔で再試行する。
+  private pendingApproval = false;
+  private pendingTimer: number | null = null;
 
   constructor(
     id: string,
@@ -269,6 +276,7 @@ export class Session {
       this.prepareTimer = null;
     }
     this.preparingVirtual = false;
+    this.clearPending();
     this.input.detach();
     this.decoder.close();
     void disconnect(this.id);
@@ -461,7 +469,7 @@ export class Session {
     this.status = kind;
     this.statusText = text;
     this.statusShowClose = showClose;
-    if (kind === "connecting") this.tabStatus = "connecting";
+    if (kind === "connecting" || kind === "pending") this.tabStatus = "connecting";
     else if (kind === "error") this.tabStatus = "error";
     this.host.refreshTab(this);
     this.host.renderStatus(this);
@@ -598,9 +606,61 @@ export class Session {
     try {
       const codecs = await this.decideSupportedCodecs();
       this.declaredCodecs = codecs;
-      await connectToHost(this.id, this.entry.host, this.entry.port, save, event, video, codecs);
+      const outcome = await connectToHost(
+        this.id,
+        this.entry.host,
+        this.entry.port,
+        save,
+        event,
+        video,
+        codecs,
+      );
+      if (outcome.status === "pending_approval") this.enterPendingApproval(outcome.fingerprint);
+      else this.clearPending();
     } finally {
       this.connectInFlight = false;
+    }
+  }
+
+  // --- デバイスピン留め承認待ち ---
+
+  /** host のペアリング窓中で承認待ちになった。待機画面を出し、固定間隔で自動再試行する。 */
+  private enterPendingApproval(fingerprint: string): void {
+    // 通常の自動再接続バックオフと二重に走らないよう止める。
+    this.cancelReconnect();
+    this.pendingApproval = true;
+    this.connected = false;
+    const msg = `ホストの承認待ちです。\nホスト側でこの端末を承認してください。\n端末ID: ${fingerprint}`;
+    this.setStatus(msg, "pending", true);
+    this.schedulePendingRetry();
+  }
+
+  /** 承認待ちループを止める (承認成立/ユーザーキャンセル/資源解放時)。 */
+  private clearPending(): void {
+    this.pendingApproval = false;
+    if (this.pendingTimer !== null) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+  }
+
+  private schedulePendingRetry(): void {
+    if (this.pendingTimer !== null) clearTimeout(this.pendingTimer);
+    this.pendingTimer = window.setTimeout(() => void this.attemptPendingRetry(), PENDING_RETRY_MS);
+  }
+
+  private async attemptPendingRetry(): Promise<void> {
+    this.pendingTimer = null;
+    if (!this.pendingApproval) return;
+    try {
+      // pending が続けば openSession 内で enterPendingApproval が再スケジュールする。
+      // 承認済みなら host_info (onHostInfo) が clearPending して接続完了 UI へ引き継ぐ。
+      await this.openSession(false);
+    } catch (e) {
+      if (!this.pendingApproval) return;
+      // 拒否/ペアリング窓終了などで例外になった場合は通常のエラー画面へ落とす。
+      this.pendingApproval = false;
+      this.setStatus(`接続に失敗しました: ${String(e)}`, "error", true);
     }
   }
 
@@ -667,6 +727,7 @@ export class Session {
     const wasReconnecting = this.reconnecting;
     const prevDisplay = this.currentDisplay;
     this.markSessionEstablished();
+    this.clearPending();
     this.connected = true;
     this.tabStatus = "connected";
     if (this.entry.host) void saveRecentHost(this.entry);
@@ -795,6 +856,7 @@ export class Session {
   private teardown(): void {
     this.disconnectHandled = true;
     this.cancelReconnect();
+    this.clearPending();
     this.connected = false;
     if (this.viewportTimer !== null) {
       clearTimeout(this.viewportTimer);
