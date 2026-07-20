@@ -11,14 +11,23 @@
 body.tab-bottom:not(.tab-fs) #toast-container { bottom: calc(var(--tabstrip-h, 37px) + 12px); }
 body.tab-right:not(.tab-fs) #toast-container { right: calc(var(--tabstrip-w, 200px) + 12px); }
 .toast {
-  padding: 8px 14px; border-radius: 8px; max-width: 360px;
+  /* 角丸最大の pill 形。左の小さな色ドットで種別を示すため flex で並べる。 */
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 16px; border-radius: 999px; max-width: 360px;
   background: var(--toast-bg); color: var(--fg);
-  border: 1px solid var(--panel-border); font-size: 13px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 13px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
   opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;
   /* コンテナは素通し (pointer-events:none) だが、各トーストはクリックで消せるよう拾う。 */
   pointer-events: auto; cursor: pointer;
 }
+/* 左端のステータスドット。枠や下線は使わず、種別はこの色だけで示す。
+ * info は淡いグレー (--fg を減光)、success/error はドットを色付け + 全不透明にする。 */
+.toast::before {
+  content: ""; flex: 0 0 auto;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--fg); opacity: 0.45;
+}
 .toast.show { opacity: 1; transform: translateY(0); }
-.toast.error { border-color: var(--danger); }
-.toast.success { border-color: var(--ok); }
+.toast.error::before { background: var(--danger); opacity: 1; }
+.toast.success::before { background: var(--ok); opacity: 1; }
