@@ -120,6 +120,22 @@ pub async fn set_audio_muted(
     send_ctrl(&state, &session_id, ControlMsg::SetAudioMuted { muted }).await
 }
 
+/// クライアント再生音量を設定する (0.0〜1.0)。host へは送らず client 内部のゲインのみ変更する。
+#[tauri::command]
+pub async fn set_audio_volume(
+    session_id: String,
+    volume: f32,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.get(&session_id).ok_or("unknown session")?;
+    // 音声非対応 (audio: None) の接続では no-op で成功扱いにする。
+    if let Some(p) = &s.audio {
+        p.set_volume(volume);
+    }
+    Ok(())
+}
+
 /// 映像送出の一時停止 / 再開をホストへ送る (非アクティブタブの帯域を止める)。
 /// 再開時は呼び出し側が別途 `request_keyframe` で映像を復帰させる。
 #[tauri::command]

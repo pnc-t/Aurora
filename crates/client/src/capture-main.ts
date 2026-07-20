@@ -209,6 +209,12 @@ const toolbar: ToolbarHandle = mountToolbar({
     if (s) s.setCaptureMode(!s.isCaptured());
   },
   onToggleMute: (muted) => active()?.setAudioMuted(muted),
+  onSetVolume: (volume) => {
+    active()?.setAudioVolume(volume);
+    // fps/Mbps と同じパターンで即時保存し、他窓 (次接続時の初期値) にも同報する。
+    settings = { ...getSettings(), audio_volume: volume };
+    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+  },
   onToggleClipboard: (enabled) => active()?.setClipboardSyncEnabled(enabled),
   onSetVideoParams: (fps, mbps) => active()?.setVideoParams(fps, mbps),
   onSetResolution: (maxHeight) => active()?.setResolution(maxHeight),

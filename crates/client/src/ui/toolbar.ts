@@ -26,6 +26,8 @@ type ToolbarOpts = {
   onToggleFullscreen: () => void;
   onToggleCapture: () => void;
   onToggleMute: (muted: boolean) => void;
+  /** 音量スライダー操作 (0.0〜1.0)。host へは送らず client 内部の再生ゲインのみ変える。 */
+  onSetVolume: (volume: number) => void;
   /** クリップボード同期のセッション毎トグル (enabled = 同期する)。 */
   onToggleClipboard: (enabled: boolean) => void;
   onSetVideoParams: (fps: number, mbps: number) => void;
@@ -45,6 +47,8 @@ export type ToolbarHandle = {
    * initialMuted で接続直後のミュート初期状態を渡す (settings.audio_muted。既定 false)。
    */
   setAudioAvailable: (available: boolean, initialMuted?: boolean) => void;
+  /** 音量スライダーの位置を設定値へ揃える (接続時)。onSetVolume は発火させない。 */
+  setAudioVolume: (volume: number) => void;
   /** クリップボード同期トグルの表示状態をセッションの現在値へ揃える (タブ切替/接続時)。 */
   setClipboardSyncState: (enabled: boolean) => void;
   setVideoParams: (fps: number, mbps: number) => void;
@@ -90,7 +94,12 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
         <button type="button" id="tb-capture" class="tb-btn" title="マウスキャプチャ (${shortcutLabel("toggle-capture")})">${icon("mouse")}</button>
         <button type="button" id="tb-files" class="tb-btn" title="ファイル転送">${icon("files")}</button>
         <button type="button" id="tb-stats" class="tb-btn" title="統計 HUD (${shortcutLabel("toggle-stats")})">${icon("stats")}</button>
-        <button type="button" id="tb-audio" class="tb-btn" title="音声ミュート">${icon("volume")}</button>
+        <div class="tb-audiogroup" id="tb-audiogroup" data-tauri-drag-region>
+          <button type="button" id="tb-audio" class="tb-btn" title="音声ミュート">${icon("volume")}</button>
+          <div class="tb-audio-pop" id="tb-audio-pop">
+            <input type="range" id="tb-volume" min="0" max="100" step="1" value="100" aria-label="再生音量" />
+          </div>
+        </div>
         <button type="button" id="tb-clipboard" class="tb-btn" title="クリップボード同期を停止">${icon("clipboard")}</button>
       </div>
       <div id="display-wrap" class="tb-popgroup" data-pop="display" title="表示するディスプレイ" data-tauri-drag-region>
@@ -129,7 +138,9 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   const displayMenu = opts.topbar.querySelector<HTMLElement>("#tb-display-menu");
   const filesBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-files");
   const statsBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-stats");
+  const audioGroup = opts.topbar.querySelector<HTMLElement>("#tb-audiogroup");
   const audioBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-audio");
+  const volumeInput = opts.topbar.querySelector<HTMLInputElement>("#tb-volume");
   const clipboardBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-clipboard");
   const captureBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-capture");
   const fullscreenBtn = opts.topbar.querySelector<HTMLButtonElement>("#tb-fullscreen");
@@ -243,8 +254,8 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   // 音声ミュート状態。ホストが音声非対応ならボタン自体を隠す (audioAvailable=false)。
   let muted = false;
   let audioAvailable = false;
-  // ミュートボタンは既定で非表示。host_info で音声対応が分かったら出す。
-  if (audioBtn) audioBtn.style.display = "none";
+  // ミュートボタン (+ 音量ポップ) は既定で非表示。host_info で音声対応が分かったら出す。
+  if (audioGroup) audioGroup.style.display = "none";
 
   // クリップボード同期のセッション毎トグル。toggled = 停止中 (ミュートボタンと同じ「OFF を強調」)。
   let clipboardEnabled = true;
@@ -257,7 +268,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
 
   function applyAudioBtn(): void {
     if (!audioBtn) return;
-    audioBtn.style.display = audioAvailable ? "inline-flex" : "none";
+    if (audioGroup) audioGroup.style.display = audioAvailable ? "inline-flex" : "none";
     audioBtn.classList.toggle("toggled", muted);
     audioBtn.title = muted ? "音声ミュート解除" : "音声ミュート";
     audioBtn.innerHTML = icon(muted ? "mute" : "volume");
@@ -370,6 +381,11 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
     applyAudioBtn();
     opts.onToggleMute(muted);
   });
+  // ミュートとは独立: スライダーは client 再生ゲインのみ変える (host 送信は止めない)。
+  volumeInput?.addEventListener("input", () => {
+    const v = Math.max(0, Math.min(100, Number(volumeInput.value) || 0));
+    opts.onSetVolume(v / 100);
+  });
   clipboardBtn?.addEventListener("click", () => {
     clipboardEnabled = !clipboardEnabled;
     applyClipboardBtn();
@@ -427,6 +443,10 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
       // ため、ここは表示 (ボタンの見た目) だけを揃える。
       muted = initialMuted;
       applyAudioBtn();
+    },
+    setAudioVolume(volume: number): void {
+      // 接続時の初期化用。onSetVolume は発火させない (無限ループ防止)。
+      if (volumeInput) volumeInput.value = String(Math.round(volume * 100));
     },
     setClipboardSyncState(enabled: boolean): void {
       clipboardEnabled = enabled;

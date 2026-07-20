@@ -5,6 +5,7 @@
 //! 外部へは Opus バイト列を渡す送信ハンドル (`AudioPlayer`) だけを公開する。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,12 +23,21 @@ const MAX_DECODE_SAMPLES: usize = 5760 * CHANNELS as usize;
 /// 音声再生ハンドル。Opus フレームを再生スレッドへ渡す。
 pub struct AudioPlayer {
     tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// 再生ゲイン (f32 bits を格納)。cpal コールバックはリアルタイム制約で
+    /// ロックを取れないため、Mutex ではなく lock-free な atomic で共有する。
+    gain: Arc<AtomicU32>,
 }
 
 impl AudioPlayer {
     /// Opus フレーム送信用のクローンを得る (udp 受信タスクへ渡す)。
     pub fn sender(&self) -> std::sync::mpsc::Sender<Vec<u8>> {
         self.tx.clone()
+    }
+
+    /// 再生音量を設定する (0.0〜1.0 にクランプ)。host へは送らない client 内部のゲイン。
+    pub fn set_volume(&self, volume: f32) {
+        self.gain
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -37,12 +47,14 @@ impl AudioPlayer {
 pub fn spawn() -> Result<AudioPlayer> {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let gain_thread = gain.clone();
 
     std::thread::Builder::new()
         .name("audio-playback".into())
         .spawn(move || {
             let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-            let stream = match build_output_stream(ring.clone()) {
+            let stream = match build_output_stream(ring.clone(), gain_thread) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e.to_string()));
@@ -84,13 +96,16 @@ pub fn spawn() -> Result<AudioPlayer> {
         })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(AudioPlayer { tx }),
+        Ok(Ok(())) => Ok(AudioPlayer { tx, gain }),
         Ok(Err(e)) => Err(anyhow!("audio playback init failed: {e}")),
         Err(_) => Err(anyhow!("audio playback thread exited before init")),
     }
 }
 
-fn build_output_stream(ring: Arc<Mutex<VecDeque<f32>>>) -> Result<cpal::Stream> {
+fn build_output_stream(
+    ring: Arc<Mutex<VecDeque<f32>>>,
+    gain: Arc<AtomicU32>,
+) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -112,8 +127,9 @@ fn build_output_stream(ring: Arc<Mutex<VecDeque<f32>>>) -> Result<cpal::Stream> 
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut buf = ring.lock().unwrap();
+                let g = f32::from_bits(gain.load(Ordering::Relaxed));
                 for sample in out.iter_mut() {
-                    *sample = buf.pop_front().unwrap_or(0.0);
+                    *sample = buf.pop_front().unwrap_or(0.0) * g;
                 }
             },
             err_fn,
