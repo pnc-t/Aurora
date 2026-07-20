@@ -142,10 +142,15 @@
 }
 .tb-audiogroup:hover .tb-audio-pop { display: inline-flex; }
 #topbar:not(.visible) .tb-audio-pop { display: none; } /* バー格納中は保険で必ず隠す */
-#topbar.pos-top .tb-audio-pop { top: 100%; margin-top: 10px; left: 50%; transform: translateX(-50%); }
-#topbar.pos-bottom .tb-audio-pop { bottom: 100%; margin-bottom: 10px; left: 50%; transform: translateX(-50%); }
-#topbar.pos-left .tb-audio-pop { left: 100%; margin-left: 10px; top: 0; }
-#topbar.pos-right .tb-audio-pop { right: 100%; margin-right: 10px; top: 0; }
+/* ポップは必ずトリガー (.tb-audiogroup) に接して開く。隙間 (margin) を空けると、
+ * ポップは absolute で親の hover ボックスを広げないため、ボタン→スライダーへ
+ * カーソルを動かす途中の隙間で :hover が切れてポップが消え、スライダーに届かない
+ * (実機で「さわれない」バグの原因)。視覚的余白は各要素の影/内側 padding で足りる。
+ * 接する側に見た目の間を作るため透明ボーダーで数 px だけ離す (hover は途切れない)。 */
+#topbar.pos-top .tb-audio-pop { top: 100%; border-top: 6px solid transparent; left: 50%; transform: translateX(-50%); }
+#topbar.pos-bottom .tb-audio-pop { bottom: 100%; border-bottom: 6px solid transparent; left: 50%; transform: translateX(-50%); }
+#topbar.pos-left .tb-audio-pop { left: 100%; border-left: 6px solid transparent; top: 0; }
+#topbar.pos-right .tb-audio-pop { right: 100%; border-right: 6px solid transparent; top: 0; }
 /* #topbar 側の `input { cursor: text }` (fps/Mbps 用) を打ち消すため #topbar を含めて
  * 詳細度を上げる (ID セレクタには詳細度で勝つ必要がある)。 */
 #topbar .tb-audio-pop input[type="range"] {
