@@ -97,7 +97,6 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
         <button type="button" class="tb-btn tb-pop-trigger" id="tb-display-trigger" title="ディスプレイ">${icon("display")}</button>
         <div class="tb-pop-panel tb-menu" id="tb-display-menu" role="menu"></div>
       </div>
-      <span class="tb-sep" data-tauri-drag-region></span>
       <div class="tb-popgroup" data-pop="quality" data-tauri-drag-region>
         <button type="button" class="tb-btn tb-pop-trigger" id="tb-quality-trigger" title="画質">${icon("tune")}</button>
         <div class="tb-pop-panel tb-menu" role="menu">
@@ -112,7 +111,6 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
         <button type="button" class="tb-btn tb-pop-trigger" id="tb-resolution-trigger" title="解像度 (送出する映像の高さ・アスペクト比維持)">${icon("resolution")}</button>
         <div class="tb-pop-panel tb-menu" id="tb-resolution-menu" role="menu"></div>
       </div>
-      <span class="tb-sep" data-tauri-drag-region></span>
       <button type="button" id="tb-pin" class="tb-btn" title="バーをピン留め (常時表示) / ${shortcutLabel("toggle-bar")}">${icon("pin")}</button>
       <button type="button" id="tb-hide" class="tb-btn" title="バーを隠す (端にカーソルを合わせても出さない) / ${shortcutLabel("toggle-bar")} で再表示">${icon("eye-off")}</button>
     </div>
