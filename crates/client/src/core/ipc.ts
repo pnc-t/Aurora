@@ -289,6 +289,11 @@ export async function setAudioMuted(sessionId: string, muted: boolean): Promise<
   await invoke("set_audio_muted", { sessionId, muted });
 }
 
+/** クライアント再生音量を設定する (0.0〜1.0)。host へは送らず client 内部のゲインのみ変更する。 */
+export async function setAudioVolume(sessionId: string, volume: number): Promise<void> {
+  await invoke("set_audio_volume", { sessionId, volume });
+}
+
 /** クリップボード同期のセッション毎トグル (OFF 中は送受信とも一時停止)。 */
 export async function setClipboardSync(sessionId: string, enabled: boolean): Promise<void> {
   await invoke("set_clipboard_sync", { sessionId, enabled });
@@ -452,6 +457,8 @@ export type ClientSettings = {
   codec: CodecChoice;
   /** 接続時に音声をミュートで開始する。 */
   audio_muted: boolean;
+  /** クライアント再生音量 (0.0〜1.0)。 */
+  audio_volume: number;
   /** マウスキャプチャ中にキーボード占有 (WH_KEYBOARD_LL) を有効にするか。 */
   grab_keyboard: boolean;
   /** 統計 HUD の表示位置。 */
@@ -482,6 +489,7 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   share_files: false,
   codec: "auto",
   audio_muted: false,
+  audio_volume: 1.0,
   grab_keyboard: true,
   stats_position: "tr",
   shortcuts: {},

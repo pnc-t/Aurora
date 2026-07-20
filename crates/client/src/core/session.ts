@@ -19,6 +19,7 @@ import {
   sendInput,
   setActiveSession,
   setAudioMuted,
+  setAudioVolume,
   setClipboardSync,
   setCursorOverlay,
   setClientViewport,
@@ -391,6 +392,10 @@ export class Session {
   setAudioMuted(muted: boolean): void {
     void setAudioMuted(this.id, muted);
     this.host.toast(this, muted ? "音声ミュート" : "音声ミュート解除");
+  }
+  /** クライアント再生音量の変更 (host へは送らない。client 内部のゲインのみ)。 */
+  setAudioVolume(volume: number): void {
+    void setAudioVolume(this.id, volume);
   }
 
   // クリップボード同期のセッション毎の現在値。Rust 側ゲートは接続時に設定値で初期化される
@@ -791,6 +796,8 @@ export class Session {
     if (settings.audio_muted) {
       void setAudioMuted(this.id, true).catch((e) => logger.warn("setAudioMuted failed", e));
     }
+    // 再生音量も接続直後に設定値で初期適用する (ホストへは送らない client 内部ゲイン)。
+    void setAudioVolume(this.id, settings.audio_volume).catch((e) => logger.warn("setAudioVolume failed", e));
     // 非アクティブで接続完了したタブは即一時停止する (帯域節約)。
     if (!this.active) void setVideoPaused(this.id, true);
 
@@ -806,6 +813,7 @@ export class Session {
       tb.setPosition(settings.toolbar_position);
       tb.setConnected(true, settings.toolbar_pinned);
       tb.setAudioAvailable(ev.audio, settings.audio_muted);
+      tb.setAudioVolume(settings.audio_volume);
       tb.setClipboardSyncState(this.clipboardSync);
       this.host.setResizable(true);
       tb.setDisplays(this.toolbarDisplayList(), target?.id);

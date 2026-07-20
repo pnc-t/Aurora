@@ -121,6 +121,38 @@
 .tb-btn.danger { color: var(--danger-fg); }
 .tb-btn.danger:hover { background: var(--danger); color: #fff; }
 
+/* --- 音量ポップ (音声ボタンのホバーで開く) ---
+ * クリックは従来通りミュートトグルに割り当て済みのため、既存の .tb-popgroup (クリック開閉)
+ * とは別に、ホバーのみで開閉する軽量な実装にする。CSS の :hover だけで完結させ、JS 側で
+ * 開閉状態を持たない (display は audioAvailable の切替のみ JS が行う)。
+ * 向き: 横帯 (top/bottom) は下/上に開く。縦サイドバー (left/right) は反対側の脇に開く
+ * (他の .tb-pop-panel と同じ規約)。 */
+.tb-audiogroup { display: inline-flex; align-items: center; position: relative; }
+.tb-audio-pop {
+  position: absolute; z-index: 40;
+  display: none; /* 既定非表示。:hover でのみ出す */
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px var(--shadow);
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+.tb-audiogroup:hover .tb-audio-pop { display: inline-flex; }
+#topbar:not(.visible) .tb-audio-pop { display: none; } /* バー格納中は保険で必ず隠す */
+#topbar.pos-top .tb-audio-pop { top: 100%; margin-top: 10px; left: 50%; transform: translateX(-50%); }
+#topbar.pos-bottom .tb-audio-pop { bottom: 100%; margin-bottom: 10px; left: 50%; transform: translateX(-50%); }
+#topbar.pos-left .tb-audio-pop { left: 100%; margin-left: 10px; top: 0; }
+#topbar.pos-right .tb-audio-pop { right: 100%; margin-right: 10px; top: 0; }
+/* #topbar 側の `input { cursor: text }` (fps/Mbps 用) を打ち消すため #topbar を含めて
+ * 詳細度を上げる (ID セレクタには詳細度で勝つ必要がある)。 */
+#topbar .tb-audio-pop input[type="range"] {
+  width: 100px; accent-color: var(--accent);
+  cursor: pointer;
+}
+
 /* ディスプレイ切替 (複数ディスプレイ時のみ表示。display は JS が制御) */
 #display-wrap { display: none; align-items: center; gap: 4px; margin-left: 2px; }
 

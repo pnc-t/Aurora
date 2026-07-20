@@ -160,6 +160,9 @@ pub struct ClientSettings {
     /// 接続時に音声をミュートで開始する。ツールバーからいつでも解除できる。
     #[serde(default)]
     pub audio_muted: bool,
+    /// クライアント再生音量 (0.0〜1.0)。既定 1.0。ツールバーのスライダーで変更・永続化される。
+    #[serde(default = "default_audio_volume")]
+    pub audio_volume: f32,
     /// マウスキャプチャ中にキーボード占有 (WH_KEYBOARD_LL) を有効にするか。既定 ON (現状踏襲):
     /// Win キーや Alt+Tab もリモートへ送る。OFF にすると手元の Windows に効く。
     #[serde(default = "default_true")]
@@ -197,6 +200,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_audio_volume() -> f32 {
+    1.0
+}
+
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
@@ -216,6 +223,7 @@ impl Default for ClientSettings {
             use_virtual_display: false,
             share_files: false,
             audio_muted: false,
+            audio_volume: 1.0,
             grab_keyboard: true,
             stats_position: default_stats_position(),
             shortcuts: HashMap::new(),
