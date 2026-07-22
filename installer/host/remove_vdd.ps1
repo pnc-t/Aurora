@@ -78,16 +78,20 @@ if (Test-Path $dst) {
 # 4. Drop VDDPATH only if it still points at OUR folder. Leaving a VDDPATH that references the
 #    now-deleted folder would send a future/other MttVDD to a missing settings path; but if the
 #    user re-pointed it elsewhere (another app), do not touch it.
-$vddRegKey = 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
-try {
-    $cur = (Get-ItemProperty -Path $vddRegKey -Name 'VDDPATH' -ErrorAction Stop).VDDPATH
-    if ($cur -eq $dst) {
-        Remove-ItemProperty -Path $vddRegKey -Name 'VDDPATH' -Force
-        Write-Host "Removed VDDPATH (was $cur)"
+#    Use reg.exe /reg:64 for the same reason install_vdd.ps1 does: this runs from the 32-bit NSIS
+#    uninstaller, so the PS registry provider would hit WOW6432Node, not the native key the
+#    installer wrote (and the driver reads).
+$vddRegPath = 'HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
+$cur = (& reg.exe query $vddRegPath /v VDDPATH /reg:64 2>$null | Select-String 'VDDPATH').ToString()
+if ($cur -match 'REG_SZ\s+(.+?)\s*$') {
+    $curVal = $Matches[1]
+    if ($curVal -eq $dst) {
+        & reg.exe delete $vddRegPath /v VDDPATH /reg:64 /f 2>&1 | Out-Null
+        Write-Host "Removed VDDPATH (was $curVal)"
     } else {
-        Write-Host "VDDPATH points elsewhere ($cur); left as-is"
+        Write-Host "VDDPATH points elsewhere ($curVal); left as-is"
     }
-} catch {
+} else {
     Write-Host "VDDPATH not set (nothing to remove)"
 }
 
