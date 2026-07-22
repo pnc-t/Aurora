@@ -47,11 +47,16 @@ jobs:
       - name: Build aurora-host
         run: cargo build --release -p aurora-host
 
-      # --- クライアント: Tauri NSIS インストーラ ---
+      # --- クライアント: Tauri NSIS インストーラ (+ updater 署名) ---
       # beforeBuildCommand (pnpm build) が dist を生成 → NSIS を生成する。
+      # createUpdaterArtifacts=true のため、NSIS setup と一緒に署名ファイル (.sig) が出る。
+      # 署名鍵は GitHub Secrets から注入する (client 自動更新の真正性検証に必須)。
       - name: Build aurora-client (Tauri NSIS)
         working-directory: crates/client/src-tauri
         run: cargo tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Collect artifacts
         shell: pwsh
@@ -60,6 +65,32 @@ jobs:
           Copy-Item target/release/aurora-host.exe dist-release/
           Copy-Item target/release/bundle/nsis/*-setup.exe dist-release/
 
+      # tauri-plugin-updater が参照する latest.json を生成する。
+      # client は endpoints (releases/latest/download/latest.json) を取得し、version 比較 +
+      # 署名検証してから setup.exe をダウンロードする。setup 名は Cargo バージョン由来なので
+      # タグから組み立てず実ファイル名を使う (タグと Cargo version の食い違いに強くする)。
+      - name: Generate updater manifest (latest.json)
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          $sig   = Get-ChildItem target/release/bundle/nsis/*-setup.exe.sig | Select-Object -First 1
+          if (-not $setup -or -not $sig) { throw "updater artifacts (setup/.sig) not found; is createUpdaterArtifacts enabled and signing key set?" }
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($setup.Name)"
+          $manifest = [ordered]@{
+            version   = $ver
+            notes     = "リリースノートは GitHub のリリースページを参照してください。"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content $sig.FullName -Raw)
+                url       = $url
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content dist-release/latest.json -Encoding utf8
+          Get-Content dist-release/latest.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -67,5 +98,6 @@ jobs:
           files: |
             dist-release/aurora-host.exe
             dist-release/*-setup.exe
+            dist-release/latest.json
           generate_release_notes: true
           fail_on_unmatched_files: true
