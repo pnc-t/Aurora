@@ -336,6 +336,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 音声ミュート状態 (クライアントの SetAudioMuted)。true の間は音声 UDP を送らない。
     // クライアント毎ローカル (各自が自分の送出のみ gate し、共有エンコーダは止めない)。
     let mut audio_muted = false;
+    // 直近に送った音声 seq。音声 nonce も `NONCE_DOMAIN_AUDIO | au.seq` で seq を下位に使うため、
+    // au.seq (u32) が一周すると nonce が再利用され ChaChaPoly が致命的に壊れる。映像送信タスクの
+    // checked_add ガードと対称に、seq の巻き戻り (broadcast は順序保証なので減少 = u32 wrap) を
+    // 検知したら以降の音声送出を止める (再接続で鍵が更新される)。
+    let mut last_audio_seq: Option<u32> = None;
+    let mut audio_nonce_exhausted = false;
     // この接続が SelectDisplay で仮想 (番兵 id) を明示選択したか。テイクオーバー発動はこれを
     // 必須条件にする (名前一致だけで発動すると、VDD の GDI 名が物理と衝突した際にクライアントが
     // 要求していないテイクオーバーが走る実機事象があった)。
@@ -820,10 +826,25 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
+                // 音声 nonce 空間の枯渇 (au.seq の u32 一周) を検知して以降の送出を止める。映像送信
+                // タスクの checked_add ガードと対称の防御。broadcast は順序保証なので、前回送った
+                // seq より小さい seq = wrap とみなせる (Lagged は前方スキップのみで減少しない)。
+                if !audio_nonce_exhausted
+                    && let Some(prev) = last_audio_seq
+                    && au.seq < prev
+                {
+                    audio_nonce_exhausted = true;
+                    tracing::error!(
+                        "audio nonce space exhausted; stopping audio send (reconnect to rekey)"
+                    );
+                }
+                // seq 進行はミュート/枯渇と独立に追跡する (ミュート中に wrap しても mute 明けで
+                // 検知できるよう、送出可否に関わらず毎フレーム更新する)。
+                last_audio_seq = Some(au.seq);
                 // ミュート中はチャネルをドレインするだけで送らない (帯域節約 + 詰まり防止)。
                 // seq は送出時のみ進めればよいが、AudioPacket は au.seq をそのまま使い nonce も
                 // au.seq 由来なので、送らない=その seq の nonce を消費しないだけで一貫性は保たれる。
-                if !audio_muted {
+                if !audio_muted && !audio_nonce_exhausted {
                     let pkt = AudioPacket { seq: au.seq, payload: &au.data };
                     let mut framed = Vec::with_capacity(au.data.len() + 4);
                     pkt.encode(&mut framed).context("encode AudioPacket")?;
