@@ -19,7 +19,12 @@ $src = $PSScriptRoot
 # C:\VirtualDisplayDriver only when unset), so we point VDDPATH here (step 1c) and the host's
 # VDD_XML_PATH const is set to the same path.
 $dst = 'C:\ProgramData\Aurora\vdd'
-$vddRegKey = 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
+# reg.exe form (no PS drive colon). We must write this via reg.exe /reg:64, NOT the PS registry
+# provider: NSIS is 32-bit so this elevated powershell is 32-bit too, and its HKLM\SOFTWARE writes
+# are WOW64-redirected to WOW6432Node -- but the 64-bit MttVDD.dll reads the NATIVE key, so a
+# redirected write leaves VDDPATH invisible to the driver and it silently falls back to
+# C:\VirtualDisplayDriver. (Same WOW64 trap the pnputil resolution below already dodges.)
+$vddRegPath = 'HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
 $log = Join-Path $dst 'install_log.txt'
 
 New-Item -ItemType Directory -Force $dst | Out-Null
@@ -52,9 +57,8 @@ if (-not (Test-Path (Join-Path $dst 'MttVDD.inf'))) { Log "FATAL: MttVDD.inf not
 #  - ProgramData subfolders grant standard users read-only by default, but the host appends client
 #    resolutions / rewrites <friendlyname> in vdd_settings.xml at runtime WITHOUT elevation, so we
 #    grant Users Modify on this folder. (Scoped to $dst only, not all of C:\ProgramData\Aurora.)
-New-Item -Path $vddRegKey -Force | Out-Null
-New-ItemProperty -Path $vddRegKey -Name 'VDDPATH' -Value $dst -PropertyType String -Force | Out-Null
-Log "set $vddRegKey\VDDPATH = $dst"
+& reg.exe add $vddRegPath /v VDDPATH /t REG_SZ /d $dst /reg:64 /f 2>&1 | ForEach-Object { Log "reg: $_" }
+Log "set (64-bit) $vddRegPath\VDDPATH = $dst (exit=$LASTEXITCODE)"
 & icacls $dst /grant '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | ForEach-Object { Log "icacls: $_" }
 Log "icacls grant Users:Modify exit=$LASTEXITCODE"
 
