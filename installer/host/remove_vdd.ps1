@@ -66,10 +66,29 @@ try {
     }
 }
 
-# 3. Remove C:\VirtualDisplayDriver (includes settings file).
-if (Test-Path 'C:\VirtualDisplayDriver') {
-    Remove-Item -Recurse -Force 'C:\VirtualDisplayDriver'
-    Write-Host "Removed C:\VirtualDisplayDriver"
+# 3. Remove Aurora's own VDD settings folder (settings + install log + staged files).
+#    We only ever installed into this Aurora-namespaced path, so deleting it cannot clobber a
+#    coexisting MttVDD that keeps its settings under the shared C:\VirtualDisplayDriver.
+$dst = 'C:\ProgramData\Aurora\vdd'
+if (Test-Path $dst) {
+    Remove-Item -Recurse -Force $dst
+    Write-Host "Removed $dst"
+}
+
+# 4. Drop VDDPATH only if it still points at OUR folder. Leaving a VDDPATH that references the
+#    now-deleted folder would send a future/other MttVDD to a missing settings path; but if the
+#    user re-pointed it elsewhere (another app), do not touch it.
+$vddRegKey = 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
+try {
+    $cur = (Get-ItemProperty -Path $vddRegKey -Name 'VDDPATH' -ErrorAction Stop).VDDPATH
+    if ($cur -eq $dst) {
+        Remove-ItemProperty -Path $vddRegKey -Name 'VDDPATH' -Force
+        Write-Host "Removed VDDPATH (was $cur)"
+    } else {
+        Write-Host "VDDPATH points elsewhere ($cur); left as-is"
+    }
+} catch {
+    Write-Host "VDDPATH not set (nothing to remove)"
 }
 
 Write-Host "VDD removal complete"

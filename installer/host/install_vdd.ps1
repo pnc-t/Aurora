@@ -11,12 +11,20 @@ param([string]$HostExe = "")
 
 $ErrorActionPreference = 'Continue'
 $src = $PSScriptRoot
-$dst = 'C:\VirtualDisplayDriver'
+# Aurora-owned settings/staging folder. We deliberately do NOT use the shared default
+# 'C:\VirtualDisplayDriver': keeping Aurora's vdd_settings.xml + install log under our own
+# namespace means a coexisting MttVDD (another app) is not mixed in, and uninstall can delete
+# this whole folder without clobbering someone else's settings. The MttVDD.dll reads its
+# settings folder from HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver\VDDPATH (falling back to
+# C:\VirtualDisplayDriver only when unset), so we point VDDPATH here (step 1c) and the host's
+# VDD_XML_PATH const is set to the same path.
+$dst = 'C:\ProgramData\Aurora\vdd'
+$vddRegKey = 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
 $log = Join-Path $dst 'install_log.txt'
 
 New-Item -ItemType Directory -Force $dst | Out-Null
 function Log($m) { $line = "$(Get-Date -Format o)  $m"; Write-Host $line; Add-Content -Path $log -Value $line }
-Log "=== Aurora VDD install start (src=$src) ==="
+Log "=== Aurora VDD install start (src=$src, dst=$dst) ==="
 
 # Resolve the REAL 64-bit pnputil.exe. NSIS is a 32-bit process, so the elevated
 # powershell.exe it launches is 32-bit too; in it a bare 'pnputil' resolves under
@@ -37,6 +45,18 @@ foreach ($f in @('MttVDD.dll','MttVDD.inf','mttvdd.cat','nefconw.exe','vdd_setti
     else { Log "MISSING $f (cannot continue)"; }
 }
 if (-not (Test-Path (Join-Path $dst 'MttVDD.inf'))) { Log "FATAL: MttVDD.inf not staged"; exit 1 }
+
+# 1c) Point the MttVDD driver at OUR settings folder and let the (non-elevated) host write to it.
+#  - VDDPATH tells MttVDD.dll where vdd_settings.xml lives (see $dst comment). Set it BEFORE the
+#    device is created so the driver reads the right folder on first start.
+#  - ProgramData subfolders grant standard users read-only by default, but the host appends client
+#    resolutions / rewrites <friendlyname> in vdd_settings.xml at runtime WITHOUT elevation, so we
+#    grant Users Modify on this folder. (Scoped to $dst only, not all of C:\ProgramData\Aurora.)
+New-Item -Path $vddRegKey -Force | Out-Null
+New-ItemProperty -Path $vddRegKey -Name 'VDDPATH' -Value $dst -PropertyType String -Force | Out-Null
+Log "set $vddRegKey\VDDPATH = $dst"
+& icacls $dst /grant '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | ForEach-Object { Log "icacls: $_" }
+Log "icacls grant Users:Modify exit=$LASTEXITCODE"
 
 # 1b) friendlyname (VDD render GPU) is intentionally left at the shipped default here.
 # Picking it via WMI VRAM-max is WRONG on muxless Optimus laptops: it selects the dGPU

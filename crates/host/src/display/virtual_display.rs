@@ -6,7 +6,7 @@
 //!   (別アダプタではない) → 既存の共有 D3D11 デバイスでそのまま Desktop Duplication 可能。
 //! - 仮想モニタのハードウェア ID は `MTT1337` (FriendlyName "Generic Monitor (VDD by MTT)")。
 //!   これで仮想ディスプレイの GDI 名 (`\\.\DISPLAYn`) を確実に識別できる。
-//! - 提供解像度は `C:\VirtualDisplayDriver\vdd_settings.xml` の `<resolutions>` で定義し、
+//! - 提供解像度は `C:\ProgramData\Aurora\vdd\vdd_settings.xml` の `<resolutions>` で定義し、
 //!   ドライバ再起動 (instance `ROOT\DISPLAY\0000`) で反映する。
 //!
 //! Windows のみ実体があり、他 OS は常に「未検出」。
@@ -157,15 +157,19 @@ pub fn detect() -> Option<VddInfo> {
 
 // --- 解像度モードの補完 + ドライバ reload (RDP 風の解像度合わせの土台) ---
 //
-// MttVDD は提供解像度を `C:\VirtualDisplayDriver\vdd_settings.xml` の `<resolutions>` からのみ
+// MttVDD は提供解像度を `C:\ProgramData\Aurora\vdd\vdd_settings.xml` の `<resolutions>` からのみ
 // 読む (named pipe に解像度設定コマンドは無い)。そこで起動時に一度だけ、よくあるクライアント
 // 解像度を XML に追記して `RELOAD_DRIVER` で反映する。以後はその豊富なモード一覧から
 // `ChangeDisplaySettingsEx` (display.rs) が最近傍を選ぶため、標準解像度では実質ピクセル一致になり、
 // 接続中の reload (チラつき・output index 変動) を避けられる。書込みは冪等 (既にあれば何もしない)。
 
-/// VDD 設定 XML の既定パス (Control アプリのインストール先)。
+/// VDD 設定 XML のパス。インストーラ (`install_vdd.ps1`) が Aurora 専用フォルダに設定を
+/// 展開し、`HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver\VDDPATH` をこのフォルダへ向けるので、
+/// MttVDD 本体もここから `vdd_settings.xml` を読む。既定の共有パス (`C:\VirtualDisplayDriver`)
+/// を使わないのは、他用途の MttVDD とファイル・設定を混ぜず、アンインストールで丸ごと安全に
+/// 消せるようにするため。install_vdd.ps1 側の `$dst` と必ず一致させること。
 #[cfg(target_os = "windows")]
-const VDD_XML_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
+const VDD_XML_PATH: &str = r"C:\ProgramData\Aurora\vdd\vdd_settings.xml";
 
 /// 追記するよくあるクライアント解像度 (物理 px・偶数)。16:9 / 16:10 / 3:2 / 21:9 / 4:3 / 5:4 と
 /// ノート PC の実解像度を広めに網羅し、最近傍が実質一致になるようにする。
