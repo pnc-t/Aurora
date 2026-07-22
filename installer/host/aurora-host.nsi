@@ -61,9 +61,51 @@ VIAddVersionKey "FileDescription" "${APPNAME} Installer"
 
 !insertmacro MUI_LANGUAGE "Japanese"
 
+; サイレント自己更新 (host の自己更新機構が "aurora-host-setup-<ver>.exe /S" を実行する)
+; の待機リトライ回数カウンタ。対話インストールでは使わない。
+Var RetryCount
+
+; ---------------------------------------------------------------------------
+; サイレント更新時のみ呼ぶ。update.rs は setup 起動後に自プロセスを exit するが、
+; ファイルハンドル解放に一瞬ラグがあるため、taskkill 後に「自分自身へのリネーム」で
+; ロック解除を確認しながら最大 2 秒 (200ms x 10) だけ待つ (対話インストールでは
+; InstFiles ページの表示自体が数百ms のバッファになるため、この待機は不要)。
+Function StopRunningHost
+  nsExec::Exec 'taskkill /IM ${EXENAME} /F'
+  Pop $0
+
+  IfFileExists "$INSTDIR\${EXENAME}" 0 stoprunninghost_done
+    StrCpy $RetryCount 0
+    stoprunninghost_wait:
+      ClearErrors
+      Rename "$INSTDIR\${EXENAME}" "$INSTDIR\${EXENAME}"
+      IfErrors 0 stoprunninghost_done
+      IntOp $RetryCount $RetryCount + 1
+      IntCmp $RetryCount 10 stoprunninghost_done
+      Sleep 200
+      Goto stoprunninghost_wait
+  stoprunninghost_done:
+FunctionEnd
+
+; サイレント (自己更新) 時は MUI_FINISHPAGE_RUN のページ自体が出ないため、
+; インストール成功後にここで明示的に再起動する。対話インストールでは
+; フィニッシュページの「今すぐ起動する」に任せるので何もしない。
+Function .onInstSuccess
+  IfSilent 0 +2
+    Exec '"$INSTDIR\${EXENAME}"'
+FunctionEnd
+
 ; ---------------------------------------------------------------------------
 Section "Aurora Host 本体" SecCore
   SectionIn RO
+
+  ; サイレント更新時のみ: 旧プロセスを止めてから配置し、確実に上書きできるようにする。
+  ; 対話インストールでは何もしない (従来通り InstFiles ページでそのまま上書き)。
+  IfSilent seccore_stop_running seccore_after_stop
+  seccore_stop_running:
+    Call StopRunningHost
+  seccore_after_stop:
+
   SetOutPath "$INSTDIR"
   File "..\..\target\release\${EXENAME}"
   ; VDD 削除スクリプトを同梱しておく (アンインストール時に使用)。
@@ -87,14 +129,24 @@ Section "Aurora Host 本体" SecCore
 SectionEnd
 
 Section "ログオン時に自動起動 (推奨)" SecAutostart
-  ; ONLOGON /RL HIGHEST タスクの登録は昇格が要る。host 自身の --install に委譲し、
-  ; ここだけ runas で 1 回だけ昇格する。タスク名は "Aurora Host" (autostart.rs)。
-  ExecShellWait "runas" "$INSTDIR\${EXENAME}" "--install" SW_HIDE
-  ; アンインストール時に --uninstall を呼ぶべきか判定するためのフラグ。
-  WriteRegDWORD HKCU "${REGROOT}" "Autostart" 1
+  ; サイレント更新契約: 自己更新は無人実行前提のため UAC を一切出さない。既存インストールの
+  ; スケジュールタスクは exe パス固定で登録済みなので再登録は不要。Autostart レジストリの
+  ; 既存フラグもここで丸ごとスキップすることで書き換えず、ユーザー設定を保持する。
+  IfSilent secautostart_skip secautostart_run
+  secautostart_run:
+    ; ONLOGON /RL HIGHEST タスクの登録は昇格が要る。host 自身の --install に委譲し、
+    ; ここだけ runas で 1 回だけ昇格する。タスク名は "Aurora Host" (autostart.rs)。
+    ExecShellWait "runas" "$INSTDIR\${EXENAME}" "--install" SW_HIDE
+    ; アンインストール時に --uninstall を呼ぶべきか判定するためのフラグ。
+    WriteRegDWORD HKCU "${REGROOT}" "Autostart" 1
+  secautostart_skip:
 SectionEnd
 
 Section /o "仮想ディスプレイドライバ (VDD) をインストール" SecVDD
+  ; サイレント更新は UAC を出さない契約のため丸ごとスキップする (既定 /o = 通常は選択されない
+  ; オプション機能だが、/COMPONENTS で明示指定された場合の防御として明示ガードする)。
+  IfSilent secvdd_skip secvdd_run
+  secvdd_run:
   ; MttVDD (Virtual Display Driver) を C:\ProgramData\Aurora\vdd に展開し、デバイスノード作成 +
   ; ドライバ束縛まで行う。ドライバのインストールは昇格が要るため runas で一回だけ UAC を出す。
   ; アンインストールではドライバは削除しない (システム共有コンポーネント、手動削除を推奨)。
@@ -128,13 +180,18 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   RMDir /r "$TEMP\AuroraVDDSetup"
 
   WriteRegDWORD HKCU "${REGROOT}" "VDDInstalled" 1
+  secvdd_skip:
 SectionEnd
 
 Section /o "ファイル転送機能を有効化 (Client-ProjFS)" SecProjFS
+  ; サイレント更新は UAC を出さない契約のため丸ごとスキップする (既定 /o の防御ガード)。
+  IfSilent secprojfs_skip secprojfs_run
+  secprojfs_run:
   ; Windows オプション機能の有効化は昇格が要る。再起動が必要な場合あり。
   ; 共有機能なのでアンインストールでは戻さない。
   ExecShellWait "runas" "powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -Command "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart"' SW_HIDE
+  secprojfs_skip:
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN

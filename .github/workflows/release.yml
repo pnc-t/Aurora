@@ -43,10 +43,6 @@ jobs:
         working-directory: crates/client
         run: pnpm install --frozen-lockfile
 
-      # --- ホスト: 単独 exe ---
-      - name: Build aurora-host
-        run: cargo build --release -p aurora-host
-
       # --- wol: raspi 向け aarch64 musl 静的バイナリ ---
       # 中継 (aurora-wol) はインストーラ不要の単一 musl 静的バイナリ。Releases から DL して
       # Pi へ置き `sudo ./aurora-wol-<ver>-aarch64 install` で常駐化する。Windows ランナーから
@@ -65,9 +61,35 @@ jobs:
       # beforeBuildCommand (pnpm build) が dist を生成 → NSIS を生成する。
       # createUpdaterArtifacts=true のため、NSIS setup と一緒に署名ファイル (.sig) が出る。
       # 署名鍵は GitHub Secrets から注入する (client 自動更新の真正性検証に必須)。
+      #
+      # host の NSIS ビルド (installer\host\build.ps1) は makensis を Tauri キャッシュ
+      # (%LOCALAPPDATA%\tauri\NSIS) から再利用するため、このステップより後に置くこと。
       - name: Build aurora-client (Tauri NSIS)
         working-directory: crates/client/src-tauri
         run: cargo tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # --- ホスト: NSIS インストーラ (生 exe 配布は廃止し client と対称にする) ---
+      # build.ps1 が内部で `cargo build -p aurora-host --release` + makensis 呼び出しまで
+      # 行い、installer\dist\aurora-host-setup-<ver>.exe を生成する。VDD ドライバ一式は
+      # installer/host/vdd/ にコミット済みのため、build.ps1 の VDD_SOURCE 未検出 Warning は
+      # 無害 (同梱済みファイルでそのままコンパイルできる)。
+      - name: Build aurora-host (NSIS installer)
+        shell: pwsh
+        run: .\installer\host\build.ps1
+
+      # host setup.exe も client と同一の minisign 鍵で署名する (host 自己更新の真正性検証用)。
+      # tauri-cli の signer サブコマンドは TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) を環境変数から
+      # 自動で読むため -k/-p を明示せず呼べる (client の updater 署名と全く同じ鍵・同じ検証方式に
+      # 揃えるため、素の minisign ではなくあえて tauri signer を使う)。
+      - name: Sign aurora-host installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem installer/dist/aurora-host-setup-*.exe | Select-Object -First 1
+          if (-not $setup) { throw "host installer (aurora-host-setup-*.exe) not found" }
+          cargo tauri signer sign $setup.FullName
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -76,8 +98,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist-release | Out-Null
-          Copy-Item target/release/aurora-host.exe dist-release/
           Copy-Item target/release/bundle/nsis/*-setup.exe dist-release/
+          Copy-Item installer/dist/aurora-host-setup-*.exe dist-release/
           # wol は build-all.ps1 と同じ命名 (aurora-wol-<ver>-aarch64) で置く。
           $ver = "${{ github.ref_name }}".TrimStart('v')
           Copy-Item target/aarch64-unknown-linux-musl/release/aurora-wol "dist-release/aurora-wol-$ver-aarch64"
@@ -108,14 +130,38 @@ jobs:
           $manifest | ConvertTo-Json -Depth 6 | Set-Content dist-release/latest.json -Encoding utf8
           Get-Content dist-release/latest.json
 
+      # host 自己更新 (update.rs) が参照する latest-host.json。スキーマは latest.json と
+      # 同形だが、host は Tauri updater を使わないため別ファイル・別 endpoint にする。
+      - name: Generate host updater manifest (latest-host.json)
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem installer/dist/aurora-host-setup-*.exe | Select-Object -First 1
+          $sig   = Get-ChildItem installer/dist/aurora-host-setup-*.exe.sig | Select-Object -First 1
+          if (-not $setup -or -not $sig) { throw "host updater artifacts (setup/.sig) not found; is signing key set?" }
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($setup.Name)"
+          $manifest = [ordered]@{
+            version   = $ver
+            notes     = "リリースノートは GitHub のリリースページを参照してください。"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content $sig.FullName -Raw)
+                url       = $url
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content dist-release/latest-host.json -Encoding utf8
+          Get-Content dist-release/latest-host.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           # 起動トリガのタグ (v1.2.3) がそのままリリース名/タグになる
           files: |
-            dist-release/aurora-host.exe
             dist-release/*-setup.exe
             dist-release/latest.json
+            dist-release/latest-host.json
             dist-release/aurora-wol-*-aarch64
           generate_release_notes: true
           fail_on_unmatched_files: true
