@@ -29,6 +29,7 @@ mod projfs;
 mod security;
 mod system;
 mod tray;
+mod update;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
@@ -1099,6 +1100,9 @@ fn run_server(
     // net→tray の実行時ステータス/通知バス。net (接続受理) が接続/切断/登録を記録し、tray が
     // ポーリングしてツールチップ更新とバルーン通知へ反映する (接続状態の可視化)。
     let tray_bus = tray::TrayBus::new();
+    // GitHub Releases 経由の自己更新の実行時状態。update スレッド (検知/適用) と tray
+    // (メニュー表示/要求) で共有する。
+    let update_state = update::UpdateState::new();
     // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
     // 設定ダイアログを自動表示する。
     tray::spawn(
@@ -1109,8 +1113,21 @@ fn run_server(
         auth_failures.clone(),
         devices.clone(),
         tray_bus.clone(),
+        update_state.clone(),
         !have_stored,
     );
+    // 更新の検知/適用スレッド。ブロッキング HTTP/sleep を使うため tokio タスクではなく
+    // 他サブシステム (capture/encode/input) と同じ流儀の std::thread にする。
+    {
+        let st = update_state.clone();
+        let bus = tray_bus.clone();
+        let up_port = port_cell.clone();
+        std::thread::Builder::new()
+            .name("update".into())
+            .spawn(move || {
+                update::run(st, bus, up_port);
+            })?;
+    }
 
     // 接続済みディスプレイを列挙する。失敗時は 1080p 単一ディスプレイで継続。
     let mut displays = match capture::enumerate_displays() {
