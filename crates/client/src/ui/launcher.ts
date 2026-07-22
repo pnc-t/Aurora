@@ -35,6 +35,7 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
 import { logger } from "../core/log";
+import { checkForUpdate, installPendingUpdate } from "../core/update";
 import { emit, listen } from "@tauri-apps/api/event";
 import {
   findPreset,
@@ -191,6 +192,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
         <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
       </aside>
       <main class="content">
+        <div class="update-banner" id="update-banner" hidden>
+          <span class="update-icon"></span>
+          <span class="update-text" id="update-text"></span>
+          <button type="button" class="update-btn" id="update-install">今すぐ更新</button>
+          <button type="button" class="update-dismiss" id="update-dismiss" title="閉じる">×</button>
+        </div>
         <section class="page active" id="page-hosts">
           <div class="page-head">
             <h2>Hosts</h2>
@@ -1515,6 +1522,37 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     applySettingsToForm();
   });
   void handle.refreshHosts();
+
+  // 起動時 + 6h ごとに更新をチェックし、新版があればバナーを表示する。
+  const updateBanner = opts.root.querySelector<HTMLElement>("#update-banner");
+  const updateText = opts.root.querySelector<HTMLElement>("#update-text");
+  const updateInstallBtn = opts.root.querySelector<HTMLButtonElement>("#update-install");
+  const updateDismissBtn = opts.root.querySelector<HTMLButtonElement>("#update-dismiss");
+
+  async function runUpdateCheck(): Promise<void> {
+    const status = await checkForUpdate();
+    if (status.kind === "available" && updateBanner && updateText) {
+      // version は自 GitHub 由来だが安全側で textContent を使う (XSS 回避規約)。
+      updateText.textContent = `新しいバージョン ${status.version} が利用できます`;
+      updateBanner.hidden = false;
+    }
+  }
+  updateInstallBtn?.addEventListener("click", () => {
+    updateInstallBtn.disabled = true;
+    updateInstallBtn.textContent = "更新中...";
+    void installPendingUpdate().catch((e) => {
+      logger.error(`update install failed: ${String(e)}`);
+      updateInstallBtn.disabled = false;
+      updateInstallBtn.textContent = "今すぐ更新";
+    });
+  });
+  updateDismissBtn?.addEventListener("click", () => {
+    if (updateBanner) updateBanner.hidden = true;
+  });
+  void runUpdateCheck();
+  window.setInterval(() => {
+    void runUpdateCheck();
+  }, 6 * 60 * 60 * 1000);
 
   // 接続中 host の変化 (capture ウィンドウでの接続/切断/ウィンドウ破棄) を購読し、
   // 接続中表示・切断ボタン・保存バッジ (接続成功で新規保存された分) を更新する。

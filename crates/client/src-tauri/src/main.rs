@@ -46,6 +46,8 @@ fn main() {
     );
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(SessionState::default())
         // ウィンドウ破棄時の後始末: capture ウィンドウはその session を切断、launcher
         // (main) を閉じたらアプリ全体を終了する。
