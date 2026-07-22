@@ -29,6 +29,8 @@ pub type Reload = Arc<tokio::sync::Notify>;
 /// tray が `TrayBus` を共有して受け取るための別名。
 pub type SharedTrayBus = Arc<TrayBus>;
 
+use crate::update::SharedUpdate;
+
 /// net→tray へ「何が起きたか」を 1 件ずつ伝える通知イベント。tray が `WM_TIMER` で drain して
 /// バルーン通知に変換する。文字列ラベルは表示用に整形済み (端末名 or peer IP)。
 pub enum TrayEvent {
@@ -38,6 +40,8 @@ pub enum TrayEvent {
     Disconnected(String),
     /// ペアリング窓中に未知端末が接続し承認待ちになった (指紋 + 端末名)。
     PendingDevice { fingerprint: String, label: String },
+    /// 新しいバージョンが利用可能になった (update スレッドが検知)。
+    UpdateAvailable(String),
 }
 
 /// 最大保持イベント数。あふれたら古いものを捨てる (常駐 UI なので無限に溜めない)。
@@ -111,6 +115,11 @@ impl TrayBus {
         self.push(TrayEvent::PendingDevice { fingerprint, label });
     }
 
+    /// 新しいバージョンが利用可能になったことを記録する (update スレッドが呼ぶ)。
+    pub fn on_update_available(&self, version: String) {
+        self.push(TrayEvent::UpdateAvailable(version));
+    }
+
     /// 溜まった通知イベントを取り出す (tray の `WM_TIMER` が呼ぶ)。
     pub fn drain_events(&self) -> Vec<TrayEvent> {
         self.events
@@ -141,6 +150,7 @@ pub fn spawn(
     auth_failures: SharedAuthFailures,
     devices: SharedDevices,
     bus: SharedTrayBus,
+    update: SharedUpdate,
     prompt_now: bool,
 ) {
     let _ = std::thread::Builder::new()
@@ -154,6 +164,7 @@ pub fn spawn(
                 auth_failures,
                 devices,
                 bus,
+                update,
                 prompt_now,
             ) {
                 tracing::warn!(error = %e, "tray UI disabled");
@@ -171,6 +182,7 @@ pub fn spawn(
     _auth_failures: SharedAuthFailures,
     _devices: SharedDevices,
     _bus: SharedTrayBus,
+    _update: SharedUpdate,
     _prompt_now: bool,
 ) {
 }
@@ -179,7 +191,7 @@ pub fn spawn(
 mod imp {
     use super::{
         Reload, SharedAuthFailures, SharedDevices, SharedHasPassword, SharedPort, SharedPsk,
-        SharedTrayBus, TrayEvent,
+        SharedTrayBus, SharedUpdate, TrayEvent,
     };
     use aurora_common::noise::psk_from_password;
     use std::cell::Cell;
@@ -212,6 +224,8 @@ mod imp {
     const ID_PIN_TOGGLE: usize = 1004;
     const ID_PIN_PAIR: usize = 1005;
     const ID_PIN_CLEAR: usize = 1006;
+    /// 更新の適用要求メニュー項目 ID。
+    const ID_UPDATE: usize = 1009;
     /// 登録端末リストの各項目 ID のベース (`ID_DEVICE_BASE + index`)。クリックでその端末を削除。
     const ID_DEVICE_BASE: usize = 2000;
     /// リスト表示する登録端末の上限 (ID 空間を有界にする。通常これを超える端末は持たない)。
@@ -249,6 +263,8 @@ mod imp {
         devices: SharedDevices,
         /// net→tray の実行時ステータス/通知バス。
         bus: SharedTrayBus,
+        /// 自己更新の実行時状態 (検知済み新版・適用要求)。update スレッドと共有する。
+        update: SharedUpdate,
         /// 前 tick の確立済みクライアント数 (変化時のみツールチップ/アイコンを更新)。
         last_connected: Cell<usize>,
         /// 前 tick の累計認証失敗数 (増分でバルーン通知)。
@@ -299,6 +315,7 @@ mod imp {
         auth_failures: SharedAuthFailures,
         devices: SharedDevices,
         bus: SharedTrayBus,
+        update: SharedUpdate,
         prompt_now: bool,
     ) -> windows::core::Result<()> {
         // SAFETY: トレイ用隠しウィンドウ生成一式。各 Win32 呼び出しの結果は ? で確認する。
@@ -327,6 +344,7 @@ mod imp {
                 auth_failures,
                 devices,
                 bus,
+                update,
                 last_connected: Cell::new(0),
                 last_auth: Cell::new(auth_base),
                 auth_cooldown: Cell::new(0),
@@ -445,6 +463,7 @@ mod imp {
                         ID_PIN_TOGGLE => toggle_pinning(hwnd),
                         ID_PIN_PAIR => toggle_pairing(hwnd),
                         ID_PIN_CLEAR => clear_devices(hwnd),
+                        ID_UPDATE => request_update(hwnd),
                         ID_EXIT => {
                             // host プロセス全体を終了する。
                             let _ = DestroyWindow(hwnd);
@@ -513,6 +532,14 @@ mod imp {
                     "Aurora Host",
                     &format!(
                         "承認待ちのデバイスが接続しました\n端末: {label}\n端末ID: {fingerprint}\nトレイメニューで端末IDを照合して承認してください。"
+                    ),
+                    false,
+                ),
+                TrayEvent::UpdateAvailable(version) => balloon(
+                    hwnd,
+                    "Aurora Host",
+                    &format!(
+                        "新しいバージョン v{version} が利用できます。\nトレイメニューの「更新」からインストールできます。"
                     ),
                     false,
                 ),
@@ -651,6 +678,11 @@ mod imp {
                 if failures > 0 {
                     let fail_w = to_wide(&format!("　認証失敗: {failures} 回 (起動以降)"));
                     let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(fail_w.as_ptr()));
+                }
+                if let Some(av) = state.update.available() {
+                    let up = to_wide(&format!("★ 更新 (v{}) をインストール...", av.version));
+                    // AppendMenuW は文字列を内部コピーするので up は直後に drop してよい (既存の他ステータス行と同様)。
+                    let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(up.as_ptr()));
                 }
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
@@ -1109,6 +1141,37 @@ mod imp {
         }
         state.devices.clear();
         message_box(hwnd, "登録端末をすべて削除しました。", "Aurora Host");
+    }
+
+    /// トレイの「更新」項目クリック。適用を要求する。接続中は update スレッドが切断後まで保留する。
+    fn request_update(hwnd: HWND) {
+        // SAFETY: wnd_state は run が Box::into_raw でセットした生存中の WndState を返す。
+        let Some(state) = (unsafe { wnd_state(hwnd) }) else {
+            return;
+        };
+        let Some(av) = state.update.available() else {
+            return;
+        };
+        state.update.request_apply();
+        if crate::net::is_active() {
+            message_box(
+                hwnd,
+                &format!(
+                    "クライアント接続中のため、切断後に v{} へ更新します。\n準備ができ次第、自動でダウンロード・再起動します。",
+                    av.version
+                ),
+                "Aurora Host",
+            );
+        } else {
+            message_box(
+                hwnd,
+                &format!(
+                    "v{} をダウンロードして更新します。\n完了すると Aurora Host が自動的に再起動します。",
+                    av.version
+                ),
+                "Aurora Host",
+            );
+        }
     }
 
     /// 新ポートで TCP/UDP を実際に bind できるか事前確認する。確認後ソケットは drop で解放され、
