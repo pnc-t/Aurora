@@ -1,8 +1,14 @@
 //! GitHub Releases 経由の host 自己更新。起動時 + 6h ごとにチェックし、新版があれば tray に
-//! 通知する。ユーザーがトレイから更新要求したら、**接続中は保留し切断後 (アイドル) に** exe を
-//! 差し替えて再起動する (接続中の入れ替えは映像/操作の継続を壊すため)。
+//! 通知する。ユーザーがトレイから更新要求したら、**接続中は保留し切断後 (アイドル) に**
+//! setup.exe をサイレント実行して更新・再起動する (接続中の入れ替えは映像/操作の継続を壊すため)。
+//!
+//! client (tauri-plugin-updater) と同じ minisign 署名スキームでマニフェスト/setup.exe を検証する。
+//! 生 exe を直接 rename する旧方式は廃止し、NSIS の `/S` サイレントインストールに一本化した
+//! (差し替え + 再起動のトランザクション責任は NSIS 側に委ねる)。
 
 use anyhow::{Context, Result};
+use base64::Engine;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,18 +16,38 @@ use std::time::{Duration, Instant};
 
 use crate::tray::SharedTrayBus;
 
-const REPO_LATEST_API: &str = "https://api.github.com/repos/pnc-t/Aurora/releases/latest";
-const HOST_ASSET_NAME: &str = "aurora-host.exe";
+const MANIFEST_URL: &str =
+    "https://github.com/pnc-t/Aurora/releases/latest/download/latest-host.json";
+const PLATFORM_KEY: &str = "windows-x86_64";
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const APPLY_POLL: Duration = Duration::from_secs(3);
-/// ダウンロードした exe がこのサイズ未満なら破損/エラーページとみなし適用を中止する下限。
+/// ダウンロードした setup.exe がこのサイズ未満なら破損/エラーページとみなし適用を中止する下限。
 const MIN_VALID_EXE_BYTES: u64 = 200 * 1024;
 
-/// 検知した新バージョンと host exe のダウンロード URL。
+// client (crates/client/src-tauri/tauri.conf.json の plugins.updater.pubkey) と同一の埋め込み
+// 公開鍵。host/client を同じリリース鍵で署名するため値を揃える。
+const HOST_UPDATE_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVCNDg5RUE5ODlBMUJEMjEKUldRaHZhR0pxWjVJVzJmd3I4TXVhamdIaDJKRWlISVJwRmFtbk82UjIzVHBlRWhqVjI5dFNqdy8K";
+
+/// latest-host.json のスキーマ (client の latest.json と同形)。
+#[derive(serde::Deserialize)]
+struct Manifest {
+    version: String,
+    platforms: HashMap<String, ManifestPlatform>,
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestPlatform {
+    signature: String,
+    url: String,
+}
+
+/// 検知した新バージョンと setup.exe のダウンロード URL・署名。
 #[derive(Clone)]
 pub struct AvailableUpdate {
     pub version: String,
     pub download_url: String,
+    /// minisign 署名ファイル全体を base64 化したもの (マニフェストの `signature` フィールドそのまま)。
+    signature: String,
 }
 
 /// 更新の実行時状態。update スレッド (検知/適用) と tray (表示/要求) で共有する。
@@ -62,15 +88,17 @@ impl UpdateState {
 
 /// 更新チェック/適用ループ本体。`std::thread` から呼ぶ想定 (ブロッキング HTTP/sleep を使うため
 /// tokio タスクにしない。他の host サブシステムと同じ流儀)。
-pub fn run(state: SharedUpdate, bus: SharedTrayBus, port: Arc<std::sync::atomic::AtomicU16>) {
-    // 前回の自己更新で残った退避 exe / 中断ダウンロードを掃除する (アンインストーラの
-    // 非再帰 RMDir が INSTDIR を消せるように残骸を残さない)。旧プロセスは新プロセス起動時点で
-    // 既に exit 済みのため .old.exe も削除できる。失敗は無視 (掃除は必須ではない)。
+pub fn run(state: SharedUpdate, bus: SharedTrayBus, _port: Arc<std::sync::atomic::AtomicU16>) {
+    // NSIS setup.exe がサイレント実行時にポート等の起動引数を持ち回らず、host は再起動後に
+    // system::load_port() の保存値から実効ポートを復元する (main.rs 参照)。そのため待受ポートは
+    // ここでは使わない (呼び出し元シグネチャ維持のため引数自体は残す)。
+
+    // 前回の自己更新で残った中断ダウンロードを掃除する (アンインストーラの非再帰 RMDir が
+    // INSTDIR を消せるように残骸を残さない)。失敗は無視 (掃除は必須ではない)。
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let _ = std::fs::remove_file(dir.join("aurora-host.old.exe"));
-        let _ = std::fs::remove_file(dir.join("aurora-host.update.tmp"));
+        let _ = std::fs::remove_file(dir.join("aurora-host.update-setup.exe"));
     }
 
     let current = env!("CARGO_PKG_VERSION");
@@ -102,7 +130,7 @@ pub fn run(state: SharedUpdate, bus: SharedTrayBus, port: Arc<std::sync::atomic:
             match state.available() {
                 Some(av) if !crate::net::is_active() => {
                     // 成功時は戻らない (exit(0))。
-                    if let Err(e) = apply(&av, port.load(Ordering::Relaxed)) {
+                    if let Err(e) = apply(&av) {
                         tracing::error!(error = %e, "update apply failed");
                         // 無限リトライを防ぐ。ユーザーは再度メニューから要求できる。
                         state.apply_requested.store(false, Ordering::Relaxed);
@@ -122,106 +150,108 @@ pub fn run(state: SharedUpdate, bus: SharedTrayBus, port: Arc<std::sync::atomic:
     }
 }
 
-/// GitHub Releases の最新版を確認する。現行版より新しければ `Some` を返す。
+/// `latest-host.json` マニフェストを確認する。現行版より新しければ `Some` を返す。
 fn check_latest(current: &str) -> Result<Option<AvailableUpdate>> {
-    let resp = ureq::get(REPO_LATEST_API)
+    let resp = ureq::get(MANIFEST_URL)
         .set("User-Agent", "aurora-host-updater")
-        .set("Accept", "application/vnd.github+json")
         .timeout(Duration::from_secs(15))
         .call()
-        .context("GitHub releases API request failed")?;
-    let json: serde_json::Value = resp.into_json().context("invalid JSON from releases API")?;
+        .context("update manifest request failed")?;
+    let manifest: Manifest = resp
+        .into_json()
+        .context("invalid JSON in update manifest")?;
 
-    let tag = json
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .context("release response missing tag_name")?;
-    let latest_str = tag.strip_prefix('v').unwrap_or(tag);
-    let latest = semver::Version::parse(latest_str)
-        .with_context(|| format!("invalid semver in tag_name '{tag}'"))?;
+    let latest = semver::Version::parse(&manifest.version)
+        .with_context(|| format!("invalid semver in manifest version '{}'", manifest.version))?;
     let current_ver =
         semver::Version::parse(current).with_context(|| format!("invalid semver '{current}'"))?;
     if latest <= current_ver {
         return Ok(None);
     }
 
-    let download_url = json
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .and_then(|assets| {
-            assets
-                .iter()
-                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(HOST_ASSET_NAME))
-        })
-        .and_then(|a| a.get("browser_download_url"))
-        .and_then(|v| v.as_str())
-        .with_context(|| format!("release {tag} has no asset named {HOST_ASSET_NAME}"))?;
+    let platform = manifest
+        .platforms
+        .get(PLATFORM_KEY)
+        .with_context(|| format!("update manifest has no platform entry '{PLATFORM_KEY}'"))?;
 
     Ok(Some(AvailableUpdate {
-        version: latest_str.to_string(),
-        download_url: download_url.to_string(),
+        version: manifest.version,
+        download_url: platform.url.clone(),
+        signature: platform.signature.clone(),
     }))
 }
 
-/// 新版 exe をダウンロードして自身と差し替え、再起動する。成功すると戻らない (`exit(0)`)。
-fn apply(av: &AvailableUpdate, current_port: u16) -> Result<()> {
+/// マニフェストの `signature` (minisign 署名ファイル全体を base64 化したもの) と埋め込み公開鍵で
+/// ダウンロード済みデータを検証する。tauri updater と同じスキームに揃え、改竄/破損した setup.exe
+/// を適用しないため。
+fn verify_signature(data: &[u8], signature_b64: &str) -> Result<()> {
+    let pubkey_bytes = base64::engine::general_purpose::STANDARD
+        .decode(HOST_UPDATE_PUBKEY)
+        .context("failed to decode embedded update public key")?;
+    let pubkey_text =
+        String::from_utf8(pubkey_bytes).context("embedded update public key is not valid UTF-8")?;
+    let public_key = minisign_verify::PublicKey::decode(&pubkey_text)
+        .context("invalid embedded minisign public key")?;
+
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .context("failed to decode update signature")?;
+    let sig_text = String::from_utf8(sig_bytes).context("update signature is not valid UTF-8")?;
+    let signature =
+        minisign_verify::Signature::decode(&sig_text).context("invalid update signature format")?;
+
+    // tauri updater は prehashed (非 legacy) 署名を生成するため allow_legacy=false で厳密照合する。
+    public_key
+        .verify(data, &signature, false)
+        .context("update signature verification failed")?;
+    Ok(())
+}
+
+/// setup.exe をダウンロード・検証してサイレントインストールを起動する。差し替え + 再起動は
+/// NSIS 側のトランザクション責任 (別タスク)。成功すると戻らない (`exit(0)`)。
+fn apply(av: &AvailableUpdate) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe failed")?;
     let dir = exe
         .parent()
         .context("current_exe has no parent directory")?;
 
-    let tmp = dir.join("aurora-host.update.tmp");
-    download_to(&av.download_url, &tmp).context("download failed")?;
+    let setup = dir.join("aurora-host.update-setup.exe");
+    download_to(&av.download_url, &setup).context("setup download failed")?;
 
-    // 破損/エラーページ (HTML) 対策。実 exe は数 MB あるため、小さすぎれば適用を中止する。
-    let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or_default();
+    // 破損/エラーページ (HTML) 対策。実 setup は数 MB あるため、小さすぎれば適用を中止する。
+    let size = std::fs::metadata(&setup)
+        .map(|m| m.len())
+        .unwrap_or_default();
     if size < MIN_VALID_EXE_BYTES {
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::bail!("downloaded file too small ({size} bytes); aborting update");
+        let _ = std::fs::remove_file(&setup);
+        anyhow::bail!("downloaded setup too small ({size} bytes); aborting update");
     }
 
-    let backup = dir.join("aurora-host.old.exe");
-    let _ = std::fs::remove_file(&backup);
-    // 実行中の exe は Windows でもリネームで退避できる (ハンドルはリネーム後のパスに追従する)。
-    std::fs::rename(&exe, &backup).context("failed to move running exe to backup")?;
-
-    if let Err(e) = std::fs::rename(&tmp, &exe) {
-        // ロールバック: 新版を置けなかったので旧 exe を戻す (どちらも消えた状態にしない)。
-        let _ = std::fs::rename(&backup, &exe);
-        return Err(e).context("failed to install downloaded exe; rolled back");
-    }
-
-    let mut args: Vec<String> = Vec::new();
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        if a == "--port" {
-            let _ = it.next();
-            continue;
-        }
-        args.push(a);
-    }
-    args.push("--port".into());
-    args.push(current_port.to_string());
-
-    let mut child = match std::process::Command::new(&exe).args(&args).spawn() {
-        Ok(c) => c,
+    let data = match std::fs::read(&setup) {
+        Ok(d) => d,
         Err(e) => {
-            let _ = std::fs::rename(&backup, &exe);
-            return Err(e).context("failed to spawn updated exe; rolled back");
+            let _ = std::fs::remove_file(&setup);
+            return Err(e).context("failed to read downloaded setup for verification");
         }
     };
+    if let Err(e) = verify_signature(&data, &av.signature) {
+        let _ = std::fs::remove_file(&setup);
+        return Err(e).context("update signature verification failed; aborting update");
+    }
+    drop(data);
 
-    // 新プロセスが起動を確認できてから旧を捨てる (起動失敗で誰も残らない事態を防ぐ)。
-    std::thread::sleep(Duration::from_millis(750));
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            let _ = std::fs::rename(&backup, &exe);
-            anyhow::bail!("updated exe exited immediately (status: {status}); rolled back");
-        }
-        _ => {
+    // 実行中の自 exe は Windows 上でロックされ setup から上書きできないため、spawn できたら
+    // 待たずに (detached) 自プロセスを速やかに終了する。setup 起動直後の失敗は検知できないが、
+    // トランザクションの成否は NSIS 側の責任とする (別タスク)。
+    match std::process::Command::new(&setup).arg("/S").spawn() {
+        Ok(_child) => {
             // プロセス終了 (exit) は Drop を走らせないため、投影ドライブを明示的に掃除する。
             crate::projfs::cleanup_drives();
             std::process::exit(0);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&setup);
+            Err(e).context("failed to spawn update setup")
         }
     }
 }

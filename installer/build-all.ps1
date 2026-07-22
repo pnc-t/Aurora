@@ -1,6 +1,6 @@
 # Aurora 配布インストーラ 一括ビルド
 #
-# client (Tauri NSIS) と host (Inno Setup) の両インストーラ、および
+# client (Tauri NSIS) と host (NSIS) の両インストーラ、および
 # wol (raspi 向け静的バイナリ) を生成し、すべて installer\dist\ に集約する。
 #
 # 出力:
@@ -9,7 +9,9 @@
 #   installer\dist\aurora-wol-<ver>-aarch64        (wol / raspi。インストーラ不要、
 #                                                   Pi 上で `sudo ./... install` するだけ)
 #
-# 前提: Inno Setup 6 (host 用)。未導入なら `winget install JRSoftware.InnoSetup`。
+# 前提: makensis (host 用)。client を一度 `cargo tauri build` していれば Tauri が取得した
+#       NSIS (%LOCALAPPDATA%\tauri\NSIS) を自動再利用するので追加導入は不要。無ければ
+#       `winget install NSIS.NSIS`。
 #       wol 用に cargo-zigbuild + zig (未導入なら crates\wol\deploy-aurora-wol.ps1 が
 #       自動導入する。手動なら `cargo install cargo-zigbuild` / `winget install zig.zig`)。
 
@@ -37,7 +39,7 @@ $clientSetup = Get-ChildItem $nsisDir -Filter '*-setup.exe' -ErrorAction Silentl
 if (-not $clientSetup) { throw "client インストーラが見つかりません: $nsisDir" }
 Copy-Item $clientSetup.FullName $dist -Force
 
-# --- host (Inno Setup) ---------------------------------------------------
+# --- host (NSIS) -----------------------------------------------------------
 # host\build.ps1 は OutputDir=..\dist のため、そのまま installer\dist へ出力される。
 Write-Host '==> host インストーラをビルド (build.ps1)' -ForegroundColor Cyan
 & (Join-Path $here 'host\build.ps1')
