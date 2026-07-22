@@ -4,7 +4,7 @@
 
 /* scrollbar-gutter で常時バー分の溝を確保し、出現/非表示でカード幅が変わらないようにする。
  * padding-right はその溝込みで content の右余白 (26px) と揃うよう補正 (24 + 8 = 32 = 6 + 26)。 */
-.wol-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; scrollbar-gutter: stable; }
+.wol-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; padding-bottom: 36px; scrollbar-gutter: stable; }
 
 /* ダイアログ用バックドロップ (launcher.css の #dialog-backdrop と同じ見た目)。#page-wol は
  * position 指定が無いため fixed で全面に被せ、中央配置する。 */

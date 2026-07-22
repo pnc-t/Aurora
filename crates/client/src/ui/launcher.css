@@ -48,8 +48,10 @@
 .statusbar.error .sb-dot { background: var(--danger); }
 .statusbar.connected .sb-text { color: var(--fg); }
 
-/* コンテンツ領域 (下端は status bar 分だけ余白を足し、末尾要素が隠れないようにする) */
-.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 0 36px 26px; overflow: hidden; }
+/* コンテンツ領域。下端の余白は各スクロールコンテナ側 (host-list/settings-body/wol-list)
+ * の padding-bottom に持たせ、スクロールバー自体はウィンドウ下端 (status bar 上) まで
+ * 伸ばす。ここで padding-bottom を付けるとバーがその分手前で切れてしまう。 */
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 0 0 26px; overflow: hidden; }
 
 /* 更新通知バナー: content 先頭に控えめな 1 行で出す (テーマ/アクセント色に追従)。 */
 .update-banner {
@@ -129,7 +131,7 @@
 /* ホスト一覧 */
 /* scrollbar-gutter で常時バー分の溝を確保し、出現/非表示でカード幅が変わらないようにする。
  * padding-right はその溝込みで content の右余白 (26px) と揃うよう補正 (24 + 8 = 32 = 6 + 26)。 */
-.host-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; scrollbar-gutter: stable; }
+.host-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; padding-bottom: 36px; scrollbar-gutter: stable; }
 .host-card {
   display: flex; align-items: center; gap: 14px;
   padding: 14px 16px; border-radius: 12px;
@@ -213,7 +215,7 @@
 /* タブバー: 下線インジケータ型。ピル背景は廃止し、選択中タブの下にアクセント色の下線を出す。
  * 下線はタブバー全幅の区切り線に重ねる (区切り線は擬似要素、下線は各タブの ::after)。 */
 .settings-tabs {
-  display: flex; gap: 4px; margin-bottom: 16px; flex-shrink: 0;
+  display: flex; gap: 4px; margin-bottom: 0; flex-shrink: 0;
   border-bottom: 1px solid var(--panel-border);
   max-width: 760px;
 }
@@ -225,12 +227,12 @@
 .settings-tab:hover { color: var(--fg); }
 .settings-tab.active { color: var(--fg); }
 .settings-tab.active::after {
-  content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
   background: var(--accent); border-radius: 2px 2px 0 0;
 }
 /* scrollbar-gutter で溝を常時確保し、バー出現時にカードが縮むのを防ぐ。
  * padding-right は溝込みで content の右余白 (26px) と揃うよう補正 (18 + 8 = 26)。 */
-.settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 18px; scrollbar-gutter: stable; }
+.settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 18px; padding-bottom: 36px; scrollbar-gutter: stable; }
 .settings-sect { display: none; flex-direction: column; max-width: 760px; }
 .settings-sect.active { display: flex; }
 .setting-group {
