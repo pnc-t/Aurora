@@ -133,9 +133,9 @@ async fn open_portal() -> Result<(u32, std::os::fd::OwnedFd)> {
         .await
         .context("open_pipe_wire_remote")?;
 
-    // session / proxy は drop されると Close が飛びキャプチャが止まるため、
-    // ストリーミング中は生かし続ける。ここでは forget せず呼び出し側へは fd/node のみ返し、
-    // session/proxy は runtime と共に run_capture スコープで保持する。
+    // session / proxy はこの関数のローカルなので、drop されると Close が飛び、キャプチャが
+    // 始まる前に PipeWire ストリームが死ぬ。呼び出し側へは fd/node_id だけ返し、本体は forget で
+    // プロセス寿命まで生かす (ストリームの生存に D-Bus セッションが必要なため意図的にリークする)。
     std::mem::forget(session);
     std::mem::forget(proxy);
     Ok((node_id, fd))
