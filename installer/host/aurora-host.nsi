@@ -95,7 +95,7 @@ Section "ログオン時に自動起動 (推奨)" SecAutostart
 SectionEnd
 
 Section /o "仮想ディスプレイドライバ (VDD) をインストール" SecVDD
-  ; MttVDD (Virtual Display Driver) を C:\VirtualDisplayDriver に展開し、デバイスノード作成 +
+  ; MttVDD (Virtual Display Driver) を C:\ProgramData\Aurora\vdd に展開し、デバイスノード作成 +
   ; ドライバ束縛まで行う。ドライバのインストールは昇格が要るため runas で一回だけ UAC を出す。
   ; アンインストールではドライバは削除しない (システム共有コンポーネント、手動削除を推奨)。
   ; $TEMP はユーザー権限で書き込み可能。コピーと nefconw/pnputil は runas で昇格して実行。
@@ -108,7 +108,7 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   ; 旧版は cmd の "&" チェーンで copy/nefconw/pnputil を繋いでいたが、クォートが脆弱でエラー検知も
   ; 検証も無く、実機で pnputil の add-driver が黙って失敗してもそのまま完了扱いになっていた。
   ; そこで導入ロジックを専用 PowerShell スクリプト install_vdd.ps1 (ASCII・ログ出力・MTT1337 検証
-  ; +再試行付き) に集約し、ここからは昇格して呼ぶだけにする。失敗時は C:\VirtualDisplayDriver\
+  ; +再試行付き) に集約し、ここからは昇格して呼ぶだけにする。失敗時は C:\ProgramData\Aurora\vdd\
   ; install_log.txt に原因が残る。
   SetOutPath "$TEMP\AuroraVDDSetup"
   File "vdd\MttVDD.dll"
@@ -157,7 +157,7 @@ Section "Uninstall"
   ${EndIf}
 
   ; 3) VDD ドライバを削除 (インストールした場合のみ)。
-  ;    デバイス削除・ドライバストア削除・C:\VirtualDisplayDriver 削除を一括で行う。
+  ;    デバイス削除・ドライバストア削除・C:\ProgramData\Aurora\vdd 削除を一括で行う。
   ReadRegDWORD $0 HKCU "${REGROOT}" "VDDInstalled"
   ${If} $0 == 1
     ExecShellWait "runas" "powershell.exe" \
