@@ -47,6 +47,20 @@ jobs:
       - name: Build aurora-host
         run: cargo build --release -p aurora-host
 
+      # --- wol: raspi 向け aarch64 musl 静的バイナリ ---
+      # 中継 (aurora-wol) はインストーラ不要の単一 musl 静的バイナリ。Releases から DL して
+      # Pi へ置き `sudo ./aurora-wol-<ver>-aarch64 install` で常駐化する。Windows ランナーから
+      # cargo-zigbuild で aarch64-linux-musl へクロスコンパイルする (installer\build-all.ps1 と同方式)。
+      # zig は python の ziglang ホイールで用意し、外部 action への依存を避ける
+      # (cargo-zigbuild は PATH の zig か `python -m ziglang` を自動検出する)。
+      - name: Build aurora-wol (raspi aarch64-musl)
+        shell: pwsh
+        run: |
+          pip install ziglang
+          rustup target add aarch64-unknown-linux-musl
+          cargo binstall -y cargo-zigbuild
+          cargo zigbuild -p aurora-wol --release --target aarch64-unknown-linux-musl
+
       # --- クライアント: Tauri NSIS インストーラ (+ updater 署名) ---
       # beforeBuildCommand (pnpm build) が dist を生成 → NSIS を生成する。
       # createUpdaterArtifacts=true のため、NSIS setup と一緒に署名ファイル (.sig) が出る。
@@ -64,6 +78,9 @@ jobs:
           New-Item -ItemType Directory -Force dist-release | Out-Null
           Copy-Item target/release/aurora-host.exe dist-release/
           Copy-Item target/release/bundle/nsis/*-setup.exe dist-release/
+          # wol は build-all.ps1 と同じ命名 (aurora-wol-<ver>-aarch64) で置く。
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          Copy-Item target/aarch64-unknown-linux-musl/release/aurora-wol "dist-release/aurora-wol-$ver-aarch64"
 
       # tauri-plugin-updater が参照する latest.json を生成する。
       # client は endpoints (releases/latest/download/latest.json) を取得し、version 比較 +
@@ -99,5 +116,6 @@ jobs:
             dist-release/aurora-host.exe
             dist-release/*-setup.exe
             dist-release/latest.json
+            dist-release/aurora-wol-*-aarch64
           generate_release_notes: true
           fail_on_unmatched_files: true
