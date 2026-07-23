@@ -23,6 +23,7 @@ import { showToast } from "./toast";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
+import { enhanceSelects } from "./select-menu";
 import "./wol-panel.css";
 
 /** 接続実行コールバック (launcher の onConnect とシグネチャを揃える)。 */
@@ -95,6 +96,8 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   function openBackdrop(): void {
     backdrop.classList.add("visible");
     applyAriaLabels(backdrop);
+    // 呼び出し側が option 追加 / select.value 代入をする前に差し替える (開くたびに再構築される)。
+    enhanceSelects(backdrop);
     releaseTrap?.();
     releaseTrap = trapFocus(backdrop);
   }
@@ -130,9 +133,11 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     const progress = card.querySelector<HTMLElement>(".wol-progress");
     const label = card.querySelector<HTMLElement>(".wol-progress-text");
     const cancelBtn = card.querySelector<HTMLElement>(".wol-progress-cancel");
+    const spinner = card.querySelector<HTMLElement>(".wol-spinner");
     if (actions) actions.hidden = true;
     if (progress) progress.hidden = false;
     if (cancelBtn) cancelBtn.hidden = !cancel;
+    if (spinner) spinner.hidden = done; // 完了表示 (✓) 時は回さない
     if (label) {
       label.textContent = text;
       label.classList.toggle("done", done);
@@ -729,6 +734,10 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       const progress = document.createElement("div");
       progress.className = "wol-progress";
       progress.hidden = true;
+      // 進行中はスピナーを添える。テキストだけだと押した実感が薄く、送信中か
+      // 何も起きていないのか区別しづらかった。
+      const spinner = document.createElement("span");
+      spinner.className = "wol-spinner";
       const progressText = document.createElement("span");
       progressText.className = "wol-progress-text";
       const cancelBtn = document.createElement("button");
@@ -739,7 +748,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
         stopPoll(t.id);
         hideProgress(card);
       });
-      progress.append(progressText, cancelBtn);
+      progress.append(spinner, progressText, cancelBtn);
 
       const actions = document.createElement("div");
       actions.className = "wol-actions";
