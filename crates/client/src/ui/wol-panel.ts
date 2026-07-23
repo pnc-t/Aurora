@@ -23,6 +23,7 @@ import { showToast } from "./toast";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
+import { enhanceSelects } from "./select-menu";
 import "./wol-panel.css";
 
 /** 接続実行コールバック (launcher の onConnect とシグネチャを揃える)。 */
@@ -95,6 +96,8 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   function openBackdrop(): void {
     backdrop.classList.add("visible");
     applyAriaLabels(backdrop);
+    // 呼び出し側が option 追加 / select.value 代入をする前に差し替える (開くたびに再構築される)。
+    enhanceSelects(backdrop);
     releaseTrap?.();
     releaseTrap = trapFocus(backdrop);
   }
@@ -130,9 +133,11 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     const progress = card.querySelector<HTMLElement>(".wol-progress");
     const label = card.querySelector<HTMLElement>(".wol-progress-text");
     const cancelBtn = card.querySelector<HTMLElement>(".wol-progress-cancel");
+    const spinner = card.querySelector<HTMLElement>(".wol-spinner");
     if (actions) actions.hidden = true;
     if (progress) progress.hidden = false;
     if (cancelBtn) cancelBtn.hidden = !cancel;
+    if (spinner) spinner.hidden = done; // 完了表示 (✓) 時は回さない
     if (label) {
       label.textContent = text;
       label.classList.toggle("done", done);
@@ -167,7 +172,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   function beginPoll(t: WolTarget, host: string, port: number, card: HTMLElement): void {
     stopPoll(t.id);
     const state: PollState = { intervalId: 0, elapsedMs: 0 };
-    showProgress(card, "起動待ち… 0s");
+    showProgress(card, "起動待ち 0s");
     state.intervalId = window.setInterval(() => {
       void (async () => {
         state.elapsedMs += POLL_STEP_MS;
@@ -177,7 +182,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
           stopPoll(t.id);
           return;
         }
-        showProgress(curCard, `起動待ち… ${Math.round(state.elapsedMs / 1000)}s`);
+        showProgress(curCard, `起動待ち ${Math.round(state.elapsedMs / 1000)}s`);
         try {
           const results = await probeHosts([{ host, port }]);
           const online = results.find((r) => r.host === host)?.online ?? false;
@@ -295,6 +300,9 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     if (!t.host) return;
     const host = t.host;
     const port = t.port ?? DEFAULT_HOST_PORT;
+    // パスワード確認と送信で await が挟まる間、押した反応が何も出ていなかった
+    // (「起こす」側だけ進捗を出していた)。ポーリング開始前からカードに出す。
+    showProgress(card, "起動信号を送信中…", { cancel: false });
     let saved = new Set<string>();
     try {
       saved = new Set((await savedPasswordHosts()).map((h) => h.trim().toLowerCase()));
@@ -302,6 +310,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       saved = new Set();
     }
     if (!saved.has(host.trim().toLowerCase())) {
+      hideProgress(card);
       showToast("先にこのホストへ一度手動接続し、パスワードを保存してください", "error");
       return;
     }
@@ -311,6 +320,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       beginPoll(t, host, port, card);
     } catch (err) {
       const msg = String(err);
+      hideProgress(card);
       if (looksLikePasswordError(msg)) {
         openWakePasswordDialog(t, () => beginPoll(t, host, port, card));
       } else {
@@ -729,17 +739,24 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       const progress = document.createElement("div");
       progress.className = "wol-progress";
       progress.hidden = true;
+      // 進行中はスピナーを添える。テキストだけだと押した実感が薄く、送信中か
+      // 何も起きていないのか区別しづらかった。
+      const spinner = document.createElement("span");
+      spinner.className = "wol-spinner";
       const progressText = document.createElement("span");
       progressText.className = "wol-progress-text";
+      // カード上の他のアクション (編集/⋯/起こす) と同じアイコンのみボタンに揃える。
+      // 枠付きラベルボタンだと進捗行だけ重く、行の高さも他カードとずれていた。
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
-      cancelBtn.className = "btn-ghost wol-progress-cancel";
-      cancelBtn.textContent = "キャンセル";
+      cancelBtn.className = "card-btn wol-progress-cancel";
+      cancelBtn.title = "キャンセル";
+      cancelBtn.innerHTML = icon("close");
       cancelBtn.addEventListener("click", () => {
         stopPoll(t.id);
         hideProgress(card);
       });
-      progress.append(progressText, cancelBtn);
+      progress.append(spinner, progressText, cancelBtn);
 
       const actions = document.createElement("div");
       actions.className = "wol-actions";
@@ -788,7 +805,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
 
       // ポーリング継続中に再描画された行 (別カードの追加/削除操作等) は進捗表示を復元する。
       const poll = activePolls.get(t.id);
-      if (poll) showProgress(card, `起動待ち… ${Math.round(poll.elapsedMs / 1000)}s`);
+      if (poll) showProgress(card, `起動待ち ${Math.round(poll.elapsedMs / 1000)}s`);
     });
     applyAriaLabels(listEl);
   }

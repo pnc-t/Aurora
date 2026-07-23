@@ -63,6 +63,7 @@ import {
 import { icon } from "./icons";
 import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
 import { mountWolPanel } from "./wol-panel";
+import { enhanceSelects } from "./select-menu";
 import "./launcher.css";
 
 // password に null を渡すと Rust 側が保存済みパスワード (DPAPI) を使って接続する。
@@ -463,6 +464,9 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     </div>
   `;
 
+  // 設定ページの select を自作ドロップダウンへ (設定値の反映より前に済ませる)。
+  enhanceSelects(opts.root);
+
   const $ = <T extends HTMLElement>(sel: string) => opts.root.querySelector<T>(sel);
   const statusBar = $("#statusbar") as HTMLElement;
   const statusText = $("#statusbar-text") as HTMLElement;
@@ -704,6 +708,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   function openBackdrop(): void {
     backdrop.classList.add("visible");
     applyAriaLabels(backdrop);
+    // 呼び出し側が select.value を入れるより前に差し替える (setter でラベルが追従するため)。
+    enhanceSelects(backdrop);
     releaseTrap?.();
     releaseTrap = trapFocus(backdrop);
   }
