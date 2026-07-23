@@ -20,12 +20,16 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 > ⚠️ 個人プロジェクトです。**ネットワークは [Tailscale](https://tailscale.com/) (Tailnet) 直結を前提**にしており、NAT 越え・シグナリング・中継サーバは実装していません。独立した第三者によるセキュリティ監査は受けていません。自己責任で利用してください。
 
 <p align="center">
-  <img src="docs/assets/screenshot-launcher.png" alt="ランチャー画面 (ホスト一覧)" width="46%" />
-  <img src="docs/assets/screenshot-wol.png" alt="Wake on LAN タブ (出先から自宅 PC を起こす)" width="46%" />
+  <img src="docs/assets/screenshot-session.jpg" alt="接続中のリモート画面と右端のツールバー" width="90%" />
 </p>
 
 <p align="center">
-  <sub>ホスト一覧から接続 / Wake-on-LAN で自宅 PC を起こしてそのまま接続</sub>
+  <img src="docs/assets/screenshot-launcher.png" alt="ランチャー画面 (ホスト一覧)" width="44%" />
+  <img src="docs/assets/screenshot-wol.png" alt="Wake on LAN タブ (出先から自宅 PC を起こす)" width="44%" />
+</p>
+
+<p align="center">
+  <sub>接続中のリモート画面 (右端がツールバー) ／ ホスト一覧から接続 ／ Wake-on-LAN で自宅 PC を起こしてそのまま接続</sub>
 </p>
 
 ---
