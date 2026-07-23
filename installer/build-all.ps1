@@ -14,6 +14,14 @@
 #       `winget install NSIS.NSIS`。
 #       wol 用に cargo-zigbuild + zig (未導入なら crates\wol\deploy-aurora-wol.ps1 が
 #       自動導入する。手動なら `cargo install cargo-zigbuild` / `winget install zig.zig`)。
+#       client の更新配信物 (.sig) 署名に minisign 秘密鍵 (環境変数 TAURI_SIGNING_PRIVATE_KEY)。
+#       署名せず動作確認だけしたいときは -NoSign。
+
+param(
+    # 署名なしでビルドする (client の updater artifacts を作らない)。
+    # インストーラの動作確認専用。生成物は自己更新に使えないので配布しないこと。
+    [switch]$NoSign
+)
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -21,11 +29,32 @@ $repo = Resolve-Path (Join-Path $here '..')
 $dist = Join-Path $here 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
+# tauri.conf.json は createUpdaterArtifacts=true なので、鍵が無いと client ビルドは
+# .sig 生成の段で失敗する。それが分かるのは 2 分超のコンパイルを終えた後なので、
+# ここで先に落として待ち時間を無駄にしない。
+if (-not $NoSign -and -not $env:TAURI_SIGNING_PRIVATE_KEY) {
+    throw @'
+署名鍵 (TAURI_SIGNING_PRIVATE_KEY) が未設定です。
+
+  $env:TAURI_SIGNING_PRIVATE_KEY = "$HOME\.tauri\aurora-updater.key"
+  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "<鍵のパスワード>"
+
+インストーラの動作確認だけで配布しないなら -NoSign を付けてください
+(署名なし = client の自己更新に使えない成果物になります)。
+'@
+}
+
 # --- client (Tauri NSIS) -------------------------------------------------
 Write-Host '==> client インストーラをビルド (cargo tauri build)' -ForegroundColor Cyan
 Push-Location (Join-Path $repo 'crates\client\src-tauri')
 try {
-    cargo tauri build
+    if ($NoSign) {
+        # 署名鍵が要るのは updater artifacts (.sig) の生成だけなので、そこだけ止める。
+        cargo tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+    }
+    else {
+        cargo tauri build
+    }
     if ($LASTEXITCODE -ne 0) { throw "cargo tauri build failed ($LASTEXITCODE)" }
 }
 finally {
@@ -75,3 +104,6 @@ Copy-Item $wolBin (Join-Path $dist "aurora-wol-$wolVersion-aarch64") -Force
 # --- 結果 ---------------------------------------------------------------
 Write-Host '==> 完了。installer\dist:' -ForegroundColor Green
 Get-ChildItem $dist -File | ForEach-Object { Write-Host "    $($_.Name)" }
+if ($NoSign) {
+    Write-Host '警告: -NoSign でビルドしました。client の .sig が無いため配布しないでください。' -ForegroundColor Yellow
+}
