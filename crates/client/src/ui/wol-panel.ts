@@ -172,7 +172,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
   function beginPoll(t: WolTarget, host: string, port: number, card: HTMLElement): void {
     stopPoll(t.id);
     const state: PollState = { intervalId: 0, elapsedMs: 0 };
-    showProgress(card, "起動待ち… 0s");
+    showProgress(card, "起動待ち 0s");
     state.intervalId = window.setInterval(() => {
       void (async () => {
         state.elapsedMs += POLL_STEP_MS;
@@ -182,7 +182,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
           stopPoll(t.id);
           return;
         }
-        showProgress(curCard, `起動待ち… ${Math.round(state.elapsedMs / 1000)}s`);
+        showProgress(curCard, `起動待ち ${Math.round(state.elapsedMs / 1000)}s`);
         try {
           const results = await probeHosts([{ host, port }]);
           const online = results.find((r) => r.host === host)?.online ?? false;
@@ -745,10 +745,13 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       spinner.className = "wol-spinner";
       const progressText = document.createElement("span");
       progressText.className = "wol-progress-text";
+      // カード上の他のアクション (編集/⋯/起こす) と同じアイコンのみボタンに揃える。
+      // 枠付きラベルボタンだと進捗行だけ重く、行の高さも他カードとずれていた。
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
-      cancelBtn.className = "btn-ghost wol-progress-cancel";
-      cancelBtn.textContent = "キャンセル";
+      cancelBtn.className = "card-btn wol-progress-cancel";
+      cancelBtn.title = "キャンセル";
+      cancelBtn.innerHTML = icon("close");
       cancelBtn.addEventListener("click", () => {
         stopPoll(t.id);
         hideProgress(card);
@@ -802,7 +805,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
 
       // ポーリング継続中に再描画された行 (別カードの追加/削除操作等) は進捗表示を復元する。
       const poll = activePolls.get(t.id);
-      if (poll) showProgress(card, `起動待ち… ${Math.round(poll.elapsedMs / 1000)}s`);
+      if (poll) showProgress(card, `起動待ち ${Math.round(poll.elapsedMs / 1000)}s`);
     });
     applyAriaLabels(listEl);
   }

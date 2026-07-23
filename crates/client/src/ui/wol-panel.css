@@ -92,13 +92,22 @@
  * display:flex は UA の [hidden]{display:none} より優先されるため、hidden 時を明示的に消す
  * (でないと非ポーリング時もキャンセルボタンが常時見える)。 */
 .wol-card .wol-progress {
-  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
   font-size: 13px; color: var(--muted);
 }
 .wol-card .wol-progress[hidden] { display: none; }
 .wol-card .wol-actions[hidden] { display: none; }
-/* 進行中の文言は本文色 + 太字。muted のままだと押した実感が薄かった。 */
-.wol-card .wol-progress-text { white-space: nowrap; color: var(--fg); font-weight: 500; }
+/* 進行中の文言は本文色 + 太字。muted のままだと押した実感が薄かった。
+ * 秒数が伸び縮みして行が揺れないよう等幅数字にする。 */
+.wol-card .wol-progress-text {
+  white-space: nowrap; color: var(--fg); font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+/* キャンセルは他のカードアクションと同じアイコンのみボタン。hover で危険色。
+ * .card-btn の display:inline-flex は UA の [hidden]{display:none} より優先されるため、
+ * 単発の「起こす」フィードバック (cancel=false) で消えるよう hidden 時を明示する。 */
+.wol-card .wol-progress-cancel:hover { color: var(--danger); }
+.wol-card .wol-progress-cancel[hidden] { display: none; }
 /* 「起こす」送信完了フィードバック。 */
 .wol-card .wol-progress-text.done { color: var(--ok); font-weight: 600; }
 /* 進行中スピナー (完了表示のときは JS が hidden にする)。 */
