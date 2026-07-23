@@ -209,6 +209,26 @@
 }
 .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
 
+/* 初回利用者向け空状態ガイド (.empty-hint とは別クラス。wol-panel は使わない前提)。
+ * ホスト一覧の余白に馴染ませつつ手順を目立たせるため、カードとして中央寄せする。 */
+.empty-guide {
+  max-width: 360px; margin: 32px auto; padding: 22px 20px;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
+  text-align: center;
+}
+.empty-guide-title { font-size: 15px; font-weight: 600; color: var(--fg); margin-bottom: 16px; }
+.empty-guide-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.empty-guide-step {
+  display: flex; align-items: center; gap: 10px; text-align: left;
+  font-size: 13px; color: var(--fg);
+}
+.empty-guide-badge {
+  flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+  color: var(--accent-fg); background: var(--accent);
+}
+
 /* 設定ページ: 間延び防止のため 1 カラムに幅上限を設ける。スクロールバーは画面右端に
  * 出したいので #page-settings 全体ではなく、幅を持つ内側の要素 (タブバー/各セクション)
  * 側に max-width を付ける (settings-body 自体は右端まで広げてバーを寄せる)。 */
