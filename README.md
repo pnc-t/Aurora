@@ -19,25 +19,34 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 
 > ⚠️ 個人プロジェクトです。**ネットワークは [Tailscale](https://tailscale.com/) (Tailnet) 直結を前提**にしており、NAT 越え・シグナリング・中継サーバは実装していません。独立した第三者によるセキュリティ監査は受けていません。自己責任で利用してください。
 
-| | |
-|--|--|
-| 言語 / ランタイム | Rust 2024 edition + `tokio` |
-| プラットフォーム | ホスト: Windows (主対象) / クライアント: Tauri v2 |
-| ネットワーク | Tailscale (Tailnet) 直結前提 |
-| ライセンス | MIT OR Apache-2.0 |
+<!--
+  画像を docs/assets/ に置いたらこのコメントを外してください。
+  <p align="center">
+    <img src="docs/assets/screenshot-launcher.png" alt="ランチャー画面 (ホスト一覧)" width="45%" />
+    <img src="docs/assets/screenshot-session.png" alt="接続中のリモート画面とツールバー" width="45%" />
+  </p>
+-->
 
 ---
 
-## ドキュメント
+## できること
 
-詳しい解説は [`docs/`](docs/README.md) にあります。
+| 分類 | 機能 |
+|------|------|
+| **映像・音声** | H.264 / HEVC / AV1 のコーデックネゴシエーション<br>GPU ハードウェアエンコード + WebCodecs GPU デコード<br>Opus 音声 / 画質プリセット<br>解像度追従 (RDP 風) と仮想ディスプレイ |
+| **入力** | マウス / キー入力注入<br>IME 日本語入力<br>キーボード占有 (Win キーや Alt+Tab をホストへ送る) |
+| **ファイル・クリップボード** | クリップボード同期<br>ファイル転送<br>ProjFS によるドライブ投影 |
+| **運用** | マルチタブ接続 / クライアント設定ページ<br>ネットワーク切替時のシームレス再接続<br>Wake-on-LAN によるリモート起動<br>自動アップデート (新版を通知しワンクリックで更新) |
 
-- [アーキテクチャ](docs/architecture.md) — クレート構成・パイプライン・タスク分割
-- [プロトコル](docs/protocol.md) — TCP 制御 / UDP 映像・音声のワイヤフォーマット
-- [セキュリティ](docs/security.md) — 暗号化・認証・脅威モデル・既知の制約
-- [ビルドと実行](docs/build.md) — 必要環境・ビルド手順・CLI オプション
-- [無人起動セットアップ](docs/remote-access-setup.md) — 自動起動 + WoL で出先から接続
-- [トラブルシュート](docs/troubleshooting.md)
+---
+
+## はじめかた
+
+1. **操作される PC (ホスト)**: [Releases](https://github.com/pnc-t/Aurora/releases/latest) から `aurora-host-setup-<ver>.exe` を実行してインストールし、タスクトレイのアイコンから接続パスワードを設定します
+2. **両方の PC**: [Tailscale](https://tailscale.com/) をインストールし、同じ Tailnet に参加させます (`tailscale ip -4` でホストの `100.x.x.x` を控えておきます)
+3. **操作する PC (クライアント)**: `Aurora_<ver>_x64-setup.exe` を実行してインストールし、ランチャーの ＋ からホストの `100.x.x.x` / ポート (既定 7000) / パスワードを登録して接続します
+
+自宅 PC を無人で起動しておく構成 (自動起動 + WoL) は [docs/remote-access-setup.md](docs/remote-access-setup.md)、うまく繋がらないときは [docs/troubleshooting.md](docs/troubleshooting.md) を参照してください。
 
 ---
 
@@ -64,35 +73,12 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 
 ---
 
-## 特徴
+## 設計の要点
 
-- **低遅延**: 1080p / 60fps を目標に、GPU ハードウェアエンコード + WebCodecs GPU デコードで End-to-End 体感遅延 < 50ms (Tailnet 直結時) を狙う設計
-- **軽量**: ホスト CPU 使用率 < 15% (GPU エンコード前提)、クライアント UI は Vanilla TypeScript でバンドル軽量
-- **ゼロコピー映像パイプライン**: DXGI Desktop Duplication → Media Foundation を GPU 上で完結 (CPU コピーを避ける)
-- **コーデックネゴシエーション**: クライアントとホスト双方の対応状況から H.264 / HEVC / AV1 を自動選択 (優先度 AV1 > HEVC > H.264)
-- **役割分離プロトコル**: 制御は TCP、映像/音声は UDP。遅延予算のために独自プロトコルで設計
-- **エンドツーエンド暗号化**: Noise XX-PSK ハンドシェイク。PSK はパスワードから Argon2id で導出
-- **付加機能**: マウス/キー入力注入 (IME 日本語入力・キーボード占有対応)、クリップボード同期、音声 (Opus)、ファイル転送、ProjFS によるドライブ投影、画質プリセット、解像度追従 (RDP 風) と仮想ディスプレイ、マルチタブ接続、ネットワーク切替時のシームレス再接続、Wake-on-LAN によるリモート起動、クライアント設定ページ
-- **自動アップデート**: host/client とも新版を検知すると通知し、ワンクリックで更新できる (client は起動時 + 6 時間ごとにチェック、host はトレイ通知から適用)
-
----
-
-## アーキテクチャ
-
-「Port & Adapter (Hexagonal)」風の構成。OS 依存部はトレイト (Port) で定義し、OS 別実装 (Adapter) を `cfg` で切り替えます。
-
-```
-crates/
-├── common/     共有: プロトコル型 (proto)、Noise 暗号化 (noise)、UDP フレーミング (framing)
-├── host/       操作される側 (サーバ)
-│   ├── capture/   画面キャプチャ (Win: DXGI / Mac: ScreenCaptureKit / Linux: PipeWire)
-│   ├── encode/    H.264 ハードウェアエンコード (Win: Media Foundation ほか)
-│   ├── input/     マウス/キー入力注入
-│   └── net.rs     TCP 制御 + UDP 映像のサーバ実装
-└── client/     操作する側 (Tauri v2 + Vanilla TS)
-    ├── src-tauri/   Rust 側ネットワーク、Webview への NALU 受け渡し
-    └── src/         フロント (core/ = ブリッジ・ランタイム、ui/ = UI コンポーネント)
-```
+- **低遅延の映像パイプライン**: DXGI Desktop Duplication → Media Foundation を GPU 上で完結させ、CPU コピーを避けます
+- **役割分離プロトコル**: 制御は TCP、映像/音声は UDP に分離し、遅延予算を確保します
+- **エンドツーエンド暗号化**: Noise XX-PSK ハンドシェイク。PSK は接続パスワードから Argon2id で導出します
+- **Tailscale 直結前提**: NAT 越え・シグナリング・中継サーバは実装しません (スコープを絞るための意図的な設計)。ホストは既定で Tailscale インターフェースのみに bind し、LAN / インターネットへ露出しません
 
 ### 技術スタック
 
@@ -101,76 +87,42 @@ crates/
 | 言語 / ランタイム | Rust 2024 edition / `tokio` |
 | クライアント GUI | Tauri v2 + Vanilla TypeScript + Vite (フレームワーク非採用) |
 | 画面キャプチャ | DXGI Desktop Duplication (Windows) |
-| 映像コーデック | H.264 / HEVC / AV1 ハードウェアエンコード (Media Foundation、ネゴシエーションで自動選択) / デコードは WebCodecs `VideoDecoder` (GPU) |
+| 映像コーデック | H.264 / HEVC / AV1 ハードウェアエンコード (ネゴシエーションで自動選択) / デコードは WebCodecs `VideoDecoder` (GPU) |
 | 音声 | `cpal` (loopback) + Opus (20ms frame) |
 | 暗号化 | `snow` (Noise XX-PSK) + `argon2` (PSK 導出) |
-| シリアライズ | `bincode` (制御) + 生バイト (映像) |
+
+詳細は [docs/architecture.md](docs/architecture.md) (クレート構成・パイプライン)、[docs/protocol.md](docs/protocol.md) (ワイヤフォーマット)、[docs/security.md](docs/security.md) (脅威モデル・既知の制約) を参照してください。
 
 ---
 
-## 必要環境
+## 開発者向け
+
+<details>
+<summary>ビルド環境・ビルドコマンド</summary>
+
+### 必要環境
 
 - **Rust** (2024 edition 対応のツールチェイン)
 - **Node.js + pnpm** (クライアントのフロントエンドビルド)
 - **Tauri v2 CLI** (`cargo install tauri-cli` など)
-- **Windows** (ホスト/クライアントとも現状 Windows を主対象。Mac/Linux は移植途上)
-- 推奨: ホスト・クライアント双方に **Tailscale** をインストール (LAN/localhost でも動作検証は可能)
 
----
-
-## ビルドと実行
-
-> Windows / PowerShell 前提。以下はクイックスタートです。CLI オプションや配布インストーラを含む詳細は [docs/build.md](docs/build.md) を参照してください。
-
-### ホスト (操作される側)
+### ビルド
 
 ```powershell
-# 起動 (debug)。リリース計測時は --release
+# 全クレートビルド (リリース)
+cargo build --workspace --release
+
+# ホスト起動 (debug)。リリース計測時は --release
 cargo run -p aurora-host
 
-# 接続パスワードを設定 (初回。トレイアイコンからも設定可)
-cargo run -p aurora-host -- --set-password
+# クライアント (crates/client/src-tauri から実行する)
+cargo tauri dev          # 開発モード (Tauri ウィンドウ + Vite dev サーバ)
+cargo tauri build        # 本番ビルド
 ```
 
-既定で TCP/UDP ともポート `7000` を待ち受けます。リリースビルドはコンソール無しでバックグラウンド + システムトレイ常駐になり、トレイアイコンからパスワード変更・終了ができます。
+ホストの CLI オプション一覧 (ポート/bind アドレス/パスワード設定/GPU 指定など) は [docs/build.md](docs/build.md) を参照してください。
 
-### クライアント (操作する側)
-
-```powershell
-# 開発モード (Tauri ウィンドウ + Vite dev サーバ)
-cargo tauri dev          # crates/client/src-tauri から実行
-
-# 本番ビルド
-cargo tauri build        # crates/client/src-tauri から実行
-```
-
-クライアントのランチャーで接続先 (Tailnet IP / ホスト名 / `localhost`)、ポート、パスワードを入力して接続します。接続後、上端のツールバーから全画面・マウスキャプチャ・ファイル転送・統計 HUD・ディスプレイ切替・画質プリセットを操作できます。
-
-### ホスト CLI オプション (主なもの)
-
-| オプション | 説明 |
-|-----------|------|
-| `--port N` | 待ち受けポート (既定 7000) |
-| `--bind ADDR` | 待ち受けアドレス (既定: Tailscale IP 自動 → 無ければ `127.0.0.1` loopback に fail-closed。公開は `--bind <ip>` で明示) |
-| `--set-password` / `--clear-password` | 接続パスワードの設定 / 削除 (DPAPI 保存) |
-| `--install` / `--uninstall` | ログオン時自動起動タスクの登録 / 解除 |
-| `--fps N` | 送出 fps 上限 (0 = 無制限) |
-| `--max-bitrate N` | ビットレート上限 (Mbps、0 = 無制限) |
-| `--encode-gpu NAME` | エンコードに使う GPU を名前の部分一致で指定 (ハイブリッド GPU ノート向け)。`auto` で既定 (キャプチャと同一 GPU) に戻す |
-| `--log-level LEVEL` | ログレベル (`RUST_LOG` でも指定可、例 `aurora=debug`) |
-
----
-
-## ネットワークとセキュリティ
-
-- **Tailscale (Tailnet) 直結が前提**。NAT 越え・シグナリング・中継サーバは実装しません (スコープを絞るための意図的な設計)
-- **暗号化**: Noise XX-PSK でハンドシェイクし、以降のセッションを暗号化。PSK は接続パスワードから **Argon2id** (m=19MiB, t=2, p=1) で導出
-- 制御チャネル (TCP) と映像/音声チャネル (UDP) を分離し、ノンスドメインでクロスチャネル注入を多重防御
-- パスワードは OS の保護ストア (Windows: DPAPI) に保存し、ログには出しません
-- ホストは既定で **Tailscale インターフェースのみに bind** し、LAN/インターネットへの露出を避けます
-- 任意の 2 要素目として、クライアント静的鍵の許可リスト (デバイスピン留め、既定無効) を有効化できます
-
-脅威モデルと既知の制約の詳細は [docs/security.md](docs/security.md) を参照してください。
+</details>
 
 ---
 
