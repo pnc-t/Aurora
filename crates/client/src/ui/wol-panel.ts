@@ -300,6 +300,9 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
     if (!t.host) return;
     const host = t.host;
     const port = t.port ?? DEFAULT_HOST_PORT;
+    // パスワード確認と送信で await が挟まる間、押した反応が何も出ていなかった
+    // (「起こす」側だけ進捗を出していた)。ポーリング開始前からカードに出す。
+    showProgress(card, "起動信号を送信中…", { cancel: false });
     let saved = new Set<string>();
     try {
       saved = new Set((await savedPasswordHosts()).map((h) => h.trim().toLowerCase()));
@@ -307,6 +310,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       saved = new Set();
     }
     if (!saved.has(host.trim().toLowerCase())) {
+      hideProgress(card);
       showToast("先にこのホストへ一度手動接続し、パスワードを保存してください", "error");
       return;
     }
@@ -316,6 +320,7 @@ export function mountWolPanel(root: HTMLElement, opts: { onConnect: ConnectCallb
       beginPoll(t, host, port, card);
     } catch (err) {
       const msg = String(err);
+      hideProgress(card);
       if (looksLikePasswordError(msg)) {
         openWakePasswordDialog(t, () => beginPoll(t, host, port, card));
       } else {
