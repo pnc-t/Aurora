@@ -109,6 +109,21 @@ client (Tauri/NSIS) と host (NSIS) の 2 つを生成し `installer\dist\` に�
 詳細・前提ツール・クリーンアンインストール手順は [`installer/README.md`](../installer/README.md)
 を参照してください。
 
+## 自動アップデート
+
+host/client とも GitHub Releases から自動アップデートします。
+
+- **client**: 公式 `tauri-plugin-updater` を使い、`latest.json` をエンドポイントとして
+  チェックします。契機は**起動時**と**6 時間ごと**。新版があればランチャーに更新バナーが出て、
+  ワンクリックでダウンロード → インストール → 再起動まで行います。
+- **host**: `latest-host.json` を取得して semver 比較し、新版検知でトレイ通知 + トレイ
+  右クリックメニューに更新項目を出します。クライアント接続中は適用を保留し、切断後
+  (アイドル時) に実行します。ダウンロードした setup は **minisign 署名を検証**してから
+  サイレント実行 (`/S`) します。
+- host / client は**同一の minisign 鍵**で署名・検証しており、方式も共通です。この署名は
+  更新配信物の真正性検証が目的で、配布インストーラ自体の Authenticode コード署名とは
+  別物です (未署名のままなので SmartScreen / Defender の警告は従来どおり出ます)。
+
 ## Tailscale 接続確認
 
 ```powershell
