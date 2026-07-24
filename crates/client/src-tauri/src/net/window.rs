@@ -3,6 +3,7 @@ use super::*;
 
 /// launcher からの接続をタブとして追加してもらうための通知ペイロード (`aurora://add-tab`)。
 /// `open_capture_window` が既存 capture 窓へルーティングする際に emit する。
+#[cfg(desktop)]
 #[derive(Clone, serde::Serialize)]
 struct AddTabPayload {
     session_id: String,
@@ -14,6 +15,7 @@ struct AddTabPayload {
 
 /// タブのドラッグ合流の通知ペイロード (`aurora://adopt-tab`)。移譲先窓へ「この session_id を
 /// `take_handoff` で引き取れ」と伝える。
+#[cfg(desktop)]
 #[derive(Clone, serde::Serialize)]
 struct AdoptTabPayload {
     session_id: String,
@@ -21,6 +23,7 @@ struct AdoptTabPayload {
 
 /// 接続中 host のタブアクティブ化通知 (`aurora://activate-host`)。`focus_host_window` が
 /// 前面化した窓へ「この host のタブへ切り替えろ」と伝える。
+#[cfg(desktop)]
 #[derive(Clone, serde::Serialize)]
 struct ActivateHostPayload {
     host: String,
@@ -29,6 +32,7 @@ struct ActivateHostPayload {
 /// launcher からの接続を流し込む先を決める。直近フォーカスした capture 窓が生存していれば
 /// それを優先し、無ければ生存している capture 窓を (順序不定で) 1 つ選ぶ。1 つも無ければ
 /// None を返し、呼び出し側が従来どおり新窓を生成する。
+#[cfg(desktop)]
 fn route_target(app: &tauri::AppHandle, state: &SessionState) -> Option<String> {
     if let Ok(g) = state.last_focused_capture.lock()
         && let Some(label) = g.as_deref()
@@ -50,6 +54,7 @@ fn route_target(app: &tauri::AppHandle, state: &SessionState) -> Option<String> 
 /// 既存の capture 窓があれば新窓は作らず、そちらへタブ追加を通知する (`route_target`)。
 /// `new_window` が true ならこのルーティングをスキップし常に新しいウィンドウを作る
 /// (ランチャーの「新しいウィンドウで接続」)。
+#[cfg(desktop)]
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn open_capture_window(
@@ -144,6 +149,7 @@ pub async fn stage_session(
 /// (最後のタブが消えて) 閉じても、その Destroyed ハンドラが移譲中セッションを巻き込んで
 /// 停止しない (window_label が既に新ラベルになっている)。`snapshot` は移譲先で `take_handoff`
 /// が取り出す表示状態 JSON。`x`/`y` は新ウィンドウの配置 (カーソル位置、論理 px)。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn open_session_window(
     app: tauri::AppHandle,
@@ -186,6 +192,7 @@ pub async fn open_session_window(
 }
 
 /// 移譲先ウィンドウが引き継ぎデータ (表示状態 JSON) を取り出す。1 回限り (pop)。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn take_handoff(
     session_id: String,
@@ -197,6 +204,7 @@ pub async fn take_handoff(
 /// 既存セッションの表示先 (映像/イベント Channel) を、この呼び出し元 webview のものへ
 /// 差し替える (Phase 3 移譲先がアタッチ)。所有ウィンドウもこの webview へ付け替える。
 /// networking はそのままなので、移譲先は別途 `request_keyframe` で映像を復帰させる。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn attach_session(
     window: WebviewWindow,
@@ -226,6 +234,7 @@ pub async fn unstage_session(
 /// ドロップ点 (論理 px、スクリーン座標) を含む「自分以外の capture ウィンドウ」のラベルを
 /// 返す。タブのドラッグ合流のヒットテスト。z-order は考慮しない (重なりは不定) — ドラッグ
 /// 合流はカーソル直下の窓を大まかに当てられれば十分で、厳密な最前面判定までは不要なため。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn find_capture_window_at(
     window: WebviewWindow,
@@ -262,6 +271,7 @@ pub async fn find_capture_window_at(
 /// 既存セッションを「既存の別 capture ウィンドウ」へ移譲する (タブのドラッグ合流)。
 /// `open_session_window` の姉妹コマンド: 新窓は作らず、所有権付替え + sink デタッチ + 引き継ぎ
 /// JSON を積んでから移譲先へ adopt を通知する。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn handoff_session_to_window(
     app: tauri::AppHandle,
@@ -348,6 +358,7 @@ pub async fn connected_hosts(state: tauri::State<'_, SessionState>) -> Result<Ve
 /// launcher からの接続中カードクリック: 指定 host のセッションを表示している capture
 /// ウィンドウを前面化し、該当タブのアクティブ化を通知する。見つからなければ false
 /// (launcher 側が接続中表示の取り直しにフォールバックする)。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn focus_host_window(
     app: tauri::AppHandle,

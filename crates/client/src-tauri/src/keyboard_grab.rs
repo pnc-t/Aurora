@@ -182,7 +182,9 @@ mod imp {
 }
 
 /// キーボード占有の ON/OFF (フロントが呼ぶ tauri コマンド)。実装は Windows のみ、非 Windows は no-op
-/// (呼び出し側は cfg 分岐せず同じコマンド名を叩ける)。
+/// (呼び出し側は cfg 分岐せず同じコマンド名を叩ける)。マルチウィンドウ前提の機能でモバイルには
+/// 存在しないため、invoke_handler への登録ごとデスクトップ限定にする。
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn set_keyboard_grab(window: tauri::Window, on: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]

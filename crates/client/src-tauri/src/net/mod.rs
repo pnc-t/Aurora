@@ -24,7 +24,11 @@ use aurora_common::noise::{
 use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent, VideoCodec};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewWindow};
+// capture ウィンドウ生成 (WebviewWindowBuilder/WebviewUrl) はデスクトップ限定
+// (net/window.rs の cfg(desktop) 関数群でのみ使う。モバイルは単一 WebView でウィンドウを作らない)。
+#[cfg(desktop)]
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
@@ -178,7 +182,9 @@ impl Sink {
             let _ = ch.send(body);
         }
     }
-    /// 表示先を差し替える (新ウィンドウのアタッチ)。
+    /// 表示先を差し替える (新ウィンドウのアタッチ)。タブのウィンドウ間移動 (Phase 3) は
+    /// デスクトップのマルチウィンドウ機能のため呼び出し元 (net/window.rs) ごとデスクトップ限定。
+    #[cfg(desktop)]
     fn set(&self, event: Channel<ClientEvent>, video: Channel<InvokeResponseBody>) {
         if let Ok(mut g) = self.event.lock() {
             *g = Some(event);
@@ -187,7 +193,9 @@ impl Sink {
             *g = Some(video);
         }
     }
-    /// 表示先を外す (旧ウィンドウのデタッチ)。ネットワークは継続する。
+    /// 表示先を外す (旧ウィンドウのデタッチ)。ネットワークは継続する。呼び出し元と同じ理由で
+    /// デスクトップ限定。
+    #[cfg(desktop)]
     fn clear(&self) {
         if let Ok(mut g) = self.event.lock() {
             *g = None;
@@ -296,9 +304,13 @@ pub struct SessionState {
     /// タブのウィンドウ分割 (Phase 3) の引き継ぎデータ。`open_session_window` が移譲元の
     /// セッション表示状態 (JSON) を session_id をキーに積み、移譲先ウィンドウの JS が
     /// `take_handoff` で取り出して `Session` を復元する。networking は継続したまま表示先だけ移す。
+    /// マルチウィンドウ前提の機能でモバイルには存在しないためデスクトップ限定。
+    #[cfg(desktop)]
     pub adopt: Mutex<HashMap<String, String>>,
     /// 最後にフォーカスされた capture ウィンドウのラベル。launcher からの接続を
     /// 既存窓のタブへルーティングするために使う (同期ハンドラから触るので std::sync::Mutex)。
+    /// `adopt` と同じ理由でデスクトップ限定。
+    #[cfg(desktop)]
     pub last_focused_capture: std::sync::Mutex<Option<String>>,
 }
 
@@ -307,6 +319,8 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// クエリ文字列値の最小 percent-encode (unreserved 以外を %XX に)。URL に host 等を
 /// 載せるとき IPv6 のコロンや空白で壊れないようにする。JS 側は URLSearchParams が復号する。
+/// capture ウィンドウの URL 生成 (net/window.rs、デスクトップ限定) でのみ使う。
+#[cfg(desktop)]
 fn q(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

@@ -31,6 +31,8 @@ pub fn perf_enabled() -> bool {
 }
 
 /// ログフォルダ (`%LOCALAPPDATA%\Aurora\logs`) をエクスプローラで開く。未作成なら作る。
+/// ファイラを開く操作はデスクトップ限定 (モバイルにファイラ相当の概念がない)。
+#[cfg(desktop)]
 #[tauri::command]
 pub fn open_logs_folder() -> Result<(), String> {
     let dir =
@@ -50,7 +52,8 @@ fn ps_squote(s: &str) -> String {
 /// ログ一式 (`logs\*.log`) を 1 つの ZIP にまとめて書き出し、生成先パスを返す。
 /// 出力先は logs の親 (`%LOCALAPPDATA%\Aurora`) で、書き出し後にそのフォルダを開く。
 /// クライアント機にあるのは client ログ (フロント転送含む) で、host ログは別マシンにある
-/// (host 側はトレイ「ログフォルダを開く」で集める)。
+/// (host 側はトレイ「ログフォルダを開く」で集める)。PowerShell 依存でデスクトップ限定。
+#[cfg(desktop)]
 #[tauri::command]
 pub fn export_logs_zip() -> Result<String, String> {
     let dir =
@@ -90,7 +93,9 @@ pub fn export_logs_zip() -> Result<String, String> {
     }
 }
 
-/// 指定フォルダをファイラで開く。
+/// 指定フォルダをファイラで開く。呼び出し元 (open_logs_folder/export_logs_zip) がいずれも
+/// デスクトップ限定のため同じく限定する。
+#[cfg(desktop)]
 fn reveal(dir: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     {
