@@ -1,0 +1,36 @@
+/* mobile.html のシェル固有スタイル (ui/ コンポーネントではないので mobile-main.ts と同名 co-locate)。
+ * ビュー切替 (launcher ⇄ remote) と safe-area (ノッチ/ジェスチャーバー) の確保だけを持つ。
+ * 各ビュー内部の見た目は ui/mobile-launcher.css / ui/mobile-controls.css 側の責務。 */
+
+#launcher-view,
+#remote-view {
+  position: absolute;
+  inset: 0;
+  /* env(safe-area-inset-*) は viewport-fit=cover 時のみ意味を持つ (mobile.html の viewport 指定)。 */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+  box-sizing: border-box;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* リモート画面表示中は映像を safe-area の外 (画面いっぱい) まで届かせたいので、
+ * #remote-view 自体の padding は解除し、操作 UI 側 (mobile-controls) だけが safe-area を考慮する。 */
+#remote-view {
+  padding: 0;
+}
+
+/* ソフトキーボードはフロートパネルなので絶対配置の器だけ確保する (中身は core/soft-keyboard.ts)。 */
+#soft-keyboard-root {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(56px + env(safe-area-inset-bottom));
+  z-index: 40;
+  pointer-events: none;
+}
+#soft-keyboard-root > * {
+  pointer-events: auto;
+}

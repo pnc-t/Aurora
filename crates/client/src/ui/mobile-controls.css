@@ -1,0 +1,119 @@
+/* リモート画面下部の操作バー (モバイル専用)。常時表示の細い帯 + 展開式の修飾キー段 + その他パネル。
+ * デスクトップの toolbar.css とは配色変数を共有するが、レイアウトはタッチ操作前提で作り直す。 */
+
+.mc-root {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: var(--toolbar-bg);
+  border-top: 1px solid var(--panel-border);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.mc-label {
+  padding: 4px 12px 0;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mc-bar {
+  display: flex;
+  align-items: stretch;
+  height: 52px;
+}
+
+.mc-btn {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-size: 20px;
+  min-width: 44px;
+  min-height: 44px;
+}
+.mc-btn.toggled {
+  color: var(--accent);
+}
+.mc-btn:disabled {
+  opacity: 0.4;
+}
+
+/* 修飾キー段 (展開時のみ表示)。単発キーも同じ段に並べる。 */
+.mc-mods {
+  display: none;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--panel-border);
+}
+.mc-mods.visible {
+  display: grid;
+}
+.mc-key {
+  min-height: 44px;
+  background: var(--control);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.mc-key.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+/* その他パネル (ディスプレイ / 画質 / ズームリセット)。バーの上に浮かせる。 */
+.mc-more-panel {
+  display: none;
+  position: absolute;
+  right: 8px;
+  bottom: calc(52px + 8px);
+  min-width: 220px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px;
+  box-shadow: 0 4px 16px var(--shadow);
+}
+.mc-more-panel.visible {
+  display: block;
+}
+.mc-more-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+}
+.mc-more-row label {
+  color: var(--muted);
+  font-size: 13px;
+}
+.mc-more-row select {
+  background: var(--control);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  min-height: 32px;
+}
+.mc-zoom-reset {
+  width: 100%;
+  min-height: 40px;
+  margin-top: 4px;
+  background: var(--control);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+}

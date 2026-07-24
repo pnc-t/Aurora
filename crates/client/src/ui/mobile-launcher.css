@@ -1,0 +1,208 @@
+/* 縦画面向け接続 UI (モバイル専用)。1 カラム・タップ領域 44px 以上を基本にする。 */
+
+.ml-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 12px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.ml-header h1 {
+  font-size: 20px;
+  margin: 4px 0 12px;
+}
+
+.ml-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ml-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  color: var(--fg);
+  text-align: left;
+}
+.ml-card:active {
+  background: var(--raised);
+}
+
+.ml-card-avatar {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+}
+
+.ml-card-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.ml-card-label {
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ml-card-host {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ml-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 8px 4px;
+}
+
+.ml-add-btn {
+  margin-top: 12px;
+  min-height: 48px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: none;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.ml-settings {
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid var(--panel-border);
+}
+.ml-settings h2 {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.ml-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  gap: 8px;
+}
+.ml-row input,
+.ml-row select {
+  min-height: 36px;
+  background: var(--control);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  width: 100px;
+  text-align: right;
+}
+
+/* --- モーダル (新規接続 / パスワード入力) --- */
+.ml-form-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: var(--backdrop);
+  align-items: flex-end;
+  z-index: 50;
+}
+.ml-form-backdrop.visible {
+  display: flex;
+}
+.ml-form {
+  width: 100%;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-border);
+  border-radius: 16px 16px 0 0;
+  padding: 16px;
+  padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ml-form h3 {
+  margin: 0 0 4px;
+}
+.ml-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.ml-form input {
+  min-height: 44px;
+  background: var(--control);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 15px;
+}
+.ml-pass-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.ml-pass-wrap input {
+  flex: 1;
+  padding-right: 40px;
+}
+.ml-pass-eye {
+  position: absolute;
+  right: 4px;
+  min-width: 36px;
+  min-height: 36px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ml-form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.ml-form-actions button {
+  flex: 1;
+  min-height: 44px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+  background: var(--control);
+  color: var(--fg);
+  font-size: 15px;
+}
+.ml-form-actions .primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+.ml-form-status {
+  font-size: 13px;
+  color: var(--danger-fg);
+  min-height: 18px;
+}
