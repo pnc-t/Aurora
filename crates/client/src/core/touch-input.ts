@@ -31,8 +31,6 @@ const GESTURE_DECIDE_PX = 10;
 const ZOOM_RATE_THRESHOLD = 0.15;
 const ZOOM_MIN = 1.0;
 const ZOOM_MAX = 4.0;
-// ズーム中にキャンバスが画面から完全に消えないよう残す最低オーバーラップ (px)。
-const MIN_OVERLAP_PX = 40;
 
 type ZoomBase = {
   scale: number;
@@ -42,8 +40,13 @@ type ZoomBase = {
   anchorLocalY: number;
   staticLeft: number;
   staticTop: number;
-  staticWidth: number;
-  staticHeight: number;
+  // 変形前 (scale=1, tx=ty=0 相当) の映像矩形 (client 座標)。object-fit:contain の
+  // レターボックス込みで、パンのクランプはキャンバス要素ではなくこちらを基準にする
+  // (要素基準だと黒帯ぶんまで動かせてしまう)。
+  staticVideoLeft: number;
+  staticVideoTop: number;
+  staticVideoWidth: number;
+  staticVideoHeight: number;
 };
 
 /** タッチ操作をホストへの入力イベントに変換する。1 canvas = 1 インスタンス。 */
@@ -439,12 +442,20 @@ export class TouchInput {
 
   private beginZoom(mid: Pt, dist: number): void {
     const rect = this.rect();
-    if (!rect) return;
+    const display = this.display;
+    if (!rect || !display) return;
     const baseScale = this.zoomScale;
     const staticLeft = rect.left - this.zoomTx;
     const staticTop = rect.top - this.zoomTy;
     const staticWidth = rect.width / baseScale;
     const staticHeight = rect.height / baseScale;
+    // videoRect() と同じ contain 計算を、変形前のキャンバス矩形 (staticWidth/Height) に対して
+    // 行う。これで「現在の transform 抜きの映像矩形」が求まり、クランプの基準にできる。
+    const containScale = Math.min(staticWidth / display.width, staticHeight / display.height);
+    const staticVideoWidth = display.width * containScale;
+    const staticVideoHeight = display.height * containScale;
+    const staticVideoLeft = staticLeft + (staticWidth - staticVideoWidth) / 2;
+    const staticVideoTop = staticTop + (staticHeight - staticVideoHeight) / 2;
     this.zoomBase = {
       scale: baseScale,
       dist,
@@ -458,8 +469,10 @@ export class TouchInput {
       anchorLocalY: (mid.y - rect.top) / baseScale,
       staticLeft,
       staticTop,
-      staticWidth,
-      staticHeight,
+      staticVideoLeft,
+      staticVideoTop,
+      staticVideoWidth,
+      staticVideoHeight,
     };
   }
 
@@ -481,16 +494,12 @@ export class TouchInput {
     let newTx = mid.x - b.staticLeft - b.anchorLocalX * newScale;
     let newTy = mid.y - b.staticTop - b.anchorLocalY * newScale;
 
-    // パンのクランプ: キャンバスが表示領域から完全に外れないよう、最低限のオーバーラップを残す。
+    // パンのクランプ: 黒帯まで含むキャンバス要素ではなく、実際に映像が描かれている矩形
+    // (staticVideo*) が表示領域を常に覆うようにする。映像のほうが表示領域より小さい軸は、
+    // 動かせても黒帯の位置が変わるだけで意味がないので中央固定にする。
     const viewport = this.viewportRect();
-    const renderedWidth = b.staticWidth * newScale;
-    const renderedHeight = b.staticHeight * newScale;
-    const minTx = viewport.left + MIN_OVERLAP_PX - b.staticLeft - renderedWidth;
-    const maxTx = viewport.right - MIN_OVERLAP_PX - b.staticLeft;
-    const minTy = viewport.top + MIN_OVERLAP_PX - b.staticTop - renderedHeight;
-    const maxTy = viewport.bottom - MIN_OVERLAP_PX - b.staticTop;
-    newTx = clamp(newTx, Math.min(minTx, maxTx), Math.max(minTx, maxTx));
-    newTy = clamp(newTy, Math.min(minTy, maxTy), Math.max(minTy, maxTy));
+    newTx = clampPanAxis(newTx, newScale, b.staticLeft, b.staticVideoLeft, b.staticVideoWidth, viewport.left, viewport.right);
+    newTy = clampPanAxis(newTy, newScale, b.staticTop, b.staticVideoTop, b.staticVideoHeight, viewport.top, viewport.bottom);
 
     this.zoomScale = newScale;
     this.zoomTx = newTx;
@@ -600,4 +609,32 @@ function midpoint(a: Pt, b: Pt): Pt {
 
 function clamp(v: number, min: number, max: number): number {
   return Math.min(Math.max(v, min), max);
+}
+
+/**
+ * ズームのパン量 (1 軸ぶん) を、映像が表示領域を覆う範囲へクランプする。
+ * 変形は transform-origin:0 0 の translate→scale なので、静的座標 s は
+ * `screen = staticElemMin + t + scale*(s - staticElemMin)` へ写る。
+ * 映像 (staticVideoMin..+Size) が表示領域以上に大きい場合はその範囲を覆うように t をクランプし、
+ * 表示領域より小さい場合は動かせても黒帯の位置が変わるだけなので中央固定の t を一意に返す。
+ */
+function clampPanAxis(
+  desiredT: number,
+  scale: number,
+  staticElemMin: number,
+  staticVideoMin: number,
+  staticVideoSize: number,
+  viewportMin: number,
+  viewportMax: number,
+): number {
+  const videoSize = scale * staticVideoSize;
+  const viewportSize = viewportMax - viewportMin;
+  if (videoSize >= viewportSize) {
+    const maxT = viewportMin - staticElemMin - scale * (staticVideoMin - staticElemMin);
+    const minT = viewportMax - staticElemMin - scale * (staticVideoMin + staticVideoSize - staticElemMin);
+    return clamp(desiredT, minT, maxT);
+  }
+  const videoCenterStatic = staticVideoMin + staticVideoSize / 2;
+  const viewportCenter = (viewportMin + viewportMax) / 2;
+  return viewportCenter - staticElemMin - scale * (videoCenterStatic - staticElemMin);
 }
