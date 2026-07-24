@@ -1,16 +1,15 @@
 /* リモート画面下部の操作バー (モバイル専用)。既定は隠れており、下端中央のハンドルをタップした
- * ときだけせり上がる (映像を覆う面積を減らすため)。展開式の修飾キー段 + その他パネルを持つ。
+ * ときだけせり上がる (映像を覆う面積を減らすため)。ボタン数が少ないため帯ではなく中央寄せの
+ * 丸いピルにして占有面積を絞る。展開式のその他パネルを持つ。
  * デスクトップの toolbar.css とは配色変数を共有するが、レイアウトはタッチ操作前提で作り直す。 */
 
-/* 引き出し用ハンドル。Android のジェスチャーナビゲーション (画面下端) と重なると誤操作に
- * なるため、safe-area のぶん上へ逃がす。下端からの上スワイプはホームジェスチャーと衝突する
- * ので、引き出しはタップのみ (スワイプでは開かない)。 */
+/* ハンドルはバー (.mc-panel) と一体で .mc-root ごとスライドする。格納時も画面下端から
+ * ハンドルだけが常に覗いているので、Android のジェスチャーナビゲーションと重ならないよう
+ * safe-area ぶんの余白を .mc-root 側の translateY 計算に含める (--mc-peek 参照)。
+ * 下端からの上スワイプはホームジェスチャーと衝突するので、引き出しはタップのみ (スワイプでは開かない)。 */
 .mc-handle {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  bottom: calc(env(safe-area-inset-bottom) + 6px);
-  z-index: 31;
+  align-self: center;
+  margin: 6px auto;
   width: 72px;
   height: 28px;
   padding: 0;
@@ -18,6 +17,7 @@
   border-radius: 14px;
   background: var(--toolbar-bg);
   opacity: 0.55;
+  pointer-events: auto;
 }
 .mc-handle::before {
   content: "";
@@ -33,6 +33,7 @@
 }
 
 .mc-root {
+  --mc-peek: calc(env(safe-area-inset-bottom) + 34px);
   position: absolute;
   left: 0;
   right: 0;
@@ -40,59 +41,52 @@
   z-index: 30;
   display: flex;
   flex-direction: column;
-  background: var(--toolbar-bg);
-  border-top: 1px solid var(--panel-border);
-  padding-bottom: env(safe-area-inset-bottom);
-  /* 既定は画面外へ退避。display の即時切替ではなく transform + transition で滑らかに出し入れする。
-   * 併せて非表示中はタッチを透過させ、下にある映像の操作を邪魔しないようにする。 */
-  transform: translateY(100%);
-  /* visibility は 0s 遷移を transform の後ろにずらす。即座に hidden にするとスライドアウトが
-   * 見えず、遷移から外すと画面外の帯が残ってタッチを拾ってしまうため。 */
-  transition:
-    transform 0.18s ease-out,
-    visibility 0s linear 0.18s;
+  /* 器自体は透明にする (背景/枠線は .mc-panel 側)。格納時はこの器が画面下端からはみ出た
+   * 状態で常駐しており、タッチを拾うとその面積ぶん映像の操作を横取りしてしまうため
+   * pointer-events は無効化し、実際に反応させたいハンドル/パネルだけ auto に戻す。 */
   pointer-events: none;
-  visibility: hidden;
+  /* 100% は要素自身の高さが基準になるため、内容の高さが変わっても
+   * この式を再計算する必要がない (常にハンドルの高さぶんだけ覗く)。 */
+  transform: translateY(calc(100% - var(--mc-peek)));
+  transition: transform 0.18s ease-out;
 }
 .mc-root.expanded {
   transform: translateY(0);
-  transition:
-    transform 0.18s ease-out,
-    visibility 0s;
-  pointer-events: auto;
-  visibility: visible;
 }
 
-.mc-label {
-  padding: 4px 12px 0;
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.mc-panel {
+  /* 帯 (全幅) ではなく、ボタン分の幅しか持たない中央寄せのピルにする。ボタンが 3 個だけの
+   * ため、全幅の帯にすると占有面積に対してできることが少なすぎる。 */
+  display: flex;
+  align-self: center;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 22px;
+  box-shadow: 0 2px 10px var(--shadow);
+  /* safe-area ぶんは帯の内側ではなく外側の余白として確保する (ピル自体の高さは一定に保つ)。 */
+  margin-bottom: env(safe-area-inset-bottom);
+  pointer-events: auto;
 }
 
 .mc-bar {
   display: flex;
-  align-items: stretch;
-  height: 52px;
-  /* 帯自体 (.mc-root) は画面端に沿わせたいので全幅のまま。ボタン群だけ横画面タブレット
-   * (実機確認: 1920x1200) で間延びしないよう幅の上限を設けて中央寄せする。 */
-  max-width: 480px;
-  margin: 0 auto;
+  align-items: center;
+  height: 44px;
+  gap: 2px;
+  padding: 0 4px;
 }
 
 .mc-btn {
-  flex: 1 1 0;
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: center;
   background: none;
   border: none;
   color: var(--fg);
-  font-size: 20px;
-  min-width: 44px;
-  min-height: 44px;
+  font-size: 18px;
+  width: 44px;
+  height: 44px;
 }
 .mc-btn.toggled {
   color: var(--accent);
@@ -101,40 +95,12 @@
   opacity: 0.4;
 }
 
-/* 修飾キー段 (展開時のみ表示)。単発キーも同じ段に並べる。 */
-.mc-mods {
-  display: none;
-  grid-template-columns: repeat(9, 1fr);
-  gap: 4px;
-  padding: 6px 8px;
-  border-top: 1px solid var(--panel-border);
-  /* .mc-bar と同じ理由で幅上限を設け中央寄せ (キー間が間延びしてタップ位置を見失わないように)。 */
-  max-width: 560px;
-  margin: 0 auto;
-}
-.mc-mods.visible {
-  display: grid;
-}
-.mc-key {
-  min-height: 44px;
-  background: var(--control);
-  color: var(--fg);
-  border: 1px solid var(--panel-border);
-  border-radius: 6px;
-  font-size: 13px;
-}
-.mc-key.active {
-  background: var(--accent);
-  color: var(--accent-fg);
-  border-color: var(--accent);
-}
-
 /* その他パネル (ディスプレイ / ズームリセット)。バーの上に浮かせる。 */
 .mc-more-panel {
   display: none;
   position: absolute;
   right: 8px;
-  bottom: calc(52px + 8px + env(safe-area-inset-bottom));
+  bottom: calc(44px + 8px + env(safe-area-inset-bottom));
   min-width: 220px;
   background: var(--panel);
   border: 1px solid var(--panel-border);

@@ -3,8 +3,8 @@
 // クライアント IME に変換させず、ローマ字/US配列のキーストロークとして 1 文字ずつ VK に
 // 落として送る。日本語等の変換済み文字は送る手段が無いため無視する (vkFromChar 参照)。
 
-/** Windows 仮想キーコード定数 (修飾キーバー等から使う)。 */
-export const VK = {
+/** Windows 仮想キーコード定数。 */
+const VK = {
   CONTROL: 0x11,
   MENU: 0x12,
   SHIFT: 0x10,
@@ -27,10 +27,8 @@ export const VK = {
 export type SoftKeyboardOpts = {
   /** VK を 1 つ送る (down/up は呼び出し側が組み立てる)。 */
   sendKey: (vk: number, down: boolean) => void;
-  /** 1 文字送出後、スティッキー修飾キーの解除を UI へ通知する。 */
-  onConsumeModifiers?: () => void;
-  /** 現在押しっぱなし扱いの修飾キー VK 群を返す (Ctrl/Alt/Shift/Win のスティッキー状態)。 */
-  getStickyModifiers: () => number[];
+  /** 開閉状態が変わったときに呼ぶ。Android の戻るキー等、外部要因で閉じた場合も通知する。 */
+  onOpenChange?: (open: boolean) => void;
 };
 
 /** Android ソフトキーボード用の隠し input を介して VK 送出を行う。 */
@@ -39,9 +37,12 @@ export class SoftKeyboard {
   // keydown フォールバックが送ろうとしている VK。同じキー入力に対して beforeinput が
   // 先に処理したら null にして二重送出を防ぐ (onBeforeInput 側で消費する)。
   private pendingKey: number | null = null;
+  // 開閉状態は自前フラグで持つ (isOpen 参照)。
+  private opened = false;
 
   private readonly hBeforeInput = (e: Event) => this.onBeforeInput(e as InputEvent);
   private readonly hKeyDown = (e: KeyboardEvent) => this.onKeyDown(e);
+  private readonly hBlur = () => this.onBlur();
 
   constructor(private readonly opts: SoftKeyboardOpts) {}
 
@@ -66,6 +67,7 @@ export class SoftKeyboard {
     el.style.caretColor = "transparent";
     el.addEventListener("beforeinput", this.hBeforeInput);
     el.addEventListener("keydown", this.hKeyDown);
+    el.addEventListener("blur", this.hBlur);
     parent.appendChild(el);
     this.input = el;
   }
@@ -73,19 +75,36 @@ export class SoftKeyboard {
   /** IME を開く (隠し input へ focus)。 */
   open(): void {
     this.input?.focus();
+    this.setOpened(true);
   }
 
-  /** IME を閉じる (blur)。 */
+  /** IME を閉じる (blur)。blur ハンドラ側でも opened=false になるが、ここでも即座に反映する。 */
   close(): void {
     this.input?.blur();
+    this.setOpened(false);
   }
 
   isOpen(): boolean {
-    return this.input !== null && document.activeElement === this.input;
+    return this.opened;
   }
 
-  /** 単発キー送出 (修飾キーバーの Esc/Tab/矢印などから呼ぶ)。スティッキー修飾を前後に挟む。 */
-  press(vk: number): void {
+  // input の blur は「閉じるボタンでの close()」だけでなく、Android の戻るキーや他要素への
+  // タップなど外部要因でも発火する。activeElement を都度比較する方式だと、キーボードボタン
+  // クリック時にフォーカスが一旦ボタン自身へ移ってしまい (mousedown の既定動作)、判定が
+  // 「常に閉じている」に化けてトグルが往復しなくなる。そのため開閉は自前フラグで持ち、
+  // blur イベントだけを「外部要因で閉じた」通知の唯一の経路として使う。
+  private onBlur(): void {
+    if (this.opened) this.setOpened(false);
+  }
+
+  private setOpened(open: boolean): void {
+    if (this.opened === open) return;
+    this.opened = open;
+    this.opts.onOpenChange?.(open);
+  }
+
+  /** 単発キー送出 (down→up)。内部の beforeinput/keydown ハンドラから呼ぶ。 */
+  private press(vk: number): void {
     this.sendKeyWithModifiers(vk, false);
   }
 
@@ -93,6 +112,7 @@ export class SoftKeyboard {
     if (this.input) {
       this.input.removeEventListener("beforeinput", this.hBeforeInput);
       this.input.removeEventListener("keydown", this.hKeyDown);
+      this.input.removeEventListener("blur", this.hBlur);
       this.input.remove();
     }
     this.input = null;
@@ -155,20 +175,12 @@ export class SoftKeyboard {
     this.sendKeyWithModifiers(mapped.vk, mapped.shift);
   }
 
-  /** 1 キー送出: スティッキー修飾 down → 対象 down/up → スティッキー修飾を逆順に up。 */
+  /** 1 キー送出: 大文字/記号のときだけ一時 Shift を挟んで対象キーを down→up する。 */
   private sendKeyWithModifiers(vk: number, needShift: boolean): void {
-    const sticky = this.opts.getStickyModifiers();
-    const hasStickyShift = sticky.includes(VK.SHIFT);
-    const tempShift = needShift && !hasStickyShift;
-
-    for (const m of sticky) this.opts.sendKey(m, true);
-    if (tempShift) this.opts.sendKey(VK.SHIFT, true);
+    if (needShift) this.opts.sendKey(VK.SHIFT, true);
     this.opts.sendKey(vk, true);
     this.opts.sendKey(vk, false);
-    if (tempShift) this.opts.sendKey(VK.SHIFT, false);
-    for (let i = sticky.length - 1; i >= 0; i--) this.opts.sendKey(sticky[i], false);
-
-    this.opts.onConsumeModifiers?.();
+    if (needShift) this.opts.sendKey(VK.SHIFT, false);
   }
 }
 

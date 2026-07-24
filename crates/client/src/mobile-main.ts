@@ -78,11 +78,12 @@ const touchInput = new TouchInput({
   onZoomChange: (scale) => controls.setZoom(scale),
 });
 
-// --- ソフトキーボード (修飾キー + 単発特殊キーのフロートパネル) ---
+// --- ソフトキーボード (隠し input 経由の文字/特殊キー送出) ---
 const softKeyboard = new SoftKeyboard({
   sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
-  onConsumeModifiers: () => controls.clearModifiers(),
-  getStickyModifiers: () => controls.stickyModifiers(),
+  // ボタン操作 (onToggleKeyboard) だけでなく、Android の戻るキー等の外部要因で閉じた場合も
+  // ここで拾えるので、下部バーのトグル表示はこの通知に一本化する。
+  onOpenChange: (open) => controls.setKeyboardOpen(open),
 });
 softKeyboard.mount(keyboardRoot);
 
@@ -103,9 +104,9 @@ function syncTouchAttach(): void {
 }
 
 const toolbar: ToolbarHandle = {
-  setConnLabel(text): void {
-    controls.setConnLabel(text);
-  },
+  // 接続先ラベル行は下部バーの縮小に伴い廃止した。ToolbarHandle の契約は満たす必要があるため
+  // no-op として残す。
+  setConnLabel: () => {},
   setDisplays(displays, selectedId): void {
     currentDisplay = displays.find((d) => d.id === selectedId) ?? displays[0] ?? null;
     // TouchInput の座標変換はディスプレイ解像度が唯一の情報源。
@@ -141,8 +142,9 @@ const toolbar: ToolbarHandle = {
       syncTouchAttach();
     } else {
       touchInput.detach();
+      // close() の onOpenChange が controls.setKeyboardOpen(false) を呼ぶので、ここでは
+      // 二重に呼ばない。
       softKeyboard.close();
-      controls.setKeyboardOpen(false);
     }
   },
   // ショートカット割当 UI はデスクトップ専用 (キーボードショートカット設定) でモバイルには無い。
@@ -202,15 +204,12 @@ const controls: MobileControlsHandle = mountMobileControls({
   root: controlsRoot,
   onDisconnect: () => session?.closeByUser(),
   onToggleKeyboard: () => {
+    // 表示反映は SoftKeyboard の onOpenChange に一本化 (ここで直接 setKeyboardOpen を
+    // 呼ぶと外部要因での閉じと二重管理になる)。
     if (softKeyboard.isOpen()) softKeyboard.close();
     else softKeyboard.open();
-    controls.setKeyboardOpen(softKeyboard.isOpen());
   },
   onSelectDisplay: (d) => session?.switchDisplay(d),
-  // スティッキー修飾の表示は mobile-controls 側で完結するため、ここでは何もしない
-  // (soft-keyboard は getStickyModifiers() で都度問い合わせる)。
-  onModifiersChanged: () => {},
-  onPressKey: (vk) => softKeyboard.press(vk),
   onResetZoom: () => touchInput.resetZoom(),
 });
 
