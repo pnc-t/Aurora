@@ -133,8 +133,8 @@ const toolbar: ToolbarHandle = {
   // ピン留め/ホバー格納の概念が無いため、Session からの操作対象にしない)。
   toggleBar: () => {},
   revealBar: () => {},
-  // ツールバー配置 (上下左右) は画面端に沿わせるデスクトップ専用の概念。下部固定のみ。
-  setPosition: () => {},
+  // ツールバー配置 (上下左右) は mobile-controls 側で実装済み。ここは橋渡しのみ。
+  setPosition: (pos) => controls.setPosition(pos),
   setConnected(connected): void {
     controls.setConnected(connected);
     toolbarConnected = connected;
@@ -229,6 +229,15 @@ async function connectTo(entry: HostEntry, password: string | null, save: boolea
   if (session) {
     session.closeByUser();
     session = null;
+  }
+  // 接続の直前に設定を読み直す。デスクトップは接続ごとに capture ウィンドウが新規生成されて
+  // その場で loadSettings するため常に最新だが、モバイルは単一 WebView でランチャーと
+  // リモート画面が同じページに居座るため、起動時に読んだきりだと設定ページでの変更
+  // (ツールバー配置・コーデック・自動再接続など) が次の接続に反映されない。
+  try {
+    settings = await loadSettings();
+  } catch (e) {
+    logger.warn("load settings failed; using cached", e);
   }
   const id = await stageSession(password);
   const s = new Session(id, entry, save, host);

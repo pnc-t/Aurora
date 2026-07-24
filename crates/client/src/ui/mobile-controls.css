@@ -1,15 +1,21 @@
-/* リモート画面下部の操作バー (モバイル専用)。既定は隠れており、下端中央のハンドルをタップした
- * ときだけせり上がる (映像を覆う面積を減らすため)。ボタン数が少ないため帯ではなく中央寄せの
- * 丸いピルにして占有面積を絞る。展開式のその他パネルを持つ。
- * デスクトップの toolbar.css とは配色変数を共有するが、レイアウトはタッチ操作前提で作り直す。 */
+/* リモート画面の操作バー (モバイル専用)。既定は隠れており、端 (配置による) 中央のハンドルを
+ * タップしたときだけせり上がる (映像を覆う面積を減らすため)。ボタン数が少ないため帯ではなく
+ * 中央寄せの丸いピルにして占有面積を絞る。ディスプレイ切替は浮動ポップオーバーを持つ。
+ * デスクトップの toolbar.css とは配色変数を共有するが、レイアウトはタッチ操作前提で作り直す。
+ * 配置は data-pos="top|bottom|left|right" (デスクトップの ToolbarPosition と共通) で切り替える。 */
 
-/* ハンドルはバー (.mc-panel) と一体で .mc-root ごとスライドする。格納時も画面下端から
+/* ハンドルはバー (.mc-panel) と一体で .mc-root ごとスライドする。格納時も画面端から
  * ハンドルだけが常に覗いているので、Android のジェスチャーナビゲーションと重ならないよう
- * safe-area ぶんの余白を .mc-root 側の translateY 計算に含める (--mc-peek 参照)。
- * 下端からの上スワイプはホームジェスチャーと衝突するので、引き出しはタップのみ (スワイプでは開かない)。 */
+ * safe-area ぶんの余白を .mc-root 側の translate 計算に含める (--mc-peek 参照)。
+ * 端からの逆スワイプはシステムジェスチャーと衝突するので、引き出しはタップのみ (スワイプでは開かない)。
+ * ハンドルは常にピルの「画面中央側」に置く。DOM 順 (ハンドル→パネル) は固定のまま、
+ * 配置ごとに flex-direction を反転させて見た目の順序を入れ替える。
+ *   bottom (既定): column          → ハンドルが上 (中央側)
+ *   top          : column-reverse  → ハンドルが下 (中央側)
+ *   left         : row-reverse     → ハンドルが右 (中央側)
+ *   right        : row             → ハンドルが左 (中央側) */
 .mc-handle {
-  align-self: center;
-  margin: 6px auto;
+  margin: 6px;
   width: 72px;
   height: 28px;
   padding: 0;
@@ -18,13 +24,14 @@
   background: var(--toolbar-bg);
   opacity: 0.55;
   pointer-events: auto;
+  flex: none;
 }
 .mc-handle::before {
   content: "";
   display: block;
   width: 32px;
   height: 4px;
-  margin: 0 auto;
+  margin: auto;
   border-radius: 2px;
   background: var(--fg);
 }
@@ -33,39 +40,96 @@
 }
 
 .mc-root {
-  --mc-peek: calc(env(safe-area-inset-bottom) + 34px);
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
   z-index: 30;
   display: flex;
-  flex-direction: column;
-  /* 器自体は透明にする (背景/枠線は .mc-panel 側)。格納時はこの器が画面下端からはみ出た
+  align-items: center;
+  /* 器自体は透明にする (背景/枠線は .mc-panel 側)。格納時はこの器が画面端からはみ出た
    * 状態で常駐しており、タッチを拾うとその面積ぶん映像の操作を横取りしてしまうため
    * pointer-events は無効化し、実際に反応させたいハンドル/パネルだけ auto に戻す。 */
   pointer-events: none;
-  /* 100% は要素自身の高さが基準になるため、内容の高さが変わっても
-   * この式を再計算する必要がない (常にハンドルの高さぶんだけ覗く)。 */
-  transform: translateY(calc(100% - var(--mc-peek)));
   transition: transform 0.18s ease-out;
 }
+
+/* 上下配置: 横帯いっぱいに広がり、中身は水平中央寄せ (align-items が横軸を揃える)。 */
+.mc-root[data-pos="bottom"],
+.mc-root[data-pos="top"] {
+  left: 0;
+  right: 0;
+}
+/* 左右配置: 縦いっぱいに広がり、中身は垂直中央寄せ。 */
+.mc-root[data-pos="left"],
+.mc-root[data-pos="right"] {
+  top: 0;
+  bottom: 0;
+}
+
+/* 100% は要素自身の高さ/幅が基準になるため、内容の増減があっても
+ * この式を再計算する必要がない (常にハンドルぶんだけ覗く)。 */
+.mc-root[data-pos="bottom"] {
+  --mc-peek: calc(env(safe-area-inset-bottom) + 34px);
+  bottom: 0;
+  flex-direction: column;
+  transform: translateY(calc(100% - var(--mc-peek)));
+}
+.mc-root[data-pos="top"] {
+  --mc-peek: calc(env(safe-area-inset-top) + 34px);
+  top: 0;
+  flex-direction: column-reverse;
+  transform: translateY(calc(-100% + var(--mc-peek)));
+}
+.mc-root[data-pos="left"] {
+  --mc-peek: calc(env(safe-area-inset-left) + 28px);
+  left: 0;
+  flex-direction: row-reverse;
+  transform: translateX(calc(-100% + var(--mc-peek)));
+}
+.mc-root[data-pos="right"] {
+  --mc-peek: calc(env(safe-area-inset-right) + 28px);
+  right: 0;
+  flex-direction: row;
+  transform: translateX(calc(100% - var(--mc-peek)));
+}
+
 .mc-root.expanded {
-  transform: translateY(0);
+  transform: translate(0, 0);
+}
+
+/* 左右配置ではハンドルを縦長にし、握り線も縦向きにする。 */
+.mc-root[data-pos="left"] .mc-handle,
+.mc-root[data-pos="right"] .mc-handle {
+  width: 28px;
+  height: 72px;
+}
+.mc-root[data-pos="left"] .mc-handle::before,
+.mc-root[data-pos="right"] .mc-handle::before {
+  width: 4px;
+  height: 32px;
 }
 
 .mc-panel {
-  /* 帯 (全幅) ではなく、ボタン分の幅しか持たない中央寄せのピルにする。ボタンが 3 個だけの
+  /* 帯 (全幅) ではなく、ボタン分の大きさしか持たない中央寄せのピルにする。ボタンが少ない
    * ため、全幅の帯にすると占有面積に対してできることが少なすぎる。 */
   display: flex;
-  align-self: center;
   background: var(--toolbar-bg);
   border: 1px solid var(--panel-border);
   border-radius: 22px;
   box-shadow: 0 2px 10px var(--shadow);
-  /* safe-area ぶんは帯の内側ではなく外側の余白として確保する (ピル自体の高さは一定に保つ)。 */
-  margin-bottom: env(safe-area-inset-bottom);
   pointer-events: auto;
+}
+/* safe-area ぶんは帯の内側ではなく外側の余白として確保する (ピル自体の大きさは一定に保つ)。
+ * 配置に応じた「画面の外側」の辺だけに付ける。 */
+.mc-root[data-pos="bottom"] .mc-panel {
+  margin-bottom: env(safe-area-inset-bottom);
+}
+.mc-root[data-pos="top"] .mc-panel {
+  margin-top: env(safe-area-inset-top);
+}
+.mc-root[data-pos="left"] .mc-panel {
+  margin-left: env(safe-area-inset-left);
+}
+.mc-root[data-pos="right"] .mc-panel {
+  margin-right: env(safe-area-inset-right);
 }
 
 .mc-bar {
@@ -74,6 +138,14 @@
   height: 44px;
   gap: 2px;
   padding: 0 4px;
+}
+/* 左右配置ではボタンを縦に並べる。 */
+.mc-root[data-pos="left"] .mc-bar,
+.mc-root[data-pos="right"] .mc-bar {
+  flex-direction: column;
+  height: auto;
+  width: 44px;
+  padding: 4px 0;
 }
 
 .mc-btn {
@@ -95,47 +167,52 @@
   opacity: 0.4;
 }
 
-/* その他パネル (ディスプレイ / ズームリセット)。バーの上に浮かせる。 */
-.mc-more-panel {
+/* ディスプレイ選択ポップオーバー。バーの「反対側へはみ出さない」よう、配置ごとに
+ * 出る辺を変える (上下配置なら反対の上下、左右配置ならバーより中央寄りの左右)。 */
+.mc-display-pop {
   display: none;
   position: absolute;
-  right: 8px;
-  bottom: calc(44px + 8px + env(safe-area-inset-bottom));
+  z-index: 31;
   min-width: 220px;
+  max-width: min(280px, calc(100vw - 24px));
   background: var(--panel);
   border: 1px solid var(--panel-border);
   border-radius: 10px;
-  padding: 10px;
+  padding: 6px;
   box-shadow: 0 4px 16px var(--shadow);
+  pointer-events: auto;
 }
-.mc-more-panel.visible {
+.mc-display-pop.visible {
   display: block;
 }
-.mc-more-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 0;
+.mc-root[data-pos="bottom"] ~ .mc-display-pop {
+  right: 8px;
+  bottom: calc(44px + 8px + env(safe-area-inset-bottom));
 }
-.mc-more-row label {
-  color: var(--muted);
-  font-size: 13px;
+.mc-root[data-pos="top"] ~ .mc-display-pop {
+  right: 8px;
+  top: calc(44px + 8px + env(safe-area-inset-top));
 }
-.mc-more-row select {
-  background: var(--control);
-  color: var(--fg);
-  border: 1px solid var(--panel-border);
-  border-radius: 6px;
-  padding: 4px 6px;
-  min-height: 32px;
+.mc-root[data-pos="left"] ~ .mc-display-pop {
+  left: calc(64px + env(safe-area-inset-left));
+  bottom: 24px;
 }
-.mc-zoom-reset {
+.mc-root[data-pos="right"] ~ .mc-display-pop {
+  right: calc(64px + env(safe-area-inset-right));
+  bottom: 24px;
+}
+
+.mc-display-item {
+  display: block;
   width: 100%;
-  min-height: 40px;
-  margin-top: 4px;
-  background: var(--control);
+  text-align: left;
+  background: none;
+  border: none;
   color: var(--fg);
-  border: 1px solid var(--panel-border);
+  font-size: 14px;
+  padding: 8px 10px;
   border-radius: 6px;
+}
+.mc-display-item.active {
+  color: var(--accent);
 }

@@ -34,3 +34,68 @@
 #soft-keyboard-root > * {
   pointer-events: auto;
 }
+
+/* オフセットカーソル (touch-input.ts)。指の位置より上に描き、指に隠れず着地点を確認できる
+ * ようにする。canvas の親 (#screen-wrap) の子として置かれる想定 (canvas 自身はピンチズームで
+ * transform が掛かるため子にできない)。十字は疑似要素、中心の点は本体の radial-gradient で描く
+ * (要素を増やさずに済み、色替え (right/invalid) も background 一箇所の差し替えで揃えられる)。 */
+.touch-cursor {
+  display: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 44px;
+  height: 44px;
+  /* left/top を中心座標として扱えるようにする (touch-input.ts 側は指位置をそのまま代入する)。 */
+  transform: translate(-50%, -50%);
+  /* タッチを奪うと指の下の要素が反応しなくなる。あくまで見た目だけの層。 */
+  pointer-events: none;
+  z-index: 30;
+  /* 中心の丸 (半径 3px)。円の外は透明にして十字の見た目を邪魔しない。 */
+  background: radial-gradient(circle 3px at center, #fff 3px, transparent 3.5px);
+  /* 指の下でも視認できるよう、白い線+暗い縁取りにする (filter は本体/疑似要素まとめて掛かる)。 */
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.85)) drop-shadow(0 0 2px rgba(0, 0, 0, 0.6));
+}
+.touch-cursor.visible {
+  display: block;
+}
+.touch-cursor::before,
+.touch-cursor::after {
+  content: "";
+  position: absolute;
+  background: #fff;
+  border-radius: 1px;
+}
+.touch-cursor::before {
+  left: 50%;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  transform: translateX(-50%);
+}
+.touch-cursor::after {
+  top: 50%;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+/* 右クリック予約中 (長押し由来): 離すと右クリックになると分かるようアクセント色に変える。 */
+.touch-cursor.right {
+  background: radial-gradient(circle 3px at center, var(--accent) 3px, transparent 3.5px);
+}
+.touch-cursor.right::before,
+.touch-cursor.right::after {
+  background: var(--accent);
+}
+
+/* オフセット後の点が映像外で送れない状態: 半透明+赤系で「ここでは押せない」と示す。 */
+.touch-cursor.invalid {
+  background: radial-gradient(circle 3px at center, var(--danger) 3px, transparent 3.5px);
+  opacity: 0.6;
+}
+.touch-cursor.invalid::before,
+.touch-cursor.invalid::after {
+  background: var(--danger);
+}

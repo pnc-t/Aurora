@@ -20,6 +20,9 @@ export type TouchInputOpts = {
 const TAP_MAX_MS = 300;
 const LONG_PRESS_MS = 500;
 const MOVE_THRESHOLD_PX = 10;
+// 精密モード (ドラッグ/長押し) のカーソルを指の位置から上へずらす量 (CSS px)。
+// 指の直下だとカーソル/着地点が指に隠れて見えないため、視認できる位置まで逃がす。
+const CURSOR_OFFSET_PX = 40;
 // トラックパッド/ホイールの px→ノッチ換算。core/input.ts の WHEEL_PX_PER_NOTCH と揃える。
 const WHEEL_PX_PER_NOTCH = 100;
 // 2 本指ジェスチャの種別判定 (ズーム/ホイール) を確定させる最小移動量。
@@ -47,6 +50,9 @@ type ZoomBase = {
 export class TouchInput {
   private canvas: HTMLCanvasElement | null = null;
   private display: DisplaySize | null = null;
+  // オフセットカーソルの DOM。canvas はピンチズームで transform が掛かるため、その子にすると
+  // カーソルまで一緒に拡大/移動してしまう。canvas の親 (#screen-wrap) 側に置いて独立させる。
+  private cursorEl: HTMLDivElement | null = null;
 
   // 現在触れている指の位置 (identifier → client 座標)。
   private readonly touches = new Map<number, Pt>();
@@ -57,10 +63,14 @@ export class TouchInput {
   private singleActive = false;
   private singleStart: Pt = { x: 0, y: 0 };
   private singleLast: Pt = { x: 0, y: 0 };
-  private singleStartTime = 0;
   private singleMoved = false;
-  private singleButtonDown = false;
   private singleLongPressTimer: number | null = null;
+  // "pending" = まだ短いタップ/ドラッグ/長押しのどれか未確定。移動しきい値超過 or 長押しタイマー
+  // 発火で "drag"/"longpress" (= 精密モード = カーソル表示) へ一度だけ遷移し、指を離すまで固定する
+  // (途中でモードが変わると微調整中にカーソルが消える/クリック種別が変わり誤操作になるため)。
+  private singleMode: "pending" | "drag" | "longpress" = "pending";
+  // 精密モード中、指を離した瞬間に送るクリック先 (カーソル位置が映像外で無効なときは null)。
+  private singleCursorHost: { x: number; y: number } | null = null;
 
   // --- 2 本指ジェスチャの状態 ---
   private multiActive = false;
@@ -97,6 +107,14 @@ export class TouchInput {
     canvas.addEventListener("touchmove", this.hMove, { passive: false });
     canvas.addEventListener("touchend", this.hEnd, { passive: false });
     canvas.addEventListener("touchcancel", this.hCancel, { passive: false });
+
+    // カーソルは canvas の子ではなく親 (#screen-wrap) へ置く。canvas にはピンチズームの
+    // transform が掛かるため、子にするとカーソルまで一緒に拡大縮小/平行移動してしまい
+    // 「指位置からオフセットした場所」という意味が崩れる。
+    const cursor = document.createElement("div");
+    cursor.className = "touch-cursor";
+    (canvas.parentElement ?? canvas).appendChild(cursor);
+    this.cursorEl = cursor;
   }
 
   detach(): void {
@@ -114,6 +132,8 @@ export class TouchInput {
     this.touches.clear();
     this.canvas = null;
     this.display = null;
+    this.cursorEl?.remove();
+    this.cursorEl = null;
   }
 
   /** ディスプレイ切替時に解像度を更新する。 */
@@ -142,19 +162,19 @@ export class TouchInput {
     canvas.style.transform = `translate(${this.zoomTx}px, ${this.zoomTy}px) scale(${this.zoomScale})`;
   }
 
-  /** 進行中の 1本指/2本指ジェスチャを、押しっぱなしを残さず中断する。 */
+  /** 進行中の 1本指/2本指ジェスチャを中断する。 */
   private abortGestures(): void {
     if (this.singleLongPressTimer !== null) {
       clearTimeout(this.singleLongPressTimer);
       this.singleLongPressTimer = null;
     }
-    if (this.singleButtonDown) {
-      // 長押しで押しっぱなしにしていたのは常に右クリック (direct 固定)。
-      this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
-    }
+    // ボタン down/up は指を離した瞬間にまとめて送る設計 (精密モード中も押しっぱなしにはしない)
+    // なので、中断時に別途ボタンを離す処理は不要。状態をリセットするだけでよい。
     this.singleActive = false;
-    this.singleButtonDown = false;
     this.singleMoved = false;
+    this.singleMode = "pending";
+    this.singleCursorHost = null;
+    this.hideCursor();
     this.multiActive = false;
     this.multiIds = null;
     this.multiDecided = "none";
@@ -220,37 +240,42 @@ export class TouchInput {
     this.singleActive = true;
     this.singleStart = p;
     this.singleLast = p;
-    this.singleStartTime = performance.now();
     this.singleMoved = false;
-    this.singleButtonDown = false;
+    this.singleMode = "pending";
+    this.singleCursorHost = null;
     if (this.singleLongPressTimer !== null) clearTimeout(this.singleLongPressTimer);
     this.singleLongPressTimer = window.setTimeout(() => this.onLongPress(), LONG_PRESS_MS);
   }
 
   private onLongPress(): void {
     this.singleLongPressTimer = null;
-    if (!this.singleActive || this.singleMoved) return;
-    this.singleButtonDown = true;
-    const host = this.toHostPoint(this.singleLast);
-    if (host) this.opts.sendInput({ MouseMove: host });
-    this.opts.sendInput({ MouseButton: { button: "Right", down: true } });
+    if (!this.singleActive || this.singleMoved || this.singleMode !== "pending") return;
+    // 長押しは精密モードへ入るだけで、ここではまだ右クリックを送らない (離すまで送らないのが新仕様)。
+    this.singleMode = "longpress";
+    this.updatePrecisionCursor(this.singleLast);
   }
 
   private onSingleMove(): void {
     const cur = this.firstTouch();
     if (!cur) return;
     const distFromStart = Math.hypot(cur.x - this.singleStart.x, cur.y - this.singleStart.y);
-    if (distFromStart >= MOVE_THRESHOLD_PX) {
+    if (this.singleMode === "pending" && distFromStart >= MOVE_THRESHOLD_PX) {
       this.singleMoved = true;
       if (this.singleLongPressTimer !== null) {
         clearTimeout(this.singleLongPressTimer);
         this.singleLongPressTimer = null;
       }
+      // ドラッグへ確定。以後は指を離すまでこのモードのまま (途中で判定を変えない)。
+      this.singleMode = "drag";
     }
-
-    const host = this.toHostPoint(cur);
-    if (host) this.opts.sendInput({ MouseMove: host });
     this.singleLast = cur;
+
+    if (this.singleMode === "drag" || this.singleMode === "longpress") {
+      this.updatePrecisionCursor(cur);
+    }
+    // pending (= 短いタップになるかもしれない段階) では、まだカーソルもホストの
+    // MouseMove も出さない。ここで送ってしまうと「カーソルは出さない」というタップの
+    // 仕様が崩れ、微小なジッタでもホスト側マウスが動いてしまう。
   }
 
   private endSingle(cancelled: boolean): void {
@@ -258,33 +283,83 @@ export class TouchInput {
       clearTimeout(this.singleLongPressTimer);
       this.singleLongPressTimer = null;
     }
-    const duration = performance.now() - this.singleStartTime;
-    if (this.singleButtonDown) {
-      this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
-    } else if (!cancelled && duration < TAP_MAX_MS && !this.singleMoved) {
-      const host = this.toHostPoint(this.singleLast);
-      if (host) this.opts.sendInput({ MouseMove: host });
-      this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
-      this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
+    if (this.singleMode === "pending") {
+      // 押下時間は条件にしない。pending のまま指を動かさず離せた時点で、長押し (LONG_PRESS_MS)
+      // には届かず精密モードにも入っていないことが確定しているため、必ずタップとして扱ってよい。
+      // 上限を課すと「ゆっくり押して離す」が長押しにもタップにもならない死角になり、
+      // 押したのに何も起きない状態になる。
+      if (!cancelled && !this.singleMoved) {
+        const host = this.toHostPoint(this.singleLast);
+        if (host) this.opts.sendInput({ MouseMove: host });
+        this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
+        this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
+      }
+    } else if (!cancelled && this.singleCursorHost) {
+      // 精密モード (ドラッグ/長押し) は離した瞬間にカーソル位置でクリックを確定する。
+      // カーソル位置が映像外 (singleCursorHost===null) のときは押せる場所が無いので何もしない。
+      const button = this.singleMode === "longpress" ? "Right" : "Left";
+      this.opts.sendInput({ MouseButton: { button, down: true } });
+      this.opts.sendInput({ MouseButton: { button, down: false } });
     }
     this.singleActive = false;
-    this.singleButtonDown = false;
     this.singleMoved = false;
+    this.singleMode = "pending";
+    this.singleCursorHost = null;
+    this.hideCursor();
   }
 
-  /** 2本目の指が触れて割り込まれた場合の単発ジェスチャの後始末 (タップ/長押し判定はしない)。 */
+  /** 2本目の指が触れて割り込まれた場合の単発ジェスチャの後始末 (クリックは確定させない)。 */
   private endSingleAbrupt(): void {
     if (this.singleLongPressTimer !== null) {
       clearTimeout(this.singleLongPressTimer);
       this.singleLongPressTimer = null;
     }
-    if (this.singleButtonDown) {
-      // 長押しで押しっぱなしにしていたのは常に右クリック (abortGestures と同じ理由)。
-      this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
-    }
+    // 精密モード中でもボタンを押しっぱなしにはしていないので、離す処理は不要。
     this.singleActive = false;
-    this.singleButtonDown = false;
     this.singleMoved = false;
+    this.singleMode = "pending";
+    this.singleCursorHost = null;
+    this.hideCursor();
+  }
+
+  /**
+   * 精密モード (ドラッグ/長押し) 中、指の位置からオフセットしたカーソルを描画し、
+   * その位置へ MouseMove を送る。指を離すまでボタンは送らない。
+   */
+  private updatePrecisionCursor(fingerPt: Pt): void {
+    const el = this.cursorEl;
+    const parent = this.canvas?.parentElement;
+    if (!el || !parent) return;
+    const cursorPt = this.offsetCursorPoint(fingerPt);
+    const parentRect = parent.getBoundingClientRect();
+    el.style.left = `${cursorPt.x - parentRect.left}px`;
+    el.style.top = `${cursorPt.y - parentRect.top}px`;
+    el.classList.add("visible");
+    el.classList.toggle("right", this.singleMode === "longpress");
+
+    const host = this.toHostPoint(cursorPt);
+    this.singleCursorHost = host;
+    el.classList.toggle("invalid", host === null);
+    if (host) this.opts.sendInput({ MouseMove: host });
+  }
+
+  /** カーソルを隠し、次のジェスチャに古い見た目 (right/invalid) を持ち越さないよう修飾クラスも外す。 */
+  private hideCursor(): void {
+    this.cursorEl?.classList.remove("visible", "right", "invalid");
+  }
+
+  /**
+   * 指の位置から `CURSOR_OFFSET_PX` 上にずらしたカーソル点 (client 座標) を返す。
+   * 画面最上部付近をタップすると、素直にオフセットすると映像の外 (黒帯/画面外) に
+   * カーソルが出てしまい toHostPoint が null を返し続けて何も押せなくなる。指の Y が
+   * 映像上端に近いときはオフセット量を縮め、カーソルが必ず映像内に収まるようにする。
+   */
+  private offsetCursorPoint(fingerPt: Pt): Pt {
+    const v = this.videoRect();
+    if (!v) return fingerPt;
+    const available = fingerPt.y - v.top;
+    const offset = Math.max(0, Math.min(CURSOR_OFFSET_PX, available));
+    return { x: fingerPt.x, y: fingerPt.y - offset };
   }
 
   private firstTouch(): Pt | null {
@@ -479,24 +554,38 @@ export class TouchInput {
     return Math.min(rect.width / display.width, rect.height / display.height);
   }
 
-  private toHostPoint(p: Pt): { x: number; y: number } | null {
+  /**
+   * 実際に映像が描かれている矩形 (client 座標、object-fit:contain のレターボックス込み)。
+   * オフセットカーソルのクランプ (offsetCursorPoint) でも映像上端の座標が要るため、
+   * toHostPoint の内部計算をここへ切り出して両者で共有する (計算がずれると toHostPoint の
+   * 「映像外は null」判定とカーソルの見た目上の位置が食い違うため)。
+   */
+  private videoRect(): { left: number; top: number; width: number; height: number } | null {
     const rect = this.rect();
     const display = this.display;
     const scale = this.containScale();
     if (!rect || !display || scale === null || scale <= 0) return null;
-    // 要素矩形全体ではなく、実際に映像が描かれている矩形 (contain 計算) で正規化する。
-    // 黒帯部分をそのままスケールすると、上下 (or 左右) の帯の分だけ座標がズレるため。
-    const videoW = display.width * scale;
-    const videoH = display.height * scale;
-    const offsetX = (rect.width - videoW) / 2;
-    const offsetY = (rect.height - videoH) / 2;
-    const vx = p.x - rect.left - offsetX;
-    const vy = p.y - rect.top - offsetY;
-    // 黒帯部分 (映像外) のタッチはホストへ送らない (端へ吸着させると誤操作になる。input.ts と同じ判断)。
-    if (vx < 0 || vy < 0 || vx > videoW || vy > videoH) return null;
+    const width = display.width * scale;
+    const height = display.height * scale;
     return {
-      x: Math.round((vx / videoW) * display.width),
-      y: Math.round((vy / videoH) * display.height),
+      left: rect.left + (rect.width - width) / 2,
+      top: rect.top + (rect.height - height) / 2,
+      width,
+      height,
+    };
+  }
+
+  private toHostPoint(p: Pt): { x: number; y: number } | null {
+    const display = this.display;
+    const v = this.videoRect();
+    if (!display || !v || v.width <= 0 || v.height <= 0) return null;
+    const vx = p.x - v.left;
+    const vy = p.y - v.top;
+    // 黒帯部分 (映像外) のタッチはホストへ送らない (端へ吸着させると誤操作になる。input.ts と同じ判断)。
+    if (vx < 0 || vy < 0 || vx > v.width || vy > v.height) return null;
+    return {
+      x: Math.round((vx / v.width) * display.width),
+      y: Math.round((vy / v.height) * display.height),
     };
   }
 }

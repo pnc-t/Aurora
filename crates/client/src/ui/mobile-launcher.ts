@@ -35,6 +35,7 @@ import {
   type ClientSettings,
   type HostEntry,
   type ThemeId,
+  type ToolbarPosition,
 } from "../core/ipc";
 import { getVersion } from "@tauri-apps/api/app";
 import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
@@ -197,6 +198,21 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               </div>
             </div>
             <div class="settings-sect" data-sect="display">
+              <div class="setting-group">操作バー</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">配置</div>
+                  <div class="s-desc">操作バーを画面のどの端に置くか。左右に置くと縦並びのサイドバーになる</div>
+                </div>
+                <select id="set-tb-position" class="select-input">
+                  <option value="top">上</option>
+                  <option value="bottom">下</option>
+                  <option value="left">左</option>
+                  <option value="right">右</option>
+                </select>
+              </div>
+              </div>
               <div class="setting-group">外観・既定値</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -275,6 +291,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   const codecSelect = $<HTMLSelectElement>("#set-codec");
   const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
   const virtualToggle = $<HTMLInputElement>("#set-virtual");
+  const tbPositionSelect = $<HTMLSelectElement>("#set-tb-position");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
   const accentInput = $<HTMLInputElement>("#set-accent");
   const portInput = $<HTMLInputElement>("#set-port");
@@ -716,6 +733,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     settings = { ...settings, use_virtual_display: virtualToggle.checked };
     persist();
   });
+  tbPositionSelect?.addEventListener("change", () => {
+    settings = { ...settings, toolbar_position: tbPositionSelect.value as ToolbarPosition };
+    persist();
+  });
   themeSelect?.addEventListener("change", () => {
     const theme = themeSelect.value as ThemeId;
     settings = { ...settings, theme };
@@ -760,6 +781,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
     if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
+    if (tbPositionSelect) tbPositionSelect.value = settings.toolbar_position;
     if (themeSelect) themeSelect.value = settings.theme;
     if (accentInput) accentInput.value = settings.accent_color;
     if (portInput) portInput.value = String(settings.default_port);

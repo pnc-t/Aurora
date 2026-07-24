@@ -3,9 +3,10 @@
 // タッチ操作にも合わないため、モバイル向けに作り直す。`mobile-main.ts` 側でこの Handle を
 // `ToolbarHandle` のアダプタから呼び出す (`ToolbarHandle` 自体は満たさない別レイヤー)。
 //
-// バーは常時表示せず、下端のハンドルをタップしたときだけせり上がる (映像を覆う面積を減らす)。
+// バーは常時表示せず、ハンドルをタップしたときだけせり上がる (映像を覆う面積を減らす)。
+// 配置 (上下左右) はデスクトップのツールバーと同じ `ToolbarPosition` を共有する。
 
-import { formatDisplayName, type DisplayDto } from "../core/ipc";
+import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
 import { icon } from "./icons";
 import "./mobile-controls.css";
 
@@ -22,6 +23,8 @@ export type MobileControlsHandle = {
   setConnected: (on: boolean) => void;
   setKeyboardOpen: (on: boolean) => void;
   setZoom: (scale: number) => void;
+  /** バーの配置を切り替える (デスクトップの ToolbarHandle.setPosition に相当)。既定は "bottom"。 */
+  setPosition: (pos: ToolbarPosition) => void;
 };
 
 /** 引き出したバーを自動格納するまでの無操作時間。 */
@@ -29,33 +32,27 @@ const AUTO_HIDE_MS = 5000;
 
 export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHandle {
   opts.root.innerHTML = `
-    <div class="mc-root" id="mc-root">
+    <div class="mc-root" id="mc-root" data-pos="bottom">
       <button type="button" class="mc-handle" id="mc-handle" aria-label="操作バー"></button>
       <div class="mc-panel">
         <div class="mc-bar">
           <button type="button" class="mc-btn" id="mc-disconnect" title="切断">${icon("power")}</button>
           <button type="button" class="mc-btn" id="mc-keyboard" title="キーボード">${icon("edit")}</button>
-          <button type="button" class="mc-btn" id="mc-more" title="その他">${icon("more")}</button>
+          <button type="button" class="mc-btn" id="mc-display" title="ディスプレイ" style="display:none">${icon("display")}</button>
+          <button type="button" class="mc-btn" id="mc-zoom-reset" title="ズームをリセット" style="display:none">${icon("refresh")}</button>
         </div>
       </div>
     </div>
-    <div class="mc-more-panel" id="mc-more-panel">
-      <div class="mc-more-row" id="mc-display-row" style="display:none">
-        <label for="mc-display-select">ディスプレイ</label>
-        <select id="mc-display-select"></select>
-      </div>
-      <button type="button" class="mc-zoom-reset" id="mc-zoom-reset" style="display:none">ズームをリセット</button>
-    </div>
+    <div class="mc-display-pop" id="mc-display-pop"></div>
   `;
 
   const handleBtn = opts.root.querySelector<HTMLButtonElement>("#mc-handle");
   const rootEl = opts.root.querySelector<HTMLElement>("#mc-root");
   const disconnectBtn = opts.root.querySelector<HTMLButtonElement>("#mc-disconnect");
   const keyboardBtn = opts.root.querySelector<HTMLButtonElement>("#mc-keyboard");
-  const moreBtn = opts.root.querySelector<HTMLButtonElement>("#mc-more");
-  const morePanel = opts.root.querySelector<HTMLElement>("#mc-more-panel");
-  const displayRow = opts.root.querySelector<HTMLElement>("#mc-display-row");
-  const displaySelect = opts.root.querySelector<HTMLSelectElement>("#mc-display-select");
+  const displayBtn = opts.root.querySelector<HTMLButtonElement>("#mc-display");
+  const displayPop = opts.root.querySelector<HTMLElement>("#mc-display-pop");
+  // ズームリセット専用のアイコンは用意していないため、意味が近い「リセット」の refresh を流用する。
   const zoomResetBtn = opts.root.querySelector<HTMLButtonElement>("#mc-zoom-reset");
 
   // --- 引き出し / 自動格納 ---
@@ -65,7 +62,7 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   // クリックとして送られてしまう。閉じる手段はハンドルの再タップと無操作時の自動格納だけにする。
   let expanded = false;
   let hideTimer: number | null = null;
-  let moreVisible = false;
+  let displayPopVisible = false;
 
   function cancelAutoHide(): void {
     if (hideTimer !== null) {
@@ -78,15 +75,19 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   function scheduleAutoHide(): void {
     cancelAutoHide();
     if (!expanded) return;
-    // その他パネルを開いている間は操作の途中なので、勝手に消さない。
-    if (moreVisible) return;
+    // ディスプレイ選択ポップオーバーを開いている間は操作の途中なので、勝手に消さない。
+    if (displayPopVisible) return;
     hideTimer = window.setTimeout(() => setExpanded(false), AUTO_HIDE_MS);
   }
 
-  function setMoreVisible(on: boolean): void {
-    moreVisible = on;
-    morePanel?.classList.toggle("visible", on);
-    moreBtn?.classList.toggle("toggled", on);
+  let hasDisplayChoice = false;
+  function setDisplayPopVisible(on: boolean): void {
+    // 表示先が 1 台しかないとき (ボタン自体が隠れている) は開けない。
+    if (on && !hasDisplayChoice) return;
+    displayPopVisible = on;
+    displayPop?.classList.toggle("visible", on);
+    displayBtn?.classList.toggle("toggled", on);
+    scheduleAutoHide();
   }
 
   function setExpanded(on: boolean): void {
@@ -95,7 +96,7 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     handleBtn?.classList.toggle("toggled", on);
     // 格納時は展開中のサブパネルも畳む (次に引き出したとき素の状態から始める)。
     if (!on) {
-      setMoreVisible(false);
+      setDisplayPopVisible(false);
     }
     scheduleAutoHide();
   }
@@ -116,53 +117,43 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     scheduleAutoHide();
   });
 
-  moreBtn?.addEventListener("click", () => {
-    setMoreVisible(!moreVisible);
-    scheduleAutoHide();
-  });
-
-  displaySelect?.addEventListener("change", () => {
-    const id = Number(displaySelect.value);
-    const d = displays.find((x) => x.id === id);
-    if (d) opts.onSelectDisplay(d);
-    scheduleAutoHide();
-  });
+  displayBtn?.addEventListener("click", () => setDisplayPopVisible(!displayPopVisible));
 
   zoomResetBtn?.addEventListener("click", () => {
     opts.onResetZoom();
     scheduleAutoHide();
   });
 
-  // 「その他」パネルの中身は両方とも条件付き表示なので、1 つも出せるものが無いときは
-  // 入口のボタンごと隠す (空のパネルが開くのを防ぐ)。
-  let hasDisplayChoice = false;
-  let hasZoomReset = false;
-  function syncMoreAvailability(): void {
-    const available = hasDisplayChoice || hasZoomReset;
-    if (moreBtn) moreBtn.style.display = available ? "" : "none";
-    if (!available && moreVisible) setMoreVisible(false);
-  }
-  syncMoreAvailability();
-
   let displays: DisplayDto[] = [];
+  let displayItems: { id: number; btn: HTMLButtonElement }[] = [];
+  function syncDisplayActive(selectedId?: number): void {
+    for (const it of displayItems) it.btn.classList.toggle("active", it.id === selectedId);
+  }
 
   return {
     setDisplays(list: DisplayDto[], selectedId?: number): void {
       displays = list;
-      if (!displaySelect || !displayRow) return;
-      // 表示名はホスト由来の文字列なので option.textContent 経由で組み innerHTML には流さない。
-      displaySelect.replaceChildren(
-        ...list.map((d) => {
-          const o = document.createElement("option");
-          o.value = String(d.id);
-          o.textContent = `${formatDisplayName(d.name)} (${d.width}x${d.height})`;
-          return o;
-        }),
-      );
-      if (selectedId !== undefined) displaySelect.value = String(selectedId);
-      hasDisplayChoice = list.length > 1;
-      displayRow.style.display = hasDisplayChoice ? "flex" : "none";
-      syncMoreAvailability();
+      hasDisplayChoice = displays.length > 1;
+      if (displayPop) {
+        // 表示名はホスト由来の文字列なので textContent で入れる (innerHTML に流さず XSS を防ぐ)。
+        displayItems = displays.map((d) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "mc-display-item";
+          btn.textContent = `${formatDisplayName(d.name)} (${d.width}x${d.height})`;
+          btn.addEventListener("click", () => {
+            opts.onSelectDisplay(d);
+            syncDisplayActive(d.id);
+            setDisplayPopVisible(false);
+          });
+          return { id: d.id, btn };
+        });
+        displayPop.replaceChildren(...displayItems.map((it) => it.btn));
+        syncDisplayActive(selectedId);
+      }
+      // ディスプレイが複数あるときだけ切替ボタンを出す。
+      if (displayBtn) displayBtn.style.display = hasDisplayChoice ? "" : "none";
+      if (!hasDisplayChoice) setDisplayPopVisible(false);
     },
     setConnected(on: boolean): void {
       opts.root.style.display = on ? "" : "none";
@@ -176,9 +167,13 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
       keyboardBtn?.classList.toggle("toggled", on);
     },
     setZoom(scale: number): void {
-      hasZoomReset = Math.abs(scale - 1) > 0.01;
+      const hasZoomReset = Math.abs(scale - 1) > 0.01;
       if (zoomResetBtn) zoomResetBtn.style.display = hasZoomReset ? "" : "none";
-      syncMoreAvailability();
+    },
+    setPosition(pos: ToolbarPosition): void {
+      // 配置が変わるとポップオーバーの開く向きも変わるため、開いていれば一旦閉じる。
+      setDisplayPopVisible(false);
+      if (rootEl) rootEl.dataset.pos = pos;
     },
   };
 }
