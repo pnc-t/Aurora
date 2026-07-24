@@ -3,10 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <!-- ブラウザ側のピンチズーム/二重タップズームを殺す: 映像のズームは TouchInput に一元化し、
-         ページ全体がズームされると座標変換の前提が崩れるため。 -->
+         ページ全体がズームされると座標変換の前提が崩れるため。
+         interactive-widget=resizes-content: ソフトキーボード表示時にビューポート自体を縮め、
+         フォームの入力欄/送信ボタンがキーボードの下に隠れて押せなくなるのを防ぐ (Chromium 108+ /
+         Android WebView)。効かない古い WebView 向けのフォールバックはフォーム側の overflow-y:auto
+         (ui/mobile-launcher.css) で担保する。 -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <title>Aurora Mobile</title>
     <!-- スタイルは TS 側で import する: 共通土台は styles/base.css、シェル固有は mobile-main.css、
@@ -22,7 +26,6 @@
         <canvas id="screen" tabindex="0" width="1920" height="1080"></canvas>
       </div>
       <div id="conn-status"></div>
-      <div id="stats-hud"></div>
       <div id="reconnect-badge"></div>
       <div id="toast-container"></div>
       <!-- ソフトキーボード (修飾キー等) はフロート表示なので下部バーとは別枠に置く。 -->

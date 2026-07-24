@@ -5,8 +5,6 @@
 
 import { type InputEvent } from "./ipc";
 
-export type TouchMode = "trackpad" | "direct";
-
 type DisplaySize = { width: number; height: number };
 
 type Pt = { x: number; y: number };
@@ -49,7 +47,6 @@ type ZoomBase = {
 export class TouchInput {
   private canvas: HTMLCanvasElement | null = null;
   private display: DisplaySize | null = null;
-  private mode: TouchMode = "trackpad";
 
   // 現在触れている指の位置 (identifier → client 座標)。
   private readonly touches = new Map<number, Pt>();
@@ -124,17 +121,6 @@ export class TouchInput {
     this.display = display;
   }
 
-  setMode(mode: TouchMode): void {
-    if (this.mode === mode) return;
-    // モード切替の瞬間にボタン押しっぱなし等が残らないよう、進行中のジェスチャは打ち切る。
-    this.abortGestures();
-    this.mode = mode;
-  }
-
-  getMode(): TouchMode {
-    return this.mode;
-  }
-
   /** ズームを等倍に戻す。 */
   resetZoom(): void {
     this.clearZoom(true);
@@ -163,8 +149,8 @@ export class TouchInput {
       this.singleLongPressTimer = null;
     }
     if (this.singleButtonDown) {
-      const button = this.mode === "direct" ? "Right" : "Left";
-      this.opts.sendInput({ MouseButton: { button, down: false } });
+      // 長押しで押しっぱなしにしていたのは常に右クリック (direct 固定)。
+      this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
     }
     this.singleActive = false;
     this.singleButtonDown = false;
@@ -245,13 +231,9 @@ export class TouchInput {
     this.singleLongPressTimer = null;
     if (!this.singleActive || this.singleMoved) return;
     this.singleButtonDown = true;
-    if (this.mode === "direct") {
-      const host = this.toHostPoint(this.singleLast);
-      if (host) this.opts.sendInput({ MouseMove: host });
-      this.opts.sendInput({ MouseButton: { button: "Right", down: true } });
-    } else {
-      this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
-    }
+    const host = this.toHostPoint(this.singleLast);
+    if (host) this.opts.sendInput({ MouseMove: host });
+    this.opts.sendInput({ MouseButton: { button: "Right", down: true } });
   }
 
   private onSingleMove(): void {
@@ -266,20 +248,8 @@ export class TouchInput {
       }
     }
 
-    if (this.mode === "trackpad") {
-      const rect = this.rect();
-      const display = this.display;
-      if (rect && display) {
-        const sx = display.width / rect.width;
-        const sy = display.height / rect.height;
-        const dx = Math.round((cur.x - this.singleLast.x) * sx);
-        const dy = Math.round((cur.y - this.singleLast.y) * sy);
-        if (dx !== 0 || dy !== 0) this.opts.sendInput({ MouseMoveRelative: { dx, dy } });
-      }
-    } else {
-      const host = this.toHostPoint(cur);
-      if (host) this.opts.sendInput({ MouseMove: host });
-    }
+    const host = this.toHostPoint(cur);
+    if (host) this.opts.sendInput({ MouseMove: host });
     this.singleLast = cur;
   }
 
@@ -290,13 +260,10 @@ export class TouchInput {
     }
     const duration = performance.now() - this.singleStartTime;
     if (this.singleButtonDown) {
-      const button = this.mode === "direct" ? "Right" : "Left";
-      this.opts.sendInput({ MouseButton: { button, down: false } });
+      this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
     } else if (!cancelled && duration < TAP_MAX_MS && !this.singleMoved) {
-      if (this.mode === "direct") {
-        const host = this.toHostPoint(this.singleLast);
-        if (host) this.opts.sendInput({ MouseMove: host });
-      }
+      const host = this.toHostPoint(this.singleLast);
+      if (host) this.opts.sendInput({ MouseMove: host });
       this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
       this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
     }
@@ -312,8 +279,8 @@ export class TouchInput {
       this.singleLongPressTimer = null;
     }
     if (this.singleButtonDown) {
-      const button = this.mode === "direct" ? "Right" : "Left";
-      this.opts.sendInput({ MouseButton: { button, down: false } });
+      // 長押しで押しっぱなしにしていたのは常に右クリック (abortGestures と同じ理由)。
+      this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
     }
     this.singleActive = false;
     this.singleButtonDown = false;
@@ -406,8 +373,14 @@ export class TouchInput {
     this.zoomBase = {
       scale: baseScale,
       dist,
-      anchorLocalX: (mid.x - staticLeft) / baseScale,
-      anchorLocalY: (mid.y - staticTop) / baseScale,
+      // アンカー (2本指の中点) の要素ローカル座標。transform-origin:0 0 で translate→scale を
+      // 掛けているのでローカル点 L の画面位置は `staticLeft + tx + scale*L`。逆変換すると
+      // `L = (画面座標 - staticLeft - tx) / scale` で、`staticLeft = rect.left - tx` だから
+      // 結局「現在の描画矩形からの相対 ÷ 現在の倍率」に等しい。tx を引き忘れると、一度ズーム/
+      // パンして tx≠0 になった後の 2 回目以降のピンチでアンカーが tx/scale ぶんずれ、その差が
+      // 一気に適用されて画面が飛ぶ。
+      anchorLocalX: (mid.x - rect.left) / baseScale,
+      anchorLocalY: (mid.y - rect.top) / baseScale,
       staticLeft,
       staticTop,
       staticWidth,
@@ -419,6 +392,17 @@ export class TouchInput {
     const b = this.zoomBase;
     if (!b) return;
     const newScale = clamp(b.scale * (dist / b.dist), ZOOM_MIN, ZOOM_MAX);
+    if (newScale <= ZOOM_MIN) {
+      // 等倍まで戻したら平行移動も原点へ戻す。クランプ範囲内に留めるだけだと、等倍なのに映像が
+      // 中央からずれた位置に居座り「ズームアウトしたら飛んでいった」という体感になる。等倍時は
+      // object-fit: contain 本来の配置に戻すのが正しい状態。
+      this.zoomScale = ZOOM_MIN;
+      this.zoomTx = 0;
+      this.zoomTy = 0;
+      this.applyTransform();
+      this.opts.onZoomChange?.(ZOOM_MIN);
+      return;
+    }
     let newTx = mid.x - b.staticLeft - b.anchorLocalX * newScale;
     let newTy = mid.y - b.staticTop - b.anchorLocalY * newScale;
 
@@ -483,15 +467,37 @@ export class TouchInput {
     return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
   }
 
-  private toHostPoint(p: Pt): { x: number; y: number } | null {
+  /**
+   * canvas は CSS で object-fit:contain (styles/base.css の #screen)。ホストと端末でアスペクト比が
+   * 異なると要素内部に黒帯が入り、映像が実際に描かれている矩形は canvas 要素の矩形と一致しない。
+   * 倍率は縦横共通の contain スケール (core/input.ts の toDisplayCoords と同じ考え方)。
+   */
+  private containScale(): number | null {
     const rect = this.rect();
     const display = this.display;
     if (!rect || !display || rect.width === 0 || rect.height === 0) return null;
-    const sx = display.width / rect.width;
-    const sy = display.height / rect.height;
-    const x = clamp(Math.round((p.x - rect.left) * sx), 0, display.width - 1);
-    const y = clamp(Math.round((p.y - rect.top) * sy), 0, display.height - 1);
-    return { x, y };
+    return Math.min(rect.width / display.width, rect.height / display.height);
+  }
+
+  private toHostPoint(p: Pt): { x: number; y: number } | null {
+    const rect = this.rect();
+    const display = this.display;
+    const scale = this.containScale();
+    if (!rect || !display || scale === null || scale <= 0) return null;
+    // 要素矩形全体ではなく、実際に映像が描かれている矩形 (contain 計算) で正規化する。
+    // 黒帯部分をそのままスケールすると、上下 (or 左右) の帯の分だけ座標がズレるため。
+    const videoW = display.width * scale;
+    const videoH = display.height * scale;
+    const offsetX = (rect.width - videoW) / 2;
+    const offsetY = (rect.height - videoH) / 2;
+    const vx = p.x - rect.left - offsetX;
+    const vy = p.y - rect.top - offsetY;
+    // 黒帯部分 (映像外) のタッチはホストへ送らない (端へ吸着させると誤操作になる。input.ts と同じ判断)。
+    if (vx < 0 || vy < 0 || vx > videoW || vy > videoH) return null;
+    return {
+      x: Math.round((vx / videoW) * display.width),
+      y: Math.round((vy / videoH) * display.height),
+    };
   }
 }
 

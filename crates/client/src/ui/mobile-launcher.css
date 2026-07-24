@@ -7,6 +7,11 @@
   padding: 12px;
   box-sizing: border-box;
   overflow-y: auto;
+  /* スマホ縦画面では上限として効かないだけ (全幅のまま)。横画面タブレット (実機確認: 1920x1200)
+   * だと全幅に間延びして不格好になるため、コンテンツ幅の上限を設けて中央寄せする。 */
+  max-width: 680px;
+  margin: 0 auto;
+  width: 100%;
 }
 
 .ml-header h1 {
@@ -132,6 +137,8 @@
 }
 .ml-form {
   width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
   background: var(--panel);
   border-top: 1px solid var(--panel-border);
   border-radius: 16px 16px 0 0;
@@ -141,6 +148,12 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* mobile.html の viewport interactive-widget=resizes-content がソフトキーボード分だけビューポート
+   * を縮めてくれるのが第一防御だが、対応 Chromium/WebView バージョン依存で効かない環境もありうる。
+   * その場合の逃げ道として、フォーム自体の高さを画面の 80% に制限し縦スクロール可能にしておく
+   * (これが無いとキーボードに隠れた password 欄・送信ボタンへ一切到達できなくなる)。 */
+  max-height: 80vh;
+  overflow-y: auto;
 }
 .ml-form h3 {
   margin: 0 0 4px;

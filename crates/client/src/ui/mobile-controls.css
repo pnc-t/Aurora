@@ -1,5 +1,36 @@
-/* リモート画面下部の操作バー (モバイル専用)。常時表示の細い帯 + 展開式の修飾キー段 + その他パネル。
+/* リモート画面下部の操作バー (モバイル専用)。既定は隠れており、下端中央のハンドルをタップした
+ * ときだけせり上がる (映像を覆う面積を減らすため)。展開式の修飾キー段 + その他パネルを持つ。
  * デスクトップの toolbar.css とは配色変数を共有するが、レイアウトはタッチ操作前提で作り直す。 */
+
+/* 引き出し用ハンドル。Android のジェスチャーナビゲーション (画面下端) と重なると誤操作に
+ * なるため、safe-area のぶん上へ逃がす。下端からの上スワイプはホームジェスチャーと衝突する
+ * ので、引き出しはタップのみ (スワイプでは開かない)。 */
+.mc-handle {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(env(safe-area-inset-bottom) + 6px);
+  z-index: 31;
+  width: 72px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background: var(--toolbar-bg);
+  opacity: 0.55;
+}
+.mc-handle::before {
+  content: "";
+  display: block;
+  width: 32px;
+  height: 4px;
+  margin: 0 auto;
+  border-radius: 2px;
+  background: var(--fg);
+}
+.mc-handle.toggled {
+  opacity: 1;
+}
 
 .mc-root {
   position: absolute;
@@ -12,6 +43,24 @@
   background: var(--toolbar-bg);
   border-top: 1px solid var(--panel-border);
   padding-bottom: env(safe-area-inset-bottom);
+  /* 既定は画面外へ退避。display の即時切替ではなく transform + transition で滑らかに出し入れする。
+   * 併せて非表示中はタッチを透過させ、下にある映像の操作を邪魔しないようにする。 */
+  transform: translateY(100%);
+  /* visibility は 0s 遷移を transform の後ろにずらす。即座に hidden にするとスライドアウトが
+   * 見えず、遷移から外すと画面外の帯が残ってタッチを拾ってしまうため。 */
+  transition:
+    transform 0.18s ease-out,
+    visibility 0s linear 0.18s;
+  pointer-events: none;
+  visibility: hidden;
+}
+.mc-root.expanded {
+  transform: translateY(0);
+  transition:
+    transform 0.18s ease-out,
+    visibility 0s;
+  pointer-events: auto;
+  visibility: visible;
 }
 
 .mc-label {
@@ -27,6 +76,10 @@
   display: flex;
   align-items: stretch;
   height: 52px;
+  /* 帯自体 (.mc-root) は画面端に沿わせたいので全幅のまま。ボタン群だけ横画面タブレット
+   * (実機確認: 1920x1200) で間延びしないよう幅の上限を設けて中央寄せする。 */
+  max-width: 480px;
+  margin: 0 auto;
 }
 
 .mc-btn {
@@ -55,6 +108,9 @@
   gap: 4px;
   padding: 6px 8px;
   border-top: 1px solid var(--panel-border);
+  /* .mc-bar と同じ理由で幅上限を設け中央寄せ (キー間が間延びしてタップ位置を見失わないように)。 */
+  max-width: 560px;
+  margin: 0 auto;
 }
 .mc-mods.visible {
   display: grid;
@@ -73,12 +129,12 @@
   border-color: var(--accent);
 }
 
-/* その他パネル (ディスプレイ / 画質 / ズームリセット)。バーの上に浮かせる。 */
+/* その他パネル (ディスプレイ / ズームリセット)。バーの上に浮かせる。 */
 .mc-more-panel {
   display: none;
   position: absolute;
   right: 8px;
-  bottom: calc(52px + 8px);
+  bottom: calc(52px + 8px + env(safe-area-inset-bottom));
   min-width: 220px;
   background: var(--panel);
   border: 1px solid var(--panel-border);

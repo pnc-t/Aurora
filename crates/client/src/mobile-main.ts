@@ -9,6 +9,10 @@
 // 再利用する。ここではモバイルに存在しない概念 (タブ・ウィンドウリサイズ・ファイル転送・
 // フルスクリーン制御等) をすべて no-op にしたアダプタを作って埋める。
 
+// :root の配色変数 (--bg/--fg/--panel/--accent 等) とリセットの土台。ui/*.css の var(--...) は
+// 全てここ由来なので、デスクトップ 3 エントリと同じく最初に読み込む (無いと未定義変数解決で
+// 装飾が全て消える)。
+import "./styles/base.css";
 import "./mobile-main.css";
 import {
   DEFAULT_SETTINGS,
@@ -21,12 +25,11 @@ import {
   type DisplayDto,
   type HostEntry,
 } from "./core/ipc";
-import { Session, type SessionHost, type StatsEvent } from "./core/session";
+import { Session, type SessionHost } from "./core/session";
 import type { ToolbarHandle } from "./ui/toolbar";
 import { mountMobileLauncher, type MobileLauncherHandle } from "./ui/mobile-launcher";
 import { mountMobileControls, type MobileControlsHandle } from "./ui/mobile-controls";
 import { initToast, showToast, type ToastKind } from "./ui/toast";
-import { clearStats, initStatsOverlay, isStatsVisible, toggleStats, updateStats } from "./ui/stats-overlay";
 import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui/reconnect-badge";
 import { initCaptureOverlay, renderStatusOverlay } from "./ui/capture-overlay";
 import { installGlobalErrorLogging, logger } from "./core/log";
@@ -40,14 +43,12 @@ const launcherView = document.getElementById("launcher-view") as HTMLElement;
 const remoteView = document.getElementById("remote-view") as HTMLElement;
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const statusEl = document.getElementById("conn-status") as HTMLElement;
-const statsHud = document.getElementById("stats-hud") as HTMLElement;
 const toastContainer = document.getElementById("toast-container") as HTMLElement;
 const reconnectBadgeEl = document.getElementById("reconnect-badge") as HTMLElement;
 const controlsRoot = document.getElementById("mobile-controls") as HTMLElement;
 const keyboardRoot = document.getElementById("soft-keyboard-root") as HTMLElement;
 
 initToast(toastContainer);
-initStatsOverlay(statsHud);
 initReconnectBadge(reconnectBadgeEl);
 initCaptureOverlay(statusEl);
 
@@ -107,14 +108,13 @@ const toolbar: ToolbarHandle = {
   },
   setDisplays(displays, selectedId): void {
     currentDisplay = displays.find((d) => d.id === selectedId) ?? displays[0] ?? null;
-    // TouchInput の座標変換 (トラックパッド/直接タップいずれも) はディスプレイ解像度が唯一の情報源。
+    // TouchInput の座標変換はディスプレイ解像度が唯一の情報源。
     if (currentDisplay) touchInput.setDisplay({ width: currentDisplay.width, height: currentDisplay.height });
     controls.setDisplays(displays, selectedId);
     syncTouchAttach();
   },
-  setStatsToggled(on): void {
-    controls.setStatsToggled(on);
-  },
+  // 統計 HUD はモバイルでは持たない (実機評価で不要と判断し、出す手段ごと削除した)。
+  setStatsToggled: () => {},
   // ファイル転送はモバイル対象外 (スコープ外)。
   setFileToggled: () => {},
   // ウィンドウが無く、全画面表示は WebView の既定表示そのものなので切替対象が無い。
@@ -126,10 +126,10 @@ const toolbar: ToolbarHandle = {
   setAudioVolume: () => {},
   // クリップボード同期 UI はスコープ外。
   setClipboardSyncState: () => {},
-  setVideoParams(fps, mbps): void {
-    controls.setVideoParams(fps, mbps);
-  },
-  // モバイルの下部バーは常時表示のみで、デスクトップのような自動格納/ピン留めが無い。
+  // 画質プリセットはランチャーの設定と重複するため下部バーから外した (現在値を映す先が無い)。
+  setVideoParams: () => {},
+  // 下部バーの開閉はハンドルのタップと無操作時の自動格納で完結する (デスクトップのような
+  // ピン留め/ホバー格納の概念が無いため、Session からの操作対象にしない)。
   toggleBar: () => {},
   revealBar: () => {},
   // ツールバー配置 (上下左右) は画面端に沿わせるデスクトップ専用の概念。下部固定のみ。
@@ -165,8 +165,9 @@ const host: SessionHost = {
     });
   },
   toast: (_s, text, kind?: ToastKind) => showToast(text, kind),
-  updateStats: (s, ev: StatsEvent) => updateStats(ev, s.videoCodec),
-  clearStats: () => clearStats(),
+  // 統計 HUD を持たないので受け口だけ用意して捨てる (SessionHost の契約を満たすため)。
+  updateStats: () => {},
+  clearStats: () => {},
   // ファイル転送はモバイル対象外 (スコープ外)。
   fileResult: () => {},
   fileProgress: () => {},
@@ -183,7 +184,6 @@ const host: SessionHost = {
     session = null;
     touchInput.detach();
     softKeyboard.close();
-    clearStats();
     hideReconnectBadge();
     showLauncherView();
   },
@@ -201,18 +201,12 @@ const host: SessionHost = {
 const controls: MobileControlsHandle = mountMobileControls({
   root: controlsRoot,
   onDisconnect: () => session?.closeByUser(),
-  onToggleTouchMode: (mode) => touchInput.setMode(mode),
   onToggleKeyboard: () => {
     if (softKeyboard.isOpen()) softKeyboard.close();
     else softKeyboard.open();
     controls.setKeyboardOpen(softKeyboard.isOpen());
   },
-  onToggleStats: () => {
-    toggleStats();
-    controls.setStatsToggled(isStatsVisible());
-  },
   onSelectDisplay: (d) => session?.switchDisplay(d),
-  onVideoParams: (fps, mbps) => session?.setVideoParams(fps, mbps),
   // スティッキー修飾の表示は mobile-controls 側で完結するため、ここでは何もしない
   // (soft-keyboard は getStickyModifiers() で都度問い合わせる)。
   onModifiersChanged: () => {},
@@ -267,6 +261,11 @@ void (async () => {
   } catch {
     settings = null; // getSettings() の既定にフォールバック
   }
+  // テーマ/アクセント色を適用する (ui/launcher.ts の applyTheme と同じ処理。設定変更 UI が
+  // モバイルには無いため、起動時に 1 回反映すれば足りる)。styles/base.css は <html data-theme>
+  // で配色を切り替える作りなので、これをやらないと設定したテーマ/アクセント色が反映されない。
+  document.documentElement.dataset.theme = getSettings().theme;
+  document.documentElement.style.setProperty("--accent", getSettings().accent_color);
   showLauncherView();
   logger.info("mobile window ready");
 })();
