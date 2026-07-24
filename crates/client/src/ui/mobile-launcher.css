@@ -1,221 +1,64 @@
-/* 縦画面向け接続 UI (モバイル専用)。1 カラム・タップ領域 44px 以上を基本にする。 */
+/* モバイル版ランチャー (mobile-launcher.ts)。見た目の大半は launcher.css を再利用する
+ * (host-card/dialog/setting-row 等はグローバルセレクタなのでそのまま効く)。ここには
+ * デスクトップの「サイドバー + コンテンツ」を「コンテンツ + 下部タブバー」へ組み替える
+ * 差分と、モバイル固有のタブバー自体のスタイルだけを書く。 */
 
-.ml-root {
+.ml-app {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 12px;
-  box-sizing: border-box;
-  overflow-y: auto;
-  /* スマホ縦画面では上限として効かないだけ (全幅のまま)。横画面タブレット (実機確認: 1920x1200)
-   * だと全幅に間延びして不格好になるため、コンテンツ幅の上限を設けて中央寄せする。 */
-  max-width: 680px;
-  margin: 0 auto;
-  width: 100%;
+  position: relative; /* #dialog-backdrop の absolute inset:0 の基準 (launcher.css の .launcher と同役) */
 }
 
-.ml-header h1 {
-  font-size: 20px;
-  margin: 4px 0 12px;
+/* デスクトップの .content はタイトルバー分の上余白 (44px) + サイドバー隣接前提の左余白のみ
+ * (右は host-list 側の padding-right で確保) だが、モバイルはウィンドウが無いので通常の余白にする。
+ * host-list/settings-body 側のスクロールバー用ガター (padding-right) もデスクトップ専用の見た目
+ * (太いスクロールバー) 前提なので、taps 主体のモバイルでは詰めて画面を広く使う。 */
+.ml-app .content {
+  padding: 16px 16px 0;
+}
+.ml-app .page-head {
+  padding-right: 0;
+}
+.ml-app .host-list,
+.ml-app .wol-list,
+.ml-app .settings-body {
+  padding-right: 0;
+  padding-bottom: 16px;
+  scrollbar-gutter: auto;
 }
 
-.ml-list {
+/* 下部タブバー: サイドバーの置き換え。アイコン+ラベルを縦積みにし、タップ領域を 56px 確保する。
+ * env(safe-area-inset-bottom) はジェスチャーナビゲーション端末でタブが隠れないようにする
+ * (#launcher-view 自体は mobile-main.css で safe-area-inset-bottom 分を既にパディングしているが、
+ * タブバー内側でも確保しておくとホームインジケータぎりぎりに文字が来ない)。 */
+.ml-tabbar {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.ml-card {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-height: 56px;
-  padding: 8px 12px;
-  background: var(--panel);
-  border: 1px solid var(--panel-border);
-  border-radius: 10px;
-  color: var(--fg);
-  text-align: left;
-}
-.ml-card:active {
-  background: var(--raised);
-}
-
-.ml-card-avatar {
   flex-shrink: 0;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: var(--accent-fg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 600;
-}
-
-.ml-card-info {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.ml-card-label {
-  font-size: 15px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ml-card-host {
-  font-size: 12px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ml-empty {
-  color: var(--muted);
-  font-size: 13px;
-  padding: 8px 4px;
-}
-
-.ml-add-btn {
-  margin-top: 12px;
-  min-height: 48px;
-  border-radius: 10px;
-  background: var(--accent);
-  color: var(--accent-fg);
-  border: none;
-  font-size: 15px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
-
-.ml-settings {
-  margin-top: 20px;
-  padding-top: 12px;
   border-top: 1px solid var(--panel-border);
+  background: var(--sidebar);
+  padding-bottom: env(safe-area-inset-bottom);
 }
-.ml-settings h2 {
-  font-size: 14px;
-  color: var(--muted);
-  margin: 0 0 8px;
-}
-
-.ml-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 44px;
-  gap: 8px;
-}
-.ml-row input,
-.ml-row select {
-  min-height: 36px;
-  background: var(--control);
-  color: var(--fg);
-  border: 1px solid var(--panel-border);
-  border-radius: 6px;
-  padding: 4px 8px;
-  width: 100px;
-  text-align: right;
-}
-
-/* --- モーダル (新規接続 / パスワード入力) --- */
-.ml-form-backdrop {
-  display: none;
-  position: fixed;
-  inset: 0;
-  background: var(--backdrop);
-  align-items: flex-end;
-  z-index: 50;
-}
-.ml-form-backdrop.visible {
-  display: flex;
-}
-.ml-form {
-  width: 100%;
-  max-width: 680px;
-  margin: 0 auto;
-  background: var(--panel);
-  border-top: 1px solid var(--panel-border);
-  border-radius: 16px 16px 0 0;
-  padding: 16px;
-  padding-bottom: calc(16px + env(safe-area-inset-bottom));
-  box-sizing: border-box;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  /* mobile.html の viewport interactive-widget=resizes-content がソフトキーボード分だけビューポート
-   * を縮めてくれるのが第一防御だが、対応 Chromium/WebView バージョン依存で効かない環境もありうる。
-   * その場合の逃げ道として、フォーム自体の高さを画面の 80% に制限し縦スクロール可能にしておく
-   * (これが無いとキーボードに隠れた password 欄・送信ボタンへ一切到達できなくなる)。 */
-  max-height: 80vh;
-  overflow-y: auto;
-}
-.ml-form h3 {
-  margin: 0 0 4px;
-}
-.ml-form label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 13px;
-  color: var(--muted);
-}
-.ml-form input {
-  min-height: 44px;
-  background: var(--control);
-  color: var(--fg);
-  border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  padding: 8px 10px;
-  font-size: 15px;
-}
-.ml-pass-wrap {
-  position: relative;
-  display: flex;
-  align-items: center;
-}
-.ml-pass-wrap input {
+.ml-tab {
   flex: 1;
-  padding-right: 40px;
-}
-.ml-pass-eye {
-  position: absolute;
-  right: 4px;
-  min-width: 36px;
-  min-height: 36px;
-  background: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 56px;
+  background: transparent;
   border: none;
   color: var(--muted);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  font-size: 11px;
+  cursor: pointer;
 }
-.ml-form-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
+.ml-tab .icon {
+  font-size: 20px;
 }
-.ml-form-actions button {
-  flex: 1;
-  min-height: 44px;
-  border-radius: 8px;
-  border: 1px solid var(--panel-border);
-  background: var(--control);
-  color: var(--fg);
-  font-size: 15px;
+.ml-tab:active {
+  background: var(--raised-faint);
 }
-.ml-form-actions .primary {
-  background: var(--accent);
-  color: var(--accent-fg);
-  border-color: var(--accent);
-}
-.ml-form-status {
-  font-size: 13px;
-  color: var(--danger-fg);
-  min-height: 18px;
+.ml-tab.active {
+  color: var(--accent);
 }
