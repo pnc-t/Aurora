@@ -212,6 +212,18 @@ mod imp {
 
     /// トレイアイコンからの通知を受けるカスタムメッセージ。
     const WM_TRAY: u32 = WM_APP + 1;
+    /// build.rs が exe へ埋め込む aurora アイコンのリソース ID (`set_icon_with_id` と対)。
+    const ICON_RESOURCE_ID: u16 = 1;
+
+    /// `MAKEINTRESOURCEW` 相当。Win32 は上位ワードが 0 のポインタを「文字列名ではなく数値 ID」と
+    /// 解釈するため、ID をそのままアドレス値として PCWSTR に載せる (逆参照はされない)。
+    ///
+    /// `std::ptr::dangling::<u16>()` で代用してはいけない。あれは u16 のアラインメント値 = 2 を返す
+    /// ので、ID 1 のつもりが ID 2 を引いて `LoadIconW` が失敗する (実際にトレイが標準アイコンに
+    /// フォールバックしていた)。
+    fn int_resource(id: u16) -> PCWSTR {
+        PCWSTR(id as usize as *const u16)
+    }
     /// メニュー項目 ID。
     const ID_CHANGE: usize = 1001;
     const ID_EXIT: usize = 1002;
@@ -376,7 +388,7 @@ mod imp {
 
             // トレイアイコン登録。build.rs で exe へ埋め込んだ aurora アイコン (リソース
             // ID = 1) を使う。万一読めなければ標準アプリアイコンへフォールバックする。
-            let hicon = LoadIconW(hinstance, PCWSTR(std::ptr::dangling::<u16>()))
+            let hicon = LoadIconW(hinstance, int_resource(ICON_RESOURCE_ID))
                 .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))?;
             let mut nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
