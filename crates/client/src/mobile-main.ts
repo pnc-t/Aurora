@@ -37,6 +37,7 @@ import { installGlobalErrorLogging, logger } from "./core/log";
 import { TouchInput } from "./core/touch-input";
 import { createStickyModifiers } from "./core/sticky-modifiers";
 import { mountMobileKeyboard, type MobileKeyboardHandle } from "./ui/mobile-keyboard";
+import { SoftKeyboard } from "./core/soft-keyboard";
 
 // 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
 installGlobalErrorLogging();
@@ -48,6 +49,7 @@ const statusEl = document.getElementById("conn-status") as HTMLElement;
 const toastContainer = document.getElementById("toast-container") as HTMLElement;
 const reconnectBadgeEl = document.getElementById("reconnect-badge") as HTMLElement;
 const controlsRoot = document.getElementById("mobile-controls") as HTMLElement;
+const softKeyboardRoot = document.getElementById("soft-keyboard-root") as HTMLElement;
 const keyboardRoot = document.getElementById("mobile-keyboard") as HTMLElement;
 const padRoot = document.getElementById("mobile-pad") as HTMLElement;
 
@@ -96,14 +98,32 @@ const touchInput = new TouchInput({
 // 残る。VK 送出は session への既存経路 (sendGrabbedKey) をそのまま使う。 ---
 const mods = createStickyModifiers((vk, down) => session?.sendGrabbedKey(vk, down));
 
-// --- 自前オンスクリーンキーボード (VK をそのまま送出。文字→VK 逆変換はしない) ---
+// --- Android IME (ソフトキーボード) ブリッジ: 文字入力の主経路。下部バーのキーボードボタンで開閉する ---
+const softKeyboard = new SoftKeyboard({
+  sendKey: (vk, down) => {
+    session?.sendGrabbedKey(vk, down);
+    // 押下時に消費すると、その文字の down と up の間でスティッキー修飾が外れてしまう。
+    // キーが離れた時点 = 1 操作の完了時に消費する。
+    if (!down) mods.consumeOnce();
+  },
+  // ボタン操作 (onToggleKeyboard) だけでなく、Android の戻るキー等の外部要因で閉じた場合も
+  // ここで拾えるので、下部バーのトグル表示はこの通知に一本化する。
+  onOpenChange: (open) => controls.setKeyboardOpen(open),
+  // パッド/操作用キーボード側で Shift をスティッキー保持しているときに一時 Shift を挟むと、
+  // 末尾の Shift up が保持中の Shift まで離してしまう。
+  isShiftHeld: () => mods.isHeld("shift"),
+});
+softKeyboard.mount(softKeyboardRoot);
+
+// --- 自前の操作用オンスクリーンキーボード (VK をそのまま送出。文字入力ではなく修飾/ショートカット/
+// ファンクション/カーソル操作が主目的)。パッドの「修飾キー」ボタンから開閉する ---
 const keyboard: MobileKeyboardHandle = mountMobileKeyboard({
   root: keyboardRoot,
   sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
   mods,
-  // ボタン操作 (onToggleKeyboard) だけでなく、Android の戻るキー等の外部要因で閉じた場合も
-  // ここで拾えるので、下部バーのトグル表示はこの通知に一本化する。
-  onOpenChange: (open) => controls.setKeyboardOpen(open),
+  // pad はこの後に生成されるため、呼び出し時点 (open/close イベント発火時) には初期化済みになる
+  // クロージャ経由で参照する (pad 自体をここより前に置くと mods 等の宣言順が崩れるため)。
+  onOpenChange: (open) => pad.setKeyboardOn(open),
 });
 
 // --- オンスクリーンコントローラ (半透明トラックパッド + クリック + 修飾キー) ---
@@ -112,11 +132,14 @@ const pad: MobilePadHandle = mountMobilePad({
   sendInput: (ev) => {
     if (session) void sendInput(session.id, ev).catch((e) => logger.warn("sendInput failed", e));
   },
-  sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
   onPositionChange: (which, pos) => {
     updateSettings(which === "pad" ? { mobile_pad_pos: pos } : { mobile_pad_buttons_pos: pos });
   },
   mods,
+  onToggleKeyboard: () => {
+    if (keyboard.isOpen()) keyboard.close();
+    else keyboard.open();
+  },
 });
 
 // --- ToolbarHandle アダプタ: desktop 専用 UI (タブ/ウィンドウ/ファイル転送/音声/クリップボード等)
@@ -174,8 +197,9 @@ const toolbar: ToolbarHandle = {
       syncTouchAttach();
     } else {
       touchInput.detach();
-      // close() の onOpenChange が controls.setKeyboardOpen(false) を呼ぶので、ここでは
-      // 二重に呼ばない。
+      // close() の onOpenChange がそれぞれ controls.setKeyboardOpen(false) / pad.setKeyboardOn(false)
+      // を呼ぶので、ここでは二重に呼ばない。
+      softKeyboard.close();
       keyboard.close();
       // 次の接続を既定 (非表示) の状態から始めるため。pad.setVisible(false) はドラッグロックと
       // スティッキー修飾も強制解除するので、押しっぱなしがホスト側に残らない。
@@ -220,6 +244,7 @@ const host: SessionHost = {
     if (session !== s) return;
     session = null;
     touchInput.detach();
+    softKeyboard.close();
     keyboard.close();
     hideReconnectBadge();
     showLauncherView();
@@ -243,6 +268,9 @@ function setPadVisible(on: boolean): void {
   pad.setVisible(on);
   controls.setPadOn(on);
   touchInput.setPointerEnabled(!on);
+  // 操作用キーボードはコントローラに属する UI (パッドの修飾キーボタンから開く) なので、
+  // コントローラを隠したまま操作用キーボードだけ残すと閉じる出口が無くなる。
+  if (!on) keyboard.close();
 }
 
 // --- 下部操作バー ---
@@ -250,10 +278,10 @@ const controls: MobileControlsHandle = mountMobileControls({
   root: controlsRoot,
   onDisconnect: () => session?.closeByUser(),
   onToggleKeyboard: () => {
-    // 表示反映は MobileKeyboard の onOpenChange に一本化 (ここで直接 setKeyboardOpen を
-    // 呼ぶと外部要因での閉じと二重管理になる)。
-    if (keyboard.isOpen()) keyboard.close();
-    else keyboard.open();
+    // 下部バーのキーボードボタンは Android IME (文字入力) の開閉。表示反映は SoftKeyboard の
+    // onOpenChange に一本化 (ここで直接 setKeyboardOpen を呼ぶと外部要因での閉じと二重管理になる)。
+    if (softKeyboard.isOpen()) softKeyboard.close();
+    else softKeyboard.open();
   },
   onSelectDisplay: (d) => session?.switchDisplay(d),
   onResetZoom: () => touchInput.resetZoom(),

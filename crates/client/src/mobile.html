@@ -28,8 +28,10 @@
       <div id="conn-status"></div>
       <div id="reconnect-badge"></div>
       <div id="toast-container"></div>
-      <!-- 自前オンスクリーンキーボード (フロート表示なので下部バーとは別枠に置く。中身は
-           ui/mobile-keyboard.ts が構築する)。 -->
+      <!-- Android IME (ソフトキーボード) の隠し input を置く器。文字入力はこちら。 -->
+      <div id="soft-keyboard-root"></div>
+      <!-- 操作用オンスクリーンキーボード (修飾/ショートカット/ファンクション)。中身は
+           ui/mobile-keyboard.ts が構築する。 -->
       <div id="mobile-keyboard"></div>
       <!-- オンスクリーンコントローラ (TS が中身を構築)。下部バーより下のレイヤーに置く。 -->
       <div id="mobile-pad"></div>

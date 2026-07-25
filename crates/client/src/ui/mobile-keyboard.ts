@@ -280,6 +280,9 @@ export function mountMobileKeyboard(opts: MobileKeyboardOpts): MobileKeyboardHan
     extEl?.classList.toggle("mkb-hidden", !extOpen);
     extToggleBtn.classList.toggle("toggled", extOpen);
     updateHeightVar();
+    // 拡張行の開閉でも高さが変わるので、開閉時と同じ経路で通知先へ知らせ直す
+    // (知らせないとコントローラのカードが拡張行の裏に残る)。
+    opts.onOpenChange?.(isOpen);
   });
 
   closeBtn?.addEventListener("click", () => handle.close());
@@ -308,16 +311,19 @@ export function mountMobileKeyboard(opts: MobileKeyboardOpts): MobileKeyboardHan
     open(): void {
       isOpen = true;
       rootEl?.classList.remove("mkb-hidden");
-      opts.onOpenChange?.(true);
+      // 高さ変数の更新は onOpenChange より先に行う。通知先 (コントローラ) はこの変数を見て
+      // カードをキーボードの上へ逃がすため、後に更新すると古い高さで計算してしまう。
       updateHeightVar();
+      opts.onOpenChange?.(true);
     },
     close(): void {
       // 修飾キーの解除はしない。パッド側の修飾表示と共有している状態なので、閉じただけで
       // 解除すると「キーボードを閉じたら意図せず Ctrl が離れる」といった意図しない挙動になる。
       isOpen = false;
       rootEl?.classList.add("mkb-hidden");
-      opts.onOpenChange?.(false);
+      // open() と同じ理由で先に 0px へ戻す (通知先がカードを元の位置へ戻せるように)。
       updateHeightVar();
+      opts.onOpenChange?.(false);
     },
     isOpen(): boolean {
       return isOpen;

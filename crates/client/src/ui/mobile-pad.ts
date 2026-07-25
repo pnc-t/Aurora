@@ -1,12 +1,14 @@
 // リモート画面上に浮かべる半透明のオンスクリーンコントローラ (モバイル専用)。
-// タッチ端末では映像を直接タップして操作すると指が映像を隠す・狙った場所を押しにくい・
-// 修飾キーが打てないため、カーソル移動/クリック/修飾キーをこのコントローラへ集約する。
+// タッチ端末では映像を直接タップして操作すると指が映像を隠す・狙った場所を押しにくいため、
+// カーソル移動/クリックをこのコントローラへ集約する。修飾キー/ファンクションキー/矢印は
+// 画面下部固定の操作用キーボード (ui/mobile-keyboard.ts) 側に集約済みのため、このコントローラの
+// 責務はカーソル移動 + クリック + 操作用キーボードの開閉に限る。
 // 物理トラックパッド + マウスボタンに寄せて「なぞる場所」と「押すボタン」を別カードに分け、
 // それぞれ独立してドラッグ配置できるようにする (パッドは左下、ボタンは右下が既定=両手持ち想定)。
 // 表示中は映像への直接タップは別レイヤー (TouchInput.setPointerEnabled) 側で無効化される。
 
 import { type InputEvent } from "../core/ipc";
-import { MOD_KEYS, MOD_LABEL, MOD_VK, type ModKey, type StickyModifiers } from "../core/sticky-modifiers";
+import { type StickyModifiers } from "../core/sticky-modifiers";
 import { icon } from "./icons";
 import "./mobile-pad.css";
 
@@ -14,13 +16,13 @@ export type MobilePadOpts = {
   root: HTMLElement;
   /** 1 入力イベントをホストへ送る (呼び出し側が session_id を内包する)。 */
   sendInput: (event: InputEvent) => void;
-  /** VK を 1 つ送る (down/up の組み立てはこのコンポーネント側で行う)。 */
-  sendKey: (vk: number, down: boolean) => void;
   /** グリップのドラッグ終了時に、どちらのカードかを区別して画面比率位置 (0〜1) を通知する (永続化用)。 */
   onPositionChange: (which: "pad" | "buttons", pos: [number, number]) => void;
   /** 修飾キーの共有ストア。自前キーボード (ui/mobile-keyboard.ts) と状態を共有するため、
    *  このコンポーネントは状態を自前で持たない。 */
   mods: StickyModifiers;
+  /** 「修飾キー」ボタンが押された。操作用キーボード (ui/mobile-keyboard.ts) の開閉に使う。 */
+  onToggleKeyboard: () => void;
 };
 
 export type MobilePadHandle = {
@@ -28,20 +30,12 @@ export type MobilePadHandle = {
   setVisible: (on: boolean) => void;
   /** 保存済みの比率位置 (0〜1) を反映する。null なら既定位置。範囲外はクランプする。 */
   setPositions: (pad: [number, number] | null, buttons: [number, number] | null) => void;
+  /** 操作用キーボードの開閉状態をボタンの見た目へ反映する。 */
+  setKeyboardOn: (on: boolean) => void;
 };
 
 type Pt = { x: number; y: number };
 type ClickButton = "Left" | "Middle" | "Right";
-
-// VK 値。ui/mobile-keyboard.ts の VK 定数は private で import できないため、必要な分だけ複製する。
-// MOD_VK から引けない定型キー分のみここで持つ。
-const VK_CONTROL = MOD_VK.ctrl;
-const VK_MENU = MOD_VK.alt; // Alt
-const VK_ESCAPE = 0x1b;
-const VK_TAB = 0x09;
-const VK_RETURN = 0x0d;
-const VK_C = 0x43;
-const VK_V = 0x56;
 
 // タップ判定のしきい値 (core/touch-input.ts の TAP_MAX_MS/MOVE_THRESHOLD_PX と同じ値)。
 const TAP_MAX_MS = 300;
@@ -63,6 +57,16 @@ function midpoint(a: Pt, b: Pt): Pt {
 
 function axisMax(viewport: number, size: number): number {
   return Math.max(0, viewport - size);
+}
+
+/**
+ * カード配置に使える高さ。操作用キーボード (ui/mobile-keyboard.ts) が開いている間はその分を除く。
+ * 除かないとカードがキーボードの裏に回り込み、「修飾キーを押しながらパッドでクリックする」という
+ * 併用そのものができなくなる。高さは ui/mobile-keyboard.ts が `--mkb-height` として出している。
+ */
+function usableHeight(): number {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue("--mkb-height");
+  return Math.max(0, window.innerHeight - (Number.parseFloat(raw) || 0));
 }
 
 function clampPos(pos: [number, number] | null, fallback: [number, number]): [number, number] {
@@ -97,7 +101,7 @@ function setupCard(
       // 比率だけ覚えておき、表示された瞬間 (setVisible(true)) に測れる寸法で当て直す。
       if (w === 0 || h === 0) return;
       const vw = window.innerWidth;
-      const vh = window.innerHeight;
+      const vh = usableHeight();
       const x = clamp(ratio[0] * axisMax(vw, w), 0, axisMax(vw, w));
       const y = clamp(ratio[1] * axisMax(vh, h), 0, axisMax(vh, h));
       el.style.left = `${x}px`;
@@ -134,7 +138,7 @@ function setupCard(
       const dx = t.clientX - gripStartTouch.x;
       const dy = t.clientY - gripStartTouch.y;
       const vw = window.innerWidth;
-      const vh = window.innerHeight;
+      const vh = usableHeight();
       const w = el.offsetWidth;
       const h = el.offsetHeight;
       const x = clamp(gripStartPos.x + dx, 0, axisMax(vw, w));
@@ -152,7 +156,7 @@ function setupCard(
     if (!t) return;
     gripDragId = null;
     const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const vh = usableHeight();
     const w = el.offsetWidth;
     const h = el.offsetHeight;
     const rect = el.getBoundingClientRect();
@@ -183,23 +187,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         <button type="button" class="mp-btn" id="mp-l" title="左クリック" aria-label="左クリック">${icon("mouse-left")}</button>
         <button type="button" class="mp-btn" id="mp-m" title="中クリック" aria-label="中クリック">${icon("mouse-middle")}</button>
         <button type="button" class="mp-btn" id="mp-r" title="右クリック" aria-label="右クリック">${icon("mouse-right")}</button>
-        <button type="button" class="mp-btn" id="mp-mods-toggle" title="修飾キー" aria-label="修飾キー">${icon("modifier")}</button>
-      </div>
-      <div class="mp-mods" id="mp-mods">
-        <div class="mp-mod-row">
-          <button type="button" class="mp-mod-btn" data-mod="ctrl">${MOD_LABEL.ctrl}</button>
-          <button type="button" class="mp-mod-btn" data-mod="alt">${MOD_LABEL.alt}</button>
-          <button type="button" class="mp-mod-btn" data-mod="shift">${MOD_LABEL.shift}</button>
-          <button type="button" class="mp-mod-btn" data-mod="win">${MOD_LABEL.win}</button>
-        </div>
-        <div class="mp-quick-row">
-          <button type="button" class="mp-quick-btn" id="mp-q-copy">Ctrl+C</button>
-          <button type="button" class="mp-quick-btn" id="mp-q-paste">Ctrl+V</button>
-          <button type="button" class="mp-quick-btn" id="mp-q-alttab">Alt+Tab</button>
-          <button type="button" class="mp-quick-btn" id="mp-q-esc">Esc</button>
-          <button type="button" class="mp-quick-btn" id="mp-q-enter">Enter</button>
-          <button type="button" class="mp-quick-btn" id="mp-q-tab">Tab</button>
-        </div>
+        <button type="button" class="mp-btn" id="mp-mods-toggle" title="キーボード" aria-label="キーボード">${icon("modifier")}</button>
       </div>
     </div>
   `;
@@ -213,50 +201,11 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   const mBtn = opts.root.querySelector<HTMLButtonElement>("#mp-m");
   const rBtn = opts.root.querySelector<HTMLButtonElement>("#mp-r");
   const modsToggleBtn = opts.root.querySelector<HTMLButtonElement>("#mp-mods-toggle");
-  const modsEl = opts.root.querySelector<HTMLElement>("#mp-mods");
-  const qCopyBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-copy");
-  const qPasteBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-paste");
-  const qAltTabBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-alttab");
-  const qEscBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-esc");
-  const qEnterBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-enter");
-  const qTabBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-tab");
 
   // mousedown の既定動作 (フォーカス移動) を止め、タップ後にフォーカスリングが残らないようにする。
   // touchstart は preventDefault しない (Android で合成 click まで消えボタンが反応しなくなる)。
   for (const btn of Array.from(opts.root.querySelectorAll<HTMLButtonElement>("button"))) {
     btn.addEventListener("mousedown", (e) => e.preventDefault());
-  }
-
-  // ================= 修飾キー (スティッキー、core/sticky-modifiers 共有ストア) =================
-
-  const modButtons = new Map<ModKey, HTMLButtonElement>();
-
-  for (const key of MOD_KEYS) {
-    const btn = opts.root.querySelector<HTMLButtonElement>(`.mp-mod-btn[data-mod="${key}"]`);
-    if (!btn) continue;
-    modButtons.set(key, btn);
-    btn.addEventListener("pointerdown", (e) => {
-      // L/M/R と同じ理由: 捕捉しないと指がボタン外へ滑った際に up/cancel が届かず、
-      // ホスト側に修飾キーが押しっぱなしのまま残ってしまう。
-      btn.setPointerCapture(e.pointerId);
-      opts.mods.pressStart(key);
-    });
-    btn.addEventListener("pointerup", () => opts.mods.pressEnd(key));
-    btn.addEventListener("pointercancel", () => opts.mods.pressCancel(key));
-  }
-
-  // 他 UI (キーボード) 由来の状態変化も含め、ボタンの見た目を常に同期する。
-  opts.mods.subscribe((key, state) => {
-    const btn = modButtons.get(key);
-    btn?.classList.toggle("mp-once", state === "once");
-    btn?.classList.toggle("mp-locked", state === "locked");
-  });
-  // マウント時点で既に他 UI 側が once/locked にしているかもしれないため、現在値を反映する。
-  for (const key of MOD_KEYS) {
-    const state = opts.mods.state(key);
-    const btn = modButtons.get(key);
-    btn?.classList.toggle("mp-once", state === "once");
-    btn?.classList.toggle("mp-locked", state === "locked");
   }
 
   // ================= L/M/R クリックボタン =================
@@ -281,6 +230,8 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       if (!pressed) return;
       pressed = false;
       opts.sendInput({ MouseButton: { button, down: false } });
+      // once 状態の修飾キーはこのクリックへ適用して消費する (Ctrl+クリック等の組み合わせを
+      // 成立させるため)。locked はここでは消費しない (StickyModifiers.consumeOnce の仕様)。
       opts.mods.consumeOnce();
     };
     btn.addEventListener("pointerup", release);
@@ -297,57 +248,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   attachClickButton(mBtn, "Middle");
   attachClickButton(rBtn, "Right");
 
-  let modsOpen = false;
-  modsToggleBtn?.addEventListener("click", () => {
-    modsOpen = !modsOpen;
-    modsEl?.classList.toggle("open", modsOpen);
-    modsToggleBtn.classList.toggle("toggled", modsOpen);
-    // パネルの開閉で .mp-btn-card の高さが変わるため、同じ比率のまま再クランプしないと
-    // 下端がビューポートからはみ出して最下段のボタンが押せなくなる。比率自体は変えない
-    // (ユーザーが動かしたわけではないので onPositionChange による永続化も呼ばない)。
-    btnCard.applyRatio(btnCard.ratio);
-  });
-
-  // ================= 定型キー =================
-
-  function tapKey(vk: number): void {
-    opts.sendKey(vk, true);
-    opts.sendKey(vk, false);
-  }
-
-  /** 複数キーを down は指定順、up は逆順で送る (Ctrl+C 等のコンボ用)。 */
-  function comboKey(vks: number[]): void {
-    for (const vk of vks) opts.sendKey(vk, true);
-    for (let i = vks.length - 1; i >= 0; i--) opts.sendKey(vks[i], false);
-  }
-
-  qCopyBtn?.addEventListener("click", () => {
-    comboKey([VK_CONTROL, VK_C]);
-    opts.mods.consumeOnce();
-  });
-  qPasteBtn?.addEventListener("click", () => {
-    comboKey([VK_CONTROL, VK_V]);
-    opts.mods.consumeOnce();
-  });
-  qAltTabBtn?.addEventListener("click", () => {
-    comboKey([VK_MENU, VK_TAB]);
-    opts.mods.consumeOnce();
-  });
-  // Win 単押し (スタートメニュー) の定型キーは置かない。修飾キー行の Win と同じラベルが
-  // 2 つ並んで紛らわしいため。単押ししたいときは修飾キー行の Win を 2 回叩く (1 回目で down、
-  // 2 回目で up が送られる = down→up と等価)。
-  qEscBtn?.addEventListener("click", () => {
-    tapKey(VK_ESCAPE);
-    opts.mods.consumeOnce();
-  });
-  qEnterBtn?.addEventListener("click", () => {
-    tapKey(VK_RETURN);
-    opts.mods.consumeOnce();
-  });
-  qTabBtn?.addEventListener("click", () => {
-    tapKey(VK_TAB);
-    opts.mods.consumeOnce();
-  });
+  modsToggleBtn?.addEventListener("click", () => opts.onToggleKeyboard());
 
   // ================= トラックパッド (なぞる場所) =================
   //
@@ -480,6 +381,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       if (!cancelled && !singleMoved && duration < TAP_MAX_MS) {
         opts.sendInput({ MouseButton: { button: "Left", down: true } });
         opts.sendInput({ MouseButton: { button: "Left", down: false } });
+        // L/M/R ボタンの release と同じ理由: once 状態の修飾キーをこのタップへ適用して消費する。
         opts.mods.consumeOnce();
       }
       abortSingle();
@@ -519,6 +421,14 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     setPositions(pad: [number, number] | null, buttons: [number, number] | null): void {
       padCard.applyRatio(clampPos(pad, PAD_DEFAULT_POS));
       btnCard.applyRatio(clampPos(buttons, BTN_DEFAULT_POS));
+    },
+    setKeyboardOn(on: boolean): void {
+      modsToggleBtn?.classList.toggle("toggled", on);
+      // 開閉で配置可能な高さ (usableHeight) が変わるため、同じ比率のまま置き直してカードを
+      // キーボードの上へ逃がす。ユーザーが動かしたわけではないので比率自体は変えず、
+      // onPositionChange による永続化も呼ばない。
+      padCard.applyRatio(padCard.ratio);
+      btnCard.applyRatio(btnCard.ratio);
     },
   };
 }
