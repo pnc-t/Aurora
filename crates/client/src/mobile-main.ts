@@ -29,6 +29,7 @@ import { Session, type SessionHost } from "./core/session";
 import type { ToolbarHandle } from "./ui/toolbar";
 import { mountMobileLauncher, type MobileLauncherHandle } from "./ui/mobile-launcher";
 import { mountMobileControls, type MobileControlsHandle } from "./ui/mobile-controls";
+import { mountMobilePad, type MobilePadHandle } from "./ui/mobile-pad";
 import { initToast, showToast, type ToastKind } from "./ui/toast";
 import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui/reconnect-badge";
 import { initCaptureOverlay, renderStatusOverlay } from "./ui/capture-overlay";
@@ -47,6 +48,7 @@ const toastContainer = document.getElementById("toast-container") as HTMLElement
 const reconnectBadgeEl = document.getElementById("reconnect-badge") as HTMLElement;
 const controlsRoot = document.getElementById("mobile-controls") as HTMLElement;
 const keyboardRoot = document.getElementById("soft-keyboard-root") as HTMLElement;
+const padRoot = document.getElementById("mobile-pad") as HTMLElement;
 
 initToast(toastContainer);
 initReconnectBadge(reconnectBadgeEl);
@@ -80,12 +82,30 @@ const touchInput = new TouchInput({
 
 // --- ソフトキーボード (隠し input 経由の文字/特殊キー送出) ---
 const softKeyboard = new SoftKeyboard({
-  sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
+  sendKey: (vk, down) => {
+    session?.sendGrabbedKey(vk, down);
+    // 押下時に消費すると、その文字の down と up の間でスティッキー修飾が外れてしまう。
+    // キーが離れた時点 = 1 操作の完了時に消費する。
+    if (!down) pad.notifyExternalKey();
+  },
   // ボタン操作 (onToggleKeyboard) だけでなく、Android の戻るキー等の外部要因で閉じた場合も
   // ここで拾えるので、下部バーのトグル表示はこの通知に一本化する。
   onOpenChange: (open) => controls.setKeyboardOpen(open),
 });
 softKeyboard.mount(keyboardRoot);
+
+// --- オンスクリーンコントローラ (半透明トラックパッド + クリック + 修飾キー) ---
+const pad: MobilePadHandle = mountMobilePad({
+  root: padRoot,
+  sendInput: (ev) => {
+    if (session) void sendInput(session.id, ev).catch((e) => logger.warn("sendInput failed", e));
+  },
+  sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
+  onPositionChange: (pos) => {
+    settings = { ...getSettings(), mobile_pad_pos: pos };
+    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+  },
+});
 
 // --- ToolbarHandle アダプタ: desktop 専用 UI (タブ/ウィンドウ/ファイル転送/音声/クリップボード等)
 // はモバイル対象外のため no-op にし、意味のある操作だけ mobile-controls / TouchInput へ橋渡しする ---
@@ -145,6 +165,9 @@ const toolbar: ToolbarHandle = {
       // close() の onOpenChange が controls.setKeyboardOpen(false) を呼ぶので、ここでは
       // 二重に呼ばない。
       softKeyboard.close();
+      // 次の接続を既定 (非表示) の状態から始めるため。pad.setVisible(false) はドラッグロックと
+      // スティッキー修飾も強制解除するので、押しっぱなしがホスト側に残らない。
+      setPadVisible(false);
     }
   },
   // ショートカット割当 UI はデスクトップ専用 (キーボードショートカット設定) でモバイルには無い。
@@ -199,6 +222,16 @@ const host: SessionHost = {
   },
 };
 
+// オンスクリーンコントローラの表示状態。表示中は映像の直接タップを止め、操作をコントローラへ
+// 一本化する (指が触れるたびにホストがクリックされる誤操作を防ぐ)。ピンチズームは残す。
+let padVisible = false;
+function setPadVisible(on: boolean): void {
+  padVisible = on;
+  pad.setVisible(on);
+  controls.setPadOn(on);
+  touchInput.setPointerEnabled(!on);
+}
+
 // --- 下部操作バー ---
 const controls: MobileControlsHandle = mountMobileControls({
   root: controlsRoot,
@@ -211,6 +244,7 @@ const controls: MobileControlsHandle = mountMobileControls({
   },
   onSelectDisplay: (d) => session?.switchDisplay(d),
   onResetZoom: () => touchInput.resetZoom(),
+  onTogglePad: () => setPadVisible(!padVisible),
 });
 
 // --- ランチャー ---
@@ -239,6 +273,9 @@ async function connectTo(entry: HostEntry, password: string | null, save: boolea
   } catch (e) {
     logger.warn("load settings failed; using cached", e);
   }
+  // モバイルは単一 WebView でランチャーとリモート画面が同じページに居座るため、起動時に
+  // 読んだきりだと別端末/別セッションで保存されたコントローラ位置が次の接続に反映されない。
+  pad.setPosition(getSettings().mobile_pad_pos);
   const id = await stageSession(password);
   const s = new Session(id, entry, save, host);
   session = s;
@@ -274,6 +311,7 @@ void (async () => {
   // で配色を切り替える作りなので、これをやらないと設定したテーマ/アクセント色が反映されない。
   document.documentElement.dataset.theme = getSettings().theme;
   document.documentElement.style.setProperty("--accent", getSettings().accent_color);
+  pad.setPosition(getSettings().mobile_pad_pos);
   showLauncherView();
   logger.info("mobile window ready");
 })();

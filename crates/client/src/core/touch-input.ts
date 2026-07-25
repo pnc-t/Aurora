@@ -66,6 +66,9 @@ export class TouchInput {
   private readonly touches = new Map<number, Pt>();
   // 2 本指ジェスチャの後、残り 1 本が単独ジェスチャとして誤発火しないようにする抑止フラグ。
   private suppressSingle = false;
+  // オンスクリーンコントローラ表示中は、映像を直接タップしてもクリックが飛ばないようにする。
+  // ズーム/ホイールは残すため、無効化するのはポインタ操作 (1本指ジェスチャと2本指タップ=右クリック) だけ。
+  private pointerEnabled = true;
 
   // --- 1 本指ジェスチャの状態 ---
   private singleActive = false;
@@ -153,6 +156,19 @@ export class TouchInput {
   /** ズームを等倍に戻す。 */
   resetZoom(): void {
     this.clearZoom(true);
+  }
+
+  /**
+   * 映像の直接タップによるポインタ操作 (1本指ジェスチャ・2本指タップの右クリック) の有効/無効を
+   * 切り替える。オンスクリーンコントローラ表示中は false にして、コントローラ側へ操作を一本化する。
+   * ピンチズームと2本指スワイプ (ホイール) はこのフラグの影響を受けない。
+   */
+  setPointerEnabled(on: boolean): void {
+    if (this.pointerEnabled === on) return;
+    this.pointerEnabled = on;
+    // 無効化の瞬間に進行中の単発ジェスチャが残っていると、カーソルが出たままになったり
+    // 離した瞬間にクリックが飛んだりする。クリックを確定させずに後始末する。
+    if (!on && this.singleActive) this.endSingleAbrupt();
   }
 
   /** ズーム状態と canvas の transform をクリアする。notify=true のときだけ onZoomChange を呼ぶ。 */
@@ -244,6 +260,9 @@ export class TouchInput {
 
   private beginSingle(): void {
     if (this.suppressSingle) return;
+    // コントローラ表示中は映像タップでのクリックを無効化する (誤操作防止)。ズーム/ホイールは
+    // 2本指ジェスチャ側のためこのガードの影響を受けない。
+    if (!this.pointerEnabled) return;
     const p = this.firstTouch();
     if (!p) return;
     this.singleActive = true;
@@ -452,7 +471,9 @@ export class TouchInput {
 
   private endMulti(cancelled: boolean): void {
     const duration = performance.now() - this.multiStartTime;
-    if (!cancelled && this.multiDecided === "none" && duration < TAP_MAX_MS && !this.multiMoved) {
+    // 2本指タップ (右クリック) もコントローラ表示中は無効化する。ズーム/ホイール判定
+    // (multiDecided が zoom/wheel) はこの分岐に来ないため影響を受けない。
+    if (this.pointerEnabled && !cancelled && this.multiDecided === "none" && duration < TAP_MAX_MS && !this.multiMoved) {
       this.opts.sendInput({ MouseButton: { button: "Right", down: true } });
       this.opts.sendInput({ MouseButton: { button: "Right", down: false } });
     }

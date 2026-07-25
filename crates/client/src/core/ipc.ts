@@ -468,6 +468,9 @@ export type ClientSettings = {
   shortcuts: Record<string, string>;
   /** クリップボード同期を行うか。接続時のセッションゲート初期値になる。 */
   clipboard_sync: boolean;
+  /** モバイルのオンスクリーンコントローラの表示位置。画面サイズに対する比率 (0〜1) の [x, y]。
+   *  null は未配置 (既定位置に出す)。 */
+  mobile_pad_pos: [number, number] | null;
 };
 
 /** ClientSettings の既定値。設定未保存時のフォールバックや capture 窓の未読込中フォールバックで使う
@@ -494,6 +497,7 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   stats_position: "tr",
   shortcuts: {},
   clipboard_sync: true,
+  mobile_pad_pos: null,
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */

@@ -1,0 +1,128 @@
+/* オンスクリーンコントローラ (半透明トラックパッド)。mobile-controls.css の見た目の言語
+ * (半透明パネル・角丸・ボタンサイズ・--accent 等の CSS 変数) に揃える。
+ * 位置は mobile-pad.ts が left/top を px で直接当てる (グリップドラッグ + 比率位置の復元)。 */
+
+.mp-root {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 25; /* mobile-controls.css の .mc-root(30)/.mc-display-pop(31) より下に置き衝突させない */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 200px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  box-shadow: 0 2px 10px var(--shadow);
+  padding: 4px 8px 8px;
+}
+
+/* グローバルの .hidden (mobile-main.css) は display: none !important 付きで、詳細度に関係なく
+ * 上書きできない。visibility:hidden を当てても効かず display:none になってしまうため、
+ * このコンポーネント専用のクラス名で畳む (寸法が測れなくなる問題は mobile-pad.ts 側の
+ * applyRatio ガード + setVisible(true) 時の当て直しで吸収する)。 */
+.mp-root.mp-hidden {
+  display: none;
+}
+
+.mp-grip {
+  width: 48px;
+  height: 20px;
+  margin: 2px 0 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* ブラウザのスクロール/ズームジェスチャにグリップのドラッグを奪われないようにする。 */
+  touch-action: none;
+}
+.mp-grip svg {
+  width: 20px;
+  height: 20px;
+}
+
+.mp-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.mp-pad {
+  width: 100%;
+  height: 120px;
+  border-radius: 10px;
+  border: 1px dashed var(--panel-border);
+  background: var(--panel);
+  opacity: 0.5;
+  /* なぞる場所であることを示す控えめな見た目 (点線枠) にする。ラベルは置かない。 */
+  /* ブラウザのスクロール/ピンチにジェスチャを奪われないようにする。 */
+  touch-action: none;
+}
+
+.mp-btns {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.mp-btn {
+  min-width: 44px;
+  min-height: 44px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 13px;
+}
+.mp-btn.toggled {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+.mp-mods {
+  width: 100%;
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--panel-border);
+}
+.mp-mods.open {
+  display: flex;
+}
+
+.mp-mod-row,
+.mp-quick-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.mp-mod-btn,
+.mp-quick-btn {
+  min-height: 44px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 12px;
+}
+
+/* 修飾キーの 3 状態を区別する: once = 枠線をアクセント色、locked = 塗りつぶし。 */
+.mp-mod-btn.mp-once {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mp-mod-btn.mp-locked {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}

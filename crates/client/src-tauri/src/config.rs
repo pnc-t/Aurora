@@ -180,6 +180,11 @@ pub struct ClientSettings {
     /// 以後はツールバーのトグル (`set_clipboard_sync`) がセッション単位で切り替える。
     #[serde(default = "default_true")]
     pub clipboard_sync: bool,
+    /// モバイルのオンスクリーンコントローラの表示位置。画面サイズに対する比率 [x, y] (0.0〜1.0)。
+    /// px ではなく比率で持つのは、端末の回転や解像度差で画面外に出ないようにするため。
+    /// None は未配置 (既定位置に出す)。
+    #[serde(default)]
+    pub mobile_pad_pos: Option<[f32; 2]>,
 }
 
 fn default_fps() -> u32 {
@@ -228,6 +233,7 @@ impl Default for ClientSettings {
             stats_position: default_stats_position(),
             shortcuts: HashMap::new(),
             clipboard_sync: true,
+            mobile_pad_pos: None,
         }
     }
 }
