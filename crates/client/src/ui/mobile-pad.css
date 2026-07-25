@@ -1,8 +1,9 @@
-/* オンスクリーンコントローラ (半透明トラックパッド)。mobile-controls.css の見た目の言語
- * (半透明パネル・角丸・ボタンサイズ・--accent 等の CSS 変数) に揃える。
- * 位置は mobile-pad.ts が left/top を px で直接当てる (グリップドラッグ + 比率位置の復元)。 */
+/* オンスクリーンコントローラ (トラックパッド + マウスボタンの 2 枚カード)。mobile-controls.css
+ * の見た目の言語 (半透明パネル・角丸・ボタンサイズ・--accent 等の CSS 変数) に揃える。
+ * 位置は mobile-pad.ts が各カードの left/top を px で直接当てる (グリップドラッグ + 比率位置の復元)。 */
 
-.mp-root {
+.mp-pad-card,
+.mp-btn-card {
   position: absolute;
   left: 0;
   top: 0;
@@ -10,7 +11,6 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  width: 200px;
   background: var(--toolbar-bg);
   border: 1px solid var(--panel-border);
   border-radius: 16px;
@@ -22,8 +22,17 @@
  * 上書きできない。visibility:hidden を当てても効かず display:none になってしまうため、
  * このコンポーネント専用のクラス名で畳む (寸法が測れなくなる問題は mobile-pad.ts 側の
  * applyRatio ガード + setVisible(true) 時の当て直しで吸収する)。 */
-.mp-root.mp-hidden {
+.mp-pad-card.mp-hidden,
+.mp-btn-card.mp-hidden {
   display: none;
+}
+
+.mp-pad-card {
+  width: 160px;
+}
+
+.mp-btn-card {
+  width: 200px;
 }
 
 .mp-grip {
@@ -46,28 +55,21 @@
   height: 20px;
 }
 
-.mp-main {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-}
-
 .mp-pad {
   width: 100%;
-  height: 120px;
+  height: 140px;
   border-radius: 10px;
-  border: 1px dashed var(--panel-border);
+  /* 暗い映像の上でも領域がはっきり分かるよう、実線枠 + 不透明な背景にする
+   * (以前の点線枠+半透明はほぼ見えなかった)。 */
+  border: 2px solid var(--panel-border);
   background: var(--panel);
-  opacity: 0.5;
-  /* なぞる場所であることを示す控えめな見た目 (点線枠) にする。ラベルは置かない。 */
   /* ブラウザのスクロール/ピンチにジェスチャを奪われないようにする。 */
   touch-action: none;
 }
 
 .mp-btns {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 4px;
 }
 
@@ -78,7 +80,13 @@
   border-radius: 8px;
   background: var(--panel);
   color: var(--fg);
-  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mp-btn svg {
+  width: 20px;
+  height: 20px;
 }
 .mp-btn.toggled {
   background: var(--accent);

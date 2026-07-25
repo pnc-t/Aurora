@@ -26,6 +26,10 @@ export type IconName =
   | "power"
   | "fullscreen"
   | "mouse"
+  | "mouse-left"
+  | "mouse-middle"
+  | "mouse-right"
+  | "modifier"
   | "files"
   | "stats"
   | "display"
@@ -59,6 +63,10 @@ const PATHS: Record<IconName, string> = {
   power: `<path d="M12 2v9"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>`,
   fullscreen: `<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>`,
   mouse: `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/>`,
+  "mouse-left": `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/><path d="M12 3a6 6 0 0 0-6 6h6z" fill="currentColor" stroke="none"/>`,
+  "mouse-middle": `<rect x="6" y="3" width="12" height="18" rx="6"/><rect x="10.8" y="6" width="2.4" height="5" rx="1.2" fill="currentColor" stroke="none"/>`,
+  "mouse-right": `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/><path d="M12 3a6 6 0 0 1 6 6h-6z" fill="currentColor" stroke="none"/>`,
+  modifier: `<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M8 14l4-4 4 4"/>`,
   files: `<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>`,
   stats: `<path d="M3 3v18h18"/><path d="M19 9l-5 5-3-3-4 4"/>`,
   display: `<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>`,

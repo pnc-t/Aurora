@@ -101,8 +101,11 @@ const pad: MobilePadHandle = mountMobilePad({
     if (session) void sendInput(session.id, ev).catch((e) => logger.warn("sendInput failed", e));
   },
   sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
-  onPositionChange: (pos) => {
-    settings = { ...getSettings(), mobile_pad_pos: pos };
+  onPositionChange: (which, pos) => {
+    settings =
+      which === "pad"
+        ? { ...getSettings(), mobile_pad_pos: pos }
+        : { ...getSettings(), mobile_pad_buttons_pos: pos };
     void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
   },
 });
@@ -275,7 +278,7 @@ async function connectTo(entry: HostEntry, password: string | null, save: boolea
   }
   // モバイルは単一 WebView でランチャーとリモート画面が同じページに居座るため、起動時に
   // 読んだきりだと別端末/別セッションで保存されたコントローラ位置が次の接続に反映されない。
-  pad.setPosition(getSettings().mobile_pad_pos);
+  pad.setPositions(getSettings().mobile_pad_pos, getSettings().mobile_pad_buttons_pos);
   const id = await stageSession(password);
   const s = new Session(id, entry, save, host);
   session = s;
@@ -311,7 +314,7 @@ void (async () => {
   // で配色を切り替える作りなので、これをやらないと設定したテーマ/アクセント色が反映されない。
   document.documentElement.dataset.theme = getSettings().theme;
   document.documentElement.style.setProperty("--accent", getSettings().accent_color);
-  pad.setPosition(getSettings().mobile_pad_pos);
+  pad.setPositions(getSettings().mobile_pad_pos, getSettings().mobile_pad_buttons_pos);
   showLauncherView();
   logger.info("mobile window ready");
 })();
