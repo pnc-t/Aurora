@@ -20,6 +20,11 @@ export type TouchInputOpts = {
 const TAP_MAX_MS = 300;
 const LONG_PRESS_MS = 500;
 const MOVE_THRESHOLD_PX = 10;
+// 2本目の指の着地を待つ猶予。ピンチは両指が完全同時には着地しないため、1本目だけが
+// 先に動くと精密モード (MouseMove 送信) へ入ってしまい、直後に2本目が来てピンチへ
+// 切り替わっても送信済み MouseMove は取り消せずカーソルが飛ぶ。2本目の着地は通常
+// 50ms 以内なので、80ms 待てば取りこぼさず、単発操作の体感遅延も無視できる。
+const MULTI_GRACE_MS = 80;
 // 精密モード (ドラッグ/長押し) のカーソルを指の位置から上へずらす量 (CSS px)。
 // 指の直下だとカーソル/着地点が指に隠れて見えないため、視認できる位置まで逃がす。
 const CURSOR_OFFSET_PX = 40;
@@ -65,6 +70,7 @@ export class TouchInput {
   // --- 1 本指ジェスチャの状態 ---
   private singleActive = false;
   private singleStart: Pt = { x: 0, y: 0 };
+  private singleStartTime = 0;
   private singleLast: Pt = { x: 0, y: 0 };
   private singleMoved = false;
   private singleLongPressTimer: number | null = null;
@@ -242,6 +248,7 @@ export class TouchInput {
     if (!p) return;
     this.singleActive = true;
     this.singleStart = p;
+    this.singleStartTime = performance.now();
     this.singleLast = p;
     this.singleMoved = false;
     this.singleMode = "pending";
@@ -262,14 +269,20 @@ export class TouchInput {
     const cur = this.firstTouch();
     if (!cur) return;
     const distFromStart = Math.hypot(cur.x - this.singleStart.x, cur.y - this.singleStart.y);
-    if (this.singleMode === "pending" && distFromStart >= MOVE_THRESHOLD_PX) {
-      this.singleMoved = true;
-      if (this.singleLongPressTimer !== null) {
-        clearTimeout(this.singleLongPressTimer);
-        this.singleLongPressTimer = null;
+    if (this.singleMode === "pending") {
+      if (distFromStart >= MOVE_THRESHOLD_PX) {
+        this.singleMoved = true;
+        if (this.singleLongPressTimer !== null) {
+          clearTimeout(this.singleLongPressTimer);
+          this.singleLongPressTimer = null;
+        }
       }
-      // ドラッグへ確定。以後は指を離すまでこのモードのまま (途中で判定を変えない)。
-      this.singleMode = "drag";
+      // MULTI_GRACE_MS 経過前は、移動量の記録だけ行いドラッグへは確定しない (2本目の指を
+      // 待つ)。経過後、その時点で移動しきい値を超えていればドラッグへ確定する。以後は
+      // 指を離すまでこのモードのまま (途中で判定を変えない)。
+      if (this.singleMoved && performance.now() - this.singleStartTime >= MULTI_GRACE_MS) {
+        this.singleMode = "drag";
+      }
     }
     this.singleLast = cur;
 
@@ -291,11 +304,24 @@ export class TouchInput {
       // には届かず精密モードにも入っていないことが確定しているため、必ずタップとして扱ってよい。
       // 上限を課すと「ゆっくり押して離す」が長押しにもタップにもならない死角になり、
       // 押したのに何も起きない状態になる。
-      if (!cancelled && !this.singleMoved) {
+      const movedWithinGrace =
+        this.singleMoved && performance.now() - this.singleStartTime < MULTI_GRACE_MS;
+      if (!cancelled && (!this.singleMoved || movedWithinGrace)) {
         const host = this.toHostPoint(this.singleLast);
         if (host) this.opts.sendInput({ MouseMove: host });
         this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
         this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
+      } else if (!cancelled) {
+        // 猶予は「2本目の指の着地を待つ」ためのものであり、待った結果として単発操作を
+        // 無効にしてはならない。ここに来るのは猶予経過後に touchmove が途絶えた場合だけで、
+        // もう1回でも touchmove が来ていれば drag へ確定し着地点はカーソル位置になる。
+        // 同じ物理操作の着地点が指の位置とカーソル位置 (40px差) で割れるのは一貫性を欠くため、
+        // drag と同じ確定処理に揃える。
+        this.updatePrecisionCursor(this.singleLast);
+        if (this.singleCursorHost) {
+          this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
+          this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
+        }
       }
     } else if (!cancelled && this.singleCursorHost) {
       // 精密モード (ドラッグ/長押し) は離した瞬間にカーソル位置でクリックを確定する。
