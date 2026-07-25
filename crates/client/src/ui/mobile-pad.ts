@@ -238,6 +238,10 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     modsOpen = !modsOpen;
     modsEl?.classList.toggle("open", modsOpen);
     modsToggleBtn.classList.toggle("toggled", modsOpen);
+    // パネルの開閉で .mp-root の高さが変わるため、同じ比率のまま再クランプしないと
+    // 下端がビューポートからはみ出して最下段のボタンが押せなくなる。比率自体は変えない
+    // (ユーザーが動かしたわけではないので onPositionChange による永続化も呼ばない)。
+    applyRatio(currentRatio);
   });
 
   // ================= 定型キー =================
