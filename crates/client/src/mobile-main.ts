@@ -59,6 +59,16 @@ let settings: ClientSettings | null = null;
 function getSettings(): ClientSettings {
   return settings ?? DEFAULT_SETTINGS;
 }
+/** 設定の一部を更新して保存する。設定をまだ一度も読めていない (settings === null) ときは
+ *  何もしない。既定値で全体を書き戻すと、読めなかっただけのユーザー設定を丸ごと潰すため。 */
+function updateSettings(patch: Partial<ClientSettings>): void {
+  if (settings === null) {
+    logger.warn("settings not loaded yet; skip save");
+    return;
+  }
+  settings = { ...settings, ...patch };
+  void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+}
 
 // --- 単一セッション (モバイルはマルチタブ非対応) ---
 let session: Session | null = null;
@@ -91,6 +101,9 @@ const softKeyboard = new SoftKeyboard({
   // ボタン操作 (onToggleKeyboard) だけでなく、Android の戻るキー等の外部要因で閉じた場合も
   // ここで拾えるので、下部バーのトグル表示はこの通知に一本化する。
   onOpenChange: (open) => controls.setKeyboardOpen(open),
+  // pad の定義はこの下だが、実際に呼ばれるのはユーザー入力時 (両方の初期化完了後) なので
+  // クロージャとして問題ない。
+  isShiftHeld: () => pad.isShiftHeld(),
 });
 softKeyboard.mount(keyboardRoot);
 
@@ -102,11 +115,7 @@ const pad: MobilePadHandle = mountMobilePad({
   },
   sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
   onPositionChange: (which, pos) => {
-    settings =
-      which === "pad"
-        ? { ...getSettings(), mobile_pad_pos: pos }
-        : { ...getSettings(), mobile_pad_buttons_pos: pos };
-    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+    updateSettings(which === "pad" ? { mobile_pad_pos: pos } : { mobile_pad_buttons_pos: pos });
   },
 });
 
@@ -219,9 +228,10 @@ const host: SessionHost = {
   setResizable: () => {},
   persistVideoParams(fps, mbps): void {
     // fps/Mbps と同じパターンで即時保存する。他窓への同報 (aurora://settings-changed) は
-    // モバイルでは単一 WebView のため不要 (デスクトップの複数窓同期はここでは対象外)。
-    settings = { ...getSettings(), fps, max_mbps: mbps };
-    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+    // ウィンドウが 1 つしかないモバイルでは行わない。代わりに、同じ WebView 内で独自に設定を
+    // キャッシュしているランチャーが表示のたびに読み直す (ui/mobile-launcher.ts の show())。
+    // これを怠るとランチャー側の古いキャッシュがここでの保存を全体上書きで潰す。
+    updateSettings({ fps, max_mbps: mbps });
   },
 };
 

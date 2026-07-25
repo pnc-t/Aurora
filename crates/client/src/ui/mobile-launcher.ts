@@ -16,7 +16,8 @@
 // - Settings ページ: モバイルで実際に機能しない項目 (自動フルスクリーン/統計 HUD/マウスキャプチャ/
 //   キーボード占有/クリップボード同期/音声ミュート/ツールバー・タブ配置/ショートカット/
 //   ファイル共有/ログ) は出さない (呼び出し元 main.rs の invoke_handler から該当コマンドが
-//   除外されているログは特に、出すと必ず失敗する)。
+//   除外されているログは特に、出すと必ず失敗する)。デバイスピン留め (端末ID表示) も同様に
+//   出さない: 取得元の `myDeviceFingerprint` が DPAPI (Windows 専用) 依存で Android では必ず失敗する。
 // - 更新チェック UI (`.update-banner`) はモバイルには無い (`tauri-plugin-updater` 無効化のため)。
 //
 // パスワード保存 (DPAPI) は Windows 専用実装 (`common::dpapi`) で Android では機能しないため、
@@ -28,7 +29,6 @@ import {
   deleteRecentHost,
   loadRecentHosts,
   loadSettings,
-  myDeviceFingerprint,
   probeHosts,
   saveRecentHost,
   saveSettings,
@@ -245,16 +245,6 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               </div>
             </div>
             <div class="settings-sect" data-sect="other">
-              <div class="setting-group">端末情報</div>
-              <div class="setting-card">
-              <div class="setting-row">
-                <div class="s-meta">
-                  <div class="s-title">この端末の端末ID</div>
-                  <div class="s-desc">ホストのデバイスピン留めで承認するとき、ホスト側に表示される端末IDとこの値が一致することを確認してください</div>
-                </div>
-                <span id="device-fingerprint" class="s-desc" style="font-family:monospace">…</span>
-              </div>
-              </div>
               <div class="setting-group">診断</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -790,18 +780,6 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     applyTheme(settings.theme, settings.accent_color);
   }
 
-  // 端末情報: この端末の識別子 (フィンガープリント)。
-  const fingerprintEl = $("#device-fingerprint");
-  if (fingerprintEl) {
-    myDeviceFingerprint()
-      .then((fp) => {
-        fingerprintEl.textContent = fp;
-      })
-      .catch((e) => {
-        logger.warn("device fingerprint fetch failed", e);
-        fingerprintEl.textContent = "取得できませんでした";
-      });
-  }
   // 診断: アプリのバージョン表示 (updater/process プラグインはモバイル無効のため getVersion を使う)。
   const versionEl = $("#app-version");
   if (versionEl) {
@@ -836,6 +814,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   return {
     show(): void {
       opts.root.classList.remove("hidden");
+      // 単一 WebView 内で mobile-main.ts (接続中の操作パッド位置/fps/mbps) が同じ設定ファイルを
+      // 独立に書き込むため、表示のたびに読み直さないと古いキャッシュの persist() で全体上書きし
+      // 他方の変更を消してしまう (例: パッド位置を保存→切断→ランチャーでテーマ変更、で位置が戻る)。
+      void refresh();
     },
     hide(): void {
       opts.root.classList.add("hidden");

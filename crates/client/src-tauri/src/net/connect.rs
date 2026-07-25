@@ -203,9 +203,13 @@ async fn connect_inner(
     state: tauri::State<'_, SessionState>,
 ) -> Result<ConnectOutcome, String> {
     // 接続資格情報は staging マップ (open_capture_window が積む) から取り出す。平文を
-    // ウィンドウ URL に載せないための受け渡し。再接続は staging が空なので None 扱いになり、
-    // 下の分岐で保存済みパスワード (DPAPI) を使う。
-    let staged = state.staging.lock().await.remove(&session_id);
+    // ウィンドウ URL に載せないための受け渡し。remove ではなく参照コピーにし、このセッションが
+    // 生きている間は staging に残す (自動/手動再接続でも同じ session_id で再度ここを通るため。
+    // DPAPI 非対応の Android では secret::get が常に None になり、remove すると再接続が
+    // 必ず失敗していた)。トレードオフとして平文パスワードをセッション終了までメモリに保持する。
+    // 恒久的な終了 (disconnect/disconnect_host/ウィンドウ破棄/孤児セッション停止) 側で明示的に
+    // staging.remove する運用とする。
+    let staged = state.staging.lock().await.get(&session_id).cloned();
     let password = match staged.flatten() {
         Some(p) => p,
         None => crate::secret::get(&app, &host)
@@ -606,6 +610,8 @@ async fn connect_inner(
         if app.get_webview_window(&handle.window_label).is_none() {
             drop(guard);
             handle.shutdown();
+            // このセッションは永続せず終了するため、staging に残した接続資格情報も破棄する。
+            state.staging.lock().await.remove(&session_id);
             return Err("ウィンドウが閉じられました".to_string());
         }
         guard.insert(session_id.clone(), handle);

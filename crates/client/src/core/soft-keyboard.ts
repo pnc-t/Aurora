@@ -29,6 +29,9 @@ export type SoftKeyboardOpts = {
   sendKey: (vk: number, down: boolean) => void;
   /** 開閉状態が変わったときに呼ぶ。Android の戻るキー等、外部要因で閉じた場合も通知する。 */
   onOpenChange?: (open: boolean) => void;
+  /** 外部 (オンスクリーンコントローラ) が既に Shift を押下保持しているか。true の間は
+   *  大文字/記号送出時に一時 Shift を挟まない (相手が保持している Shift を離してしまうため)。 */
+  isShiftHeld?: () => boolean;
 };
 
 /** Android ソフトキーボード用の隠し input を介して VK 送出を行う。 */
@@ -175,12 +178,15 @@ export class SoftKeyboard {
     this.sendKeyWithModifiers(mapped.vk, mapped.shift);
   }
 
-  /** 1 キー送出: 大文字/記号のときだけ一時 Shift を挟んで対象キーを down→up する。 */
+  /** 1 キー送出: 大文字/記号のときだけ一時 Shift を挟んで対象キーを down→up する。
+   *  ただし、パッド側が既に Shift をスティッキーで押下保持している場合は挟まない
+   *  (末尾の Shift up が、パッドが保持している Shift まで離してしまうため)。 */
   private sendKeyWithModifiers(vk: number, needShift: boolean): void {
-    if (needShift) this.opts.sendKey(VK.SHIFT, true);
+    const shift = needShift && this.opts.isShiftHeld?.() !== true;
+    if (shift) this.opts.sendKey(VK.SHIFT, true);
     this.opts.sendKey(vk, true);
     this.opts.sendKey(vk, false);
-    if (needShift) this.opts.sendKey(VK.SHIFT, false);
+    if (shift) this.opts.sendKey(VK.SHIFT, false);
   }
 }
 

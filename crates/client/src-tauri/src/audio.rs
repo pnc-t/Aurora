@@ -5,8 +5,9 @@
 //! 外部へは Opus バイト列を渡す送信ハンドル (`AudioPlayer`) だけを公開する。
 //!
 //! Android/iOS は cpal/opus が NDK クロスコンパイルに対応しないため、音声フェーズ2
-//! (Oboe/AAudio 等のネイティブ実装) まで no-op スタブで応答する。公開 API (`AudioPlayer`/
-//! `spawn`) はデスクトップと完全に同一なので、呼び出し側 (`net/` 配下) は変更不要。
+//! (Oboe/AAudio 等のネイティブ実装) まで `spawn` が Err を返し初期化に失敗する扱いとする。
+//! 公開 API (`AudioPlayer`/`spawn`) の型はデスクトップと完全に同一なので、呼び出し側
+//! (`net/` 配下) は変更不要 (`audio::spawn()` の Err は既に「映像のみで継続」に倒す作り)。
 
 pub use imp::{AudioPlayer, spawn};
 
@@ -150,16 +151,16 @@ mod imp {
     }
 }
 
-/// Android/iOS 向け no-op スタブ。Opus フレームを受け取って捨てるだけで、再生は行わない。
+/// Android/iOS 向け未実装スタブ。`spawn` が常に Err を返すため `AudioPlayer` は構築されない
+/// (型と関連メソッドは呼び出し側 `net/` が `Option<AudioPlayer>` として参照するため残す)。
 #[cfg(mobile)]
 mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
 
-    /// 音声再生ハンドル (no-op)。`sender()` が返すチャンネルの受信側は存在しないため、
-    /// 送信は即座に読み捨てられる (エラーにはならない)。
+    /// 音声再生ハンドル。Android/iOS では `spawn` が Err を返すため実体は生成されない。
     pub struct AudioPlayer {
         tx: std::sync::mpsc::Sender<Vec<u8>>,
         gain: Arc<AtomicU32>,
@@ -176,12 +177,10 @@ mod imp {
         }
     }
 
-    /// 受信スレッドを起こさず、送信端だけ返す (受信側は即 drop、送られたフレームは捨てられる)。
+    /// 音声フェーズ2 (Oboe/AAudio 等) まで未実装。呼び出し側は Err を受けて映像のみで継続する。
     pub fn spawn() -> Result<AudioPlayer> {
-        let (tx, _rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        Ok(AudioPlayer {
-            tx,
-            gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
-        })
+        Err(anyhow!(
+            "audio playback is not supported on this platform yet"
+        ))
     }
 }

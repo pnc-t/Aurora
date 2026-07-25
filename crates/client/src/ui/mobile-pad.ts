@@ -27,6 +27,9 @@ export type MobilePadHandle = {
   /** このコンポーネント以外の経路 (ソフトキーボード) でキーが送られたことを通知する。
    *  短押しスティッキー修飾の自動解除に使う。 */
   notifyExternalKey: () => void;
+  /** パッドのスティッキー Shift が有効 (once / locked) かどうか。ソフトキーボード側が
+   *  一時 Shift を二重に掛けない判断に使う。 */
+  isShiftHeld: () => boolean;
 };
 
 type Pt = { x: number; y: number };
@@ -313,7 +316,12 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     const btn = opts.root.querySelector<HTMLButtonElement>(`.mp-mod-btn[data-mod="${key}"]`);
     if (!btn) continue;
     modButtons.set(key, btn);
-    btn.addEventListener("pointerdown", () => onModPointerDown(key));
+    btn.addEventListener("pointerdown", (e) => {
+      // L/M/R と同じ理由: 捕捉しないと指がボタン外へ滑った際に up/cancel が届かず、
+      // ホスト側に修飾キーが押しっぱなしのまま残ってしまう。
+      btn.setPointerCapture(e.pointerId);
+      onModPointerDown(key);
+    });
     btn.addEventListener("pointerup", () => onModPointerUp(key));
     btn.addEventListener("pointercancel", () => onModPointerCancel(key));
   }
@@ -587,6 +595,9 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     },
     notifyExternalKey(): void {
       consumeOnce();
+    },
+    isShiftHeld(): boolean {
+      return modState.shift !== "off";
     },
   };
 }

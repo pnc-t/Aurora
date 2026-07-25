@@ -98,12 +98,21 @@ pub fn run() {
                                 .filter(|(_, h)| h.window_label == label)
                                 .map(|(id, _)| id.clone())
                                 .collect();
+                            let mut stopped_ids = Vec::with_capacity(ids.len());
                             for id in ids {
                                 if let Some(h) = guard.remove(&id) {
                                     h.shutdown();
+                                    stopped_ids.push(id);
                                 }
                             }
                             drop(guard);
+                            // 停止した全セッション分、staging に保持していた接続資格情報も破棄する。
+                            {
+                                let mut staging = state.staging.lock().await;
+                                for id in &stopped_ids {
+                                    staging.remove(id);
+                                }
+                            }
                             // ランチャーへ接続中 host 一覧を通知 (ウィンドウを閉じた分の切断を反映)。
                             net::emit_connections(&app, &state).await;
                         });
