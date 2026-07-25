@@ -195,7 +195,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       </div>
       <div class="mp-pad-actions">
         <button type="button" class="mp-btn" id="mp-mode" title="スティックに切替" aria-label="スティックに切替">${icon("touchpad")}</button>
-        <button type="button" class="mp-btn" id="mp-keyboard" title="キーボード" aria-label="キーボード">${icon("key")}</button>
+        <button type="button" class="mp-btn" id="mp-keyboard" title="操作キーボード" aria-label="操作キーボード">${icon("modifier")}</button>
       </div>
     </div>
     <div class="mp-btn-card mp-hidden" id="mp-btn-card">

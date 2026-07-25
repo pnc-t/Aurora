@@ -41,10 +41,10 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
       <div class="mc-panel">
         <div class="mc-bar">
           <button type="button" class="mc-btn" id="mc-disconnect" title="切断">${icon("power")}</button>
-          <button type="button" class="mc-btn" id="mc-keyboard" title="キーボード">${icon("edit")}</button>
+          <button type="button" class="mc-btn" id="mc-keyboard" title="キーボード">${icon("keyboard")}</button>
           <button type="button" class="mc-btn" id="mc-pad" title="コントローラ">${icon("mouse")}</button>
           <button type="button" class="mc-btn" id="mc-display" title="ディスプレイ" style="display:none">${icon("display")}</button>
-          <button type="button" class="mc-btn" id="mc-zoom-reset" title="ズームをリセット" style="display:none">${icon("refresh")}</button>
+          <button type="button" class="mc-btn" id="mc-zoom-reset" title="ズームをリセット" style="display:none">${icon("zoom-reset")}</button>
         </div>
       </div>
     </div>
@@ -58,7 +58,6 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   const padBtn = opts.root.querySelector<HTMLButtonElement>("#mc-pad");
   const displayBtn = opts.root.querySelector<HTMLButtonElement>("#mc-display");
   const displayPop = opts.root.querySelector<HTMLElement>("#mc-display-pop");
-  // ズームリセット専用のアイコンは用意していないため、意味が近い「リセット」の refresh を流用する。
   const zoomResetBtn = opts.root.querySelector<HTMLButtonElement>("#mc-zoom-reset");
 
   // --- 引き出し / 自動格納 ---
