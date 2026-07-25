@@ -6,6 +6,13 @@
   left: 0;
   right: 0;
   bottom: 0;
+  /* 横に広い画面 (タブレット/横持ち/デスクトップ WebView) では幅一杯に伸ばすとキーが
+   * 間延びして押しにくくなるため、上限幅を決めて中央に寄せる。 */
+  max-width: 760px;
+  margin-inline: auto;
+  /* 拡張行を開くと 9 段になり画面外へはみ出しうるため、offsetParent
+   * (#remote-view, 高さ確定済み) に対する割合で上限を決め、行側を縮めて収める。 */
+  max-height: 70%;
   z-index: 45; /* mobile-controls.css の .mc-root(30)/.mc-display-pop(31) より上に置く */
   display: flex;
   flex-direction: column;
@@ -13,6 +20,9 @@
   padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
   background: var(--toolbar-bg);
   border-top: 1px solid var(--panel-border);
+  /* 画面より狭い幅で中央寄せになったとき border-top だけだと切れて見えるため、
+   * 角丸で意図した浮きとして見せる。 */
+  border-radius: 10px 10px 0 0;
   box-shadow: 0 -2px 10px var(--shadow);
   /* ブラウザ既定のタッチ操作 (スクロール/ダブルタップズーム/長押しの選択・コールアウト) を
    * 全て止める。止めないとキー連打がズームに化けたり、長押しリピート中に文字選択が始まる。
@@ -30,6 +40,11 @@
 }
 
 .mkb-ext {
+  /* 基本 6 段より優先度を下げつつ一緒に縮められるように、行 (.mkb-row) より
+   * 縮小の伸び代を大きく取る。min-height:0 が無いと flex アイテムは既定の
+   * min-height:auto で中身の高さより縮まらない。 */
+  flex: 3 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -41,24 +56,29 @@
 .mkb-row {
   display: flex;
   gap: 3px;
+  /* 44px を基準の高さとして欲しがるが、.mkb-root の max-height に収まらない
+   * ときは 22px まで縮む (固定 min-height をやめ、親の高さ基準で可変にする)。 */
+  flex: 1 1 44px;
+  min-height: 22px;
 }
 
 .mkb-key {
   flex: 1;
   min-width: 0;
-  min-height: 44px;
+  height: 100%;
+  min-height: 0;
   border: 1px solid var(--panel-border);
   border-radius: 6px;
   background: var(--panel);
   color: var(--fg);
-  font-size: 14px;
+  font-size: clamp(10px, 1.9vh, 14px);
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
 .mkb-fn {
-  font-size: 11px;
+  font-size: clamp(9px, 1.5vh, 11px);
 }
 
 .mkb-wide {
@@ -95,15 +115,4 @@
   background: var(--accent);
   color: var(--accent-fg);
   border-color: var(--accent);
-}
-
-/* 横持ち (画面が低い) では 6〜9 段の合計高さが画面の大半を占めるため、キーを詰める。 */
-@media (max-height: 480px) {
-  .mkb-key {
-    min-height: 32px;
-    font-size: 12px;
-  }
-  .mkb-fn {
-    font-size: 10px;
-  }
 }
