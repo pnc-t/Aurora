@@ -75,41 +75,60 @@ const VK_OEM = {
 const REPEAT_DELAY_MS = 400;
 const REPEAT_INTERVAL_MS = 50;
 
-/** 通常キー 1 個ぶんの `<button>` HTML を作る。 */
-function keyHtml(vk: number, label: string, ariaLabel: string, extraClass = ""): string {
-  return `<button type="button" class="mkb-key ${extraClass}" data-vk="${vk}" aria-label="${ariaLabel}">${label}</button>`;
+/** 通常キー 1 個ぶんの `<button>` HTML を作る。修飾・ユーティリティ系は `util` を立てて
+ *  文字キーと見た目 (背景/文字サイズ) を分ける (CSS 側の `.mkb-util`)。 */
+function keyHtml(vk: number, label: string, ariaLabel: string, extraClass = "", util = false): string {
+  const cls = util ? `mkb-key mkb-util ${extraClass}` : `mkb-key ${extraClass}`;
+  return `<button type="button" class="${cls}" data-vk="${vk}" aria-label="${ariaLabel}">${label}</button>`;
 }
 
-/** 修飾キー 1 個ぶんの `<button>` HTML を作る。 */
-function modHtml(key: ModKey, label: string): string {
-  return `<button type="button" class="mkb-key mkb-mod" data-mod="${key}" aria-label="${MOD_LABEL[key]}">${label}</button>`;
+/** 修飾キー 1 個ぶんの `<button>` HTML を作る。修飾キーは常にユーティリティ扱い。 */
+function modHtml(key: ModKey, label: string, extraClass = ""): string {
+  return `<button type="button" class="mkb-key mkb-mod mkb-util ${extraClass}" data-mod="${key}" aria-label="${MOD_LABEL[key]}">${label}</button>`;
 }
 
+// 拡張 3 段 (F1-F12 / OEM 記号 / 半角全角・Ins・Del・Home・End・PgUp・PgDn)。
+// 中身は現状のまま。全キーがユーティリティ (補助) 扱い。
 const EXT_MARKUP = `
   <div class="mkb-row">
     ${[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-      .map((n) => keyHtml(0x70 + (n - 1), `F${n}`, `F${n}`, "mkb-fn"))
+      .map((n) => keyHtml(0x70 + (n - 1), `F${n}`, `F${n}`, "", true))
       .join("")}
   </div>
   <div class="mkb-row">
-    ${keyHtml(VK_OEM["`"], "`", "`")}
-    ${keyHtml(VK_OEM["-"], "-", "-")}
-    ${keyHtml(VK_OEM["="], "=", "=")}
-    ${keyHtml(VK_OEM["["], "[", "[")}
-    ${keyHtml(VK_OEM["]"], "]", "]")}
-    ${keyHtml(VK_OEM["\\"], "\\", "\\")}
-    ${keyHtml(VK_OEM[";"], ";", ";")}
-    ${keyHtml(VK_OEM["'"], "'", "'")}
-    ${keyHtml(VK_OEM["/"], "/", "/")}
+    ${keyHtml(VK_OEM["`"], "`", "`", "", true)}
+    ${keyHtml(VK_OEM["-"], "-", "-", "", true)}
+    ${keyHtml(VK_OEM["="], "=", "=", "", true)}
+    ${keyHtml(VK_OEM["["], "[", "[", "", true)}
+    ${keyHtml(VK_OEM["]"], "]", "]", "", true)}
+    ${keyHtml(VK_OEM["\\"], "\\", "\\", "", true)}
+    ${keyHtml(VK_OEM[";"], ";", ";", "", true)}
+    ${keyHtml(VK_OEM["'"], "'", "'", "", true)}
+    ${keyHtml(VK_OEM["/"], "/", "/", "", true)}
   </div>
   <div class="mkb-row">
-    ${keyHtml(VK_KANJI, "半/全", "半角/全角")}
-    ${keyHtml(VK_INSERT, "Ins", "Insert")}
-    ${keyHtml(VK_DELETE, "Del", "Delete")}
-    ${keyHtml(VK_HOME, "Home", "Home")}
-    ${keyHtml(VK_END, "End", "End")}
-    ${keyHtml(VK_PRIOR, "PgUp", "Page Up")}
-    ${keyHtml(VK_NEXT, "PgDn", "Page Down")}
+    ${keyHtml(VK_KANJI, "半/全", "半角/全角", "", true)}
+    ${keyHtml(VK_INSERT, "Ins", "Insert", "", true)}
+    ${keyHtml(VK_DELETE, "Del", "Delete", "", true)}
+    ${keyHtml(VK_HOME, "Home", "Home", "", true)}
+    ${keyHtml(VK_END, "End", "End", "", true)}
+    ${keyHtml(VK_PRIOR, "PgUp", "Page Up", "", true)}
+    ${keyHtml(VK_NEXT, "PgDn", "Page Down", "", true)}
+  </div>
+`;
+
+// ユーティリティ行 (Esc/Tab/矢印/拡張トグル/閉じる)。物理キーボードに寄せ、文字ブロックの
+// 上に置くことで下段が文字キーだけでまとまるようにする。
+const ROW_UTIL = `
+  <div class="mkb-row">
+    ${keyHtml(VK_ESCAPE, "Esc", "Escape", "", true)}
+    ${keyHtml(VK_TAB, "Tab", "Tab", "", true)}
+    ${keyHtml(VK_LEFT, "←", "左", "", true)}
+    ${keyHtml(VK_UP, "↑", "上", "", true)}
+    ${keyHtml(VK_DOWN, "↓", "下", "", true)}
+    ${keyHtml(VK_RIGHT, "→", "右", "", true)}
+    <button type="button" class="mkb-key mkb-util" id="mkb-ext-toggle" aria-label="拡張キー">拡張</button>
+    <button type="button" class="mkb-key mkb-util" id="mkb-close" aria-label="キーボードを閉じる">⌄</button>
   </div>
 `;
 
@@ -131,48 +150,39 @@ const ROW2 = `
   </div>
 `;
 
+// asdf 行。両端に幅 0.5 のスペーサーを入れて本物のキーボードの段ずれを再現する。
+// スペーサーは button ではなく span にし、[data-vk] のイベント配線ループに拾われないようにする。
 const ROW3 = `
   <div class="mkb-row">
+    <span class="mkb-spacer"></span>
     ${"asdfghjkl"
       .split("")
       .map((ch) => keyHtml(vkAlpha(ch), ch, ch))
       .join("")}
-    ${keyHtml(VK_BACK, "⌫", "Backspace", "mkb-wide")}
+    <span class="mkb-spacer"></span>
   </div>
 `;
 
 const ROW4 = `
   <div class="mkb-row">
-    ${modHtml("shift", "⇧")}
+    ${modHtml("shift", "⇧", "mkb-wide")}
     ${"zxcvbnm"
       .split("")
       .map((ch) => keyHtml(vkAlpha(ch), ch, ch))
       .join("")}
-    ${keyHtml(VK_OEM[","], ",", ",")}
-    ${keyHtml(VK_OEM["."], ".", ".")}
+    ${keyHtml(VK_BACK, "⌫", "Backspace", "mkb-wide", true)}
   </div>
 `;
 
 const ROW5 = `
   <div class="mkb-row">
-    ${keyHtml(VK_ESCAPE, "Esc", "Escape")}
-    ${keyHtml(VK_TAB, "Tab", "Tab")}
-    ${keyHtml(VK_LEFT, "←", "左")}
-    ${keyHtml(VK_UP, "↑", "上")}
-    ${keyHtml(VK_DOWN, "↓", "下")}
-    ${keyHtml(VK_RIGHT, "→", "右")}
-    <button type="button" class="mkb-key" id="mkb-ext-toggle" aria-label="拡張キー">拡張</button>
-    <button type="button" class="mkb-key" id="mkb-close" aria-label="キーボードを閉じる">⌄</button>
-  </div>
-`;
-
-const ROW6 = `
-  <div class="mkb-row">
     ${modHtml("ctrl", MOD_LABEL.ctrl)}
     ${modHtml("alt", MOD_LABEL.alt)}
     ${modHtml("win", MOD_LABEL.win)}
-    ${keyHtml(VK_SPACE, "", "Space", "mkb-space")}
-    ${keyHtml(VK_RETURN, "Enter", "Enter", "mkb-enter")}
+    ${keyHtml(VK_OEM[","], ",", ",")}
+    ${keyHtml(VK_SPACE, "", "Space", "mkb-space", true)}
+    ${keyHtml(VK_OEM["."], ".", ".")}
+    ${keyHtml(VK_RETURN, "Enter", "Enter", "mkb-enter", true)}
   </div>
 `;
 
@@ -181,7 +191,7 @@ export function mountMobileKeyboard(opts: MobileKeyboardOpts): MobileKeyboardHan
   opts.root.innerHTML = `
     <div class="mkb-root mkb-hidden" id="mkb-root">
       <div class="mkb-ext mkb-hidden" id="mkb-ext">${EXT_MARKUP}</div>
-      ${ROW1}${ROW2}${ROW3}${ROW4}${ROW5}${ROW6}
+      ${ROW_UTIL}${ROW1}${ROW2}${ROW3}${ROW4}${ROW5}
     </div>
   `;
 

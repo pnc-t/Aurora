@@ -8,7 +8,7 @@
   bottom: 0;
   /* 横に広い画面 (タブレット/横持ち/デスクトップ WebView) では幅一杯に伸ばすとキーが
    * 間延びして押しにくくなるため、上限幅を決めて中央に寄せる。 */
-  max-width: 760px;
+  max-width: 560px;
   margin-inline: auto;
   /* 拡張行を開くと 9 段になり画面外へはみ出しうるため、offsetParent
    * (#remote-view, 高さ確定済み) に対する割合で上限を決め、行側を縮めて収める。 */
@@ -16,7 +16,7 @@
   z-index: 45; /* mobile-controls.css の .mc-root(30)/.mc-display-pop(31) より上に置く */
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
   padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
   background: var(--toolbar-bg);
   border-top: 1px solid var(--panel-border);
@@ -55,30 +55,42 @@
 
 .mkb-row {
   display: flex;
-  gap: 3px;
+  gap: 5px;
   /* 44px を基準の高さとして欲しがるが、.mkb-root の max-height に収まらない
    * ときは 22px まで縮む (固定 min-height をやめ、親の高さ基準で可変にする)。 */
   flex: 1 1 44px;
   min-height: 22px;
 }
 
+/* 文字キーが主役なので背景を明るく (--control)・文字も大きく取り、修飾/ユーティリティ系
+ * (.mkb-util) は --raised + 小さい文字で一段沈ませる。これで「文字盤」と「補助キー」を
+ * 見分けられるようにする (表計算グリッド化の対策)。border は使わず下辺の box-shadow で
+ * 物理キーの浮きを表現する。 */
 .mkb-key {
   flex: 1;
   min-width: 0;
   height: 100%;
   min-height: 0;
-  border: 1px solid var(--panel-border);
-  border-radius: 6px;
-  background: var(--panel);
+  border-radius: 7px;
+  background: var(--control);
   color: var(--fg);
-  font-size: clamp(10px, 1.9vh, 14px);
+  box-shadow: 0 1px 0 var(--shadow);
+  font-size: clamp(12px, 2.1vh, 17px);
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.mkb-fn {
-  font-size: clamp(9px, 1.5vh, 11px);
+.mkb-key.mkb-util {
+  background: var(--raised);
+  color: var(--muted);
+  font-size: clamp(9px, 1.6vh, 12px);
+}
+
+/* asdf 行の段ずれ用スペーサー。button ではないのでイベント配線・タップ対象にはならない。 */
+.mkb-spacer {
+  flex: 0.5;
+  min-width: 0;
 }
 
 .mkb-wide {
@@ -86,33 +98,31 @@
 }
 
 .mkb-space {
-  flex: 4;
+  flex: 3.5;
 }
 
 .mkb-enter {
   flex: 1.5;
 }
 
-/* 押下中・スティッキー状態の見た目は ui/mobile-pad.css の .mp-btn 系と同じ表現に揃える。 */
+/* 押下中・スティッキー状態の見た目は ui/mobile-pad.css の .mp-btn 系と同じ表現に揃える。
+ * border を廃したため、枠の表現は box-shadow の内側リングに置き換える。 */
 .mkb-key.mkb-active {
   background: var(--accent);
   color: var(--accent-fg);
-  border-color: var(--accent);
 }
 
 .mkb-key.toggled {
   background: var(--accent);
   color: var(--accent-fg);
-  border-color: var(--accent);
 }
 
 /* 修飾キーの 3 状態: once = 枠線をアクセント色、locked = 塗りつぶし。 */
 .mkb-mod.mkb-once {
-  border-color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
   color: var(--accent);
 }
 .mkb-mod.mkb-locked {
   background: var(--accent);
   color: var(--accent-fg);
-  border-color: var(--accent);
 }
