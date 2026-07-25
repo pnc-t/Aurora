@@ -208,7 +208,6 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
           <button type="button" class="mp-quick-btn" id="mp-q-copy">Ctrl+C</button>
           <button type="button" class="mp-quick-btn" id="mp-q-paste">Ctrl+V</button>
           <button type="button" class="mp-quick-btn" id="mp-q-alttab">Alt+Tab</button>
-          <button type="button" class="mp-quick-btn" id="mp-q-win">Win</button>
           <button type="button" class="mp-quick-btn" id="mp-q-esc">Esc</button>
           <button type="button" class="mp-quick-btn" id="mp-q-enter">Enter</button>
           <button type="button" class="mp-quick-btn" id="mp-q-tab">Tab</button>
@@ -230,7 +229,6 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   const qCopyBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-copy");
   const qPasteBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-paste");
   const qAltTabBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-alttab");
-  const qWinBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-win");
   const qEscBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-esc");
   const qEnterBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-enter");
   const qTabBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-tab");
@@ -400,10 +398,9 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     comboKey([VK_MENU, VK_TAB]);
     consumeOnce();
   });
-  qWinBtn?.addEventListener("click", () => {
-    tapKey(VK_LWIN);
-    consumeOnce();
-  });
+  // Win 単押し (スタートメニュー) の定型キーは置かない。修飾キー行の Win と同じラベルが
+  // 2 つ並んで紛らわしいため。単押ししたいときは修飾キー行の Win を 2 回叩く (1 回目で down、
+  // 2 回目で up が送られる = down→up と等価)。
   qEscBtn?.addEventListener("click", () => {
     tapKey(VK_ESCAPE);
     consumeOnce();
