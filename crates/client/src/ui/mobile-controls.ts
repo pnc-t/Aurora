@@ -111,10 +111,8 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
 
   disconnectBtn?.addEventListener("click", () => opts.onDisconnect());
 
-  // mousedown の既定動作はフォーカス移動で、これを許すとキーボードボタンをタップした瞬間に
-  // 隠し input からフォーカスが奪われて blur し、SoftKeyboard の開閉フラグが「閉じた」に
-  // 化ける (トグルする前提の isOpen() 判定が壊れ、ボタンが常に青いままになるバグの原因)。
-  // preventDefault で入力欄のフォーカスを保ったまま click は素通しする。
+  // mousedown の既定動作 (フォーカス移動) は他のモバイル UI ボタンと同様に止める
+  // (意図しないフォーカス変化を防ぐ)。click は素通しする。
   // touchstart は preventDefault しない (Android では合成 click まで消えボタンが反応しなくなる)。
   keyboardBtn?.addEventListener("mousedown", (e) => e.preventDefault());
 
@@ -123,8 +121,7 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     scheduleAutoHide();
   });
 
-  // キーボードボタンと同じ理由: mousedown の既定動作 (フォーカス移動) を許すと、
-  // ソフトキーボード表示中に隠し input が blur してキーボードが閉じてしまう。
+  // キーボードボタンと同じ理由 (タップ後にフォーカスリングが残るのを防ぐ)。
   padBtn?.addEventListener("mousedown", (e) => e.preventDefault());
 
   padBtn?.addEventListener("click", () => {

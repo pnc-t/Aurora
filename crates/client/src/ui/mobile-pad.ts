@@ -6,6 +6,7 @@
 // 表示中は映像への直接タップは別レイヤー (TouchInput.setPointerEnabled) 側で無効化される。
 
 import { type InputEvent } from "../core/ipc";
+import { MOD_KEYS, MOD_LABEL, MOD_VK, type ModKey, type StickyModifiers } from "../core/sticky-modifiers";
 import { icon } from "./icons";
 import "./mobile-pad.css";
 
@@ -17,6 +18,9 @@ export type MobilePadOpts = {
   sendKey: (vk: number, down: boolean) => void;
   /** グリップのドラッグ終了時に、どちらのカードかを区別して画面比率位置 (0〜1) を通知する (永続化用)。 */
   onPositionChange: (which: "pad" | "buttons", pos: [number, number]) => void;
+  /** 修飾キーの共有ストア。自前キーボード (ui/mobile-keyboard.ts) と状態を共有するため、
+   *  このコンポーネントは状態を自前で持たない。 */
+  mods: StickyModifiers;
 };
 
 export type MobilePadHandle = {
@@ -24,40 +28,24 @@ export type MobilePadHandle = {
   setVisible: (on: boolean) => void;
   /** 保存済みの比率位置 (0〜1) を反映する。null なら既定位置。範囲外はクランプする。 */
   setPositions: (pad: [number, number] | null, buttons: [number, number] | null) => void;
-  /** このコンポーネント以外の経路 (ソフトキーボード) でキーが送られたことを通知する。
-   *  短押しスティッキー修飾の自動解除に使う。 */
-  notifyExternalKey: () => void;
-  /** パッドのスティッキー Shift が有効 (once / locked) かどうか。ソフトキーボード側が
-   *  一時 Shift を二重に掛けない判断に使う。 */
-  isShiftHeld: () => boolean;
 };
 
 type Pt = { x: number; y: number };
 type ClickButton = "Left" | "Middle" | "Right";
 
-// VK 値。core/soft-keyboard.ts の VK 定数は private で import できないため、必要な分だけ複製する。
-const VK_SHIFT = 0x10;
-const VK_CONTROL = 0x11;
-const VK_MENU = 0x12; // Alt
+// VK 値。ui/mobile-keyboard.ts の VK 定数は private で import できないため、必要な分だけ複製する。
+// MOD_VK から引けない定型キー分のみここで持つ。
+const VK_CONTROL = MOD_VK.ctrl;
+const VK_MENU = MOD_VK.alt; // Alt
 const VK_ESCAPE = 0x1b;
 const VK_TAB = 0x09;
 const VK_RETURN = 0x0d;
-const VK_LWIN = 0x5b;
 const VK_C = 0x43;
 const VK_V = 0x56;
-
-type ModKey = "ctrl" | "alt" | "shift" | "win";
-type ModState = "off" | "once" | "locked";
-
-const MOD_KEYS: ModKey[] = ["ctrl", "alt", "shift", "win"];
-const MOD_VK: Record<ModKey, number> = { ctrl: VK_CONTROL, alt: VK_MENU, shift: VK_SHIFT, win: VK_LWIN };
-const MOD_LABEL: Record<ModKey, string> = { ctrl: "Ctrl", alt: "Alt", shift: "Shift", win: "Win" };
 
 // タップ判定のしきい値 (core/touch-input.ts の TAP_MAX_MS/MOVE_THRESHOLD_PX と同じ値)。
 const TAP_MAX_MS = 300;
 const MOVE_THRESHOLD_PX = 10;
-// 修飾キーの長押しでスティッキーを "locked" に固定するまでの時間。
-const MOD_LONG_PRESS_MS = 500;
 // 2 本指ホイールの px→ノッチ換算。core/touch-input.ts の WHEEL_PX_PER_NOTCH と揃える。
 const WHEEL_PX_PER_NOTCH = 100;
 // 既定のグリップ位置 (画面比率)。両手持ち想定でパッドは左下、ボタンは右下に離して置く。
@@ -233,82 +221,15 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   const qEnterBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-enter");
   const qTabBtn = opts.root.querySelector<HTMLButtonElement>("#mp-q-tab");
 
-  // mousedown の既定動作 (フォーカス移動) を許すと、ソフトキーボード表示中に隠し input が
-  // blur してキーボードが意図せず閉じてしまう (mobile-controls.ts と同じ理由)。
+  // mousedown の既定動作 (フォーカス移動) を止め、タップ後にフォーカスリングが残らないようにする。
   // touchstart は preventDefault しない (Android で合成 click まで消えボタンが反応しなくなる)。
   for (const btn of Array.from(opts.root.querySelectorAll<HTMLButtonElement>("button"))) {
     btn.addEventListener("mousedown", (e) => e.preventDefault());
   }
 
-  // ================= 修飾キー (スティッキー) =================
+  // ================= 修飾キー (スティッキー、core/sticky-modifiers 共有ストア) =================
 
-  const modState: Record<ModKey, ModState> = { ctrl: "off", alt: "off", shift: "off", win: "off" };
   const modButtons = new Map<ModKey, HTMLButtonElement>();
-  const modLongPressTimers = new Map<ModKey, number>();
-  const modLongPressFired = new Set<ModKey>();
-
-  function setModState(key: ModKey, state: ModState): void {
-    modState[key] = state;
-    const btn = modButtons.get(key);
-    btn?.classList.toggle("mp-once", state === "once");
-    btn?.classList.toggle("mp-locked", state === "locked");
-  }
-
-  /** "once" 状態の修飾キーを全て消費して off に戻す。L/M/R を離した時・定型キー送出・
-   *  パッドのタップ・notifyExternalKey() の直後に呼ぶ。 */
-  function consumeOnce(): void {
-    for (const key of MOD_KEYS) {
-      if (modState[key] === "once") {
-        opts.sendKey(MOD_VK[key], false);
-        setModState(key, "off");
-      }
-    }
-  }
-
-  function onModPointerDown(key: ModKey): void {
-    modLongPressFired.delete(key);
-    const startState = modState[key];
-    // locked からの長押しは未定義のため開始しない (locked は短押しでのみ off に戻す)。
-    if (startState === "locked") return;
-    const timer = window.setTimeout(() => {
-      modLongPressFired.add(key);
-      // "once" は既に down 済みなので送らない。"off" からはここで down を送る。
-      if (startState === "off") opts.sendKey(MOD_VK[key], true);
-      setModState(key, "locked");
-    }, MOD_LONG_PRESS_MS);
-    modLongPressTimers.set(key, timer);
-  }
-
-  function onModPointerUp(key: ModKey): void {
-    const timer = modLongPressTimers.get(key);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      modLongPressTimers.delete(key);
-    }
-    if (modLongPressFired.has(key)) {
-      // 長押しで既に locked へ確定済み。短押し扱いの二重処理はしない。
-      modLongPressFired.delete(key);
-      return;
-    }
-    const cur = modState[key];
-    if (cur === "off") {
-      opts.sendKey(MOD_VK[key], true);
-      setModState(key, "once");
-    } else {
-      // "once" → off / "locked" → off はどちらも同じ (down 済みのキーを離す)。
-      opts.sendKey(MOD_VK[key], false);
-      setModState(key, "off");
-    }
-  }
-
-  function onModPointerCancel(key: ModKey): void {
-    const timer = modLongPressTimers.get(key);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      modLongPressTimers.delete(key);
-    }
-    modLongPressFired.delete(key);
-  }
 
   for (const key of MOD_KEYS) {
     const btn = opts.root.querySelector<HTMLButtonElement>(`.mp-mod-btn[data-mod="${key}"]`);
@@ -318,10 +239,24 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       // L/M/R と同じ理由: 捕捉しないと指がボタン外へ滑った際に up/cancel が届かず、
       // ホスト側に修飾キーが押しっぱなしのまま残ってしまう。
       btn.setPointerCapture(e.pointerId);
-      onModPointerDown(key);
+      opts.mods.pressStart(key);
     });
-    btn.addEventListener("pointerup", () => onModPointerUp(key));
-    btn.addEventListener("pointercancel", () => onModPointerCancel(key));
+    btn.addEventListener("pointerup", () => opts.mods.pressEnd(key));
+    btn.addEventListener("pointercancel", () => opts.mods.pressCancel(key));
+  }
+
+  // 他 UI (キーボード) 由来の状態変化も含め、ボタンの見た目を常に同期する。
+  opts.mods.subscribe((key, state) => {
+    const btn = modButtons.get(key);
+    btn?.classList.toggle("mp-once", state === "once");
+    btn?.classList.toggle("mp-locked", state === "locked");
+  });
+  // マウント時点で既に他 UI 側が once/locked にしているかもしれないため、現在値を反映する。
+  for (const key of MOD_KEYS) {
+    const state = opts.mods.state(key);
+    const btn = modButtons.get(key);
+    btn?.classList.toggle("mp-once", state === "once");
+    btn?.classList.toggle("mp-locked", state === "locked");
   }
 
   // ================= L/M/R クリックボタン =================
@@ -346,7 +281,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       if (!pressed) return;
       pressed = false;
       opts.sendInput({ MouseButton: { button, down: false } });
-      consumeOnce();
+      opts.mods.consumeOnce();
     };
     btn.addEventListener("pointerup", release);
     btn.addEventListener("pointercancel", release);
@@ -388,30 +323,30 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
 
   qCopyBtn?.addEventListener("click", () => {
     comboKey([VK_CONTROL, VK_C]);
-    consumeOnce();
+    opts.mods.consumeOnce();
   });
   qPasteBtn?.addEventListener("click", () => {
     comboKey([VK_CONTROL, VK_V]);
-    consumeOnce();
+    opts.mods.consumeOnce();
   });
   qAltTabBtn?.addEventListener("click", () => {
     comboKey([VK_MENU, VK_TAB]);
-    consumeOnce();
+    opts.mods.consumeOnce();
   });
   // Win 単押し (スタートメニュー) の定型キーは置かない。修飾キー行の Win と同じラベルが
   // 2 つ並んで紛らわしいため。単押ししたいときは修飾キー行の Win を 2 回叩く (1 回目で down、
   // 2 回目で up が送られる = down→up と等価)。
   qEscBtn?.addEventListener("click", () => {
     tapKey(VK_ESCAPE);
-    consumeOnce();
+    opts.mods.consumeOnce();
   });
   qEnterBtn?.addEventListener("click", () => {
     tapKey(VK_RETURN);
-    consumeOnce();
+    opts.mods.consumeOnce();
   });
   qTabBtn?.addEventListener("click", () => {
     tapKey(VK_TAB);
-    consumeOnce();
+    opts.mods.consumeOnce();
   });
 
   // ================= トラックパッド (なぞる場所) =================
@@ -545,7 +480,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       if (!cancelled && !singleMoved && duration < TAP_MAX_MS) {
         opts.sendInput({ MouseButton: { button: "Left", down: true } });
         opts.sendInput({ MouseButton: { button: "Left", down: false } });
-        consumeOnce();
+        opts.mods.consumeOnce();
       }
       abortSingle();
     }
@@ -579,22 +514,11 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       }
       // 押しっぱなしが残ると実害が出るため、非表示にする瞬間に必ず解除する。
       for (const release of clickReleasers) release();
-      for (const key of MOD_KEYS) {
-        if (modState[key] !== "off") {
-          opts.sendKey(MOD_VK[key], false);
-          setModState(key, "off");
-        }
-      }
+      opts.mods.releaseAll();
     },
     setPositions(pad: [number, number] | null, buttons: [number, number] | null): void {
       padCard.applyRatio(clampPos(pad, PAD_DEFAULT_POS));
       btnCard.applyRatio(clampPos(buttons, BTN_DEFAULT_POS));
-    },
-    notifyExternalKey(): void {
-      consumeOnce();
-    },
-    isShiftHeld(): boolean {
-      return modState.shift !== "off";
     },
   };
 }

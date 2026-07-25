@@ -22,19 +22,6 @@
   padding: 0;
 }
 
-/* ソフトキーボードはフロートパネルなので絶対配置の器だけ確保する (中身は core/soft-keyboard.ts)。 */
-#soft-keyboard-root {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: calc(56px + env(safe-area-inset-bottom));
-  z-index: 40;
-  pointer-events: none;
-}
-#soft-keyboard-root > * {
-  pointer-events: auto;
-}
-
 /* オフセットカーソル (touch-input.ts)。指の位置より上に描き、指に隠れず着地点を確認できる
  * ようにする。canvas の親 (#screen-wrap) の子として置かれる想定 (canvas 自身はピンチズームで
  * transform が掛かるため子にできない)。十字は疑似要素、中心の点は本体の radial-gradient で描く

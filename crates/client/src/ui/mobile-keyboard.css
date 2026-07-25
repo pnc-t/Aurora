@@ -1,0 +1,109 @@
+/* モバイル用オンスクリーンキーボード。配色・角丸・押下感は ui/mobile-pad.css の
+ * .mp-btn/.mp-once/.mp-locked に揃える (同じ CSS 変数を使う)。 */
+
+.mkb-root {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 45; /* mobile-controls.css の .mc-root(30)/.mc-display-pop(31) より上に置く */
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+  background: var(--toolbar-bg);
+  border-top: 1px solid var(--panel-border);
+  box-shadow: 0 -2px 10px var(--shadow);
+  /* ブラウザ既定のタッチ操作 (スクロール/ダブルタップズーム/長押しの選択・コールアウト) を
+   * 全て止める。止めないとキー連打がズームに化けたり、長押しリピート中に文字選択が始まる。
+   * ui/mobile-pad.css のパッド面と同じ理由。 */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* グローバルの .hidden (mobile-main.css) は display:none !important 付きで詳細度に
+ * 関係なく上書きできないため、このコンポーネント専用のクラス名で畳む。 */
+.mkb-root.mkb-hidden {
+  display: none;
+}
+
+.mkb-ext {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mkb-ext.mkb-hidden {
+  display: none;
+}
+
+.mkb-row {
+  display: flex;
+  gap: 3px;
+}
+
+.mkb-key {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mkb-fn {
+  font-size: 11px;
+}
+
+.mkb-wide {
+  flex: 1.5;
+}
+
+.mkb-space {
+  flex: 4;
+}
+
+.mkb-enter {
+  flex: 1.5;
+}
+
+/* 押下中・スティッキー状態の見た目は ui/mobile-pad.css の .mp-btn 系と同じ表現に揃える。 */
+.mkb-key.mkb-active {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+.mkb-key.toggled {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+/* 修飾キーの 3 状態: once = 枠線をアクセント色、locked = 塗りつぶし。 */
+.mkb-mod.mkb-once {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mkb-mod.mkb-locked {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+/* 横持ち (画面が低い) では 6〜9 段の合計高さが画面の大半を占めるため、キーを詰める。 */
+@media (max-height: 480px) {
+  .mkb-key {
+    min-height: 32px;
+    font-size: 12px;
+  }
+  .mkb-fn {
+    font-size: 10px;
+  }
+}

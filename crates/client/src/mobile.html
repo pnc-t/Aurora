@@ -28,8 +28,9 @@
       <div id="conn-status"></div>
       <div id="reconnect-badge"></div>
       <div id="toast-container"></div>
-      <!-- ソフトキーボード (修飾キー等) はフロート表示なので下部バーとは別枠に置く。 -->
-      <div id="soft-keyboard-root"></div>
+      <!-- 自前オンスクリーンキーボード (フロート表示なので下部バーとは別枠に置く。中身は
+           ui/mobile-keyboard.ts が構築する)。 -->
+      <div id="mobile-keyboard"></div>
       <!-- オンスクリーンコントローラ (TS が中身を構築)。下部バーより下のレイヤーに置く。 -->
       <div id="mobile-pad"></div>
       <!-- 下部操作バー (TS が中身を構築)。 -->

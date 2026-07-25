@@ -66,9 +66,12 @@
 
 /* 100% は要素自身の高さ/幅が基準になるため、内容の増減があっても
  * この式を再計算する必要がない (常にハンドルぶんだけ覗く)。 */
+/* 自前キーボード (ui/mobile-keyboard.ts) は開いている間 --mkb-height (px) を document 直下に
+ * 設定する。下部バーはそのぶん上へ逃がさないとキーボードに隠れて押せなくなるため、bottom を
+ * この変数ぶん足す。閉じているとき/他配置の未設定時は 0px にフォールバックする。 */
 .mc-root[data-pos="bottom"] {
   --mc-peek: calc(env(safe-area-inset-bottom) + 34px);
-  bottom: 0;
+  bottom: var(--mkb-height, 0px);
   flex-direction: column;
   transform: translateY(calc(100% - var(--mc-peek)));
 }
@@ -185,9 +188,11 @@
 .mc-display-pop.visible {
   display: block;
 }
+/* ポップオーバーはバーに追従する別要素なので、こちらにも同じ --mkb-height ぶんの逃がしを足す
+ * (足さないと下部バーの直上に浮かせたつもりがキーボードの下に埋もれる)。 */
 .mc-root[data-pos="bottom"] ~ .mc-display-pop {
   right: 8px;
-  bottom: calc(44px + 8px + env(safe-area-inset-bottom));
+  bottom: calc(44px + 8px + env(safe-area-inset-bottom) + var(--mkb-height, 0px));
 }
 .mc-root[data-pos="top"] ~ .mc-display-pop {
   right: 8px;

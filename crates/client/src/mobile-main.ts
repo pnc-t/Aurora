@@ -35,7 +35,8 @@ import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui
 import { initCaptureOverlay, renderStatusOverlay } from "./ui/capture-overlay";
 import { installGlobalErrorLogging, logger } from "./core/log";
 import { TouchInput } from "./core/touch-input";
-import { SoftKeyboard } from "./core/soft-keyboard";
+import { createStickyModifiers } from "./core/sticky-modifiers";
+import { mountMobileKeyboard, type MobileKeyboardHandle } from "./ui/mobile-keyboard";
 
 // 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
 installGlobalErrorLogging();
@@ -47,7 +48,7 @@ const statusEl = document.getElementById("conn-status") as HTMLElement;
 const toastContainer = document.getElementById("toast-container") as HTMLElement;
 const reconnectBadgeEl = document.getElementById("reconnect-badge") as HTMLElement;
 const controlsRoot = document.getElementById("mobile-controls") as HTMLElement;
-const keyboardRoot = document.getElementById("soft-keyboard-root") as HTMLElement;
+const keyboardRoot = document.getElementById("mobile-keyboard") as HTMLElement;
 const padRoot = document.getElementById("mobile-pad") as HTMLElement;
 
 initToast(toastContainer);
@@ -90,22 +91,20 @@ const touchInput = new TouchInput({
   onZoomChange: (scale) => controls.setZoom(scale),
 });
 
-// --- ソフトキーボード (隠し input 経由の文字/特殊キー送出) ---
-const softKeyboard = new SoftKeyboard({
-  sendKey: (vk, down) => {
-    session?.sendGrabbedKey(vk, down);
-    // 押下時に消費すると、その文字の down と up の間でスティッキー修飾が外れてしまう。
-    // キーが離れた時点 = 1 操作の完了時に消費する。
-    if (!down) pad.notifyExternalKey();
-  },
+// --- 修飾キーの共有ストア: パッドと自前キーボードで 1 つを共有する。別々に持つと「パッドで
+// Ctrl を once にしてキーボードで C を打つ」ときに消費側が分からず、ホストに押しっぱなしが
+// 残る。VK 送出は session への既存経路 (sendGrabbedKey) をそのまま使う。 ---
+const mods = createStickyModifiers((vk, down) => session?.sendGrabbedKey(vk, down));
+
+// --- 自前オンスクリーンキーボード (VK をそのまま送出。文字→VK 逆変換はしない) ---
+const keyboard: MobileKeyboardHandle = mountMobileKeyboard({
+  root: keyboardRoot,
+  sendKey: (vk, down) => session?.sendGrabbedKey(vk, down),
+  mods,
   // ボタン操作 (onToggleKeyboard) だけでなく、Android の戻るキー等の外部要因で閉じた場合も
   // ここで拾えるので、下部バーのトグル表示はこの通知に一本化する。
   onOpenChange: (open) => controls.setKeyboardOpen(open),
-  // pad の定義はこの下だが、実際に呼ばれるのはユーザー入力時 (両方の初期化完了後) なので
-  // クロージャとして問題ない。
-  isShiftHeld: () => pad.isShiftHeld(),
 });
-softKeyboard.mount(keyboardRoot);
 
 // --- オンスクリーンコントローラ (半透明トラックパッド + クリック + 修飾キー) ---
 const pad: MobilePadHandle = mountMobilePad({
@@ -117,6 +116,7 @@ const pad: MobilePadHandle = mountMobilePad({
   onPositionChange: (which, pos) => {
     updateSettings(which === "pad" ? { mobile_pad_pos: pos } : { mobile_pad_buttons_pos: pos });
   },
+  mods,
 });
 
 // --- ToolbarHandle アダプタ: desktop 専用 UI (タブ/ウィンドウ/ファイル転送/音声/クリップボード等)
@@ -176,7 +176,7 @@ const toolbar: ToolbarHandle = {
       touchInput.detach();
       // close() の onOpenChange が controls.setKeyboardOpen(false) を呼ぶので、ここでは
       // 二重に呼ばない。
-      softKeyboard.close();
+      keyboard.close();
       // 次の接続を既定 (非表示) の状態から始めるため。pad.setVisible(false) はドラッグロックと
       // スティッキー修飾も強制解除するので、押しっぱなしがホスト側に残らない。
       setPadVisible(false);
@@ -220,7 +220,7 @@ const host: SessionHost = {
     if (session !== s) return;
     session = null;
     touchInput.detach();
-    softKeyboard.close();
+    keyboard.close();
     hideReconnectBadge();
     showLauncherView();
   },
@@ -250,10 +250,10 @@ const controls: MobileControlsHandle = mountMobileControls({
   root: controlsRoot,
   onDisconnect: () => session?.closeByUser(),
   onToggleKeyboard: () => {
-    // 表示反映は SoftKeyboard の onOpenChange に一本化 (ここで直接 setKeyboardOpen を
+    // 表示反映は MobileKeyboard の onOpenChange に一本化 (ここで直接 setKeyboardOpen を
     // 呼ぶと外部要因での閉じと二重管理になる)。
-    if (softKeyboard.isOpen()) softKeyboard.close();
-    else softKeyboard.open();
+    if (keyboard.isOpen()) keyboard.close();
+    else keyboard.open();
   },
   onSelectDisplay: (d) => session?.switchDisplay(d),
   onResetZoom: () => touchInput.resetZoom(),
