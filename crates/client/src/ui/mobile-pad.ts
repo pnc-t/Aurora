@@ -42,6 +42,16 @@ const TAP_MAX_MS = 300;
 const MOVE_THRESHOLD_PX = 10;
 // 2 本指ホイールの px→ノッチ換算。core/touch-input.ts の WHEEL_PX_PER_NOTCH と揃える。
 const WHEEL_PX_PER_NOTCH = 100;
+// スティックモードの土台半径に対する不感帯の比率。指を置いただけで動き出さないようにする。
+const STICK_DEADZONE_RATIO = 0.12;
+// スティック最大速度 [px/秒] (デッドゾーン外の正規化量が 1 のとき)。
+const STICK_MAX_SPEED = 1400;
+// 傾け始めは細かく、大きく傾けると素早く動けるようにするための速度カーブの指数。
+const STICK_SPEED_EXP = 1.8;
+// パッド面の余白 (px)。スティック半径をこの分だけ内側に取り、土台が枠に接しないようにする。
+const STICK_EDGE_MARGIN = 6;
+
+type PadMode = "pad" | "stick";
 // 既定のグリップ位置 (画面比率)。両手持ち想定でパッドは左下、ボタンは右下に離して置く。
 // 下端中央には既存の下部バーのハンドルがあるため、どちらもそこには重ねない。
 const PAD_DEFAULT_POS: [number, number] = [0, 0.85];
@@ -179,7 +189,14 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   opts.root.innerHTML = `
     <div class="mp-pad-card mp-hidden" id="mp-pad-card">
       <button type="button" class="mp-grip" id="mp-pad-grip" aria-label="パッドを移動">${icon("grip")}</button>
-      <div class="mp-pad" id="mp-pad"></div>
+      <div class="mp-pad" id="mp-pad">
+        <div class="mp-stick-base mp-stick-hidden" id="mp-stick-base"></div>
+        <div class="mp-stick-knob mp-stick-hidden" id="mp-stick-knob"></div>
+      </div>
+      <div class="mp-pad-actions">
+        <button type="button" class="mp-btn" id="mp-mode" title="スティックに切替" aria-label="スティックに切替">${icon("touchpad")}</button>
+        <button type="button" class="mp-btn" id="mp-keyboard" title="キーボード" aria-label="キーボード">${icon("key")}</button>
+      </div>
     </div>
     <div class="mp-btn-card mp-hidden" id="mp-btn-card">
       <button type="button" class="mp-grip" id="mp-btn-grip" aria-label="ボタンを移動">${icon("grip")}</button>
@@ -187,7 +204,6 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         <button type="button" class="mp-btn" id="mp-l" title="左クリック" aria-label="左クリック">${icon("mouse-left")}</button>
         <button type="button" class="mp-btn" id="mp-m" title="中クリック" aria-label="中クリック">${icon("mouse-middle")}</button>
         <button type="button" class="mp-btn" id="mp-r" title="右クリック" aria-label="右クリック">${icon("mouse-right")}</button>
-        <button type="button" class="mp-btn" id="mp-mods-toggle" title="キーボード" aria-label="キーボード">${icon("modifier")}</button>
       </div>
     </div>
   `;
@@ -195,12 +211,15 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   const padCardEl = opts.root.querySelector<HTMLElement>("#mp-pad-card");
   const padGripEl = opts.root.querySelector<HTMLButtonElement>("#mp-pad-grip");
   const padEl = opts.root.querySelector<HTMLElement>("#mp-pad");
+  const stickBaseEl = opts.root.querySelector<HTMLElement>("#mp-stick-base");
+  const stickKnobEl = opts.root.querySelector<HTMLElement>("#mp-stick-knob");
+  const modeBtn = opts.root.querySelector<HTMLButtonElement>("#mp-mode");
+  const keyboardBtn = opts.root.querySelector<HTMLButtonElement>("#mp-keyboard");
   const btnCardEl = opts.root.querySelector<HTMLElement>("#mp-btn-card");
   const btnGripEl = opts.root.querySelector<HTMLButtonElement>("#mp-btn-grip");
   const lBtn = opts.root.querySelector<HTMLButtonElement>("#mp-l");
   const mBtn = opts.root.querySelector<HTMLButtonElement>("#mp-m");
   const rBtn = opts.root.querySelector<HTMLButtonElement>("#mp-r");
-  const modsToggleBtn = opts.root.querySelector<HTMLButtonElement>("#mp-mods-toggle");
 
   // mousedown の既定動作 (フォーカス移動) を止め、タップ後にフォーカスリングが残らないようにする。
   // touchstart は preventDefault しない (Android で合成 click まで消えボタンが反応しなくなる)。
@@ -248,7 +267,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   attachClickButton(mBtn, "Middle");
   attachClickButton(rBtn, "Right");
 
-  modsToggleBtn?.addEventListener("click", () => opts.onToggleKeyboard());
+  keyboardBtn?.addEventListener("click", () => opts.onToggleKeyboard());
 
   // ================= トラックパッド (なぞる場所) =================
   //
@@ -275,6 +294,185 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     singleId = null;
     singleMoved = false;
   }
+
+  // ================= スティックモード (傾けている間ずっと動き続ける) =================
+  //
+  // 固定中心方式: パッド面中央に土台+ノブを常設し、指の位置をノブへ反映しつつ、
+  // 中心からの距離に応じた速度で rAF ループが移動量を送り続ける。トラックパッドの
+  // 「なぞった分だけ動く」とは別の入力系統のため、状態も分けて持つ。
+
+  let padMode: PadMode = "pad";
+  let stickTouchId: number | null = null;
+  let stickCenter: Pt = { x: 0, y: 0 };
+  let stickRadius = 0;
+  let stickStartTime = 0;
+  let stickExceededDeadzone = false;
+  let stickVX = 0;
+  let stickVY = 0;
+  let stickAccX = 0;
+  let stickAccY = 0;
+  let stickRafId: number | null = null;
+  let stickLastFrameTime = 0;
+
+  /** パッド面の実寸から土台/ノブの半径・中心を再計算し、DOM の位置/サイズへ反映する。 */
+  function layoutStick(): void {
+    if (!padEl || !stickBaseEl || !stickKnobEl) return;
+    const w = padEl.clientWidth;
+    const h = padEl.clientHeight;
+    // 非表示中は寸法が 0 になり無意味な値になるため、表示された時点 (setVisible/resize) で
+    // 呼び直される前提でここでは何もしない。
+    if (w === 0 || h === 0) return;
+    stickRadius = Math.max(0, Math.min(w, h) / 2 - STICK_EDGE_MARGIN);
+    stickCenter = { x: w / 2, y: h / 2 };
+    const baseSize = stickRadius * 2;
+    stickBaseEl.style.width = `${baseSize}px`;
+    stickBaseEl.style.height = `${baseSize}px`;
+    stickBaseEl.style.left = `${stickCenter.x - stickRadius}px`;
+    stickBaseEl.style.top = `${stickCenter.y - stickRadius}px`;
+    const knobSize = Math.max(16, stickRadius * 0.5);
+    stickKnobEl.style.width = `${knobSize}px`;
+    stickKnobEl.style.height = `${knobSize}px`;
+    stickKnobEl.style.left = `${stickCenter.x - knobSize / 2}px`;
+    stickKnobEl.style.top = `${stickCenter.y - knobSize / 2}px`;
+  }
+
+  function setStickKnobOffset(dx: number, dy: number): void {
+    if (!stickKnobEl) return;
+    stickKnobEl.style.transform = `translate(${dx}px, ${dy}px)`;
+  }
+
+  function stopStickLoop(): void {
+    if (stickRafId !== null) {
+      cancelAnimationFrame(stickRafId);
+      stickRafId = null;
+    }
+  }
+
+  function startStickLoop(): void {
+    stopStickLoop();
+    stickLastFrameTime = performance.now();
+    const step = (now: number): void => {
+      const dt = (now - stickLastFrameTime) / 1000;
+      stickLastFrameTime = now;
+      if (stickVX !== 0 || stickVY !== 0) {
+        // 小数のまま累積し、整数分だけ切り出して送る。切り捨てたままにすると、ゆっくり
+        // 傾けたときの速度 (< 1px/フレーム) が永久に送信されなくなるため。
+        stickAccX += stickVX * dt;
+        stickAccY += stickVY * dt;
+        const dx = Math.trunc(stickAccX);
+        const dy = Math.trunc(stickAccY);
+        if (dx !== 0 || dy !== 0) {
+          stickAccX -= dx;
+          stickAccY -= dy;
+          opts.sendInput({ MouseMoveRelative: { dx, dy } });
+        }
+      }
+      stickRafId = requestAnimationFrame(step);
+    };
+    stickRafId = requestAnimationFrame(step);
+  }
+
+  function startStick(id: number): void {
+    stickTouchId = id;
+    stickStartTime = performance.now();
+    stickExceededDeadzone = false;
+    stickVX = 0;
+    stickVY = 0;
+    stickAccX = 0;
+    stickAccY = 0;
+    layoutStick();
+    setStickKnobOffset(0, 0);
+    startStickLoop();
+  }
+
+  function updateStickFromTouch(cur: Pt): void {
+    if (!padEl) return;
+    const rect = padEl.getBoundingClientRect();
+    const rawDx = cur.x - rect.left - stickCenter.x;
+    const rawDy = cur.y - rect.top - stickCenter.y;
+    const dist = Math.hypot(rawDx, rawDy);
+    const clampedDist = Math.min(dist, stickRadius);
+    const ux = dist > 0 ? rawDx / dist : 0;
+    const uy = dist > 0 ? rawDy / dist : 0;
+    setStickKnobOffset(ux * clampedDist, uy * clampedDist);
+
+    const deadzone = STICK_DEADZONE_RATIO * stickRadius;
+    if (dist >= deadzone) stickExceededDeadzone = true;
+
+    const range = stickRadius - deadzone;
+    const n = range > 0 ? clamp((clampedDist - deadzone) / range, 0, 1) : 0;
+    if (n <= 0) {
+      stickVX = 0;
+      stickVY = 0;
+      return;
+    }
+    const speed = STICK_MAX_SPEED * Math.pow(n, STICK_SPEED_EXP);
+    stickVX = ux * speed;
+    stickVY = uy * speed;
+  }
+
+  /** 2本目の指が触れた等、タップ判定なしでスティック操作を打ち切る。 */
+  function abortStickTouch(): void {
+    stopStickLoop();
+    stickTouchId = null;
+    stickVX = 0;
+    stickVY = 0;
+    stickAccX = 0;
+    stickAccY = 0;
+    setStickKnobOffset(0, 0);
+  }
+
+  function endStick(cancelled: boolean): void {
+    stopStickLoop();
+    const duration = performance.now() - stickStartTime;
+    // トラックパッドのタップ判定と同じ扱い: デッドゾーンを超えず短時間で離したときだけ左クリック。
+    if (!cancelled && !stickExceededDeadzone && duration < TAP_MAX_MS) {
+      opts.sendInput({ MouseButton: { button: "Left", down: true } });
+      opts.sendInput({ MouseButton: { button: "Left", down: false } });
+      opts.mods.consumeOnce();
+    }
+    stickTouchId = null;
+    stickVX = 0;
+    stickVY = 0;
+    stickAccX = 0;
+    stickAccY = 0;
+    setStickKnobOffset(0, 0);
+  }
+
+  function updateModeButton(): void {
+    if (!modeBtn) return;
+    if (padMode === "pad") {
+      modeBtn.innerHTML = icon("touchpad");
+      modeBtn.title = "スティックに切替";
+      modeBtn.setAttribute("aria-label", "スティックに切替");
+    } else {
+      modeBtn.innerHTML = icon("stick");
+      modeBtn.title = "タッチパッドに切替";
+      modeBtn.setAttribute("aria-label", "タッチパッドに切替");
+    }
+  }
+
+  function setPadMode(mode: PadMode): void {
+    if (mode === padMode) return;
+    // 進行中のジェスチャを残したままモードを切り替えると、押しっぱなし相当の入力が
+    // 新モードに引き継がれてカーソルが暴走するため、両モードの状態を必ず中断してから切り替える。
+    abortSingle();
+    if (multiActive) {
+      multiActive = false;
+      multiIds = null;
+      wheelAccX = 0;
+      wheelAccY = 0;
+    }
+    abortStickTouch();
+    padTouches.clear();
+    padMode = mode;
+    stickBaseEl?.classList.toggle("mp-stick-hidden", mode !== "stick");
+    stickKnobEl?.classList.toggle("mp-stick-hidden", mode !== "stick");
+    if (mode === "stick") layoutStick();
+    updateModeButton();
+  }
+
+  modeBtn?.addEventListener("click", () => setPadMode(padMode === "pad" ? "stick" : "pad"));
 
   function updateWheel(mid: Pt): void {
     const dxStep = mid.x - multiLastMid.x;
@@ -308,16 +506,21 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       }
       if (padTouches.size === 1 && !multiActive) {
         for (const [id, pt] of padTouches) {
-          singleActive = true;
-          singleId = id;
-          singleStart = pt;
-          singleLast = pt;
-          singleStartTime = performance.now();
-          singleMoved = false;
+          if (padMode === "stick") {
+            startStick(id);
+          } else {
+            singleActive = true;
+            singleId = id;
+            singleStart = pt;
+            singleLast = pt;
+            singleStartTime = performance.now();
+            singleMoved = false;
+          }
         }
       } else if (padTouches.size === 2) {
         // 1本指操作の途中で2本目が触れたら、タップ/クリックを誤発火させないよう打ち切る。
-        abortSingle();
+        if (padMode === "stick") abortStickTouch();
+        else abortSingle();
         const ids = Array.from(padTouches.keys()) as [number, number];
         multiActive = true;
         multiIds = ids;
@@ -346,6 +549,10 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         const mid = midpoint(p1, p2);
         updateWheel(mid);
         multiLastMid = mid;
+      } else if (padMode === "stick" && stickTouchId !== null) {
+        const cur = padTouches.get(stickTouchId);
+        if (!cur) return;
+        updateStickFromTouch(cur);
       } else if (singleActive && singleId !== null) {
         const cur = padTouches.get(singleId);
         if (!cur) return;
@@ -375,6 +582,8 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         wheelAccX = 0;
         wheelAccY = 0;
       }
+    } else if (padMode === "stick" && stickTouchId !== null && endedIds.includes(stickTouchId)) {
+      endStick(cancelled);
     } else if (singleActive && singleId !== null && endedIds.includes(singleId)) {
       const duration = performance.now() - singleStartTime;
       // 移動量 10px 未満かつ 300ms 未満で離した場合だけタップ=左クリックとして扱う。
@@ -401,6 +610,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   window.addEventListener("resize", () => {
     padCard.applyRatio(padCard.ratio);
     btnCard.applyRatio(btnCard.ratio);
+    layoutStick();
   });
 
   return {
@@ -412,9 +622,12 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         // applyRatio/setPositions は寸法 0 で空振りしているため、ここで確定させる)。
         padCard.applyRatio(padCard.ratio);
         btnCard.applyRatio(btnCard.ratio);
+        layoutStick();
         return;
       }
       // 押しっぱなしが残ると実害が出るため、非表示にする瞬間に必ず解除する。
+      // スティックの rAF ループも、非表示のまま回り続けないようここで必ず止める。
+      abortStickTouch();
       for (const release of clickReleasers) release();
       opts.mods.releaseAll();
     },
@@ -423,7 +636,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       btnCard.applyRatio(clampPos(buttons, BTN_DEFAULT_POS));
     },
     setKeyboardOn(on: boolean): void {
-      modsToggleBtn?.classList.toggle("toggled", on);
+      keyboardBtn?.classList.toggle("toggled", on);
       // 開閉で配置可能な高さ (usableHeight) が変わるため、同じ比率のまま置き直してカードを
       // キーボードの上へ逃がす。ユーザーが動かしたわけではないので比率自体は変えず、
       // onPositionChange による永続化も呼ばない。
