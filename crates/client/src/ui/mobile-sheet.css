@@ -1,0 +1,112 @@
+/* モバイル共通のアクションシート (mobile-sheet.ts)。
+ * ダイアログ用 backdrop (#dialog-backdrop / #mwol-dialog-backdrop, z-index 60) より上に
+ * 重ねる必要がある (カードの ⋯ から開き、続けてダイアログを開く導線があるため) ので
+ * z-index は 62 にしてある。新しい色は発明せず既存の CSS 変数のみを使う。 */
+
+.ms-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 62;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: var(--backdrop);
+}
+
+.ms-sheet {
+  width: 100%;
+  max-width: 480px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-bottom: none;
+  border-radius: 16px 16px 0 0;
+  box-shadow: 0 -4px 24px var(--shadow);
+  padding: 8px 0 calc(8px + env(safe-area-inset-bottom));
+  transform: translateY(100%);
+  animation: ms-rise 0.18s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ms-sheet {
+    animation: none;
+    transform: translateY(0);
+  }
+}
+@keyframes ms-rise {
+  to {
+    transform: translateY(0);
+  }
+}
+
+.ms-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.ms-item,
+.ms-cancel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  width: 100%;
+  padding: 8px 20px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+}
+.ms-item:active,
+.ms-cancel:active {
+  background: var(--menu-hover);
+}
+
+.ms-item-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 18px;
+  color: var(--muted);
+}
+.ms-item.ms-danger .ms-item-icon {
+  color: var(--danger);
+}
+
+.ms-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-item.ms-danger {
+  color: var(--danger);
+}
+
+.ms-cancel {
+  margin-top: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--panel-border);
+  font-weight: 600;
+  justify-content: center;
+}
+
+/* --- 既存モーダルダイアログ (.dialog) のボトムシート化 ---
+ * .dialog 本体の定義は launcher.css にあり (デスクトップと共有のため編集禁止)、
+ * ここではスマホ幅のときだけ .ml-app 配下に限定して上書きする。
+ * タブレット幅 (481px 以上) に漏れないよう max-width: 480px の中に閉じ込める。 */
+@media (max-width: 480px) {
+  .ml-app #dialog-backdrop,
+  .ml-app #mwol-dialog-backdrop {
+    align-items: flex-end;
+  }
+  .ml-app #dialog-backdrop > .dialog,
+  .ml-app #mwol-dialog-backdrop > .dialog {
+    width: 100%;
+    max-width: none;
+    border-radius: 16px 16px 0 0;
+    max-height: 85vh;
+    padding-bottom: calc(18px + env(safe-area-inset-bottom));
+  }
+}

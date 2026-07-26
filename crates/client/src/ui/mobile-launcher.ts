@@ -11,8 +11,10 @@
 //   デスクトップ (`launcher.ts`) と同じ実装をそのままモバイル用に持たせている。
 //
 // モバイル固有の縮小方針:
-// - Hosts ページ: デスクトップの「⋯ メニュー」は持たず、タップ=接続 / 長押し=削除確認 に絞る
-//   (タッチ操作向け・現行モバイル版の挙動を維持)。ドラッグ並べ替えも対象外。
+// - Hosts ページ: タップ=接続、カード右端の ⋮ =アクションシート (編集/削除) に統一する。
+//   不可視のジェスチャ (長押し) に破壊的操作を割り当てない方針のため、長押し削除は廃止した。
+//   デスクトップの ⋯ メニュー (card-menu、複数項目のポップアップ) の代わりに、共通部品の
+//   アクションシート (mobile-sheet.ts) を使う。ドラッグ並べ替えは対象外。
 // - Settings ページ: モバイルで実際に機能しない項目 (自動フルスクリーン/統計 HUD/マウスキャプチャ/
 //   キーボード占有/クリップボード同期/音声ミュート/ツールバー・タブ配置/ショートカット/
 //   ファイル共有/ログ) は出さない (呼び出し元 main.rs の invoke_handler から該当コマンドが
@@ -34,18 +36,27 @@ import {
   saveSettings,
   type ClientSettings,
   type HostEntry,
+  type HostOverrides,
   type ThemeId,
   type ToolbarPosition,
 } from "../core/ipc";
 import { getVersion } from "@tauri-apps/api/app";
 import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
 import { logger } from "../core/log";
-import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
+import {
+  CUSTOM_PRESET_ID,
+  findPreset,
+  matchPreset,
+  presetOptionsHtml,
+  VIDEO_PRESETS,
+} from "../core/video-presets";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
 import { mountMobileWolPanel } from "./mobile-wol";
 import { enhanceSelects } from "./select-menu";
+import { openActionSheet, type SheetAction } from "./mobile-sheet";
+import { attachPullToRefresh } from "./pull-to-refresh";
 import "./launcher.css";
 import "./mobile-launcher.css";
 
@@ -70,12 +81,18 @@ const CODEC_LABELS: Record<Exclude<CodecChoice, "auto">, string> = {
 // ブラウザ (WebCodecs) が実際に対応するコーデック一覧。起動時に 1 回プローブしてここへ反映する。
 let supportedCodecs: CodecChoice[] = [];
 
-/** コーデック `<select>` の option 一覧 (非対応は disabled + 「(非対応)」表記)。 */
-function codecOptionsHtml(): string {
-  const items: string[] = [`<option value="auto">自動</option>`];
+/** コーデック `<select>` の option 一覧。includeDefault=true でホスト別 override 用の
+ *  「既定に従う」を先頭に足す (launcher.ts の codecOptionsHtml と同じ仕様)。非対応コーデックは
+ *  disabled + 「(非対応)」表記にする。 */
+function codecOptionsHtml(includeDefault: boolean): string {
+  const items: string[] = [];
+  if (includeDefault) items.push(`<option value="default">既定に従う</option>`);
+  items.push(`<option value="auto">自動</option>`);
   (["h264", "hevc", "av1"] as const).forEach((c) => {
     const ok = supportedCodecs.includes(c);
-    items.push(`<option value="${c}"${ok ? "" : " disabled"}>${CODEC_LABELS[c]}${ok ? "" : " (非対応)"}</option>`);
+    items.push(
+      `<option value="${c}"${ok ? "" : " disabled"}>${CODEC_LABELS[c]}${ok ? "" : " (非対応)"}</option>`,
+    );
   });
   return items.join("");
 }
@@ -132,8 +149,8 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
           <div class="page-head">
             <h2>Hosts</h2>
             <div class="actions">
-              <button class="icon-btn" id="probe-refresh" title="オンライン状態を更新">${icon("refresh")}</button>
-              <button class="icon-btn" id="add-host" title="ホストを追加">${icon("add")}</button>
+              <button class="icon-btn ml-icon-btn-labeled" id="probe-refresh" title="オンライン状態を更新">${icon("refresh")}<span>更新</span></button>
+              <button class="icon-btn ml-icon-btn-labeled" id="add-host" title="ホストを追加">${icon("add")}<span>追加</span></button>
             </div>
           </div>
           <div class="host-list" id="host-list"></div>
@@ -176,7 +193,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                   <div class="s-title">映像コーデック</div>
                   <div class="s-desc">自動はホストと対応コーデックを相談して選ぶ。手動でこの端末が非対応のものを選ぶと H.264 にフォールバックする</div>
                 </div>
-                <select id="set-codec" class="select-input">${codecOptionsHtml()}</select>
+                <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
               </div>
               </div>
               <div class="setting-group">接続</div>
@@ -232,7 +249,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                   <div class="s-title">アクセントカラー</div>
                   <div class="s-desc">ボタンや選択中の表示に使う色</div>
                 </div>
-                <input type="color" id="set-accent" class="color-input" />
+                <label class="ml-tap44"><input type="color" id="set-accent" class="color-input" /></label>
               </div>
               <div class="setting-row">
                 <div class="s-meta">
@@ -366,12 +383,30 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     });
   }
 
-  /** ホスト追加ダイアログ (デスクトップの openHostDialog と同じ見た目。overrides 系の設定行は
-   *  対象外: モバイル設定ページに対応する host 別上書き UI 自体を作っていないため)。 */
-  function openAddHostDialog(): void {
+  /** ホスト追加/編集ダイアログ (デスクトップの openHostDialog と項目・組み立てを揃える)。
+   *  entry=null で新規追加、指定時は編集。ホスト別設定は <details> に折りたたむ。 */
+  function openHostDialog(entry: HostEntry | null): void {
+    const isAdd = entry === null;
+    const e: HostEntry = entry ?? {
+      label: "",
+      host: "",
+      port: settings.default_port,
+    };
+    const o: HostOverrides = e.overrides ?? {};
+    const hasQuality = o.fps != null && o.max_mbps != null;
+    const qualityId = hasQuality ? matchPreset(o.fps as number, o.max_mbps as number) : "default";
+    // 手で JSON を編集した等でプリセット外の値が入っている場合は現値ラベルで残す (保存時は維持)。
+    const customOpt =
+      qualityId === CUSTOM_PRESET_ID
+        ? `<option value="${CUSTOM_PRESET_ID}">カスタム (${o.fps}fps / ${o.max_mbps}Mbps)</option>`
+        : "";
+    const presetOpts =
+      `<option value="default">既定に従う</option>` +
+      VIDEO_PRESETS.map((p) => `<option value="${p.id}">${p.label}</option>`).join("") +
+      customOpt;
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
-        <h3>ホストを追加</h3>
+        <h3>${isAdd ? "ホストを追加" : "ホストを編集"}</h3>
         <div class="icon-picker">
           <div class="icon-preview" id="h-icon-preview"></div>
           <div class="icon-picker-actions">
@@ -380,21 +415,41 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
           </div>
           <input type="file" id="h-icon-file" accept="image/*" hidden />
         </div>
-        <label>表示名 (任意)<input id="h-label" type="text" placeholder="home-pc" /></label>
-        <label>host (Tailscale IP / hostname)<input id="h-host" type="text" placeholder="100.x.x.x" required /></label>
+        <label>表示名 (任意)<input id="h-label" type="text" value="${escapeHtml(e.label)}" placeholder="home-pc" /></label>
+        <label>host (Tailscale IP / hostname)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
         <label>port
-          <input id="h-port" type="text" inputmode="numeric" value="${settings.default_port}" />
+          <input id="h-port" type="text" inputmode="numeric" value="${e.port}" />
           <span class="shortcut-error" data-h-port-error></span>
         </label>
+        <details class="ml-host-adv">
+          <summary>詳細設定 (このホストのみ)</summary>
+          <label>仮想ディスプレイ
+            <select id="h-virtual" class="select-input">
+              <option value="default">既定に従う</option>
+              <option value="on">使う</option>
+              <option value="off">使わない</option>
+            </select>
+          </label>
+          <label>画質プリセット<select id="h-preset" class="select-input">${presetOpts}</select></label>
+          <label>コーデック<select id="h-codec" class="select-input">${codecOptionsHtml(true)}</select></label>
+        </details>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="h-cancel">cancel</button>
-          <button type="submit" class="btn-primary">add</button>
+          <button type="submit" class="btn-primary">${isAdd ? "add" : "save"}</button>
         </div>
       </form>
     `;
     openBackdrop();
 
-    let currentIcon = "";
+    const virtualSel = backdrop.querySelector<HTMLSelectElement>("#h-virtual");
+    const presetSel = backdrop.querySelector<HTMLSelectElement>("#h-preset");
+    const codecSel = backdrop.querySelector<HTMLSelectElement>("#h-codec");
+    if (virtualSel)
+      virtualSel.value = o.use_virtual_display == null ? "default" : o.use_virtual_display ? "on" : "off";
+    if (presetSel) presetSel.value = qualityId;
+    if (codecSel) codecSel.value = o.codec == null ? "default" : o.codec;
+
+    let currentIcon = e.icon ?? "";
     const labelInput = backdrop.querySelector<HTMLInputElement>("#h-label");
     const hostInput = backdrop.querySelector<HTMLInputElement>("#h-host");
     const preview = backdrop.querySelector<HTMLElement>("#h-icon-preview");
@@ -455,12 +510,42 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
         );
         return;
       }
-      void saveRecentHost({ label: label || host, host, port, icon: currentIcon })
-        .then(() => {
-          closeDialog();
-          return refresh();
-        })
-        .catch((e) => logger.warn("save host failed", e));
+      const ov: HostOverrides = {};
+      if (virtualSel?.value === "on") ov.use_virtual_display = true;
+      else if (virtualSel?.value === "off") ov.use_virtual_display = false;
+      if (codecSel?.value && codecSel.value !== "default") ov.codec = codecSel.value as CodecChoice;
+      const pv = presetSel?.value ?? "default";
+      if (pv === CUSTOM_PRESET_ID) {
+        // プリセット外の既存値をそのまま維持
+        ov.fps = o.fps;
+        ov.max_mbps = o.max_mbps;
+      } else {
+        const p = findPreset(pv);
+        if (p) {
+          ov.fps = p.fps;
+          ov.max_mbps = p.mbps;
+        }
+      }
+      void (async () => {
+        // host を変えた編集なら旧エントリを消してから保存する (デスクトップ launcher.ts と同じ挙動:
+        // 新 host で重複排除される)。
+        const hostChanged = e.host.localeCompare(host, undefined, { sensitivity: "accent" }) !== 0;
+        if (!isAdd && hostChanged) {
+          await deleteRecentHost(e.host);
+        }
+        // overrides は空オブジェクトも常に送る: Rust 側が「既定に従う」への明示リセットとして
+        // None へ正規化する (undefined だと「情報なし」扱いで既存値が残ってしまう)。icon も
+        // 常に明示値 (空文字 = 解除) を送る。
+        await saveRecentHost({
+          label: label || host,
+          host,
+          port,
+          icon: currentIcon,
+          overrides: ov,
+        });
+        closeDialog();
+        await refresh();
+      })().catch((e) => logger.warn("save host failed", e));
     });
   }
 
@@ -636,40 +721,41 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
 
       const tail = document.createElement("div");
       tail.className = "card-tail";
-      const chevron = document.createElement("span");
-      chevron.className = "chevron";
-      chevron.innerHTML = icon("chevron"); // 固定 SVG のみなので innerHTML で可
-      tail.appendChild(chevron);
+      const moreBtn = document.createElement("button");
+      moreBtn.type = "button";
+      moreBtn.className = "card-btn";
+      moreBtn.title = "メニュー";
+      moreBtn.innerHTML = icon("more"); // 固定 SVG のみなので innerHTML で可
+      tail.appendChild(moreBtn);
 
       card.append(avatarWrap, meta, tail);
       hostList.appendChild(card);
 
-      // 長押し (600ms) で削除確認、それ未満のタップ/クリックは接続ダイアログを開く。
-      let pressTimer: number | null = null;
-      let longPressFired = false;
-      const clearPress = (): void => {
-        if (pressTimer !== null) {
-          window.clearTimeout(pressTimer);
-          pressTimer = null;
-        }
-      };
-      card.addEventListener("pointerdown", () => {
-        longPressFired = false;
-        clearPress();
-        pressTimer = window.setTimeout(() => {
-          pressTimer = null;
-          longPressFired = true;
-          openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
-            await deleteRecentHost(entry.host);
-            await refresh();
-          });
-        }, 600);
+      // ⋮ は不可視の長押しではなく明示タップでメニューを開く (編集/削除)。カードへの
+      // クリック伝播 (=接続) を止める。
+      moreBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const actions: SheetAction[] = [
+          {
+            label: "編集",
+            icon: "edit",
+            onSelect: () => openHostDialog(entry),
+          },
+          {
+            label: "削除",
+            icon: "delete",
+            danger: true,
+            onSelect: () => {
+              openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
+                await deleteRecentHost(entry.host);
+                await refresh();
+              });
+            },
+          },
+        ];
+        openActionSheet(actions);
       });
-      card.addEventListener("pointerup", clearPress);
-      card.addEventListener("pointerleave", clearPress);
-      card.addEventListener("pointercancel", clearPress);
       card.addEventListener("click", () => {
-        if (longPressFired) return;
         openConnectDialog(entry);
       });
       card.addEventListener("keydown", (e) => {
@@ -683,8 +769,9 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     applyAriaLabels(hostList);
   }
 
-  $("#add-host")?.addEventListener("click", openAddHostDialog);
+  $("#add-host")?.addEventListener("click", () => openHostDialog(null));
   $("#probe-refresh")?.addEventListener("click", () => void runProbe());
+  attachPullToRefresh(hostList, runProbe);
 
   // --- 設定 ---
   let settings: ClientSettings = { ...DEFAULT_SETTINGS };
@@ -739,7 +826,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     persist();
   });
   tbPositionSelect?.addEventListener("change", () => {
-    settings = { ...settings, toolbar_position: tbPositionSelect.value as ToolbarPosition };
+    settings = {
+      ...settings,
+      toolbar_position: tbPositionSelect.value as ToolbarPosition,
+    };
     persist();
   });
   themeSelect?.addEventListener("change", () => {
@@ -772,7 +862,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   /** コーデック select の option を最新のプローブ結果で作り直し、現在値を反映する。 */
   function syncCodecSelect(): void {
     if (!codecSelect) return;
-    codecSelect.innerHTML = codecOptionsHtml();
+    codecSelect.innerHTML = codecOptionsHtml(false);
     codecSelect.value = settings.codec;
   }
   void probeSupportedCodecs().then((list) => {

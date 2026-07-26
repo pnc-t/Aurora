@@ -4,7 +4,7 @@
  * launcher.css のグローバル定義 (mobile-launcher.ts が読み込み済み) をそのまま使う。
  *
  * スマホ幅 (320px 想定) でも横にはみ出さないよう、固定 px 幅の要素 (flex: 0 0 <px> 等) は作らず、
- * ラベル/リンク/MAC は必ず ellipsis で切る。タップ領域は編集/キャンセルボタンとも 44px を確保する。 */
+ * ラベル/リンク/MAC は必ず ellipsis で切る。タップ領域は ⋮ メニュー/キャンセルボタンとも 44px を確保する。 */
 
 .mwol-list {
   display: flex;
@@ -106,7 +106,7 @@
   display: none;
 }
 
-/* 編集ボタン。タップ領域 44px を確保 (見た目のアイコンは小さいまま、padding で拡張)。 */
+/* ⋮ メニューボタン (編集/削除の起点)。タップ領域 44px を確保 (見た目のアイコンは小さいまま、padding で拡張)。 */
 .mwol-card .card-btn {
   background: transparent;
   border: none;

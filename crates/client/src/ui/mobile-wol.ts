@@ -1,5 +1,5 @@
 // モバイル (Android) 専用の Wake on LAN パネル。ロジックはデスクトップ版 `wol-panel.ts` の移植だが、
-// 見た目とダイアログ操作は `mobile-launcher.ts` の Hosts カード (タップ=主操作 / 長押し=削除確認)
+// 見た目とダイアログ操作は `mobile-launcher.ts` の Hosts カード (タップ=主操作 / ⋮ メニュー=編集・削除)
 // に合わせて別実装にしている。
 //
 // デスクトップ版と分離した理由 (=単なる差分ではなく意図的な縮小):
@@ -8,9 +8,12 @@
 //   「起こして接続」前のガード・鍵バッジ・⋯メニューの「パスワードを忘れる」を実装しているが、
 //   Android でそのまま使うと判定が常に false になり、ガードがある「起こして接続」が永久に
 //   実行できなくなる。そのためこのファイルは savedPasswordHosts を一切呼ばず、鍵バッジも
-//   ⋯メニューも持たない (削除はカード長押しへ移した)。
+//   「パスワードを忘れる」も持たない。
 // - 並べ替え (grip ドラッグ) も持たない。モバイル版 Hosts タブが並べ替え非対応であるのに揃えた。
 // - 中継先パスワード入力ダイアログの「保存する」チェックも同じ理由で外し、save=false 固定で送る。
+//
+// カード操作は Hosts タブと統一し ⋮ ボタン → アクションシート (編集/削除) に集約している。
+// 不可視のジェスチャ (長押し) に破壊的操作 (削除) を割り当てない方針のため、長押し削除は廃止した。
 //
 // ホスト由来/ユーザー入力の文字列 (label / mac / relay_host / host) は innerHTML に載せず
 // textContent / DOM API で描画する (XSS 注意、CLAUDE.md 規約)。固定の SVG アイコン (icon() の
@@ -32,8 +35,10 @@ import { logger } from "../core/log";
 import { showToast } from "./toast";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
-import { avatarColor, hasImageIcon } from "./avatar";
+import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
 import { enhanceSelects } from "./select-menu";
+import { openActionSheet } from "./mobile-sheet";
+import { attachPullToRefresh } from "./pull-to-refresh";
 
 export type MobileWolPanelHandle = {
   refresh: () => Promise<void>;
@@ -46,7 +51,6 @@ const POLL_STEP_MS = 3000;
 // コールドブート→ログイン→ホスト常駐起動→Tailscale 復帰まで数分かかることがあるため長めに取る
 // (デスクトップ版 wol-panel.ts と同じ値。実機で 90 秒では起動が間に合わなかった実績に合わせる)。
 const POLL_MAX_MS = 240_000;
-const LONG_PRESS_MS = 600;
 
 /** MAC を ":" 区切り大文字へ正規化する。形式不正なら null。 */
 function normalizeMac(raw: string): string | null {
@@ -72,7 +76,9 @@ export function mountMobileWolPanel(
     <div class="page-head">
       <h2>Wake on LAN</h2>
       <div class="actions">
-        <button class="icon-btn" id="mwol-add" title="WoL 先を追加">${icon("add")}</button>
+        <!-- .ml-icon-btn-labeled は mobile-launcher.css 定義 (.ml-app 配下スコープ)。
+             このパネルは .ml-app の子孫にマウントされるため流用できる。 -->
+        <button class="icon-btn ml-icon-btn-labeled" id="mwol-add" title="WoL 先を追加">${icon("add")}<span>追加</span></button>
       </div>
     </div>
     <div class="mwol-list" id="mwol-list"></div>
@@ -348,8 +354,8 @@ export function mountMobileWolPanel(
 
   /** 追加/編集ダイアログ。target=null で新規。
    *  デスクトップ版と違い、中継先パスワードの「保存済み/未保存」ヒントは出さない
-   *  (savedPasswordHosts を呼ばないため判定材料が無い)。画像アイコン選択もモバイル版では
-   *  持たない (デスクトップ側で設定済みの icon フィールドは編集時も保持する)。 */
+   *  (savedPasswordHosts を呼ばないため判定材料が無い)。画像アイコン選択は Hosts の追加ダイアログ
+   *  (`mobile-launcher.ts` の openAddHostDialog) と同じ体裁で持たせている。 */
   function openTargetDialog(target: WolTarget | null): void {
     const isAdd = target === null;
     void (async () => {
@@ -364,6 +370,14 @@ export function mountMobileWolPanel(
       backdrop.innerHTML = `
         <form class="dialog" autocomplete="off">
           <h3>${isAdd ? "WoL 先を追加" : "WoL 先を編集"}</h3>
+          <div class="icon-picker">
+            <div class="icon-preview" id="mw-icon-preview"></div>
+            <div class="icon-picker-actions">
+              <button type="button" class="btn-secondary" id="mw-icon-pick">画像を選択</button>
+              <button type="button" class="btn-ghost" id="mw-icon-clear">解除</button>
+            </div>
+            <input type="file" id="mw-icon-file" accept="image/*" hidden />
+          </div>
           <label>表示名 (任意)<input id="mw-label" type="text" placeholder="home-pc" /></label>
           <label>登録済みホストから選ぶ
             <select id="mw-host" class="select-input"><option value="">(紐付けなし・手動)</option></select>
@@ -412,11 +426,59 @@ export function mountMobileWolPanel(
       if (relayPortInput) relayPortInput.value = String(target?.relay_port ?? DEFAULT_RELAY_PORT);
       if (linkedNow?.mac && macInput && !macInput.value) macInput.value = linkedNow.mac;
 
+      // 画像アイコン選択 (mobile-launcher.ts の openAddHostDialog と同じ体裁)。
+      // 頭文字フォールバックはカード描画と同じ規則 (表示名 → MAC の順)。フィールドの初期値を
+      // 埋めた後に呼ぶ (編集時に頭文字フォールバックが正しい表示名/MAC を参照できるようにする)。
+      let currentIcon = target?.icon ?? "";
+      const iconPreview = backdrop.querySelector<HTMLElement>("#mw-icon-preview");
+      const iconFileInput = backdrop.querySelector<HTMLInputElement>("#mw-icon-file");
+      const iconClearBtn = backdrop.querySelector<HTMLButtonElement>("#mw-icon-clear");
+      function renderIconPreview(): void {
+        if (!iconPreview) return;
+        if (hasImageIcon(currentIcon)) {
+          iconPreview.style.background = "";
+          const img = document.createElement("img");
+          img.src = currentIcon; // 自前生成の data URL
+          img.alt = "";
+          img.draggable = false;
+          iconPreview.replaceChildren(img);
+        } else {
+          const nm = labelInput?.value.trim() || macInput?.value.trim() || "?";
+          iconPreview.style.background = avatarColor(nm);
+          iconPreview.textContent = (nm[0] ?? "?").toUpperCase();
+        }
+        if (iconClearBtn) iconClearBtn.style.display = currentIcon ? "" : "none";
+      }
+      renderIconPreview();
+      labelInput?.addEventListener("input", () => {
+        if (!hasImageIcon(currentIcon)) renderIconPreview();
+      });
+      macInput?.addEventListener("input", () => {
+        if (!hasImageIcon(currentIcon)) renderIconPreview();
+      });
+      backdrop.querySelector("#mw-icon-pick")?.addEventListener("click", () => iconFileInput?.click());
+      iconFileInput?.addEventListener("change", () => {
+        const file = iconFileInput.files?.[0];
+        iconFileInput.value = "";
+        if (!file) return;
+        void imageToIconDataUrl(file)
+          .then((url) => {
+            currentIcon = url;
+            renderIconPreview();
+          })
+          .catch((err) => logger.warn("icon load failed", err));
+      });
+      iconClearBtn?.addEventListener("click", () => {
+        currentIcon = "";
+        renderIconPreview();
+      });
+
       hostSelect?.addEventListener("change", () => {
         const linked = hosts.find((h) => h.host === hostSelect.value);
         if (!linked) return;
         if (labelInput && !labelInput.value.trim()) labelInput.value = linked.label || linked.host;
         if (macInput && !macInput.value.trim() && linked.mac) macInput.value = linked.mac;
+        if (!hasImageIcon(currentIcon)) renderIconPreview();
       });
 
       eyeBtn?.addEventListener("click", () => {
@@ -453,7 +515,9 @@ export function mountMobileWolPanel(
           relay_port: relayPort,
           host: linked ? linked.host : null,
           port: linked ? linked.port : null,
-          icon: target?.icon ?? null, // 画像アイコン選択 UI は持たないので既存値をそのまま保持する
+          // 画像を選んでいればその data URL、「解除」を押していれば空文字、
+          // 何も操作していなければ既存値 (target?.icon) をそのまま保持する。
+          icon: currentIcon,
         };
         void (async () => {
           await saveWolTarget(saved);
@@ -516,24 +580,43 @@ export function mountMobileWolPanel(
       const meta = document.createElement("div");
       meta.className = "meta";
 
-      // 1 行目: ラベル + 編集ボタン。
+      // 1 行目: ラベル + ⋮ メニュー (編集/削除)。Hosts タブのカードと同じ導線に統一している。
       const row1 = document.createElement("div");
       row1.className = "row1";
       const labelEl = document.createElement("span");
       labelEl.className = "label";
       labelEl.textContent = name;
-      const editBtn = document.createElement("button");
-      editBtn.type = "button";
-      editBtn.className = "card-btn mwol-edit";
-      editBtn.title = "編集";
-      editBtn.innerHTML = icon("edit");
+      const moreBtn = document.createElement("button");
+      moreBtn.type = "button";
+      moreBtn.className = "card-btn mwol-more";
+      moreBtn.title = "メニュー";
+      moreBtn.innerHTML = icon("more");
       // カードのタップ (主アクション) へ伝播させない。
-      editBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
-      editBtn.addEventListener("click", (e) => {
+      moreBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+      moreBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        openTargetDialog(t);
+        openActionSheet([
+          {
+            label: "編集",
+            icon: "edit",
+            onSelect: () => openTargetDialog(t),
+          },
+          {
+            label: "削除",
+            icon: "delete",
+            danger: true,
+            onSelect: () => {
+              openConfirmDialog(`「${name}」を一覧から削除しますか?`, async () => {
+                stopPoll(t.id);
+                sending.delete(t.id);
+                await deleteWolTarget(t.id);
+                await refresh();
+              });
+            },
+          },
+        ]);
       });
-      row1.append(labelEl, editBtn);
+      row1.append(labelEl, moreBtn);
 
       // 2 行目: 紐付けホストがあれば接続先、無ければ MAC (紐付けありの MAC は編集ダイアログで確認)。
       const sub = document.createElement("div");
@@ -570,35 +653,9 @@ export function mountMobileWolPanel(
       const poll = activePolls.get(t.id);
       if (poll) showProgress(card, `起動待ち ${Math.round(poll.elapsedMs / 1000)}s`);
 
-      // タップ = 主アクション (紐付けあり: 起こして接続 / 紐付けなし: 起こす)、
-      // 長押し (600ms) = 削除確認 (mobile-launcher.ts の Hosts カードと同じジェスチャ)。
-      let pressTimer: number | null = null;
-      let longPressFired = false;
-      const clearPress = (): void => {
-        if (pressTimer !== null) {
-          window.clearTimeout(pressTimer);
-          pressTimer = null;
-        }
-      };
-      card.addEventListener("pointerdown", () => {
-        longPressFired = false;
-        clearPress();
-        pressTimer = window.setTimeout(() => {
-          pressTimer = null;
-          longPressFired = true;
-          openConfirmDialog(`「${name}」を一覧から削除しますか?`, async () => {
-            stopPoll(t.id);
-            sending.delete(t.id);
-            await deleteWolTarget(t.id);
-            await refresh();
-          });
-        }, LONG_PRESS_MS);
-      });
-      card.addEventListener("pointerup", clearPress);
-      card.addEventListener("pointerleave", clearPress);
-      card.addEventListener("pointercancel", clearPress);
+      // タップ = 主アクション (紐付けあり: 起こして接続 / 紐付けなし: 起こす)。
+      // 削除は ⋮ メニュー経由に一本化している (不可視のジェスチャに破壊的操作を割り当てない方針)。
       card.addEventListener("click", () => {
-        if (longPressFired) return;
         if (isBusy(t.id)) return; // 進捗表示中はタップを無視する
         if (t.host) void handleWakeAndConnect(t, card);
         else void handleWake(t, card);
@@ -624,6 +681,9 @@ export function mountMobileWolPanel(
       logger.warn("load wol targets failed", e);
     }
   }
+
+  // 引っ張って更新 (Hosts タブと同じ共通部品)。
+  attachPullToRefresh(listEl, refresh);
 
   void refresh();
 

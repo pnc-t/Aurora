@@ -73,6 +73,59 @@
   color: var(--muted);
 }
 
+/* page-head のアイコンボタン (更新/追加、WoL の追加) にラベルを併記する。タッチ環境はホバーが
+ * 無く title 属性 (a11y 用に残す) が常時見えないため、アイコンだけでは意味が伝わらない。
+ * .icon-btn 本来の固定 34x34 の正方形は崩し、テキスト分だけ横に伸ばす。min-height:44px を
+ * ここで直接持たせているため、モバイル画面上の .icon-btn は現状すべて本クラス経由でタップ領域を
+ * 満たしており、ラベル無し版向けの別ルールは (使われないため) 用意していない。 */
+.ml-app .ml-icon-btn-labeled {
+  width: auto;
+  height: auto;
+  min-height: 44px; /* ラベル付きにするため 34px 固定は解く。タップ領域は最初から 44px 確保する */
+  padding: 0 14px;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* アクセントカラー <input type=color> を包む <label> (タップ領域拡張用、下の @media で
+ * padding/margin を足す)。label 自体は既定 display:inline のままだと setting-row の flex 行内で
+ * レイアウトが崩れるため、幅を問わず常に inline-flex にしておく (padding/margin は幅依存の
+ * タップ領域確保の一部なのでここでは付けない)。 */
+.ml-app .ml-tap44 {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* ホスト編集ダイアログの「詳細設定」折りたたみ。中身 (仮想ディスプレイ/画質/コーデック) は
+ * dialog 内の label 要素をそのまま流用するので、ここでは summary の見た目と開閉インジケータだけ書く。 */
+.ml-app .ml-host-adv {
+  margin-top: 4px;
+}
+.ml-app .ml-host-adv summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 8px 0;
+  list-style: none; /* 既定のマーカー三角を消し、自前の chevron に統一する */
+}
+.ml-app .ml-host-adv summary::-webkit-details-marker {
+  display: none;
+}
+.ml-app .ml-host-adv summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s;
+}
+.ml-app .ml-host-adv[open] summary::before {
+  transform: rotate(90deg);
+}
+.ml-app .ml-host-adv label {
+  margin-top: 10px;
+}
+
 /* グローバルの .hidden (mobile-main.css) は display: none !important で、ページ全体の表示/非表示
  * 切替専用のため、行単位の表示制御に流用すると !important 同士の優先度で意図せず衝突しうる
  * (.mp-hidden / .mkb-hidden と同じ理由)。カスタムプリセット以外のときに fps/Mbps 行を隠す専用クラス。 */
@@ -94,7 +147,7 @@
   }
   .ml-app .setting-row > .sel-wrap,
   .ml-app .setting-row > .num-input,
-  .ml-app .setting-row > .color-input,
+  .ml-app .setting-row > .ml-tap44,
   .ml-app .setting-row > .switch,
   .ml-app .setting-row > .select-input {
     align-self: flex-end;
@@ -110,7 +163,7 @@
     max-width: 100%;
   }
 
-  /* Hosts カード末尾 (chevron のみ) の固定幅 72px は過剰。中身に合わせて縮める。 */
+  /* Hosts カード末尾 (⋮ のみ) の固定幅 72px は過剰。中身に合わせて縮める。 */
   .ml-app .host-card .card-tail {
     flex: 0 0 auto;
   }
@@ -129,5 +182,47 @@
     padding-bottom: 10px;
     box-sizing: border-box;
     min-height: 44px;
+  }
+
+  /* Hosts カードの ⋮ (card-btn は launcher.css 側で背景透明・hover のみ着色のため、
+   * padding 拡張しても待機時の見た目は変わらない)。box-sizing はプロジェクト既定の
+   * border-box のまま (content-box を明示すると padding が外側に足されず 40x40 止まりになる。
+   * mwol-card .card-btn と同じ min-width/min-height で 44px を保証する)。 */
+  .ml-app .host-card .card-btn {
+    padding: 12px;
+    margin: -12px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* .color-input (input[type=color], 42x28 固定) は置換要素なので疑似要素で当たり判定を
+   * 重ねられない (ブラウザが要素自身の描画だけをヒットテストする)。代わりに mobile-launcher.ts
+   * 側で <label class="ml-tap44"> に包み、label の余白タップをネイティブの「ラベル→紐付く
+   * コントロールへのクリック転送」に委ねる。swatch (.color-input) 自体には触れないため
+   * 42x28 の見た目はそのまま (display:inline-flex は幅を問わず上で常時適用済み)。 */
+  .ml-app .ml-tap44 {
+    padding: 8px;
+    margin: -8px;
+  }
+
+  /* .switch (42x24) はスイッチの見た目 (.slider) を変えない、と明示要求されている。
+   * .slider は親 (.switch) の position:relative を基準に inset:0 で敷き詰められているため、
+   * 素直に .switch へ padding を足すと slider ごと拡大してしまう。padding 分だけ slider の
+   * inset をずらして元の 42x24 の見た目位置に固定し直す。 */
+  .ml-app .switch {
+    padding: 10px;
+    margin: -10px;
+    box-sizing: content-box;
+  }
+  .ml-app .switch .slider {
+    inset: 10px;
+  }
+
+  /* .settings-tab は下端に active タブの下線 (::after, bottom:0) があるため、下方向へ padding を
+   * 足すと下線の位置がずれる。上方向だけ広げて高さを稼ぎ、見た目 (下線位置・文字位置は
+   * padding-bottom 側で維持) を変えない。 */
+  .ml-app .settings-tab {
+    padding-top: 18px;
+    margin-top: -8px;
   }
 }
