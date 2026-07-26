@@ -192,7 +192,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">映像コーデック</div>
-                  <div class="s-desc">自動はホストと対応コーデックを相談して選ぶ。手動でこの端末が非対応のものを選ぶと H.264 にフォールバックする</div>
+                  <div class="s-desc">自動はホストと相談して選ぶ。非対応を選ぶと H.264 に戻る</div>
                 </div>
                 <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
               </div>
@@ -201,17 +201,17 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               <div class="ml-set-block">
               <div class="setting-group">接続</div>
               <div class="setting-card">
-              <div class="setting-row">
+              <div class="setting-row ml-row-toggle">
                 <div class="s-meta">
                   <div class="s-title">切断時に自動で再接続</div>
                   <div class="s-desc">通信断などで切れたとき、間隔を空けて自動的に接続し直す</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-reconnect" /><span class="slider"></span></label>
               </div>
-              <div class="setting-row">
+              <div class="setting-row ml-row-toggle">
                 <div class="s-meta">
                   <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
-                  <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャし画面に解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
+                  <div class="s-desc">端末の画面比に解像度を合わせ黒帯を消す。物理画面とは別の空デスクトップになる</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
               </div>
@@ -225,7 +225,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">配置</div>
-                  <div class="s-desc">操作バーを画面のどの端に置くか。左右に置くと縦並びのサイドバーになる</div>
+                  <div class="s-desc">操作バーを置く画面の端。左右は縦並びになる</div>
                 </div>
                 <select id="set-tb-position" class="select-input">
                   <option value="top">上</option>
@@ -242,7 +242,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">テーマ</div>
-                  <div class="s-desc">配色。auto は OS のダーク/ライト設定に追従。legacy はグレーのクラシック調</div>
+                  <div class="s-desc">配色。システム連動は OS のダーク/ライト設定に追従する</div>
                 </div>
                 <select id="set-theme" class="select-input">
                   <option value="auto">システム連動</option>
@@ -380,7 +380,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
         <h3>削除の確認</h3>
         <div class="s-desc">${message}</div>
         <div class="dlg-actions">
-          <button type="button" class="btn-ghost" id="c-cancel">cancel</button>
+          <button type="button" class="btn-ghost" id="c-cancel">キャンセル</button>
           <button type="button" class="btn-danger" id="c-ok">削除</button>
         </div>
       </div>
@@ -426,8 +426,8 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
           <input type="file" id="h-icon-file" accept="image/*" hidden />
         </div>
         <label>表示名 (任意)<input id="h-label" type="text" value="${escapeHtml(e.label)}" placeholder="home-pc" /></label>
-        <label>host (Tailscale IP / hostname)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
-        <label>port
+        <label>ホスト (Tailscale IP / ホスト名)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
+        <label>ポート
           <input id="h-port" type="text" inputmode="numeric" value="${e.port}" />
           <span class="shortcut-error" data-h-port-error></span>
         </label>
@@ -444,8 +444,8 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
           <label>コーデック<select id="h-codec" class="select-input">${codecOptionsHtml(true)}</select></label>
         </details>
         <div class="dlg-actions">
-          <button type="button" class="btn-ghost" id="h-cancel">cancel</button>
-          <button type="submit" class="btn-primary">${isAdd ? "add" : "save"}</button>
+          <button type="button" class="btn-ghost" id="h-cancel">キャンセル</button>
+          <button type="submit" class="btn-primary">${isAdd ? "追加" : "保存"}</button>
         </div>
       </form>
     `;
@@ -565,7 +565,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
       <form class="dialog" autocomplete="off">
         <h3>${escapeHtml(entry.label || entry.host)}</h3>
         <div class="s-desc" style="font-family:monospace">${escapeHtml(entry.host)}:${entry.port}</div>
-        <label>password
+        <label>パスワード
           <span class="pass-wrap">
             <input id="d-pass" type="password" required />
             <button type="button" class="pass-eye" id="d-eye" title="パスワードを表示">${icon("eye")}</button>
@@ -573,8 +573,8 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
         </label>
         <div class="dlg-status" id="d-status"></div>
         <div class="dlg-actions">
-          <button type="button" class="btn-ghost" id="d-cancel">cancel</button>
-          <button type="submit" class="btn-primary" id="d-ok">connect</button>
+          <button type="button" class="btn-ghost" id="d-cancel">キャンセル</button>
+          <button type="submit" class="btn-primary" id="d-ok">接続</button>
         </div>
       </form>
     `;
@@ -599,21 +599,21 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
       if (!password) return;
       if (okBtn) {
         okBtn.disabled = true;
-        okBtn.textContent = "connecting…";
+        okBtn.textContent = "接続中…";
       }
-      if (statusEl) statusEl.textContent = `connecting to ${entry.host}…`;
+      if (statusEl) statusEl.textContent = `${entry.host} に接続中…`;
       // モバイルはパスワード非保存 (DPAPI が Windows 専用のため)。save は常に false。
       void opts
         .onConnect(entry, password, false)
         .then(() => closeDialog())
         .catch((err) => {
           if (statusEl) {
-            statusEl.textContent = `error: ${String(err)}`;
+            statusEl.textContent = `エラー: ${String(err)}`;
             statusEl.classList.add("error");
           }
           if (okBtn) {
             okBtn.disabled = false;
-            okBtn.textContent = "connect";
+            okBtn.textContent = "接続";
           }
         });
     });
@@ -724,9 +724,20 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
         lc.textContent = formatRelativeConnected(entry.last_connected);
         labelRow.appendChild(lc);
       }
+      // アドレス部分だけ ellipsis で省略できるよう専用 span に分ける (addr 自体は flex 行になり、
+      // 到達性テキスト (下記) と並べて置くため)。
       const addr = document.createElement("div");
       addr.className = "addr";
-      addr.textContent = `${entry.host}:${entry.port}`;
+      const addrText = document.createElement("span");
+      addrText.className = "ml-addr-text";
+      addrText.textContent = `${entry.host}:${entry.port}`;
+      addr.appendChild(addrText);
+      if (online !== undefined) {
+        const presenceText = document.createElement("span");
+        presenceText.className = `ml-presence-text ${online ? "online" : "offline"}`;
+        presenceText.textContent = online ? "オンライン" : "応答なし";
+        addr.appendChild(presenceText);
+      }
       meta.append(labelRow, addr);
 
       const tail = document.createElement("div");

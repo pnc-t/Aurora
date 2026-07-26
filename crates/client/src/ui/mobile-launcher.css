@@ -1,7 +1,11 @@
 /* モバイル版ランチャー (mobile-launcher.ts)。見た目の大半は launcher.css を再利用する
  * (host-card/dialog/setting-row 等はグローバルセレクタなのでそのまま効く)。ここには
  * デスクトップの「サイドバー + コンテンツ」を「コンテンツ + 下部タブバー」へ組み替える
- * 差分と、モバイル固有のタブバー自体のスタイルだけを書く。 */
+ * 差分と、モバイル固有のタブバー自体のスタイルだけを書く。
+ * 幅ブレークポイントは 4 段構成: 常時適用 (幅を問わない差分) → @media (max-width: 480px)
+ * (スマホ幅の崩れ対策) → @media (max-width: 360px) (480px 内側のさらに狭い幅専用、
+ * addr 行の折り返しのみ) → @media (min-width: 700px) (タブレット 2 カラム化)。狭い方の
+ * 例外は広い方のブロックに混ぜず別メディアクエリに分離し、対象幅を取り違えないようにする。 */
 
 .ml-app {
   display: flex;
@@ -50,7 +54,7 @@
   background: transparent;
   border: none;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
 }
 .ml-tab .icon {
@@ -69,7 +73,7 @@
 .ml-last-connected {
   flex-shrink: 0;
   margin-left: auto;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
 }
 
@@ -146,6 +150,59 @@
   display: none;
 }
 
+/* デスクトップ由来の文字サイズ (launcher.css) は 11-12px 台が多く、タッチ・高 DPI のスマホ画面では
+ * 物理的に小さすぎるため、モバイル (.ml-app 配下) だけ 1 段上げる。 */
+.ml-app .host-card .meta .label {
+  font-size: 16px;
+}
+.ml-app .setting-row .s-desc {
+  font-size: 13px;
+  line-height: 1.45;
+}
+.ml-app .setting-group {
+  font-size: 12px;
+}
+.ml-app .host-card .avatar-wrap .presence {
+  width: 12px;
+  height: 12px;
+}
+
+/* ホストの到達性はアバターの色ドットだけでは伝わらない (色弱・強い外光での視認性) ため、
+ * addr 行の末尾にテキストでも状態を出す。addr は元々 monospace のテキストノード 1 本だったが、
+ * アドレス部分だけ ellipsis で省略できるよう <span class="ml-addr-text"> に分ける。
+ * font-size: 13px は上の「文字サイズ底上げ」の一環 (addr の宣言をここへ統合し、同セレクタが
+ * ファイル内に重複しないようにしている)。 */
+.ml-app .host-card .meta .addr {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+}
+.ml-app .host-card .meta .ml-addr-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ml-app .host-card .meta .ml-presence-text {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-family: inherit; /* .addr の monospace 指定を打ち消し、状態テキストだけ本文フォントに戻す */
+}
+.ml-app .host-card .meta .ml-presence-text.online {
+  color: var(--ok);
+}
+.ml-app .host-card .meta .ml-presence-text.offline {
+  color: var(--muted);
+}
+
+/* ダイアログのボタンはタッチの主要動線 (接続/削除/追加) なので、既存の 44px タップ領域確保より
+ * 一段大きく確保する。 */
+.ml-app .dialog .dlg-actions button {
+  min-height: 48px;
+}
+
 /* スマホ幅 (~320-480px) 専用の崩れ対策。タブレット幅 (481px 以上) の見た目は変えないため
  * 必ずこのメディアクエリ内に閉じ込め、セレクタは .ml-app 配下にスコープする。
  * launcher.css / select-menu.css はデスクトップ版ランチャーと共有しておりここでは編集できない
@@ -180,12 +237,9 @@
   .ml-app .host-card .card-tail {
     flex: 0 0 auto;
   }
-  /* launcher.css の .addr にはみ出し対策が無いため、host:port が長いホスト名で溢れないよう追加。 */
-  .ml-app .host-card .meta .addr {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+  /* host:port の溢れ対策は .addr を flex 化した際に .ml-addr-text の ellipsis へ移設済み
+   * (常時適用の領域、上部の「ホストの到達性は…」ブロック参照)。幅ブレークポイント内に
+   * 残す必要が無いためここには置かない。 */
 
   /* タップ領域確保 (配色/角丸/フォント/アイコンは変えず padding のみで高さを稼ぐ)。 */
   .ml-app .num-input,
@@ -237,6 +291,35 @@
   .ml-app .settings-tab {
     padding-top: 18px;
     margin-top: -8px;
+  }
+
+  /* トグル (.switch) 行だけ縦積みを解除し「ラベル左 / スイッチ右」の 1 行に戻す。縦に離すと
+   * どの説明文がどのスイッチに対応するか分かりにくくなるため。値選択系 (select/数値/カラー) は
+   * 選択肢ラベルが長く 1 行では潰れるので縦積みのまま維持する。タップ領域 44px 確保
+   * (.ml-app .switch の padding:10px / margin:-10px、.slider の inset:10px) はそのまま残す。 */
+  .ml-app .setting-row.ml-row-toggle {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+  .ml-app .setting-row.ml-row-toggle > .s-meta {
+    flex: 1;
+    min-width: 0;
+  }
+  .ml-app .setting-row.ml-row-toggle > .switch {
+    align-self: center;
+    flex-shrink: 0;
+  }
+}
+
+/* 320-360px 専用 (480px ブロックのさらに内側の狭幅)。実測: 320px 幅では addr 行の使える幅が
+ * 164px で、`100.xx.xx.xxx:7000` (約120px) + gap 8px + 「オンライン」(60px) = 188px となり
+ * アドレス側が ellipsis で削られ IP が読めなくなる。この幅だけ折り返しを許し、到達性テキストを
+ * 2 行目へ落とす。390px 以上は 1 行に収まるため、480px ブロックに混ぜると無意味にカードが
+ * 高くなってしまう。 */
+@media (max-width: 360px) {
+  .ml-app .host-card .meta .addr {
+    flex-wrap: wrap;
   }
 }
 

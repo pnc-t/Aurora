@@ -22,7 +22,8 @@
   border: 1px solid var(--panel-border);
   border-radius: 14px;
   background: var(--toolbar-bg);
-  opacity: 0.55;
+  /* 暗い映像の上では 0.55 だと見つけにくいため少し上げる。 */
+  opacity: 0.7;
   pointer-events: auto;
   flex: none;
 }
