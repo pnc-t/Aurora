@@ -126,6 +126,19 @@
   margin-top: 10px;
 }
 
+/* タブレット 2 カラム化 (下の @media (min-width: 700px)) のため、見出し (.setting-group) と
+ * カード (.setting-card) を <div class="ml-set-block"> で包んだ (mobile-launcher.ts)。しかし
+ * launcher.css の `.setting-group:first-child { margin-top: 4px; }` は「そのブロック内で
+ * 最初の要素か」を見るため、包んだことで全ての .setting-group がラッパー内の :first-child に
+ * なってしまい、ブロック間の余白 (24px) が意図せず 4px に詰まる。この退行はスマホ幅でも起きるため
+ * 幅を問わず常時、ラッパー同士の間隔として 24px を入れ直す (2 カラム時はグリッドの gap と
+ * 二重にならないよう下の @media 側で 0 に戻す)。 */
+/* 20px なのは、包まれた .setting-group 側に :first-child 由来の 4px が必ず乗るため
+ * (20 + 4 = 24 で、包む前の .setting-group の margin-top: 24px と実測で一致する)。 */
+.ml-app .ml-set-block + .ml-set-block {
+  margin-top: 20px;
+}
+
 /* グローバルの .hidden (mobile-main.css) は display: none !important で、ページ全体の表示/非表示
  * 切替専用のため、行単位の表示制御に流用すると !important 同士の優先度で意図せず衝突しうる
  * (.mp-hidden / .mkb-hidden と同じ理由)。カスタムプリセット以外のときに fps/Mbps 行を隠す専用クラス。 */
@@ -224,5 +237,44 @@
   .ml-app .settings-tab {
     padding-top: 18px;
     margin-top: -8px;
+  }
+}
+
+/* タブレット幅の 2 カラム化。481px から「タブレット」扱いだが、600px で 2 列にすると
+ * 1 列あたり約 285px しか残らず設定行 (ラベル+コントロール) が窮屈になるため、700px 以上
+ * (実機でおよそ 8 インチ以上) でのみ 2 列にする。600-699px は引き続き 1 列のまま。
+ * launcher.css はデスクトップと共有で編集禁止のため、打ち消しは必ずこちら側の上書きで行う
+ * (既存の @media (max-width: 480px) と同じ流儀)。セレクタは全て .ml-app 配下にスコープし、
+ * デスクトップ版ランチャー (`.launcher` 配下、こちらは対象外) に影響しないようにする。 */
+@media (min-width: 700px) {
+  /* launcher.css は `.settings-sect.active { display: flex }` (縦積み) なので、この上書きで
+   * 見出し+カードのブロックを 2 列グリッドに並べ替える。align-items: start でブロックの
+   * 高さが揃わなくても下端が引っ張られないようにする。 */
+  .ml-app .settings-sect.active {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0 24px;
+    align-items: start;
+  }
+  /* デスクトップのウィンドウ幅想定の 760px 上限はタブレット全画面表示には合わないため外す。 */
+  .ml-app .settings-tabs,
+  .ml-app .settings-sect {
+    max-width: none;
+  }
+  /* グリッドの行間 (gap) で縦方向の間隔が付くため、上のラッパー間 margin-top: 24px と
+   * 二重に空いてしまう。2 列時はグリッド側に間隔を委ね、ラッパー側の margin は 0 に戻す。 */
+  .ml-app .ml-set-block + .ml-set-block {
+    margin-top: 0;
+  }
+
+  .ml-app .host-list {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    align-content: start;
+  }
+  /* 空状態ガイドは 1 カラム分の幅では窮屈なため、2 列をぶち抜いて元の横幅を保つ。 */
+  .ml-app .empty-guide {
+    grid-column: 1 / -1;
   }
 }

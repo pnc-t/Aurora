@@ -182,3 +182,18 @@
     transform: rotate(360deg);
   }
 }
+
+/* タブレット幅の 2 カラム化 (mobile-launcher.css の Hosts 一覧と同じしきい値・同じ理由: 600px では
+ * 1 列あたりが狭すぎるため 700px 以上でのみ 2 列にする)。このファイルはモバイル専用でセレクタも
+ * mwol- 接頭辞のため、launcher.css との衝突を気にするスコープは不要。 */
+@media (min-width: 700px) {
+  .mwol-list {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+  /* 空メッセージは 1 カラム分では窮屈なため 2 列をぶち抜く。 */
+  .empty-hint {
+    grid-column: 1 / -1;
+  }
+}

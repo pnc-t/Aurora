@@ -165,6 +165,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
           </div>
           <div class="settings-body">
             <div class="settings-sect active" data-sect="av">
+              <div class="ml-set-block">
               <div class="setting-group">映像 (接続時にホストへ適用)</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -196,6 +197,8 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                 <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
               </div>
               </div>
+              </div>
+              <div class="ml-set-block">
               <div class="setting-group">接続</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -213,8 +216,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
               </div>
               </div>
+              </div>
             </div>
             <div class="settings-sect" data-sect="display">
+              <div class="ml-set-block">
               <div class="setting-group">操作バー</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -230,6 +235,8 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                 </select>
               </div>
               </div>
+              </div>
+              <div class="ml-set-block">
               <div class="setting-group">外観・既定値</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -260,8 +267,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                 <input type="text" inputmode="numeric" id="set-port" class="num-input" />
               </div>
               </div>
+              </div>
             </div>
             <div class="settings-sect" data-sect="other">
+              <div class="ml-set-block">
               <div class="setting-group">診断</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -269,6 +278,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                   <div class="s-title">バージョン</div>
                 </div>
                 <span id="app-version" class="s-desc">…</span>
+              </div>
               </div>
               </div>
             </div>
