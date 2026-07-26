@@ -1,0 +1,184 @@
+/* モバイル (Android) 専用 Wake on LAN パネル (mobile-wol.ts)。デスクトップ版の wol-panel.css /
+ * mobile-launcher.css と同じ配色言語 (CSS 変数) に揃えるが、セレクタは全て mwol- 接頭辞にして
+ * 既存の .wol-* と衝突させない。page-head / .dialog / .dlg-row / .btn-primary 等の共通クラスは
+ * launcher.css のグローバル定義 (mobile-launcher.ts が読み込み済み) をそのまま使う。
+ *
+ * スマホ幅 (320px 想定) でも横にはみ出さないよう、固定 px 幅の要素 (flex: 0 0 <px> 等) は作らず、
+ * ラベル/リンク/MAC は必ず ellipsis で切る。タップ領域は編集/キャンセルボタンとも 44px を確保する。 */
+
+.mwol-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding-bottom: 16px;
+}
+
+/* ダイアログ用バックドロップ (wol-panel.css の #wol-dialog-backdrop と同じ体裁)。 */
+#mwol-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--backdrop);
+  backdrop-filter: blur(2px);
+}
+#mwol-dialog-backdrop.visible {
+  display: flex;
+}
+
+.mwol-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  cursor: pointer;
+  touch-action: manipulation; /* ダブルタップズームで長押し判定が乱れるのを防ぐ */
+}
+.mwol-card:active {
+  border-color: var(--card-hover-border);
+  background: var(--raised-faint);
+}
+/* 進行中のカードはアクセント枠で「今このカードが動いている」ことを示す (wol-panel.css と同じ)。 */
+.mwol-card:has(.mwol-progress:not([hidden])) {
+  border-color: var(--accent);
+}
+
+.mwol-card .avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+}
+.mwol-card .avatar.avatar-img {
+  background: var(--control);
+  overflow: hidden;
+}
+.mwol-card .avatar.avatar-img img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.mwol-card .meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.mwol-card .row1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.mwol-card .row1 .label {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mwol-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+  font-family: monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mwol-sub[hidden] {
+  display: none;
+}
+
+/* 編集ボタン。タップ領域 44px を確保 (見た目のアイコンは小さいまま、padding で拡張)。 */
+.mwol-card .card-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 12px;
+  margin: -12px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+}
+.mwol-card .card-btn:hover {
+  background: var(--menu-hover);
+  color: var(--fg);
+}
+.mwol-card .card-btn:active {
+  background: var(--menu-hover);
+}
+
+/* 進捗表示 (起動待ち/送信中)。.mwol-sub と入れ替わりで表示する。 */
+.mwol-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.mwol-progress[hidden] {
+  display: none;
+}
+.mwol-progress-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.mwol-progress-text.done {
+  color: var(--ok);
+  font-weight: 600;
+}
+.mwol-progress-cancel:hover {
+  color: var(--danger);
+}
+.mwol-progress-cancel[hidden] {
+  display: none;
+}
+
+.mwol-spinner {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 2px solid var(--panel-border);
+  border-top-color: var(--accent);
+  animation: mwol-spin 0.9s linear infinite;
+}
+.mwol-spinner[hidden] {
+  display: none;
+}
+@keyframes mwol-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

@@ -40,11 +40,11 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
 import { logger } from "../core/log";
-import { findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
+import { CUSTOM_PRESET_ID, findPreset, matchPreset, presetOptionsHtml } from "../core/video-presets";
 import { applyAriaLabels, trapFocus } from "../core/a11y";
 import { icon } from "./icons";
 import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
-import { mountWolPanel } from "./wol-panel";
+import { mountMobileWolPanel } from "./mobile-wol";
 import { enhanceSelects } from "./select-menu";
 import "./launcher.css";
 import "./mobile-launcher.css";
@@ -157,14 +157,14 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                 </div>
                 <select id="set-preset" class="select-input">${presetOptionsHtml()}</select>
               </div>
-              <div class="setting-row">
+              <div class="setting-row" data-custom-only>
                 <div class="s-meta">
                   <div class="s-title">送出 fps 上限</div>
                   <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
                 </div>
                 <input type="text" inputmode="numeric" id="set-fps" class="num-input" />
               </div>
-              <div class="setting-row">
+              <div class="setting-row" data-custom-only>
                 <div class="s-meta">
                   <div class="s-title">ビットレート上限 (Mbps)</div>
                   <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
@@ -287,11 +287,15 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   const portInput = $<HTMLInputElement>("#set-port");
   const portError = $<HTMLElement>('[data-num-error="port"]');
 
-  // WoL タブ: 中継 (raspi) 経由でマジックパケットを送るパネル。onConnect は launcher と共有する
-  // (シグネチャは newWindow 引数を持つが、モバイルは単一セッションのため常に無視する)。
+  // WoL タブ: 中継 (raspi) 経由でマジックパケットを送るパネル。
+  // 旧 wol-panel の「起こして接続」は保存済みパスワード (DPAPI = Windows 専用) を前提にしており
+  // Android では必ず失敗するため使わない。モバイル専用パネルは到達確認のみ行い、到達したら
+  // 毎回パスワード入力を求める接続ダイアログ (openConnectDialog) を開く配線にする。
+  // openConnectDialog は下方で宣言されるため、参照時点でまだ定義されていない可能性がある
+  // (宣言順の都合)。アロー関数で包んで呼び出し時まで評価を遅延させる。
   const wolRoot = $("#page-wol") as HTMLElement;
-  mountWolPanel(wolRoot, {
-    onConnect: (entry, password, save) => opts.onConnect(entry, password, save),
+  mountMobileWolPanel(wolRoot, {
+    onReachable: (entry) => openConnectDialog(entry),
   });
 
   applyAriaLabels(opts.root);
@@ -617,15 +621,17 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
       labelEl.className = "label";
       labelEl.textContent = name;
       labelRow.appendChild(labelEl);
+      // スマホ幅では「IP:port · N時間前」が addr 行 1 行に収まらず溢れるため、相対時刻は
+      // ラベル行の右端 (.ml-last-connected) へ移し、addr は host:port のみにする。
+      if (entry.last_connected != null) {
+        const lc = document.createElement("span");
+        lc.className = "ml-last-connected";
+        lc.textContent = formatRelativeConnected(entry.last_connected);
+        labelRow.appendChild(lc);
+      }
       const addr = document.createElement("div");
       addr.className = "addr";
       addr.textContent = `${entry.host}:${entry.port}`;
-      if (entry.last_connected != null) {
-        const lc = document.createElement("span");
-        lc.className = "last-connected";
-        lc.textContent = ` · ${formatRelativeConnected(entry.last_connected)}`;
-        addr.appendChild(lc);
-      }
       meta.append(labelRow, addr);
 
       const tail = document.createElement("div");
@@ -691,13 +697,22 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   function syncPresetSelect(): void {
     if (presetSelect) presetSelect.value = matchPreset(settings.fps, settings.max_mbps);
   }
+  // fps/Mbps の生値はプリセットが決めるカスタム時のみ意味を持つため、スマホ幅の縦積みで
+  // 場所を取る 2 行を「カスタム」選択時だけ出す (値自体は非表示中も保持・変更しない)。
+  const customOnlyRows = opts.root.querySelectorAll<HTMLElement>("[data-custom-only]");
+  function syncCustomOnlyRows(): void {
+    const isCustom = presetSelect?.value === CUSTOM_PRESET_ID;
+    customOnlyRows.forEach((row) => row.classList.toggle("ml-hidden", !isCustom));
+  }
   presetSelect?.addEventListener("change", () => {
     const p = findPreset(presetSelect.value);
-    if (!p) return; // カスタム: fps/Mbps の手動値を維持する
-    settings = { ...settings, fps: p.fps, max_mbps: p.mbps };
-    if (fpsInput) fpsInput.value = String(p.fps);
-    if (mbpsInput) mbpsInput.value = String(p.mbps);
-    persist();
+    if (p) {
+      settings = { ...settings, fps: p.fps, max_mbps: p.mbps };
+      if (fpsInput) fpsInput.value = String(p.fps);
+      if (mbpsInput) mbpsInput.value = String(p.mbps);
+      persist();
+    } // カスタム: fps/Mbps の手動値を維持する
+    syncCustomOnlyRows();
   });
   fpsInput?.addEventListener("change", () => {
     settings = { ...settings, fps: parseFps(fpsInput.value) };
@@ -777,6 +792,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     if (portInput) portInput.value = String(settings.default_port);
     syncPresetSelect();
     syncCodecSelect();
+    syncCustomOnlyRows();
     applyTheme(settings.theme, settings.accent_color);
   }
 

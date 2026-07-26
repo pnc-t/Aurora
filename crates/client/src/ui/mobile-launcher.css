@@ -13,7 +13,8 @@
 /* デスクトップの .content はタイトルバー分の上余白 (44px) + サイドバー隣接前提の左余白のみ
  * (右は host-list 側の padding-right で確保) だが、モバイルはウィンドウが無いので通常の余白にする。
  * host-list/settings-body 側のスクロールバー用ガター (padding-right) もデスクトップ専用の見た目
- * (太いスクロールバー) 前提なので、taps 主体のモバイルでは詰めて画面を広く使う。 */
+ * (太いスクロールバー) 前提なので、taps 主体のモバイルでは詰めて画面を広く使う。
+ * WoL タブは mobile-wol.ts (`.mwol-list`) が自前で padding を持つためここには含めない。 */
 .ml-app .content {
   padding: 16px 16px 0;
 }
@@ -21,7 +22,6 @@
   padding-right: 0;
 }
 .ml-app .host-list,
-.ml-app .wol-list,
 .ml-app .settings-body {
   padding-right: 0;
   padding-bottom: 16px;
@@ -61,4 +61,73 @@
 }
 .ml-tab.active {
   color: var(--accent);
+}
+
+/* 最終接続日時をラベル行の右端へ (mobile-launcher.ts が addr 行から移設)。
+ * ラベルが伸びても押し出されないよう margin-left: auto で右寄せ・flex-shrink: 0 で潰さない。
+ * 幅に関わらず常時この位置なので、スマホ幅ブレークポイントの外 (常時適用) に置く。 */
+.ml-last-connected {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* グローバルの .hidden (mobile-main.css) は display: none !important で、ページ全体の表示/非表示
+ * 切替専用のため、行単位の表示制御に流用すると !important 同士の優先度で意図せず衝突しうる
+ * (.mp-hidden / .mkb-hidden と同じ理由)。カスタムプリセット以外のときに fps/Mbps 行を隠す専用クラス。 */
+.ml-hidden {
+  display: none;
+}
+
+/* スマホ幅 (~320-480px) 専用の崩れ対策。タブレット幅 (481px 以上) の見た目は変えないため
+ * 必ずこのメディアクエリ内に閉じ込め、セレクタは .ml-app 配下にスコープする。
+ * launcher.css / select-menu.css はデスクトップ版ランチャーと共有しておりここでは編集できない
+ * ため、直接編集の代わりにここで .ml-app 配下だけを上書きする。 */
+@media (max-width: 480px) {
+  /* 設定行を縦積みに: 説明文 (.s-desc) がラベル分の幅しか使えず数文字で折り返す問題を解消する。
+   * コントロール類は 2 行目・右寄せにして、右側に寄った操作感を保つ。 */
+  .ml-app .setting-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .ml-app .setting-row > .sel-wrap,
+  .ml-app .setting-row > .num-input,
+  .ml-app .setting-row > .color-input,
+  .ml-app .setting-row > .switch,
+  .ml-app .setting-row > .select-input {
+    align-self: flex-end;
+  }
+
+  /* .sel-wrap は select-menu.css で flex-shrink: 0 のため、横幅を圧迫する犯人の一つ。
+   * 縦積みにした上でトリガの最大幅を親幅に抑え、長いラベルは既存の ellipsis で省略させる。 */
+  .ml-app .sel-wrap {
+    flex-shrink: 1;
+    max-width: 100%;
+  }
+  .ml-app .sel-trigger {
+    max-width: 100%;
+  }
+
+  /* Hosts カード末尾 (chevron のみ) の固定幅 72px は過剰。中身に合わせて縮める。 */
+  .ml-app .host-card .card-tail {
+    flex: 0 0 auto;
+  }
+  /* launcher.css の .addr にはみ出し対策が無いため、host:port が長いホスト名で溢れないよう追加。 */
+  .ml-app .host-card .meta .addr {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* タップ領域確保 (配色/角丸/フォント/アイコンは変えず padding のみで高さを稼ぐ)。 */
+  .ml-app .num-input,
+  .ml-app .select-input,
+  .ml-app .sel-trigger {
+    padding-top: 10px;
+    padding-bottom: 10px;
+    box-sizing: border-box;
+    min-height: 44px;
+  }
 }
