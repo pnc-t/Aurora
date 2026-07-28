@@ -66,16 +66,6 @@
   color: var(--accent);
 }
 
-/* 最終接続日時をラベル行の右端へ (mobile-launcher.ts が addr 行から移設)。
- * ラベルが伸びても押し出されないよう margin-left: auto で右寄せ・flex-shrink: 0 で潰さない。
- * 幅に関わらず常時この位置なので、スマホ幅ブレークポイントの外 (常時適用) に置く。 */
-.ml-last-connected {
-  flex-shrink: 0;
-  margin-left: auto;
-  font-size: 12px;
-  color: var(--muted);
-}
-
 /* page-head のアイコンボタン (更新/追加、WoL の追加) にラベルを併記する。タッチ環境はホバーが
  * 無く title 属性 (a11y 用に残す) が常時見えないため、アイコンだけでは意味が伝わらない。
  * .icon-btn 本来の固定 34x34 の正方形は崩し、テキスト分だけ横に伸ばす。min-height:44px を
@@ -155,7 +145,10 @@
 
 /* font-size: 13px は上の「文字サイズ底上げ」の一環 (addr の宣言をここへ統合し、同セレクタが
  * ファイル内に重複しないようにしている)。overflow/ellipsis は host:port が長い場合に
- * カード幅からはみ出さないようにするための溢れ対策。 */
+ * カード幅からはみ出さないようにするための溢れ対策。
+ * 320px 幅では「100.xx.xx.xxx:7000 · たった今」の自然幅 189px がこの行の使える幅 164px を
+ * 超えて末尾が ellipsis で切れる (360px=204px/412px=256px では収まる) が、削られるのは末尾の
+ * 相対時刻側で IP:port 自体は読めるため許容している。 */
 .ml-app .host-card .meta .addr {
   font-size: 13px;
   overflow: hidden;

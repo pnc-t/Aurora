@@ -706,17 +706,16 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
       labelEl.className = "label";
       labelEl.textContent = name;
       labelRow.appendChild(labelEl);
-      // スマホ幅では「IP:port · N時間前」が addr 行 1 行に収まらず溢れるため、相対時刻は
-      // ラベル行の右端 (.ml-last-connected) へ移し、addr は host:port のみにする。
-      if (entry.last_connected != null) {
-        const lc = document.createElement("span");
-        lc.className = "ml-last-connected";
-        lc.textContent = formatRelativeConnected(entry.last_connected);
-        labelRow.appendChild(lc);
-      }
       const addr = document.createElement("div");
       addr.className = "addr";
       addr.textContent = `${entry.host}:${entry.port}`;
+      // デスクトップ版 (launcher.ts) と体裁を揃える: 相対時刻は addr 行末に別 span で追記する。
+      if (entry.last_connected != null) {
+        const lc = document.createElement("span");
+        lc.className = "last-connected";
+        lc.textContent = ` · ${formatRelativeConnected(entry.last_connected)}`;
+        addr.appendChild(lc);
+      }
       meta.append(labelRow, addr);
 
       const tail = document.createElement("div");
