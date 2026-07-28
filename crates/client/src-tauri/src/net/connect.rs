@@ -205,8 +205,9 @@ async fn connect_inner(
     // 接続資格情報は staging マップ (open_capture_window が積む) から取り出す。平文を
     // ウィンドウ URL に載せないための受け渡し。remove ではなく参照コピーにし、このセッションが
     // 生きている間は staging に残す (自動/手動再接続でも同じ session_id で再度ここを通るため。
-    // DPAPI 非対応の Android では secret::get が常に None になり、remove すると再接続が
-    // 必ず失敗していた)。トレードオフとして平文パスワードをセッション終了までメモリに保持する。
+    // Android は Keystore 対応済みで保存済みパスワードなら secret::get で取れるが、「今回だけ
+    // 接続」(未保存) の場合は依然 secret::get が None になるため、remove すると再接続が
+    // 必ず失敗する)。トレードオフとして平文パスワードをセッション終了までメモリに保持する。
     // 恒久的な終了 (disconnect/disconnect_host/ウィンドウ破棄/孤児セッション停止) 側で明示的に
     // staging.remove する運用とする。
     let staged = state.staging.lock().await.get(&session_id).cloned();

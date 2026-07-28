@@ -335,6 +335,7 @@ dependencies = [
  "bincode",
  "bytes",
  "cpal",
+ "jni 0.21.1",
  "opus",
  "serde",
  "serde_json",

@@ -22,18 +22,20 @@
 //   出さない: 取得元の `myDeviceFingerprint` が DPAPI (Windows 専用) 依存で Android では必ず失敗する。
 // - 更新チェック UI (`.update-banner`) はモバイルには無い (`tauri-plugin-updater` 無効化のため)。
 //
-// パスワード保存 (DPAPI) は Windows 専用実装 (`common::dpapi`) で Android では機能しないため、
-// 「パスワードを保存」トグルは出さず、保存済みパスワードでの即時接続もしない。毎回パスワード
-// 入力を求め、`onConnect` の save は常に false を渡す。
+// パスワード保存は Android Keystore バックエンド追加により Windows (DPAPI) と同じ UX を出せる
+// ようになったため、デスクトップ版 (launcher.ts) と同じく保存トグル/鍵バッジ/即接続/
+// 「パスワードを忘れる」を実装する。
 
 import {
   DEFAULT_SETTINGS,
+  deleteHostPassword,
   deleteRecentHost,
   loadRecentHosts,
   loadSettings,
   probeHosts,
   saveRecentHost,
   saveSettings,
+  savedPasswordHosts,
   type ClientSettings,
   type HostEntry,
   type HostOverrides,
@@ -549,8 +551,9 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     });
   }
 
-  /** 接続ダイアログ (パスワードのみ。パスワード保存トグルは出さない: save は常に false)。 */
-  function openConnectDialog(entry: HostEntry): void {
+  /** 接続ダイアログ。initialError は保存済みパスワードでの即接続が失敗した直後の
+   *  フォールバック表示用 (デスクトップ launcher.ts と同じ)。 */
+  function openConnectDialog(entry: HostEntry, initialError?: string): void {
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
         <h3>${escapeHtml(entry.label || entry.host)}</h3>
@@ -561,6 +564,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
             <button type="button" class="pass-eye" id="d-eye" title="パスワードを表示">${icon("eye")}</button>
           </span>
         </label>
+        <label class="dlg-check"><input id="d-save" type="checkbox" checked /> このパスワードを保存する</label>
         <div class="dlg-status" id="d-status"></div>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="d-cancel">キャンセル</button>
@@ -572,6 +576,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     const passInput = backdrop.querySelector<HTMLInputElement>("#d-pass");
     const okBtn = backdrop.querySelector<HTMLButtonElement>("#d-ok");
     const statusEl = backdrop.querySelector<HTMLElement>("#d-status");
+    if (initialError && statusEl) {
+      statusEl.textContent = `保存済みパスワードで接続できませんでした: ${initialError}`;
+      statusEl.classList.add("error");
+    }
     const eyeBtn = backdrop.querySelector<HTMLButtonElement>("#d-eye");
     eyeBtn?.addEventListener("click", () => {
       if (!passInput) return;
@@ -592,9 +600,9 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
         okBtn.textContent = "接続中…";
       }
       if (statusEl) statusEl.textContent = `${entry.host} に接続中…`;
-      // モバイルはパスワード非保存 (DPAPI が Windows 専用のため)。save は常に false。
+      const save = backdrop.querySelector<HTMLInputElement>("#d-save")?.checked ?? true;
       void opts
-        .onConnect(entry, password, false)
+        .onConnect(entry, password, save)
         .then(() => closeDialog())
         .catch((err) => {
           if (statusEl) {
@@ -611,6 +619,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
 
   // --- ホスト一覧の描画 ---
   let currentHosts: HostEntry[] = [];
+  // パスワード保存済みの host(小文字) 集合。refresh で更新し、カードの鍵バッジ表示・即接続・
+  // 「忘れる」メニューの出し分けに使う (デスクトップ launcher.ts と同じ)。
+  let savedSet = new Set<string>();
+  const hasSaved = (host: string): boolean => savedSet.has(host.trim().toLowerCase());
   const probeMap = new Map<string, boolean>();
   let probing = false;
   const refreshBtn = $("#probe-refresh");
@@ -706,6 +718,13 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
       labelEl.className = "label";
       labelEl.textContent = name;
       labelRow.appendChild(labelEl);
+      if (hasSaved(entry.host)) {
+        const saved = document.createElement("span");
+        saved.className = "saved-badge";
+        saved.title = "パスワード保存済み (押すと即接続)";
+        saved.innerHTML = icon("key"); // 固定 SVG のみなので innerHTML で可
+        labelRow.appendChild(saved);
+      }
       const addr = document.createElement("div");
       addr.className = "addr";
       addr.textContent = `${entry.host}:${entry.port}`;
@@ -740,22 +759,43 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
             icon: "edit",
             onSelect: () => openHostDialog(entry),
           },
-          {
-            label: "削除",
-            icon: "delete",
-            danger: true,
-            onSelect: () => {
-              openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
-                await deleteRecentHost(entry.host);
-                await refresh();
-              });
-            },
-          },
         ];
+        if (hasSaved(entry.host)) {
+          actions.push({
+            label: "パスワードを忘れる",
+            icon: "key",
+            onSelect: () => {
+              void deleteHostPassword(entry.host)
+                .then(() => refresh())
+                .catch((e) => logger.warn("forget host password failed", e));
+            },
+          });
+        }
+        actions.push({
+          label: "削除",
+          icon: "delete",
+          danger: true,
+          onSelect: () => {
+            openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
+              // 一覧から消すときは保存済みパスワードも一緒に消す (孤立を防ぐ、デスクトップと同じ)。
+              await deleteHostPassword(entry.host);
+              await deleteRecentHost(entry.host);
+              await refresh();
+            });
+          },
+        });
         openActionSheet(actions);
       });
       card.addEventListener("click", () => {
-        openConnectDialog(entry);
+        if (hasSaved(entry.host)) {
+          // 保存済み: ダイアログを出さず即接続 (password=null は Rust が復号)。
+          // 失敗したら入力ダイアログへフォールバックする (デスクトップと同じ)。
+          void opts
+            .onConnect(entry, null, false)
+            .catch((err) => openConnectDialog(entry, String(err)));
+        } else {
+          openConnectDialog(entry);
+        }
       });
       card.addEventListener("keydown", (e) => {
         if (e.target !== card) return;
@@ -899,6 +939,13 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   }
 
   async function refresh(): Promise<void> {
+    // 鍵バッジ/即接続の判定用に、保存済みパスワードの host 集合も更新する。失敗しても
+    // 一覧描画自体は止めない (デスクトップ launcher.ts の refreshHosts と同じ)。
+    try {
+      savedSet = new Set(await savedPasswordHosts());
+    } catch {
+      savedSet = new Set();
+    }
     try {
       renderHosts(await loadRecentHosts());
       void runProbe();

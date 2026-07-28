@@ -1,19 +1,15 @@
-// モバイル (Android) 専用の Wake on LAN パネル。ロジックはデスクトップ版 `wol-panel.ts` の移植だが、
+// モバイル (Android) 専用の Wake on LAN パネル。ロジックはデスクトップ版 `wol-panel.ts` の移植で、
 // 見た目とダイアログ操作は `mobile-launcher.ts` の Hosts カード (タップ=主操作 / ⋮ メニュー=編集・削除)
 // に合わせて別実装にしている。
 //
 // デスクトップ版と分離した理由 (=単なる差分ではなく意図的な縮小):
-// - `savedPasswordHosts()` (中継先パスワードが DPAPI に保存済みか) は Rust 側実装が DPAPI
-//   (Windows 専用) のため、Android では常に失敗し空集合を返す。デスクトップ版はこれを使って
-//   「起こして接続」前のガード・鍵バッジ・⋯メニューの「パスワードを忘れる」を実装しているが、
-//   Android でそのまま使うと判定が常に false になり、ガードがある「起こして接続」が永久に
-//   実行できなくなる。そのためこのファイルは savedPasswordHosts を一切呼ばず、鍵バッジも
-//   「パスワードを忘れる」も持たない。
-// - 並べ替え (grip ドラッグ) も持たない。モバイル版 Hosts タブが並べ替え非対応であるのに揃えた。
-// - 中継先パスワード入力ダイアログの「保存する」チェックも同じ理由で外し、save=false 固定で送る。
+// - Android Keystore バックエンドの追加により `savedPasswordHosts()` はモバイルでも機能するように
+//   なったため、鍵バッジ・「パスワードを忘れる」・保存チェックはデスクトップ版と同等に実装している。
+// - 並べ替え (grip ドラッグ) は持たない。モバイル版 Hosts タブが並べ替え非対応であるのに揃えた。
 //
-// カード操作は Hosts タブと統一し ⋮ ボタン → アクションシート (編集/削除) に集約している。
-// 不可視のジェスチャ (長押し) に破壊的操作 (削除) を割り当てない方針のため、長押し削除は廃止した。
+// カード操作は Hosts タブと統一し ⋮ ボタン → アクションシート (編集/削除/[保存済みなら]パスワードを
+// 忘れる) に集約している。不可視のジェスチャ (長押し) に破壊的操作 (削除) を割り当てない方針のため、
+// 長押し削除は廃止した。
 //
 // ホスト由来/ユーザー入力の文字列 (label / mac / relay_host / host) は innerHTML に載せず
 // textContent / DOM API で描画する (XSS 注意、CLAUDE.md 規約)。固定の SVG アイコン (icon() の
@@ -22,10 +18,12 @@
 import "./mobile-wol.css";
 
 import {
+  deleteHostPassword,
   deleteWolTarget,
   listWolTargets,
   loadRecentHosts,
   probeHosts,
+  savedPasswordHosts,
   saveWolTarget,
   wakeHost,
   type HostEntry,
@@ -57,6 +55,12 @@ function normalizeMac(raw: string): string | null {
   const s = raw.trim();
   if (!MAC_RE.test(s)) return null;
   return s.replace(/-/g, ":").toUpperCase();
+}
+
+/** 中継先パスワードの secret キー (Rust 側 wol_secret_key + key() の正規化と一致させる。
+ *  デスクトップ版 wol-panel.ts と同一)。 */
+function relaySecretKey(relayHost: string, relayPort: number): string {
+  return `wol:${relayHost}:${relayPort}`.trim().toLowerCase();
 }
 
 /** Rust から返るエラーメッセージが「中継先パスワード未保存」を示すかのヒューリスティック判定。
@@ -94,6 +98,11 @@ export function mountMobileWolPanel(
   const sending = new Set<string>();
   function isBusy(id: string): boolean {
     return sending.has(id) || activePolls.has(id);
+  }
+  // 中継先パスワードが保存済みの secret キー (relaySecretKey 形式)。refresh で更新する。
+  let savedKeys = new Set<string>();
+  function hasSavedRelay(relayHost: string, relayPort: number): boolean {
+    return savedKeys.has(relaySecretKey(relayHost, relayPort));
   }
 
   // --- ダイアログ共通 (追加/編集/削除確認/パスワード入力で使い回す) ---
@@ -222,8 +231,7 @@ export function mountMobileWolPanel(
     activePolls.set(t.id, state);
   }
 
-  /** パスワード未保存エラー時に出す入力ダイアログ。Android では DPAPI 保存が機能しないため
-   *  「保存する」チェックは持たず、save=false 固定で送る。成功したら afterSuccess を呼ぶ。 */
+  /** パスワード未保存エラー時に出す入力ダイアログ。成功したら afterSuccess を呼ぶ。 */
   function openWakePasswordDialog(t: WolTarget, afterSuccess?: () => void): void {
     backdrop.innerHTML = `
       <form class="dialog" autocomplete="off">
@@ -235,6 +243,7 @@ export function mountMobileWolPanel(
             <button type="button" class="pass-eye" id="mwp-eye" title="パスワードを表示">${icon("eye")}</button>
           </span>
         </label>
+        <label class="dlg-check"><input id="mwp-save" type="checkbox" checked /> このパスワードを保存する</label>
         <div class="dlg-status" id="mwp-status"></div>
         <div class="dlg-actions">
           <button type="button" class="btn-ghost" id="mwp-cancel">キャンセル</button>
@@ -263,11 +272,12 @@ export function mountMobileWolPanel(
       ev.preventDefault();
       const password = passInput?.value ?? "";
       if (!password) return;
+      const save = backdrop.querySelector<HTMLInputElement>("#mwp-save")?.checked ?? true;
       if (okBtn) {
         okBtn.disabled = true;
         okBtn.textContent = "送信中…";
       }
-      void wakeHost(t.relay_host, t.relay_port, password, false, t.mac)
+      void wakeHost(t.relay_host, t.relay_port, password, save, t.mac)
         .then(() => {
           closeDialog();
           showToast("マジックパケットを送信しました", "success");
@@ -313,8 +323,9 @@ export function mountMobileWolPanel(
 
   /** 「起こして接続」。起こしてから到達性を待ち、届いたら opts.onReachable を呼ぶ
    *  (呼び出し側が接続ダイアログを開く。このパネル自身は接続処理をしない)。
-   *  デスクトップ版と違い savedPasswordHosts() による事前ガードは持たない
-   *  (Android では常に空集合を返し、ガードがあると永久に実行できなくなるため)。 */
+   *  中継先パスワードの保存/未保存は wakeHost の成否 (password=null → 失敗ならダイアログ) で
+   *  自然に扱う。接続先ホスト自体のセッションパスワード保存有無による事前ガードは今回のスコープ外
+   *  (中継先パスワードの保存対応のみが対象のため)。 */
   async function handleWakeAndConnect(t: WolTarget, card: HTMLElement): Promise<void> {
     if (!t.host) return;
     if (isBusy(t.id)) return;
@@ -372,9 +383,8 @@ export function mountMobileWolPanel(
   }
 
   /** 追加/編集ダイアログ。target=null で新規。
-   *  デスクトップ版と違い、中継先パスワードの「保存済み/未保存」ヒントは出さない
-   *  (savedPasswordHosts を呼ばないため判定材料が無い)。画像アイコン選択は Hosts の追加ダイアログ
-   *  (`mobile-launcher.ts` の openAddHostDialog) と同じ体裁で持たせている。 */
+   *  中継先パスワードの「保存済み/未保存」ヒントはデスクトップ版と同様に出す。画像アイコン選択は
+   *  Hosts の追加ダイアログ (`mobile-launcher.ts` の openAddHostDialog) と同じ体裁で持たせている。 */
   function openTargetDialog(target: WolTarget | null): void {
     const isAdd = target === null;
     void (async () => {
@@ -406,13 +416,14 @@ export function mountMobileWolPanel(
             <label>中継先 (raspi) host<input id="mw-relay-host" type="text" placeholder="100.x.x.x" required /></label>
             <label class="port">port<input id="mw-relay-port" type="text" inputmode="numeric" /></label>
           </div>
-          <div class="dlg-sub">中継先のパスワード (入力すると保存後すぐ起動信号を送ります・空欄可)</div>
+          <div class="dlg-sub" id="mw-pass-sub">中継先のパスワード (初回のみ・以降は空欄で保存済みを使用)</div>
           <label>password
             <span class="pass-wrap">
               <input id="mw-pass" type="password" />
               <button type="button" class="pass-eye" id="mw-eye" title="パスワードを表示">${icon("eye")}</button>
             </span>
           </label>
+          <label class="dlg-check"><input id="mw-save" type="checkbox" checked /> このパスワードを保存する</label>
           <div class="dlg-status" id="mw-status"></div>
           <div class="dlg-actions">
             <button type="button" class="btn-ghost" id="mw-cancel">キャンセル</button>
@@ -430,6 +441,21 @@ export function mountMobileWolPanel(
       const passInput = backdrop.querySelector<HTMLInputElement>("#mw-pass");
       const eyeBtn = backdrop.querySelector<HTMLButtonElement>("#mw-eye");
       const statusEl = backdrop.querySelector<HTMLElement>("#mw-status");
+      const passSub = backdrop.querySelector<HTMLElement>("#mw-pass-sub");
+
+      // relay host/port の入力値に応じて、保存済みかどうかの文言を出し分ける (デスクトップ版と同じ)。
+      function updatePassHint(): void {
+        if (!passSub) return;
+        const key = relaySecretKey(
+          relayHostInput?.value.trim() ?? "",
+          Number(relayPortInput?.value) || DEFAULT_RELAY_PORT,
+        );
+        passSub.textContent = savedKeys.has(key)
+          ? "中継先のパスワード (保存済み。変更する場合のみ入力)"
+          : "中継先のパスワード (未保存。起動時に入力を求めます)";
+      }
+      relayHostInput?.addEventListener("input", updatePassHint);
+      relayPortInput?.addEventListener("input", updatePassHint);
 
       // ホスト由来文字列 (label/host) は option の value/textContent に DOM API で入れる。
       for (const h of hosts) {
@@ -444,6 +470,7 @@ export function mountMobileWolPanel(
       if (relayHostInput) relayHostInput.value = target?.relay_host ?? "";
       if (relayPortInput) relayPortInput.value = String(target?.relay_port ?? DEFAULT_RELAY_PORT);
       if (linkedNow?.mac && macInput && !macInput.value) macInput.value = linkedNow.mac;
+      updatePassHint(); // relay host/port の初期値セット後に呼ぶ (先だと "" 扱いで未保存誤判定になる)
 
       // 画像アイコン選択 (mobile-launcher.ts の openAddHostDialog と同じ体裁)。
       // 頭文字フォールバックはカード描画と同じ規則 (表示名 → MAC の順)。フィールドの初期値を
@@ -542,10 +569,9 @@ export function mountMobileWolPanel(
           await saveWolTarget(saved);
           const password = passInput?.value ?? "";
           if (password) {
-            // Android は DPAPI 保存が機能しないため「保存する」チェックは持たず save=false 固定
-            // (保存できないのにできるかのような UI を出さない)。
+            const save = backdrop.querySelector<HTMLInputElement>("#mw-save")?.checked ?? true;
             try {
-              await wakeHost(relayHost, relayPort, password, false, macNorm);
+              await wakeHost(relayHost, relayPort, password, save, macNorm);
               showToast("マジックパケットを送信しました", "success");
             } catch (err) {
               showToast(`起動操作に失敗しました: ${String(err)}`, "error");
@@ -606,6 +632,14 @@ export function mountMobileWolPanel(
       const labelEl = document.createElement("span");
       labelEl.className = "label";
       labelEl.textContent = name;
+      row1.appendChild(labelEl);
+      if (hasSavedRelay(t.relay_host, t.relay_port)) {
+        const badge = document.createElement("span");
+        badge.className = "saved-badge";
+        badge.title = "中継先パスワード保存済み";
+        badge.innerHTML = icon("key"); // 固定 SVG のみなので innerHTML で可
+        row1.appendChild(badge);
+      }
       const moreBtn = document.createElement("button");
       moreBtn.type = "button";
       moreBtn.className = "card-btn mwol-more";
@@ -615,12 +649,26 @@ export function mountMobileWolPanel(
       moreBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
       moreBtn.addEventListener("click", (e) => {
         e.stopPropagation();
+        const forgetItem = hasSavedRelay(t.relay_host, t.relay_port)
+          ? [
+              {
+                label: "パスワードを忘れる",
+                icon: "key" as const,
+                onSelect: () => {
+                  void deleteHostPassword(relaySecretKey(t.relay_host, t.relay_port))
+                    .then(() => refresh())
+                    .catch((e: unknown) => logger.warn("forget wol relay password failed", e));
+                },
+              },
+            ]
+          : [];
         openActionSheet([
           {
             label: "編集",
             icon: "edit",
             onSelect: () => openTargetDialog(t),
           },
+          ...forgetItem,
           {
             label: "削除",
             icon: "delete",
@@ -644,7 +692,6 @@ export function mountMobileWolPanel(
           },
         ]);
       });
-      row1.append(labelEl);
 
       // 2 行目: 紐付けホストがあれば接続先、無ければ MAC (紐付けありの MAC は編集ダイアログで確認)。
       const sub = document.createElement("div");
@@ -732,6 +779,12 @@ export function mountMobileWolPanel(
   async function refresh(): Promise<void> {
     try {
       const targets = await listWolTargets();
+      try {
+        savedKeys = new Set((await savedPasswordHosts()).map((h) => h.trim().toLowerCase()));
+      } catch (e) {
+        savedKeys = new Set();
+        logger.warn("load saved password hosts failed", e);
+      }
       renderTargets(targets);
     } catch (e) {
       logger.warn("load wol targets failed", e);

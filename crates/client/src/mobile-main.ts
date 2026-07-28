@@ -325,10 +325,20 @@ async function connectTo(entry: HostEntry, password: string | null, save: boolea
   try {
     await s.start();
   } catch (e) {
-    renderStatusOverlay("error", `接続に失敗しました: ${String(e)}`, {
-      onClose: () => s.closeByUser(),
-      onReconnect: () => s.manualReconnect(),
-    });
+    if (password === null) {
+      // 保存済みパスワードでの即接続 (mobile-launcher.ts のカードタップ) が失敗したケース。
+      // 呼び出し元がこの例外の .catch でパスワード入力ダイアログを開くが、そのダイアログの
+      // #dialog-backdrop は launcher-view の内側にあり、remote-view のエラーオーバーレイを
+      // 出したままだと launcher-view が hidden で不可視のまま裏で開いてしまう
+      // (デスクトップは launcher 窓と capture 窓が別ウィンドウなのでこの問題が起きない)。
+      // エラーオーバーレイは出さず、先にランチャーへ戻してから例外を投げる。
+      s.closeByUser();
+    } else {
+      renderStatusOverlay("error", `接続に失敗しました: ${String(e)}`, {
+        onClose: () => s.closeByUser(),
+        onReconnect: () => s.manualReconnect(),
+      });
+    }
     throw e;
   }
   s.activate();

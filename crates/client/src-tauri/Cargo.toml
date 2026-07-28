@@ -50,6 +50,13 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
 ]
 
+# Android Keystore を直接 JNI で叩くための依存 (secret::android)。Kotlin プラグインは
+# gen/android が git 管理外で再生成のたびに消えるため使わず、Rust から JNI 呼び出しする。
+# JavaVM の取得は ndk-context を使わず自前の JNI_OnLoad で行う (ndk-context は未初期化時に
+# panic する実装で、Tauri のスタック(tao/wry)はこれを初期化しないため実機で確実に落ちる)。
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
