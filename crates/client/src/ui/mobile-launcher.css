@@ -4,7 +4,7 @@
  * 差分と、モバイル固有のタブバー自体のスタイルだけを書く。
  * 幅ブレークポイントは 4 段構成: 常時適用 (幅を問わない差分) → @media (max-width: 480px)
  * (スマホ幅の崩れ対策) → @media (max-width: 360px) (480px 内側のさらに狭い幅専用、
- * addr 行の折り返しのみ) → @media (min-width: 700px) (タブレット 2 カラム化)。狭い方の
+ * addr 行の折り返しのみ) → @media (min-width: 700px) (タブレット幅の全幅化)。狭い方の
  * 例外は広い方のブロックに混ぜず別メディアクエリに分離し、対象幅を取り違えないようにする。 */
 
 .ml-app {
@@ -128,19 +128,6 @@
 }
 .ml-app .ml-host-adv label {
   margin-top: 10px;
-}
-
-/* タブレット 2 カラム化 (下の @media (min-width: 700px)) のため、見出し (.setting-group) と
- * カード (.setting-card) を <div class="ml-set-block"> で包んだ (mobile-launcher.ts)。しかし
- * launcher.css の `.setting-group:first-child { margin-top: 4px; }` は「そのブロック内で
- * 最初の要素か」を見るため、包んだことで全ての .setting-group がラッパー内の :first-child に
- * なってしまい、ブロック間の余白 (24px) が意図せず 4px に詰まる。この退行はスマホ幅でも起きるため
- * 幅を問わず常時、ラッパー同士の間隔として 24px を入れ直す (2 カラム時はグリッドの gap と
- * 二重にならないよう下の @media 側で 0 に戻す)。 */
-/* 20px なのは、包まれた .setting-group 側に :first-child 由来の 4px が必ず乗るため
- * (20 + 4 = 24 で、包む前の .setting-group の margin-top: 24px と実測で一致する)。 */
-.ml-app .ml-set-block + .ml-set-block {
-  margin-top: 20px;
 }
 
 /* グローバルの .hidden (mobile-main.css) は display: none !important で、ページ全体の表示/非表示
@@ -323,41 +310,19 @@
   }
 }
 
-/* タブレット幅の 2 カラム化。481px から「タブレット」扱いだが、600px で 2 列にすると
- * 1 列あたり約 285px しか残らず設定行 (ラベル+コントロール) が窮屈になるため、700px 以上
- * (実機でおよそ 8 インチ以上) でのみ 2 列にする。600-699px は引き続き 1 列のまま。
+/* タブレット幅の全幅化。481px から「タブレット」扱いだが、2 カラム化は撤回済み
+ * (2 列にすると左右に視線が飛び、設定項目の並び順が追いにくくなったため)。ここでやるのは
+ * 1 カラムのまま画面を全幅で使う (760px 上限解除) ことだけで、行内のレイアウト
+ * (ラベル左 / コントロール右端) は launcher.css のデスクトップ既定をそのまま使う。
+ * 一度 `.s-meta` に上限幅を与えてコントロールをラベル側へ寄せたが、コントロールが行の中央付近に
+ * 浮いて右に大きな余白が残る見た目になったため撤回した (右端揃えの方が行間で位置が揃い読みやすい)。
  * launcher.css はデスクトップと共有で編集禁止のため、打ち消しは必ずこちら側の上書きで行う
  * (既存の @media (max-width: 480px) と同じ流儀)。セレクタは全て .ml-app 配下にスコープし、
  * デスクトップ版ランチャー (`.launcher` 配下、こちらは対象外) に影響しないようにする。 */
 @media (min-width: 700px) {
-  /* launcher.css は `.settings-sect.active { display: flex }` (縦積み) なので、この上書きで
-   * 見出し+カードのブロックを 2 列グリッドに並べ替える。align-items: start でブロックの
-   * 高さが揃わなくても下端が引っ張られないようにする。 */
-  .ml-app .settings-sect.active {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 0 24px;
-    align-items: start;
-  }
   /* デスクトップのウィンドウ幅想定の 760px 上限はタブレット全画面表示には合わないため外す。 */
   .ml-app .settings-tabs,
   .ml-app .settings-sect {
     max-width: none;
-  }
-  /* グリッドの行間 (gap) で縦方向の間隔が付くため、上のラッパー間 margin-top: 24px と
-   * 二重に空いてしまう。2 列時はグリッド側に間隔を委ね、ラッパー側の margin は 0 に戻す。 */
-  .ml-app .ml-set-block + .ml-set-block {
-    margin-top: 0;
-  }
-
-  .ml-app .host-list {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 10px;
-    align-content: start;
-  }
-  /* 空状態ガイドは 1 カラム分の幅では窮屈なため、2 列をぶち抜いて元の横幅を保つ。 */
-  .ml-app .empty-guide {
-    grid-column: 1 / -1;
   }
 }
