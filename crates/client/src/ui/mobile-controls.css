@@ -222,3 +222,40 @@
 .mc-display-item.active {
   color: var(--accent);
 }
+
+/* 音量ポップオーバー (長押しで開く)。ディスプレイ選択ポップと同じ「反対側へはみ出さない」
+ * 配置ルールを流用するが、中身はスライダー 1 本だけなので幅を狭める。 */
+.mc-audio-pop {
+  display: none;
+  position: absolute;
+  z-index: 31;
+  width: 160px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 4px 16px var(--shadow);
+  pointer-events: auto;
+}
+.mc-audio-pop.visible {
+  display: block;
+}
+.mc-audio-pop input[type="range"] {
+  width: 100%;
+}
+.mc-root[data-pos="bottom"] ~ .mc-audio-pop {
+  right: 8px;
+  bottom: calc(44px + 8px + env(safe-area-inset-bottom) + var(--mkb-height, 0px));
+}
+.mc-root[data-pos="top"] ~ .mc-audio-pop {
+  right: 8px;
+  top: calc(44px + 8px + env(safe-area-inset-top));
+}
+.mc-root[data-pos="left"] ~ .mc-audio-pop {
+  left: calc(64px + env(safe-area-inset-left));
+  bottom: 24px;
+}
+.mc-root[data-pos="right"] ~ .mc-audio-pop {
+  right: calc(64px + env(safe-area-inset-right));
+  bottom: 24px;
+}

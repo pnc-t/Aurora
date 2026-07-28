@@ -94,6 +94,11 @@ export interface SessionHost {
   clearReconnectBadge(s: Session): void;
   /** タブの見た目 (ラベル/ドット) を更新するよう orchestrator へ通知。 */
   refreshTab(s: Session): void;
+  /**
+   * モバイル専用: ホスト→端末のクリップボード適用要求 (`clipboard_update` イベント)。
+   * デスクトップは host_info からこのイベント自体が発火しないため未実装のままでよい (optional)。
+   */
+  clipboardUpdate?(s: Session, text: string): void;
   /** このセッションが恒久終了した (ユーザー切断/接続不正)。タブ除去・最後なら窓を閉じる。 */
   removed(s: Session): void;
   /** 窓単位のリサイズ可否を設定する。 */
@@ -722,6 +727,9 @@ export class Session {
         break;
       case "disconnected":
         this.doDisconnect(`disconnected: ${ev.reason}`);
+        break;
+      case "clipboard_update":
+        this.host.clipboardUpdate?.(this, ev.text);
         break;
     }
   }

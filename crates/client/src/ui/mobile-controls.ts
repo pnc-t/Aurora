@@ -18,6 +18,10 @@ export type MobileControlsOpts = {
   onResetZoom: () => void;
   /** オンスクリーンコントローラの表示を切り替える。 */
   onTogglePad: () => void;
+  /** 音声ボタンのタップ (ミュート切替)。引数は切替後の状態 (デスクトップ toolbar.ts と同じ規約)。 */
+  onToggleMute: (muted: boolean) => void;
+  /** 音量ポップオーバーのスライダー操作 (0.0〜1.0)。 */
+  onSetVolume: (volume: number) => void;
 };
 
 export type MobileControlsHandle = {
@@ -29,6 +33,10 @@ export type MobileControlsHandle = {
   setPosition: (pos: ToolbarPosition) => void;
   /** オンスクリーンコントローラの表示状態をボタンの見た目へ反映する。 */
   setPadOn: (on: boolean) => void;
+  /** ホストが音声対応かどうか (非対応ならボタン自体を隠す) と接続直後のミュート初期状態。 */
+  setAudioAvailable: (available: boolean, initialMuted?: boolean) => void;
+  /** 音量ポップオーバーのスライダー位置を設定値へ揃える (onSetVolume は発火させない)。 */
+  setAudioVolume: (volume: number) => void;
 };
 
 /** 引き出したバーを自動格納するまでの無操作時間。 */
@@ -44,11 +52,15 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
           <button type="button" class="mc-btn" id="mc-keyboard" title="キーボード">${icon("keyboard")}</button>
           <button type="button" class="mc-btn" id="mc-pad" title="コントローラ">${icon("mouse")}</button>
           <button type="button" class="mc-btn" id="mc-display" title="ディスプレイ" style="display:none">${icon("display")}</button>
+          <button type="button" class="mc-btn" id="mc-audio" title="音声ミュート (長押しで音量)" style="display:none">${icon("volume")}</button>
           <button type="button" class="mc-btn" id="mc-zoom-reset" title="ズームをリセット" style="display:none">${icon("zoom-reset")}</button>
         </div>
       </div>
     </div>
     <div class="mc-display-pop" id="mc-display-pop"></div>
+    <div class="mc-audio-pop" id="mc-audio-pop">
+      <input type="range" id="mc-volume" min="0" max="100" step="1" value="100" aria-label="再生音量" />
+    </div>
   `;
 
   const handleBtn = opts.root.querySelector<HTMLButtonElement>("#mc-handle");
@@ -59,6 +71,9 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   const displayBtn = opts.root.querySelector<HTMLButtonElement>("#mc-display");
   const displayPop = opts.root.querySelector<HTMLElement>("#mc-display-pop");
   const zoomResetBtn = opts.root.querySelector<HTMLButtonElement>("#mc-zoom-reset");
+  const audioBtn = opts.root.querySelector<HTMLButtonElement>("#mc-audio");
+  const audioPop = opts.root.querySelector<HTMLElement>("#mc-audio-pop");
+  const volumeInput = opts.root.querySelector<HTMLInputElement>("#mc-volume");
 
   // --- 引き出し / 自動格納 ---
   //
@@ -68,6 +83,7 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   let expanded = false;
   let hideTimer: number | null = null;
   let displayPopVisible = false;
+  let audioPopVisible = false;
 
   function cancelAutoHide(): void {
     if (hideTimer !== null) {
@@ -80,8 +96,8 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   function scheduleAutoHide(): void {
     cancelAutoHide();
     if (!expanded) return;
-    // ディスプレイ選択ポップオーバーを開いている間は操作の途中なので、勝手に消さない。
-    if (displayPopVisible) return;
+    // ディスプレイ選択/音量ポップオーバーを開いている間は操作の途中なので、勝手に消さない。
+    if (displayPopVisible || audioPopVisible) return;
     hideTimer = window.setTimeout(() => setExpanded(false), AUTO_HIDE_MS);
   }
 
@@ -95,6 +111,22 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     scheduleAutoHide();
   }
 
+  let audioAvailable = false;
+  // ミュート状態はこの UI が持ち、タップのたびに反転させて opts.onToggleMute(muted) へ渡す
+  // (デスクトップ toolbar.ts と同じパターン)。実際のホストへの適用は呼び出し元が行う。
+  let muted = false;
+  function applyAudioBtn(): void {
+    if (!audioBtn) return;
+    audioBtn.classList.toggle("toggled", muted);
+    audioBtn.innerHTML = icon(muted ? "mute" : "volume");
+  }
+  function setAudioPopVisible(on: boolean): void {
+    if (on && !audioAvailable) return;
+    audioPopVisible = on;
+    audioPop?.classList.toggle("visible", on);
+    scheduleAutoHide();
+  }
+
   function setExpanded(on: boolean): void {
     expanded = on;
     rootEl?.classList.toggle("expanded", on);
@@ -102,6 +134,7 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     // 格納時は展開中のサブパネルも畳む (次に引き出したとき素の状態から始める)。
     if (!on) {
       setDisplayPopVisible(false);
+      setAudioPopVisible(false);
     }
     scheduleAutoHide();
   }
@@ -129,6 +162,51 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
   });
 
   displayBtn?.addEventListener("click", () => setDisplayPopVisible(!displayPopVisible));
+
+  // 音声ボタン: タップ=ミュート切替 / 長押し=音量ポップオーバー表示。長押しが成立した click は
+  // ミュート切替を発火させない (長押し終了時に指を離すことで発生する click を打ち消す)。
+  const AUDIO_LONG_PRESS_MS = 450;
+  let audioPressTimer: number | null = null;
+  let audioLongPressed = false;
+  function cancelAudioPressTimer(): void {
+    if (audioPressTimer !== null) {
+      clearTimeout(audioPressTimer);
+      audioPressTimer = null;
+    }
+  }
+  audioBtn?.addEventListener("mousedown", (e) => e.preventDefault());
+  audioBtn?.addEventListener("pointerdown", () => {
+    if (!audioAvailable) return;
+    audioLongPressed = false;
+    audioPressTimer = window.setTimeout(() => {
+      audioPressTimer = null;
+      audioLongPressed = true;
+      setAudioPopVisible(true);
+    }, AUDIO_LONG_PRESS_MS);
+  });
+  audioBtn?.addEventListener("pointerup", cancelAudioPressTimer);
+  audioBtn?.addEventListener("pointercancel", cancelAudioPressTimer);
+  audioBtn?.addEventListener("click", () => {
+    if (audioLongPressed) {
+      // 長押しで開いた直後の click は消費するだけ (ミュートは切り替えない)。
+      audioLongPressed = false;
+      return;
+    }
+    if (audioPopVisible) {
+      // ポップオーバーが開いている間のタップは閉じる操作として扱う。
+      setAudioPopVisible(false);
+      return;
+    }
+    muted = !muted;
+    applyAudioBtn();
+    opts.onToggleMute(muted);
+    scheduleAutoHide();
+  });
+  volumeInput?.addEventListener("input", () => {
+    const v = Math.max(0, Math.min(100, Number(volumeInput.value) || 0));
+    opts.onSetVolume(v / 100);
+    scheduleAutoHide();
+  });
 
   zoomResetBtn?.addEventListener("click", () => {
     opts.onResetZoom();
@@ -184,10 +262,22 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     setPosition(pos: ToolbarPosition): void {
       // 配置が変わるとポップオーバーの開く向きも変わるため、開いていれば一旦閉じる。
       setDisplayPopVisible(false);
+      setAudioPopVisible(false);
       if (rootEl) rootEl.dataset.pos = pos;
     },
     setPadOn(on: boolean): void {
       padBtn?.classList.toggle("toggled", on);
+    },
+    setAudioAvailable(available: boolean, initialMuted = false): void {
+      audioAvailable = available;
+      if (audioBtn) audioBtn.style.display = available ? "" : "none";
+      if (!available) setAudioPopVisible(false);
+      muted = initialMuted;
+      applyAudioBtn();
+    },
+    setAudioVolume(volume: number): void {
+      // 接続時の初期化用。onSetVolume は発火させない (無限ループ防止、デスクトップ toolbar.ts と同じ)。
+      if (volumeInput) volumeInput.value = String(Math.round(volume * 100));
     },
   };
 }

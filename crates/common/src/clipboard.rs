@@ -6,8 +6,9 @@
 //! ループバック抑止: 最後に観測 / 書き込んだテキストを保持し、同一なら send/apply とも何もしない。
 //!
 //! Android/iOS は arboard が NDK クロスコンパイルに対応しないため、`imp` を
-//! デスクトップ実装とモバイル no-op スタブに分ける。公開 API (`ClipboardHandle`/`spawn`) は
-//! 完全に同一で、呼び出し側 (host/client 双方) は cfg 分岐せずに使える。
+//! デスクトップ実装とモバイル実装 (host→端末の一方向のみ) に分ける。`ClipboardHandle`/`spawn`
+//! は host/client 双方が同じ呼び出しで使える。モバイルの `ClipboardHandle` だけ持つ
+//! `take_apply_rx` (net/connect.rs がフロント通知に使う) はモバイル側呼び出し元で cfg 分岐する。
 //!
 //! `common` crate は tauri-build を経由しないため `cfg(desktop)`/`cfg(mobile)` は使えず、
 //! Cargo.toml の target セレクタと揃えて `target_os` で直接分岐する。
@@ -102,28 +103,48 @@ mod imp {
     }
 }
 
-/// Android/iOS 向け no-op スタブ。クリップボード同期はフェーズ2 (モバイル対応後続) のため、
-/// 呼び出し側 (host/client) の networking/セッション管理を変更せずに済むよう、デスクトップと
-/// 同一 API だけ提供し実処理はしない。
+/// Android/iOS 向け実装。ネイティブ `ClipboardManager` は Activity Context 前提で未検証のため
+/// 使わず、host→端末の一方向だけを WebView 側 (`navigator.clipboard.writeText`) に委ねる。
+/// ここでは「リモートから適用要求されたテキストを外部へ引き渡す」導線 (`take_apply_rx`) だけを
+/// 持ち、実際にクリップボードへ書き込む処理はフロント (mobile-main.ts) が担う。
+/// ローカル変化の検出 (`change_rx` に流す側) は arboard 同様に行わない
+/// (= 端末→ホスト方向は自動化しない。ネイティブ ClipboardManager 未検証のスコープ外)。
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod imp {
-    use tokio::sync::mpsc;
+    use std::sync::Arc;
 
-    /// クリップボードアクターのハンドル (no-op)。`shutdown` は何もしない。
+    use tokio::sync::{Mutex, mpsc};
+
+    /// クリップボードアクターのハンドル (モバイル)。`apply_tx` への送信は消費されず溜まる
+    /// だけにならないよう、受信端を `take_apply_rx` で一度だけ取り出せるようにしておく
+    /// (net/connect.rs がフロント通知タスクの起動時に呼ぶ)。
     #[derive(Clone)]
     pub struct ClipboardHandle {
         pub apply_tx: mpsc::UnboundedSender<String>,
+        apply_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
     }
 
     impl ClipboardHandle {
         pub fn shutdown(&self) {}
+
+        /// リモートから適用要求されたテキストを受け取る受信端を 1 回だけ取り出す。
+        /// 2 回目以降の呼び出しは `None` (既に取り出し済み)。
+        pub async fn take_apply_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> {
+            self.apply_rx.lock().await.take()
+        }
     }
 
-    /// 何も監視しない `change_rx` を返す (送信端を保持したまま放置し、リモート変化の通知は
+    /// 何も監視しない `change_rx` を返す (送信端を保持したまま放置し、ローカル変化の通知は
     /// 永久に来ない = ローカル→リモート同期なし)。
     pub fn spawn() -> (ClipboardHandle, mpsc::UnboundedReceiver<String>) {
-        let (apply_tx, _apply_rx) = mpsc::unbounded_channel::<String>();
+        let (apply_tx, apply_rx) = mpsc::unbounded_channel::<String>();
         let (_change_tx, change_rx) = mpsc::unbounded_channel::<String>();
-        (ClipboardHandle { apply_tx }, change_rx)
+        (
+            ClipboardHandle {
+                apply_tx,
+                apply_rx: Arc::new(Mutex::new(Some(apply_rx))),
+            },
+            change_rx,
+        )
     }
 }

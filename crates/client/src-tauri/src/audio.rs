@@ -4,10 +4,10 @@
 //! cpal の `Stream` は `!Send` のため、デコードと再生はすべて専用スレッド上で完結させ、
 //! 外部へは Opus バイト列を渡す送信ハンドル (`AudioPlayer`) だけを公開する。
 //!
-//! Android/iOS は cpal/opus が NDK クロスコンパイルに対応しないため、音声フェーズ2
-//! (Oboe/AAudio 等のネイティブ実装) まで `spawn` が Err を返し初期化に失敗する扱いとする。
-//! 公開 API (`AudioPlayer`/`spawn`) の型はデスクトップと完全に同一なので、呼び出し側
-//! (`net/` 配下) は変更不要 (`audio::spawn()` の Err は既に「映像のみで継続」に倒す作り)。
+//! Android/iOS は cpal/opus が NDK クロスコンパイルに対応しないため、方式A (WebView 再生) を
+//! 採る: host から届いた Opus フレームをデコードせず、そのまま WebView へ転送し、フロント側
+//! WebCodecs `AudioDecoder` + Web Audio で再生する。呼び出し側 (`net/connect.rs`) は
+//! デスクトップと異なり `Sink` (映像/イベントと同じ差し替え可能な転送先) を渡して `spawn` する。
 
 pub use imp::{AudioPlayer, spawn};
 
@@ -151,19 +151,20 @@ mod imp {
     }
 }
 
-/// Android/iOS 向け未実装スタブ。`spawn` が常に Err を返すため `AudioPlayer` は構築されない
-/// (型と関連メソッドは呼び出し側 `net/` が `Option<AudioPlayer>` として参照するため残す)。
+/// Android/iOS 向け実装 (方式A: WebView 再生)。デコードは行わず、受け取った Opus フレームを
+/// `Sink` 経由でそのまま WebView へ転送する。再生 (デコード/ゲイン) はフロント側
+/// (`core/audio-player.ts`) が担う。
 #[cfg(mobile)]
 mod imp {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use anyhow::Result;
+    use tauri::ipc::InvokeResponseBody;
 
-    use anyhow::{Result, anyhow};
+    use crate::net::Sink;
 
-    /// 音声再生ハンドル。Android/iOS では `spawn` が Err を返すため実体は生成されない。
+    /// 音声転送ハンドル。`sender()` は udp 受信タスクへ渡す Opus フレーム送信口
+    /// (デスクトップの `AudioPlayer` と同じインタフェース)。
     pub struct AudioPlayer {
         tx: std::sync::mpsc::Sender<Vec<u8>>,
-        gain: Arc<AtomicU32>,
     }
 
     impl AudioPlayer {
@@ -171,16 +172,25 @@ mod imp {
             self.tx.clone()
         }
 
-        pub fn set_volume(&self, volume: f32) {
-            self.gain
-                .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-        }
+        /// 再生ゲインはフロント側 GainNode で当てるため no-op (呼び出し側とのインタフェース
+        /// 互換のためだけに残す)。
+        pub fn set_volume(&self, _volume: f32) {}
     }
 
-    /// 音声フェーズ2 (Oboe/AAudio 等) まで未実装。呼び出し側は Err を受けて映像のみで継続する。
-    pub fn spawn() -> Result<AudioPlayer> {
-        Err(anyhow!(
-            "audio playback is not supported on this platform yet"
-        ))
+    /// Opus フレームを sink 経由でフロントへ転送する専用スレッドを起動する。デコード/デバイス
+    /// 初期化を伴わないため常に成功する (デスクトップの cpal/opus 初期化失敗に相当する経路が無い)。
+    pub fn spawn(sink: Sink) -> Result<AudioPlayer> {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        std::thread::Builder::new()
+            .name("audio-forward".into())
+            .spawn(move || {
+                // 全送信端 (AudioPlayer::sender の clone) が閉じたら recv が Err になり終了する。
+                while let Ok(frame) = rx.recv() {
+                    sink.send_audio(InvokeResponseBody::Raw(frame));
+                }
+            })?;
+
+        Ok(AudioPlayer { tx })
     }
 }

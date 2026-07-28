@@ -133,6 +133,23 @@ pub async fn set_audio_muted(
     send_ctrl(&state, &session_id, ControlMsg::SetAudioMuted { muted }).await
 }
 
+/// モバイル専用: 音声 (Opus) フレームを流すための Channel をセッションへアタッチする。
+/// デスクトップは cpal ネイティブ再生のため呼ばない。接続/再接続のたびに (フロントの
+/// `setAudioAvailable` から) 呼び直す必要がある: `connect_to_host` はセッション置換のたびに
+/// 新しい `Sink` を作るため、以前アタッチした Channel は引き継がれない。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn attach_audio_channel(
+    session_id: String,
+    audio_channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.get(&session_id).ok_or("unknown session")?;
+    s.sink.set_audio(audio_channel);
+    Ok(())
+}
+
 /// クライアント再生音量を設定する (0.0〜1.0)。host へは送らず client 内部のゲインのみ変更する。
 #[tauri::command]
 pub async fn set_audio_volume(

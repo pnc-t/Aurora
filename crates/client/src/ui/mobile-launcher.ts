@@ -16,10 +16,11 @@
 //   デスクトップの ⋯ メニュー (card-menu、複数項目のポップアップ) の代わりに、共通部品の
 //   アクションシート (mobile-sheet.ts) を使う。ドラッグ並べ替えは対象外。
 // - Settings ページ: モバイルで実際に機能しない項目 (自動フルスクリーン/統計 HUD/マウスキャプチャ/
-//   キーボード占有/クリップボード同期/音声ミュート/ツールバー・タブ配置/ショートカット/
-//   ファイル共有/ログ) は出さない (呼び出し元 main.rs の invoke_handler から該当コマンドが
-//   除外されているログは特に、出すと必ず失敗する)。デバイスピン留め (端末ID表示) も同様に
-//   出さない: 取得元の `myDeviceFingerprint` が DPAPI (Windows 専用) 依存で Android では必ず失敗する。
+//   キーボード占有/ツールバー・タブ配置/ショートカット/ファイル共有/ログ) は出さない
+//   (呼び出し元 main.rs の invoke_handler から該当コマンドが除外されているものは、出すと必ず失敗する)。
+//   端末ID表示は `myDeviceFingerprint` が Android Keystore 対応 (2026-07-29) 済みのため出す。
+//   クリップボード同期はホスト→端末の一方向のみ (WebView `navigator.clipboard.writeText` 書き込み)
+//   のため、その旨を説明文に明記した上で出す。
 // - 更新チェック UI (`.update-banner`) はモバイルには無い (`tauri-plugin-updater` 無効化のため)。
 //
 // パスワード保存は Android Keystore バックエンド追加により Windows (DPAPI) と同じ UX を出せる
@@ -32,6 +33,7 @@ import {
   deleteRecentHost,
   loadRecentHosts,
   loadSettings,
+  myDeviceFingerprint,
   probeHosts,
   saveRecentHost,
   saveSettings,
@@ -59,6 +61,7 @@ import { mountMobileWolPanel } from "./mobile-wol";
 import { enhanceSelects } from "./select-menu";
 import { openActionSheet, type SheetAction } from "./mobile-sheet";
 import { attachPullToRefresh } from "./pull-to-refresh";
+import { showToast } from "./toast";
 import "./launcher.css";
 import "./mobile-launcher.css";
 
@@ -214,6 +217,13 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
                 </div>
                 <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
               </div>
+              <div class="setting-row ml-row-toggle">
+                <div class="s-meta">
+                  <div class="s-title">クリップボードを同期</div>
+                  <div class="s-desc">ホスト→この端末の一方向のみ。ホストでコピーした内容をこの端末のクリップボードへ反映する (逆方向は未対応)</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-clipboard-sync" /><span class="slider"></span></label>
+              </div>
               </div>
             </div>
             <div class="settings-sect" data-sect="display">
@@ -264,6 +274,16 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
               </div>
             </div>
             <div class="settings-sect" data-sect="other">
+              <div class="setting-group">端末情報</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">この端末の端末ID</div>
+                  <div class="s-desc">ホストのデバイスピン留めで承認するとき、ホスト側に表示される端末IDとこの値が一致することを確認してください (タップでコピー)</div>
+                </div>
+                <button type="button" id="device-fingerprint" class="s-desc ml-fingerprint-btn" style="font-family:monospace">…</button>
+              </div>
+              </div>
               <div class="setting-group">診断</div>
               <div class="setting-card">
               <div class="setting-row">
@@ -300,6 +320,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   const codecSelect = $<HTMLSelectElement>("#set-codec");
   const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
   const virtualToggle = $<HTMLInputElement>("#set-virtual");
+  const clipboardSyncToggle = $<HTMLInputElement>("#set-clipboard-sync");
   const tbPositionSelect = $<HTMLSelectElement>("#set-tb-position");
   const themeSelect = $<HTMLSelectElement>("#set-theme");
   const accentInput = $<HTMLInputElement>("#set-accent");
@@ -864,6 +885,10 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     settings = { ...settings, use_virtual_display: virtualToggle.checked };
     persist();
   });
+  clipboardSyncToggle?.addEventListener("change", () => {
+    settings = { ...settings, clipboard_sync: clipboardSyncToggle.checked };
+    persist();
+  });
   tbPositionSelect?.addEventListener("change", () => {
     settings = {
       ...settings,
@@ -915,6 +940,7 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
     if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
+    if (clipboardSyncToggle) clipboardSyncToggle.checked = settings.clipboard_sync;
     if (tbPositionSelect) tbPositionSelect.value = settings.toolbar_position;
     if (themeSelect) themeSelect.value = settings.theme;
     if (accentInput) accentInput.value = settings.accent_color;
@@ -923,6 +949,33 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     syncCodecSelect();
     syncCustomOnlyRows();
     applyTheme(settings.theme, settings.accent_color);
+  }
+
+  // 端末情報: この端末の識別子 (フィンガープリント)。host のデバイスピン留め承認時に
+  // host トレイ表示と照合するための読み取り専用表示。タップでクリップボードへコピーする
+  // (デスクトップ版は据え置き表示のみだが、モバイルは長い文字列を手入力で照合しづらいため追加)。
+  const fingerprintBtn = $<HTMLButtonElement>("#device-fingerprint");
+  let fingerprintValue = "";
+  if (fingerprintBtn) {
+    myDeviceFingerprint()
+      .then((fp) => {
+        fingerprintValue = fp;
+        fingerprintBtn.textContent = fp;
+      })
+      .catch((e) => {
+        logger.warn("device fingerprint fetch failed", e);
+        fingerprintBtn.textContent = "取得できませんでした";
+      });
+    fingerprintBtn.addEventListener("click", () => {
+      if (!fingerprintValue) return;
+      void navigator.clipboard
+        .writeText(fingerprintValue)
+        .then(() => showToast("端末IDをコピーしました", "success"))
+        .catch((e) => {
+          logger.warn("clipboard write failed", e);
+          showToast("コピーに失敗しました", "error");
+        });
+    });
   }
 
   // 診断: アプリのバージョン表示 (updater/process プラグインはモバイル無効のため getVersion を使う)。

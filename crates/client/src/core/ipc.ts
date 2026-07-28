@@ -30,7 +30,9 @@ export type ClientEvent =
   | { kind: "file_result"; id: number; ok: boolean; message: string }
   | { kind: "file_progress"; id: number; done: number; total: number }
   | { kind: "video_codec_changed"; codec: CodecId }
-  | { kind: "disconnected"; reason: string };
+  | { kind: "disconnected"; reason: string }
+  /** モバイル専用: ホスト→端末のクリップボード適用要求 (デスクトップは発火しない)。 */
+  | { kind: "clipboard_update"; text: string };
 
 export type InputEvent =
   | { MouseMove: { x: number; y: number } }
@@ -292,6 +294,18 @@ export async function setAudioMuted(sessionId: string, muted: boolean): Promise<
 /** クライアント再生音量を設定する (0.0〜1.0)。host へは送らず client 内部のゲインのみ変更する。 */
 export async function setAudioVolume(sessionId: string, volume: number): Promise<void> {
   await invoke("set_audio_volume", { sessionId, volume });
+}
+
+/**
+ * モバイル専用: 音声 (Opus) フレームを流す Channel をセッションへアタッチする。
+ * デスクトップは cpal ネイティブ再生のため呼ばない (呼んでも該当コマンド未登録でエラーになる)。
+ * `connect_to_host` はセッション置換のたびに新しい表示先を作るため、接続/再接続のたびに呼び直す。
+ */
+export async function attachAudioChannel(
+  sessionId: string,
+  audioChannel: Channel<ArrayBuffer>,
+): Promise<void> {
+  await invoke("attach_audio_channel", { sessionId, audioChannel });
 }
 
 /** クリップボード同期のセッション毎トグル (OFF 中は送受信とも一時停止)。 */

@@ -367,6 +367,23 @@ async fn connect_inner(
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
+    // モバイル専用: tcp_reader_loop が clip_apply_tx へ流したリモート適用要求は、デスクトップでは
+    // clipboard アクタースレッドがそのままローカルクリップボードへ書き込むが、モバイルは
+    // arboard 非対応のため誰も消費しない。ここでフロントへ転送するタスクを立てる
+    // (実際の端末クリップボードへの書き込みは mobile-main.ts の navigator.clipboard.writeText)。
+    #[cfg(mobile)]
+    let clip_forward_to_front_task = {
+        let sink_clip = sink.clone();
+        let clip_handle_for_apply = clip_handle.clone();
+        tokio::spawn(async move {
+            let Some(mut apply_rx) = clip_handle_for_apply.take_apply_rx().await else {
+                return;
+            };
+            while let Some(text) = apply_rx.recv().await {
+                sink_clip.send_event(ClientEvent::ClipboardUpdate { text });
+            }
+        })
+    };
     // クリップボード同期の可否ゲート。設定の初期値をここで直接反映する (TS 側の後追い適用に
     // 依存すると、起動直後の数回分がレースで漏れうるため Rust 側で初期化する)。設定読み込み
     // 失敗時は安全側の既定 (ON) にする。
@@ -437,8 +454,18 @@ async fn connect_inner(
         .instrument(tracing::Span::current()),
     );
 
-    // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。
+    // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。デスクトップは cpal ネイティブ
+    // 再生、モバイルは sink 経由で WebView へ転送する (audio.rs 参照、方式A)。
+    #[cfg(desktop)]
     let audio_player = match audio::spawn() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "audio playback disabled");
+            None
+        }
+    };
+    #[cfg(mobile)]
+    let audio_player = match audio::spawn(sink.clone()) {
         Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(error = %e, "audio playback disabled");
@@ -585,16 +612,23 @@ async fn connect_inner(
         host: host.clone(),
         ctrl_tx,
         file_tx,
-        tasks: vec![
-            writer_task,
-            reader_task,
-            udp_task,
-            ping_task,
-            stats_task,
-            clip_forward_task,
-            pong_watchdog_task,
-            udp_watchdog_task,
-        ],
+        tasks: {
+            // mut は #[cfg(mobile)] の push でのみ使う (デスクトップ build では未使用になる)。
+            #[cfg_attr(not(mobile), allow(unused_mut))]
+            let mut tasks = vec![
+                writer_task,
+                reader_task,
+                udp_task,
+                ping_task,
+                stats_task,
+                clip_forward_task,
+                pong_watchdog_task,
+                udp_watchdog_task,
+            ];
+            #[cfg(mobile)]
+            tasks.push(clip_forward_to_front_task);
+            tasks
+        },
         clipboard: clip_handle,
         audio: audio_player,
         pending_downloads,

@@ -116,6 +116,12 @@ pub enum ClientEvent {
     VideoCodecChanged {
         codec: String,
     },
+    /// モバイル専用: ホスト→端末のクリップボード適用要求。デスクトップは arboard が直接
+    /// ローカルクリップボードへ書き込むため構築されない (net/connect.rs 参照)。
+    #[cfg(mobile)]
+    ClipboardUpdate {
+        text: String,
+    },
 }
 
 /// TS の `["h264","hevc","av1"]` のような小文字文字列を `VideoCodec` へ変換する
@@ -157,6 +163,10 @@ pub(crate) fn codec_to_str(codec: VideoCodec) -> &'static str {
 pub struct Sink {
     event: Arc<std::sync::Mutex<Option<Channel<ClientEvent>>>>,
     video: Arc<std::sync::Mutex<Option<Channel<InvokeResponseBody>>>>,
+    /// モバイル専用: 音声 (Opus) フレームの転送先。デスクトップは cpal ネイティブ再生のため
+    /// 使わない (#1 音声再生、方式A: デコードせず WebView の WebCodecs AudioDecoder へ渡す)。
+    #[cfg(mobile)]
+    audio: Arc<std::sync::Mutex<Option<Channel<InvokeResponseBody>>>>,
 }
 
 impl Sink {
@@ -164,6 +174,8 @@ impl Sink {
         Self {
             event: Arc::new(std::sync::Mutex::new(Some(event))),
             video: Arc::new(std::sync::Mutex::new(Some(video))),
+            #[cfg(mobile)]
+            audio: Arc::new(std::sync::Mutex::new(None)),
         }
     }
     /// 現在の表示先へイベントを送る (未アタッチ = デタッチ中なら捨てる)。
@@ -177,6 +189,23 @@ impl Sink {
     /// 現在の表示先へ映像フレームを送る (未アタッチなら捨てる。次キーフレームで回復)。
     fn send_video(&self, body: InvokeResponseBody) {
         if let Ok(g) = self.video.lock()
+            && let Some(ch) = g.as_ref()
+        {
+            let _ = ch.send(body);
+        }
+    }
+    /// モバイル専用: 音声フレームの転送先を設定する (接続/再接続ごとに `attach_audio_channel`
+    /// から呼ばれる)。
+    #[cfg(mobile)]
+    pub(crate) fn set_audio(&self, ch: Channel<InvokeResponseBody>) {
+        if let Ok(mut g) = self.audio.lock() {
+            *g = Some(ch);
+        }
+    }
+    /// モバイル専用: 現在の表示先へ音声フレームを送る (未アタッチなら捨てる)。
+    #[cfg(mobile)]
+    pub(crate) fn send_audio(&self, body: InvokeResponseBody) {
+        if let Ok(g) = self.audio.lock()
             && let Some(ch) = g.as_ref()
         {
             let _ = ch.send(body);

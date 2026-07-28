@@ -195,6 +195,7 @@ pub fn run() {
         net::set_supported_codecs,
         net::set_audio_muted,
         net::set_audio_volume,
+        net::attach_audio_channel,
         net::set_clipboard_sync,
         net::set_video_paused,
         net::set_cursor_overlay,

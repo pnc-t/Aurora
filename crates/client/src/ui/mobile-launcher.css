@@ -119,6 +119,19 @@
   margin-top: 10px;
 }
 
+/* 端末ID表示 (タップでコピー)。launcher.css の .s-desc (span 前提) を button へ流用しているため、
+ * button 既定の背景/枠線/paddingだけリセットし、フォント/色は .s-desc のまま引き継ぐ。 */
+.ml-app .ml-fingerprint-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: right;
+}
+.ml-app .ml-fingerprint-btn:active {
+  color: var(--accent);
+}
+
 /* グローバルの .hidden (mobile-main.css) は display: none !important で、ページ全体の表示/非表示
  * 切替専用のため、行単位の表示制御に流用すると !important 同士の優先度で意図せず衝突しうる
  * (.mp-hidden / .mkb-hidden と同じ理由)。カスタムプリセット以外のときに fps/Mbps 行を隠す専用クラス。 */

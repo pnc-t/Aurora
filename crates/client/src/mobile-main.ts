@@ -14,7 +14,9 @@
 // 装飾が全て消える)。
 import "./styles/base.css";
 import "./mobile-main.css";
+import { Channel } from "@tauri-apps/api/core";
 import {
+  attachAudioChannel,
   DEFAULT_SETTINGS,
   initPerfFlag,
   loadSettings,
@@ -38,6 +40,7 @@ import { TouchInput } from "./core/touch-input";
 import { createStickyModifiers } from "./core/sticky-modifiers";
 import { mountMobileKeyboard, type MobileKeyboardHandle } from "./ui/mobile-keyboard";
 import { SoftKeyboard } from "./core/soft-keyboard";
+import { AudioPlayer } from "./core/audio-player";
 
 // 未捕捉例外/Promise reject を Rust ログ (client.log) へ転送する。
 installGlobalErrorLogging();
@@ -142,8 +145,13 @@ const pad: MobilePadHandle = mountMobilePad({
   },
 });
 
-// --- ToolbarHandle アダプタ: desktop 専用 UI (タブ/ウィンドウ/ファイル転送/音声/クリップボード等)
-// はモバイル対象外のため no-op にし、意味のある操作だけ mobile-controls / TouchInput へ橋渡しする ---
+// --- 音声再生 (#1: WebCodecs 方式)。1 WebView = 1 インスタンスで使い回す
+// (接続/再接続のたびに core/audio-player.ts の start()/stop() で開閉する) ---
+const audioPlayer = new AudioPlayer();
+
+// --- ToolbarHandle アダプタ: desktop 専用 UI (タブ/ウィンドウ/ファイル転送/クリップボード等)
+// はモバイル対象外のため no-op にし、意味のある操作 (音声含む) だけ mobile-controls / TouchInput
+// へ橋渡しする ---
 let currentDisplay: DisplayDto | null = null;
 // 接続状態。TouchInput の attach は「接続済み」かつ「ディスプレイ解像度が判明」の両方が揃った
 // 時点で行う必要があり、この 2 条件が別々のタイミングで満たされるためここで保持する
@@ -177,9 +185,35 @@ const toolbar: ToolbarHandle = {
   setFullscreenToggled: () => {},
   // マウスキャプチャ (ポインタロック) の概念が無く、タッチ操作は常時有効なため表示対象が無い。
   setCaptureToggled: () => {},
-  // 音声 UI はスコープ外。
-  setAudioAvailable: () => {},
-  setAudioVolume: () => {},
+  // ホストが音声対応なら下部バーの音声ボタンを出し、Opus フレームを流す Channel をアタッチして
+  // 再生を開始する (方式A: デコードは WebView 側)。`connect_to_host` はセッション置換のたびに
+  // 新しい表示先を作るため、接続/再接続 (= host_info 到達) のたびに呼び直す必要がある。
+  setAudioAvailable(available, initialMuted = false): void {
+    controls.setAudioAvailable(available, initialMuted);
+    if (!available || !session) {
+      audioPlayer.stop();
+      return;
+    }
+    const sessionId = session.id;
+    // Channel の張り直しは毎回行う。再接続では Session の id が変わらないまま Rust 側の Sink が
+    // 作り直され、以前アタッチした Channel が捨てられるため (attach_audio_channel の doc 参照)。
+    const audioChannel = new Channel<ArrayBuffer>();
+    audioChannel.onmessage = (data) => {
+      const buf =
+        data instanceof ArrayBuffer ? data : new Uint8Array(data as unknown as number[]).buffer;
+      audioPlayer.push(buf);
+    };
+    void attachAudioChannel(sessionId, audioChannel).catch((e) =>
+      logger.warn("attachAudioChannel failed", e),
+    );
+    // 接続操作 (ランチャーのタップ) から続く呼び出しチェーン内で呼ぶことで、AudioContext の
+    // ユーザージェスチャ起点制約を満たす。
+    void audioPlayer.start().catch((e) => logger.warn("audio start failed", e));
+  },
+  setAudioVolume(volume): void {
+    audioPlayer.setVolume(volume);
+    controls.setAudioVolume(volume);
+  },
   // クリップボード同期 UI はスコープ外。
   setClipboardSyncState: () => {},
   // 画質プリセットはランチャーの設定と重複するため下部バーから外した (現在値を映す先が無い)。
@@ -204,6 +238,8 @@ const toolbar: ToolbarHandle = {
       // 次の接続を既定 (非表示) の状態から始めるため。pad.setVisible(false) はドラッグロックと
       // スティッキー修飾も強制解除するので、押しっぱなしがホスト側に残らない。
       setPadVisible(false);
+      // 切断のたびに確実に音声を止める (再接続時は setAudioAvailable が再度 start() する)。
+      audioPlayer.stop();
     }
   },
   // ショートカット割当 UI はデスクトップ専用 (キーボードショートカット設定) でモバイルには無い。
@@ -247,10 +283,20 @@ const host: SessionHost = {
     softKeyboard.close();
     keyboard.close();
     hideReconnectBadge();
+    audioPlayer.stop();
     showLauncherView();
   },
   // ウィンドウが無いのでリサイズ可否の概念が無い。
   setResizable: () => {},
+  // ホスト→端末のクリップボード適用要求 (#2)。ネイティブ ClipboardManager は未検証のため
+  // WebView の navigator.clipboard.writeText で書き込むだけの一方向。失敗しても静かに無視する
+  // (端末→ホスト方向がそもそも無いので、ユーザーに警告を出しても打つ手が無い死んだ UI になる)。
+  clipboardUpdate(s, text): void {
+    if (session !== s) return;
+    void navigator.clipboard.writeText(text).catch((e) => {
+      logger.debug("clipboard write failed (ignored)", e);
+    });
+  },
   persistVideoParams(fps, mbps): void {
     // fps/Mbps と同じパターンで即時保存する。他窓への同報 (aurora://settings-changed) は
     // ウィンドウが 1 つしかないモバイルでは行わない。代わりに、同じ WebView 内で独自に設定を
@@ -286,6 +332,11 @@ const controls: MobileControlsHandle = mountMobileControls({
   onSelectDisplay: (d) => session?.switchDisplay(d),
   onResetZoom: () => touchInput.resetZoom(),
   onTogglePad: () => setPadVisible(!padVisible),
+  onToggleMute: (muted) => session?.setAudioMuted(muted),
+  onSetVolume: (volume) => {
+    audioPlayer.setVolume(volume);
+    updateSettings({ audio_volume: volume });
+  },
 });
 
 // --- ランチャー ---
