@@ -2,10 +2,9 @@
  * (host-card/dialog/setting-row 等はグローバルセレクタなのでそのまま効く)。ここには
  * デスクトップの「サイドバー + コンテンツ」を「コンテンツ + 下部タブバー」へ組み替える
  * 差分と、モバイル固有のタブバー自体のスタイルだけを書く。
- * 幅ブレークポイントは 4 段構成: 常時適用 (幅を問わない差分) → @media (max-width: 480px)
- * (スマホ幅の崩れ対策) → @media (max-width: 360px) (480px 内側のさらに狭い幅専用、
- * addr 行の折り返しのみ) → @media (min-width: 700px) (タブレット幅の全幅化)。狭い方の
- * 例外は広い方のブロックに混ぜず別メディアクエリに分離し、対象幅を取り違えないようにする。 */
+ * 幅ブレークポイントは 3 段構成: 常時適用 (幅を問わない差分) → @media (max-width: 480px)
+ * (スマホ幅の崩れ対策) → @media (min-width: 700px) (タブレット幅の全幅化 + 行内幅の抑制)。
+ * 狭い方の例外は広い方のブロックに混ぜず別メディアクエリに分離し、対象幅を取り違えないようにする。 */
 
 .ml-app {
   display: flex;
@@ -154,34 +153,14 @@
   height: 12px;
 }
 
-/* ホストの到達性はアバターの色ドットだけでは伝わらない (色弱・強い外光での視認性) ため、
- * addr 行の末尾にテキストでも状態を出す。addr は元々 monospace のテキストノード 1 本だったが、
- * アドレス部分だけ ellipsis で省略できるよう <span class="ml-addr-text"> に分ける。
- * font-size: 13px は上の「文字サイズ底上げ」の一環 (addr の宣言をここへ統合し、同セレクタが
- * ファイル内に重複しないようにしている)。 */
+/* font-size: 13px は上の「文字サイズ底上げ」の一環 (addr の宣言をここへ統合し、同セレクタが
+ * ファイル内に重複しないようにしている)。overflow/ellipsis は host:port が長い場合に
+ * カード幅からはみ出さないようにするための溢れ対策。 */
 .ml-app .host-card .meta .addr {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
   font-size: 13px;
-}
-.ml-app .host-card .meta .ml-addr-text {
-  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.ml-app .host-card .meta .ml-presence-text {
-  flex-shrink: 0;
-  font-size: 12px;
-  font-family: inherit; /* .addr の monospace 指定を打ち消し、状態テキストだけ本文フォントに戻す */
-}
-.ml-app .host-card .meta .ml-presence-text.online {
-  color: var(--ok);
-}
-.ml-app .host-card .meta .ml-presence-text.offline {
-  color: var(--muted);
 }
 
 /* ダイアログのボタンはタッチの主要動線 (接続/削除/追加) なので、既存の 44px タップ領域確保より
@@ -224,9 +203,8 @@
   .ml-app .host-card .card-tail {
     flex: 0 0 auto;
   }
-  /* host:port の溢れ対策は .addr を flex 化した際に .ml-addr-text の ellipsis へ移設済み
-   * (常時適用の領域、上部の「ホストの到達性は…」ブロック参照)。幅ブレークポイント内に
-   * 残す必要が無いためここには置かない。 */
+  /* host:port の溢れ対策は常時適用の .addr 自身 (overflow/ellipsis) で完結しているため、
+   * ここには何も置かない。 */
 
   /* タップ領域確保 (配色/角丸/フォント/アイコンは変えず padding のみで高さを稼ぐ)。 */
   .ml-app .num-input,
@@ -296,17 +274,6 @@
   .ml-app .setting-row.ml-row-toggle > .switch {
     align-self: center;
     flex-shrink: 0;
-  }
-}
-
-/* 320-360px 専用 (480px ブロックのさらに内側の狭幅)。実測: 320px 幅では addr 行の使える幅が
- * 164px で、`100.xx.xx.xxx:7000` (約120px) + gap 8px + 「オンライン」(60px) = 188px となり
- * アドレス側が ellipsis で削られ IP が読めなくなる。この幅だけ折り返しを許し、到達性テキストを
- * 2 行目へ落とす。390px 以上は 1 行に収まるため、480px ブロックに混ぜると無意味にカードが
- * 高くなってしまう。 */
-@media (max-width: 360px) {
-  .ml-app .host-card .meta .addr {
-    flex-wrap: wrap;
   }
 }
 

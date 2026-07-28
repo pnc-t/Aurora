@@ -714,20 +714,9 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
         lc.textContent = formatRelativeConnected(entry.last_connected);
         labelRow.appendChild(lc);
       }
-      // アドレス部分だけ ellipsis で省略できるよう専用 span に分ける (addr 自体は flex 行になり、
-      // 到達性テキスト (下記) と並べて置くため)。
       const addr = document.createElement("div");
       addr.className = "addr";
-      const addrText = document.createElement("span");
-      addrText.className = "ml-addr-text";
-      addrText.textContent = `${entry.host}:${entry.port}`;
-      addr.appendChild(addrText);
-      if (online !== undefined) {
-        const presenceText = document.createElement("span");
-        presenceText.className = `ml-presence-text ${online ? "online" : "offline"}`;
-        presenceText.textContent = online ? "オンライン" : "応答なし";
-        addr.appendChild(presenceText);
-      }
+      addr.textContent = `${entry.host}:${entry.port}`;
       meta.append(labelRow, addr);
 
       const tail = document.createElement("div");
