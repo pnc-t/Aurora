@@ -4,7 +4,9 @@
  * launcher.css のグローバル定義 (mobile-launcher.ts が読み込み済み) をそのまま使う。
  *
  * スマホ幅 (320px 想定) でも横にはみ出さないよう、固定 px 幅の要素 (flex: 0 0 <px> 等) は作らず、
- * ラベル/リンク/MAC は必ず ellipsis で切る。タップ領域は ⋮ メニュー/キャンセルボタンとも 44px を確保する。 */
+ * ラベル/リンク/MAC は必ず ellipsis で切る。タップ領域は ⋮ メニュー/キャンセルボタンとも 44px を確保する。
+ * ⋮ と × は同一の tail スロットに排他表示で置き (showProgress/hideProgress で切替)、
+ * 44px 領域同士が縦に重なって誤タップする問題を構造的に無くしている。 */
 
 .mwol-list {
   display: flex;
@@ -77,6 +79,17 @@
   min-width: 0;
 }
 
+/* ⋮ メニューと × キャンセルボタンの共有スロット (Hosts カードの .card-tail と同じ構造)。
+ * min-width は、進捗の開始/終了で ⋮⇔× が入れ替わる瞬間に中身が空になっても
+ * カード右端の幅が変わらないようにするため (がたつき防止)。 */
+.mwol-tail {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  min-width: 44px;
+}
+
 .mwol-card .row1 {
   display: flex;
   align-items: center;
@@ -129,6 +142,10 @@
 }
 .mwol-card .card-btn:active {
   background: var(--menu-hover);
+}
+/* .card-btn は display:inline-flex を持つため hidden 属性だけでは消えない (.mwol-progress-cancel と同じ理由)。 */
+.mwol-more[hidden] {
+  display: none;
 }
 
 /* 進捗表示 (起動待ち/送信中)。.mwol-sub と入れ替わりで表示する。 */

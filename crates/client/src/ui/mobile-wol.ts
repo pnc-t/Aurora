@@ -139,9 +139,13 @@ export function mountMobileWolPanel(
     const label = card.querySelector<HTMLElement>(".mwol-progress-text");
     const cancelBtn = card.querySelector<HTMLElement>(".mwol-progress-cancel");
     const spinner = card.querySelector<HTMLElement>(".mwol-spinner");
+    const moreBtn = card.querySelector<HTMLElement>(".mwol-more");
     if (sub) sub.hidden = true;
     if (progress) progress.hidden = false;
     if (cancelBtn) cancelBtn.hidden = !cancel;
+    // ⋮ と × は tail の同じスロットを共有する (44px タップ領域の重なりを防ぐため排他表示)。
+    // cancel=false (単発の「起こす」フィードバック) では × を出さないので ⋮ は隠さない。
+    if (moreBtn) moreBtn.hidden = cancel;
     if (spinner) spinner.hidden = done; // 完了表示 (✓) 時は回さない
     if (label) {
       label.textContent = text;
@@ -152,9 +156,14 @@ export function mountMobileWolPanel(
     const sub = card.querySelector<HTMLElement>(".mwol-sub");
     const progress = card.querySelector<HTMLElement>(".mwol-progress");
     const label = card.querySelector<HTMLElement>(".mwol-progress-text");
+    const moreBtn = card.querySelector<HTMLElement>(".mwol-more");
+    const cancelBtn = card.querySelector<HTMLElement>(".mwol-progress-cancel");
     if (sub) sub.hidden = false;
     if (progress) progress.hidden = true;
     if (label) label.classList.remove("done");
+    // ⋮ / × は tail 直下で progress とは別要素になったため、両方を明示的に戻す。
+    if (moreBtn) moreBtn.hidden = false;
+    if (cancelBtn) cancelBtn.hidden = true;
   }
   /** 「起こす」成功時の一時フィードバック。数秒後、ポーリング中でなければ元へ戻す。 */
   function flashWakeSent(id: string): void {
@@ -228,7 +237,7 @@ export function mountMobileWolPanel(
         </label>
         <div class="dlg-status" id="mwp-status"></div>
         <div class="dlg-actions">
-          <button type="button" class="btn-ghost" id="mwp-cancel">cancel</button>
+          <button type="button" class="btn-ghost" id="mwp-cancel">キャンセル</button>
           <button type="submit" class="btn-primary" id="mwp-ok">起動</button>
         </div>
       </form>
@@ -331,20 +340,30 @@ export function mountMobileWolPanel(
     }
   }
 
-  /** 削除確認ダイアログ。 */
-  function openConfirmDialog(message: string, onConfirm: () => Promise<void>): void {
+  /** 汎用の確認ダイアログ (削除確認/起動確認で使い回す)。
+   *  title/confirmLabel は固定文言に埋め込まず引数化し、danger で削除相当の危険色を切り替える。 */
+  function openConfirmDialog(
+    dialogOpts: { title: string; message: string; confirmLabel: string; danger?: boolean },
+    onConfirm: () => Promise<void>,
+  ): void {
+    const { title, message, confirmLabel, danger = false } = dialogOpts;
     backdrop.innerHTML = `
       <div class="dialog">
-        <h3>削除の確認</h3>
+        <h3></h3>
         <div class="s-desc"></div>
         <div class="dlg-actions">
-          <button type="button" class="btn-ghost" id="mwc-cancel">cancel</button>
-          <button type="button" class="btn-danger" id="mwc-ok">削除</button>
+          <button type="button" class="btn-ghost" id="mwc-cancel">キャンセル</button>
+          <button type="button" class="${danger ? "btn-danger" : "btn-primary"}" id="mwc-ok"></button>
         </div>
       </div>
     `;
+    // title/message/confirmLabel は呼び出し元が name (ホスト由来ラベル) を埋め込むため textContent で入れる。
+    const titleEl = backdrop.querySelector<HTMLElement>("h3");
+    if (titleEl) titleEl.textContent = title;
     const desc = backdrop.querySelector<HTMLElement>(".s-desc");
     if (desc) desc.textContent = message;
+    const okBtn = backdrop.querySelector<HTMLElement>("#mwc-ok");
+    if (okBtn) okBtn.textContent = confirmLabel;
     openBackdrop();
     backdrop.querySelector("#mwc-cancel")?.addEventListener("click", closeDialog);
     backdrop.querySelector("#mwc-ok")?.addEventListener("click", () => {
@@ -396,8 +415,8 @@ export function mountMobileWolPanel(
           </label>
           <div class="dlg-status" id="mw-status"></div>
           <div class="dlg-actions">
-            <button type="button" class="btn-ghost" id="mw-cancel">cancel</button>
-            <button type="submit" class="btn-primary">${isAdd ? "add" : "save"}</button>
+            <button type="button" class="btn-ghost" id="mw-cancel">キャンセル</button>
+            <button type="submit" class="btn-primary">${isAdd ? "追加" : "保存"}</button>
           </div>
         </form>
       `;
@@ -580,7 +599,8 @@ export function mountMobileWolPanel(
       const meta = document.createElement("div");
       meta.className = "meta";
 
-      // 1 行目: ラベル + ⋮ メニュー (編集/削除)。Hosts タブのカードと同じ導線に統一している。
+      // 1 行目: ラベルのみ。⋮ メニューは tail (カード右端) へ移した (× キャンセルボタンと
+      // 同じスロットを共有させ、44px タップ領域の重なりを構造的に無くすため)。
       const row1 = document.createElement("div");
       row1.className = "row1";
       const labelEl = document.createElement("span");
@@ -606,17 +626,25 @@ export function mountMobileWolPanel(
             icon: "delete",
             danger: true,
             onSelect: () => {
-              openConfirmDialog(`「${name}」を一覧から削除しますか?`, async () => {
-                stopPoll(t.id);
-                sending.delete(t.id);
-                await deleteWolTarget(t.id);
-                await refresh();
-              });
+              openConfirmDialog(
+                {
+                  title: "削除の確認",
+                  message: `「${name}」を一覧から削除しますか?`,
+                  confirmLabel: "削除",
+                  danger: true,
+                },
+                async () => {
+                  stopPoll(t.id);
+                  sending.delete(t.id);
+                  await deleteWolTarget(t.id);
+                  await refresh();
+                },
+              );
             },
           },
         ]);
       });
-      row1.append(labelEl, moreBtn);
+      row1.append(labelEl);
 
       // 2 行目: 紐付けホストがあれば接続先、無ければ MAC (紐付けありの MAC は編集ダイアログで確認)。
       const sub = document.createElement("div");
@@ -634,6 +662,9 @@ export function mountMobileWolPanel(
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
       cancelBtn.className = "card-btn mwol-progress-cancel";
+      // tail へ移す前は .mwol-progress の子だったため progress ごと隠れていたが、tail 直下では
+      // 自前で初期状態を持つ必要がある (待機中のカードに × が出っぱなしになる)。
+      cancelBtn.hidden = true;
       cancelBtn.title = "キャンセル";
       cancelBtn.innerHTML = icon("close");
       cancelBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
@@ -643,10 +674,17 @@ export function mountMobileWolPanel(
         sending.delete(t.id);
         hideProgress(card);
       });
-      progress.append(spinner, progressText, cancelBtn);
+      progress.append(spinner, progressText);
 
       meta.append(row1, sub, progress);
-      card.append(avatar, meta);
+
+      // tail: ⋮ メニューと × キャンセルボタンを同じスロットに置き、showProgress/hideProgress で
+      // 排他表示する (Hosts カードの .card-tail と同じ構造。launcher.css は共有のため触らない)。
+      const tail = document.createElement("div");
+      tail.className = "mwol-tail";
+      tail.append(moreBtn, cancelBtn);
+
+      card.append(avatar, meta, tail);
       listEl.appendChild(card);
 
       // ポーリング継続中に再描画された行 (別カードの追加/削除操作等) は進捗表示を復元する。
@@ -657,8 +695,26 @@ export function mountMobileWolPanel(
       // 削除は ⋮ メニュー経由に一本化している (不可視のジェスチャに破壊的操作を割り当てない方針)。
       card.addEventListener("click", () => {
         if (isBusy(t.id)) return; // 進捗表示中はタップを無視する
-        if (t.host) void handleWakeAndConnect(t, card);
-        else void handleWake(t, card);
+        // 誤タップで即 PC を起動してしまわないよう、主アクションの前に確認ダイアログを挟む。
+        if (t.host) {
+          openConfirmDialog(
+            {
+              title: "起動の確認",
+              message: `「${name}」を起動して、起動後に接続しますか?`,
+              confirmLabel: "起動して接続",
+            },
+            () => handleWakeAndConnect(t, card),
+          );
+        } else {
+          openConfirmDialog(
+            {
+              title: "起動の確認",
+              message: `「${name}」に起動信号 (マジックパケット) を送信しますか?`,
+              confirmLabel: "起動",
+            },
+            () => handleWake(t, card),
+          );
+        }
       });
       card.addEventListener("keydown", (e) => {
         if (e.target !== card) return;
