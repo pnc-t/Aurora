@@ -42,6 +42,34 @@ export type MobileControlsHandle = {
 /** 引き出したバーを自動格納するまでの無操作時間。 */
 const AUTO_HIDE_MS = 5000;
 
+/**
+ * mobile-main.css の --sysbar-inset-* (Android のシステムバー相当の下限を含む値) の
+ * うち最大のものを px 数値で返す。JS 側でシステムバー幅を決め打ちしないための唯一の参照点。
+ *
+ * カスタムプロパティは型を持たないため getComputedStyle(el).getPropertyValue("--x") は
+ * "max(env(...), 32px)" という未評価の文字列をそのまま返し、px には解決されない。
+ * padding のような実際のレイアウトプロパティに割り当てて初めてブラウザが計算するため、
+ * 非表示の probe 要素へ 4 辺の padding として当てて resolved 値を読み取る。
+ */
+let sysbarProbe: HTMLDivElement | null = null;
+function maxSysbarInsetPx(): number {
+  if (!sysbarProbe) {
+    sysbarProbe = document.createElement("div");
+    sysbarProbe.style.position = "fixed";
+    sysbarProbe.style.top = "-9999px";
+    sysbarProbe.style.left = "-9999px";
+    sysbarProbe.style.pointerEvents = "none";
+    sysbarProbe.style.paddingTop = "var(--sysbar-inset-top)";
+    sysbarProbe.style.paddingBottom = "var(--sysbar-inset-bottom)";
+    sysbarProbe.style.paddingLeft = "var(--sysbar-inset-left)";
+    sysbarProbe.style.paddingRight = "var(--sysbar-inset-right)";
+    document.body.appendChild(sysbarProbe);
+  }
+  const cs = getComputedStyle(sysbarProbe);
+  const raw = [cs.paddingTop, cs.paddingBottom, cs.paddingLeft, cs.paddingRight];
+  return Math.max(...raw.map((v) => parseFloat(v) || 0));
+}
+
 export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHandle {
   opts.root.innerHTML = `
     <div class="mc-root" id="mc-root" data-pos="bottom">
@@ -120,10 +148,41 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     audioBtn.classList.toggle("toggled", muted);
     audioBtn.innerHTML = icon(muted ? "mute" : "volume");
   }
+  /** 音量ポップオーバーを音声ボタンの直下/直上/脇 (ツールバー配置に応じて反対側) へ置く。
+   *  display:none の間は getBoundingClientRect が 0 を返す罠があるため、.visible を付けて
+   *  実際にレイアウトされた後の矩形で計算すること (呼び出し側の順序に注意)。 */
+  function positionAudioPop(): void {
+    if (!audioPop || !audioBtn) return;
+    // クランプ余白は mobile-main.css の --sysbar-inset-* (Android のシステムバー分の下限を
+    // 含む値) を使う。ここで数値を決め打ちで二重に持たず、4 辺のうち最大値を使ってどの辺の
+    // システムバーとも重ならないようにする。
+    const margin = Math.max(8, maxSysbarInsetPx());
+    const btnRect = audioBtn.getBoundingClientRect();
+    const popRect = audioPop.getBoundingClientRect();
+    const pos = rootEl?.dataset.pos ?? "bottom";
+    let left: number;
+    let top: number;
+    if (pos === "left" || pos === "right") {
+      // 縦バー: ボタンの高さに中央を揃え、画面内側 (left 配置ならバーより右、right 配置なら左) へ出す。
+      top = btnRect.top + btnRect.height / 2 - popRect.height / 2;
+      left = pos === "left" ? btnRect.right + margin : btnRect.left - popRect.width - margin;
+    } else {
+      // 横バー: ボタン中心に水平を揃え、bottom 配置ならバーの上、top 配置ならバーの下に出す。
+      left = btnRect.left + btnRect.width / 2 - popRect.width / 2;
+      top = pos === "bottom" ? btnRect.top - popRect.height - margin : btnRect.bottom + margin;
+    }
+    // 画面外へはみ出さないようクランプする (position: fixed なのでビューポート基準)。
+    left = Math.max(margin, Math.min(left, window.innerWidth - popRect.width - margin));
+    top = Math.max(margin, Math.min(top, window.innerHeight - popRect.height - margin));
+    audioPop.style.left = `${left}px`;
+    audioPop.style.top = `${top}px`;
+  }
   function setAudioPopVisible(on: boolean): void {
     if (on && !audioAvailable) return;
     audioPopVisible = on;
     audioPop?.classList.toggle("visible", on);
+    // 表示 (display:block) された後でないと矩形が測れないため、visible クラス付与の後に計算する。
+    if (on) positionAudioPop();
     scheduleAutoHide();
   }
 

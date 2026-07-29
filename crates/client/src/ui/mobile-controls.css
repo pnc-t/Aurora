@@ -71,25 +71,27 @@
  * 設定する。下部バーはそのぶん上へ逃がさないとキーボードに隠れて押せなくなるため、bottom を
  * この変数ぶん足す。閉じているとき/他配置の未設定時は 0px にフォールバックする。 */
 .mc-root[data-pos="bottom"] {
-  --mc-peek: calc(env(safe-area-inset-bottom) + 34px);
+  /* env(safe-area-inset-*) だけでは Android のナビゲーションバーぶんが 0 になる
+   * (mobile-main.css の --sysbar-inset-* 定義コメント参照)。 */
+  --mc-peek: calc(var(--sysbar-inset-bottom) + 34px);
   bottom: var(--mkb-height, 0px);
   flex-direction: column;
   transform: translateY(calc(100% - var(--mc-peek)));
 }
 .mc-root[data-pos="top"] {
-  --mc-peek: calc(env(safe-area-inset-top) + 34px);
+  --mc-peek: calc(var(--sysbar-inset-top) + 34px);
   top: 0;
   flex-direction: column-reverse;
   transform: translateY(calc(-100% + var(--mc-peek)));
 }
 .mc-root[data-pos="left"] {
-  --mc-peek: calc(env(safe-area-inset-left) + 28px);
+  --mc-peek: calc(var(--sysbar-inset-left) + 28px);
   left: 0;
   flex-direction: row-reverse;
   transform: translateX(calc(-100% + var(--mc-peek)));
 }
 .mc-root[data-pos="right"] {
-  --mc-peek: calc(env(safe-area-inset-right) + 28px);
+  --mc-peek: calc(var(--sysbar-inset-right) + 28px);
   right: 0;
   flex-direction: row;
   transform: translateX(calc(100% - var(--mc-peek)));
@@ -124,16 +126,16 @@
 /* safe-area ぶんは帯の内側ではなく外側の余白として確保する (ピル自体の大きさは一定に保つ)。
  * 配置に応じた「画面の外側」の辺だけに付ける。 */
 .mc-root[data-pos="bottom"] .mc-panel {
-  margin-bottom: env(safe-area-inset-bottom);
+  margin-bottom: var(--sysbar-inset-bottom);
 }
 .mc-root[data-pos="top"] .mc-panel {
-  margin-top: env(safe-area-inset-top);
+  margin-top: var(--sysbar-inset-top);
 }
 .mc-root[data-pos="left"] .mc-panel {
-  margin-left: env(safe-area-inset-left);
+  margin-left: var(--sysbar-inset-left);
 }
 .mc-root[data-pos="right"] .mc-panel {
-  margin-right: env(safe-area-inset-right);
+  margin-right: var(--sysbar-inset-right);
 }
 
 .mc-bar {
@@ -193,18 +195,18 @@
  * (足さないと下部バーの直上に浮かせたつもりがキーボードの下に埋もれる)。 */
 .mc-root[data-pos="bottom"] ~ .mc-display-pop {
   right: 8px;
-  bottom: calc(44px + 8px + env(safe-area-inset-bottom) + var(--mkb-height, 0px));
+  bottom: calc(44px + 8px + var(--sysbar-inset-bottom) + var(--mkb-height, 0px));
 }
 .mc-root[data-pos="top"] ~ .mc-display-pop {
   right: 8px;
-  top: calc(44px + 8px + env(safe-area-inset-top));
+  top: calc(44px + 8px + var(--sysbar-inset-top));
 }
 .mc-root[data-pos="left"] ~ .mc-display-pop {
-  left: calc(64px + env(safe-area-inset-left));
+  left: calc(64px + var(--sysbar-inset-left));
   bottom: 24px;
 }
 .mc-root[data-pos="right"] ~ .mc-display-pop {
-  right: calc(64px + env(safe-area-inset-right));
+  right: calc(64px + var(--sysbar-inset-right));
   bottom: 24px;
 }
 
@@ -223,11 +225,15 @@
   color: var(--accent);
 }
 
-/* 音量ポップオーバー (長押しで開く)。ディスプレイ選択ポップと同じ「反対側へはみ出さない」
- * 配置ルールを流用するが、中身はスライダー 1 本だけなので幅を狭める。 */
+/* 音量ポップオーバー (長押しで開く)。幅 160px と狭く、ディスプレイ選択ポップ (幅広で
+ * right:8px 固定でも目立たない) と同じ「画面右端固定」を流用するとツールバー中央のボタンから
+ * 大きく離れて浮いて見えるため、これだけは音声ボタンの矩形を起点に JS (mobile-controls.ts の
+ * positionAudioPop) で left/top を都度計算する。position: absolute だと祖先要素 (#remote-view)
+ * の座標系に依存するが、getBoundingClientRect はビューポート基準の値を返すため fixed にして
+ * 座標系を合わせる。 */
 .mc-audio-pop {
   display: none;
-  position: absolute;
+  position: fixed;
   z-index: 31;
   width: 160px;
   background: var(--panel);
@@ -242,20 +248,4 @@
 }
 .mc-audio-pop input[type="range"] {
   width: 100%;
-}
-.mc-root[data-pos="bottom"] ~ .mc-audio-pop {
-  right: 8px;
-  bottom: calc(44px + 8px + env(safe-area-inset-bottom) + var(--mkb-height, 0px));
-}
-.mc-root[data-pos="top"] ~ .mc-audio-pop {
-  right: 8px;
-  top: calc(44px + 8px + env(safe-area-inset-top));
-}
-.mc-root[data-pos="left"] ~ .mc-audio-pop {
-  left: calc(64px + env(safe-area-inset-left));
-  bottom: 24px;
-}
-.mc-root[data-pos="right"] ~ .mc-audio-pop {
-  right: calc(64px + env(safe-area-inset-right));
-  bottom: 24px;
 }

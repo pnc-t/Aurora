@@ -288,15 +288,6 @@ const host: SessionHost = {
   },
   // ウィンドウが無いのでリサイズ可否の概念が無い。
   setResizable: () => {},
-  // ホスト→端末のクリップボード適用要求 (#2)。ネイティブ ClipboardManager は未検証のため
-  // WebView の navigator.clipboard.writeText で書き込むだけの一方向。失敗しても静かに無視する
-  // (端末→ホスト方向がそもそも無いので、ユーザーに警告を出しても打つ手が無い死んだ UI になる)。
-  clipboardUpdate(s, text): void {
-    if (session !== s) return;
-    void navigator.clipboard.writeText(text).catch((e) => {
-      logger.debug("clipboard write failed (ignored)", e);
-    });
-  },
   persistVideoParams(fps, mbps): void {
     // fps/Mbps と同じパターンで即時保存する。他窓への同報 (aurora://settings-changed) は
     // ウィンドウが 1 つしかないモバイルでは行わない。代わりに、同じ WebView 内で独自に設定を
@@ -368,6 +359,11 @@ async function connectTo(entry: HostEntry, password: string | null, save: boolea
   // モバイルは単一 WebView でランチャーとリモート画面が同じページに居座るため、起動時に
   // 読んだきりだと別端末/別セッションで保存されたコントローラ位置が次の接続に反映されない。
   pad.setPositions(getSettings().mobile_pad_pos, getSettings().mobile_pad_buttons_pos);
+  // ツールバー配置も同じ理由でここで再適用する。session.ts の onHostInfo 経由の setPosition は
+  // `active` (= s.activate() 後) 判定の内側にしかなく、初回接続の host_info 到達時点では
+  // まだ active が false のため効かない (mobile-controls.ts のハードコード初期値 "bottom" の
+  // まま表示されてしまう)。active ゲートに依存せず自分で当てる。
+  controls.setPosition(getSettings().toolbar_position);
   const id = await stageSession(password);
   const s = new Session(id, entry, save, host);
   session = s;
@@ -414,6 +410,8 @@ void (async () => {
   document.documentElement.dataset.theme = getSettings().theme;
   document.documentElement.style.setProperty("--accent", getSettings().accent_color);
   pad.setPositions(getSettings().mobile_pad_pos, getSettings().mobile_pad_buttons_pos);
+  // 起動直後 (まだ未接続) の見た目もハードコードの "bottom" ではなく保存値に揃えておく。
+  controls.setPosition(getSettings().toolbar_position);
   showLauncherView();
   logger.info("mobile window ready");
 })();
