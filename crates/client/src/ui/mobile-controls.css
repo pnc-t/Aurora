@@ -5,8 +5,10 @@
  * 配置は data-pos="top|bottom|left|right" (デスクトップの ToolbarPosition と共通) で切り替える。 */
 
 /* ハンドルはバー (.mc-panel) と一体で .mc-root ごとスライドする。格納時も画面端から
- * ハンドルだけが常に覗いているので、Android のジェスチャーナビゲーションと重ならないよう
- * safe-area ぶんの余白を .mc-root 側の translate 計算に含める (--mc-peek 参照)。
+ * ハンドルだけが常に覗いている状態にする (--mc-peek はハンドル寸法ちょうど。詳細は
+ * --mc-peek 定義側のコメント参照)。Android のジェスチャーナビゲーション/システムバーと
+ * 重ならないための余白は translate (peek) 側ではなく .mc-root 自体の bottom/top/left/right
+ * (器の位置) 側で確保する。
  * 端からの逆スワイプはシステムジェスチャーと衝突するので、引き出しはタップのみ (スワイプでは開かない)。
  * ハンドルは常にピルの「画面中央側」に置く。DOM 順 (ハンドル→パネル) は固定のまま、
  * 配置ごとに flex-direction を反転させて見た目の順序を入れ替える。
@@ -26,6 +28,9 @@
   opacity: 0.7;
   pointer-events: auto;
   flex: none;
+  /* 格納時だけ本体との間に空ける逃げ (下の :not(.expanded) 側) を、器のスライドと同じ速さで
+   * 詰める。合わせないと展開の瞬間にハンドルだけ段差でずれて見える。 */
+  transition: margin 0.18s ease-out;
 }
 .mc-handle::before {
   content: "";
@@ -66,35 +71,65 @@
 }
 
 /* 100% は要素自身の高さ/幅が基準になるため、内容の増減があっても
- * この式を再計算する必要がない (常にハンドルぶんだけ覗く)。 */
+ * この式を再計算する必要がない (常にハンドルぶんだけ覗く)。
+ *
+ * 格納時に画面へ残るのは「要素の端から peek ぶん」で、その中身は DOM 順 (ハンドル→パネル) と
+ * flex-direction で決まる。つまり peek をハンドル寸法より大きくすると、超過ぶんだけパネル
+ * 本体が覗く。一方でハンドルを画面端 (システムバー) から浮かせたいので、peek はハンドル寸法
+ * + inset にしたうえで、**ハンドルのパネル側に同じ inset の margin を入れて「空白」を作る**。
+ * こうして初めて「見える帯 = ハンドル + 空白」になる。
+ *
+ * .mc-root 自体を bottom/top/left/right でずらす方式では直らない: transform は要素自身の
+ * サイズ基準なので、器を内側へずらしても見える量は inset + peek に増えるだけだった
+ * (実機で確認済みの失敗。同じ方式へ戻さないこと)。 */
 /* 自前キーボード (ui/mobile-keyboard.ts) は開いている間 --mkb-height (px) を document 直下に
  * 設定する。下部バーはそのぶん上へ逃がさないとキーボードに隠れて押せなくなるため、bottom を
  * この変数ぶん足す。閉じているとき/他配置の未設定時は 0px にフォールバックする。 */
 .mc-root[data-pos="bottom"] {
   /* env(safe-area-inset-*) だけでは Android のナビゲーションバーぶんが 0 になる
    * (mobile-main.css の --sysbar-inset-* 定義コメント参照)。 */
-  --mc-peek: calc(var(--sysbar-inset-bottom) + 34px);
+  --mc-peek: calc(34px + var(--sysbar-inset-bottom));
   bottom: var(--mkb-height, 0px);
   flex-direction: column;
   transform: translateY(calc(100% - var(--mc-peek)));
 }
 .mc-root[data-pos="top"] {
-  --mc-peek: calc(var(--sysbar-inset-top) + 34px);
+  --mc-peek: calc(34px + var(--sysbar-inset-top));
   top: 0;
   flex-direction: column-reverse;
   transform: translateY(calc(-100% + var(--mc-peek)));
 }
 .mc-root[data-pos="left"] {
-  --mc-peek: calc(var(--sysbar-inset-left) + 28px);
+  --mc-peek: calc(28px + var(--sysbar-inset-left));
   left: 0;
   flex-direction: row-reverse;
   transform: translateX(calc(-100% + var(--mc-peek)));
 }
 .mc-root[data-pos="right"] {
-  --mc-peek: calc(var(--sysbar-inset-right) + 28px);
+  --mc-peek: calc(28px + var(--sysbar-inset-right));
   right: 0;
   flex-direction: row;
   transform: translateX(calc(100% - var(--mc-peek)));
+}
+
+/* 格納時にハンドルを画面端から浮かせるための「空白」。ハンドルのパネル側へ inset ぶんの
+ * margin を置くことで、見える帯が「ハンドル + 空白」になる。これが無いと peek の超過ぶんに
+ * パネル本体が入り込む (上のコメント参照)。
+ *
+ * 格納時 (:not(.expanded)) だけに効かせる。展開時まで残すとハンドルがバー本体から離れて
+ * 浮いて見える (実機で指摘を受けた)。peek/translate は展開時に使わない (translate(0,0) に
+ * なる) ので、状態で高さが変わっても格納位置の計算は破綻しない。 */
+.mc-root[data-pos="bottom"]:not(.expanded) .mc-handle {
+  margin-bottom: var(--sysbar-inset-bottom);
+}
+.mc-root[data-pos="top"]:not(.expanded) .mc-handle {
+  margin-top: var(--sysbar-inset-top);
+}
+.mc-root[data-pos="left"]:not(.expanded) .mc-handle {
+  margin-left: var(--sysbar-inset-left);
+}
+.mc-root[data-pos="right"]:not(.expanded) .mc-handle {
+  margin-right: var(--sysbar-inset-right);
 }
 
 .mc-root.expanded {
@@ -123,8 +158,9 @@
   box-shadow: 0 2px 10px var(--shadow);
   pointer-events: auto;
 }
-/* safe-area ぶんは帯の内側ではなく外側の余白として確保する (ピル自体の大きさは一定に保つ)。
- * 配置に応じた「画面の外側」の辺だけに付ける。 */
+/* 展開時に本体がシステムバー/画面端へ食い込まないための余白。配置に応じた「画面の外側」の
+ * 辺だけに付ける (ピル自体の大きさは一定に保つ)。格納時の逃げは .mc-handle の margin 側で
+ * 別に確保しており、役割が違うので二重取りにはならない。 */
 .mc-root[data-pos="bottom"] .mc-panel {
   margin-bottom: var(--sysbar-inset-bottom);
 }
