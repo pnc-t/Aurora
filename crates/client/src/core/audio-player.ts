@@ -65,6 +65,9 @@ export class AudioPlayer {
     this.closed = false;
     this.chunkTimestampUs = 0;
     this.nextStartTime = 0;
+    // 前の再生で記録済みでも、次の再生 (再接続) の失敗は改めて残す。
+    // ここで戻さないと 2 回目以降の不具合が無音のまま闇に消える。
+    this.loggedAudioDataError = false;
     if (!this.ctx) {
       this.ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
       this.gain = this.ctx.createGain();
@@ -114,20 +117,60 @@ export class AudioPlayer {
     }
   }
 
+  /**
+   * onAudioData の失敗を 1 度だけログするためのフラグ。デコード出力は 20ms 毎に来るため、
+   * 握りつぶさずログすると client.log が同一メッセージで埋まる (実機で確認済)。
+   */
+  private loggedAudioDataError = false;
+
   /** デコード出力 1 フレームを Web Audio へスケジュールする。 */
   private onAudioData(data: AudioData): void {
     if (this.closed || !this.ctx || !this.gain) {
       data.close();
       return;
     }
+    try {
+      this.writeAudioData(data);
+    } catch (e) {
+      if (!this.loggedAudioDataError) {
+        this.loggedAudioDataError = true;
+        logger.warn("audio frame write failed (このフレーム以降は再生を諦めて破棄する)", e);
+      }
+    } finally {
+      data.close();
+    }
+  }
+
+  /** AudioData を AudioBuffer へコピーし、再生キューへスケジュールする (実処理本体)。 */
+  private writeAudioData(data: AudioData): void {
+    if (!this.ctx || !this.gain) return;
     const frames = data.numberOfFrames;
     const buffer = this.ctx.createBuffer(CHANNELS, frames, SAMPLE_RATE);
-    for (let ch = 0; ch < CHANNELS; ch++) {
-      const channelData = buffer.getChannelData(ch);
-      // AudioData のチャンネル数が host と食い違う場合の保険 (モノラルへフォールバック等)。
-      data.copyTo(channelData, { planeIndex: Math.min(ch, data.numberOfChannels - 1) });
+
+    if (data.format === "f32-planar" || data.format === "s16-planar" || data.format === "u8-planar") {
+      for (let ch = 0; ch < CHANNELS; ch++) {
+        const channelData = buffer.getChannelData(ch);
+        // AudioData のチャンネル数が host と食い違う場合の保険 (モノラルへフォールバック等)。
+        data.copyTo(channelData, { planeIndex: Math.min(ch, data.numberOfChannels - 1) });
+      }
+    } else {
+      // Chromium の AudioDecoder (opus) は "f32" (インターリーブ) を返す。planar ではなく
+      // plane は 0 番の 1 枚のみで、そこに全チャンネル分が [L0,R0,L1,R1,...] の順で詰まっている。
+      // 必要バイト数は決め打ちせず allocationSize() に必ず従う (destination is not large enough
+      // で 1 フレームも再生できなかった実機不具合の再発防止)。
+      const byteLength = data.allocationSize({ planeIndex: 0 });
+      const interleaved = new Float32Array(byteLength / Float32Array.BYTES_PER_ELEMENT);
+      data.copyTo(interleaved, { planeIndex: 0 });
+
+      const srcChannels = data.numberOfChannels;
+      for (let ch = 0; ch < CHANNELS; ch++) {
+        const channelData = buffer.getChannelData(ch);
+        const srcCh = Math.min(ch, srcChannels - 1);
+        for (let i = 0; i < frames; i++) {
+          channelData[i] = interleaved[i * srcChannels + srcCh];
+        }
+      }
     }
-    data.close();
 
     const now = this.ctx.currentTime;
     const queuedMs = (this.nextStartTime - now) * 1000;
