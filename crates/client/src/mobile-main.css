@@ -3,14 +3,14 @@
  * 各ビュー内部の見た目は ui/mobile-launcher.css / ui/mobile-controls.css 側の責務。 */
 
 :root {
-  /* Android の WebView (WebView2 ではなく Chromium ベース) は env(safe-area-inset-*) が
-   * ディスプレイカットアウト (ノッチ) のみを反映し、ステータスバー/ナビゲーションバーの高さを
-   * 含まない (iOS Safari との仕様差)。実機 (ノッチ無しタブレット) では safe-area の値が 0 に
-   * なる一方、ステータスバーは実測約 30 CSS px あり、env() だけに頼るとツールバーが時計/日付や
-   * ナビゲーションバーの下に潜り込む。ネイティブから正確な inset を取る (WindowInsets 等) のは
-   * Kotlin プラグインが gen/android (git 管理外) の再生成で消える/JNI は Activity Context 要で
-   * 未検証、とコストが見合わないため、カットアウト実値とシステムバー相当の下限の大きい方を採る
-   * 固定値で代替する (案A)。操作 UI (mobile-controls) 側だけがこの変数を使う。 */
+  /* Android の WebView が env(safe-area-inset-*) に何を返すかは端末/辺によって異なる。
+   * 実機 (SM-X230 / Android 16 / ノッチ無し) をピクセルで実測したところ **下は 24px 返る**
+   * (ジェスチャーバーぶん) 一方、左右は 0 だった。「Android では常に 0」ではないので、
+   * 値を仮定した設計にしないこと。
+   * とはいえ辺ごとに 0 が返る場合があり、そのままだと操作 UI がシステムバーの下へ潜り込む。
+   * ネイティブから正確な inset を取る (WindowInsets 等) のはコストが見合わない (Kotlin
+   * プラグインは gen/android の再生成で消える / JNI は Activity Context が要る) ため、
+   * 実値とシステムバー相当の下限の大きい方を採る。操作 UI (mobile-controls) 側だけが使う。 */
   --sysbar-inset-top: max(env(safe-area-inset-top), 32px);
   --sysbar-inset-bottom: max(env(safe-area-inset-bottom), 24px);
   /* 左右は実機でノッチが無く env() が 0 のままだと、左右配置のハンドルが画面の最端 (角の
@@ -24,9 +24,12 @@
 #remote-view {
   position: absolute;
   inset: 0;
-  /* env(safe-area-inset-*) は viewport-fit=cover 時のみ意味を持つ (mobile.html の viewport 指定)。 */
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
-    env(safe-area-inset-left);
+  /* env(safe-area-inset-*) は viewport-fit=cover 時のみ意味を持つ (mobile.html の viewport 指定)。
+   * 下だけは 0 にする: ランチャーの下端は .ml-tabbar が占めており、そちらが内側で同じ inset を
+   * 確保しているため、ここでも取ると余白が二重になる。実機ではタブバーの内側 24px と、その下に
+   * 地の色の帯 24px の「空白 2 個」として見えていた。タブバーの背景は画面下端まで伸ばし、
+   * ラベルだけがジェスチャーバーの内側に来る形 (モバイルの下部ナビの通常形) が正しい。 */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
   box-sizing: border-box;
 }
 

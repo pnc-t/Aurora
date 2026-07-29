@@ -32,15 +32,17 @@
 }
 
 /* 下部タブバー: サイドバーの置き換え。アイコン+ラベルを縦積みにし、タップ領域を 56px 確保する。
- * env(safe-area-inset-bottom) はジェスチャーナビゲーション端末でタブが隠れないようにする
- * (#launcher-view 自体は mobile-main.css で safe-area-inset-bottom 分を既にパディングしているが、
- * タブバー内側でも確保しておくとホームインジケータぎりぎりに文字が来ない)。 */
+ * ジェスチャーバーぶんの余白 env(safe-area-inset-bottom) は、バーではなく **タブ自身** が持つ。
+ * バー側の padding にすると、タップ時のハイライト (.ml-tab:active の背景) がボタンの箱までしか
+ * 広がらず、バー下端の余白ぶんだけ光らない帯が残る (実機で指摘を受けた)。タブ側の padding なら
+ * ボタンの箱が下端まで届いてハイライトが最後まで塗られ、アイコン/ラベルはパディングぶん押し
+ * 上げられるので位置は変わらない。
+ * #launcher-view 側 (mobile-main.css) は下パディングを持たない。両方で取ると余白が二重になる。 */
 .ml-tabbar {
   display: flex;
   flex-shrink: 0;
   border-top: 1px solid var(--panel-border);
   background: var(--sidebar);
-  padding-bottom: env(safe-area-inset-bottom);
 }
 .ml-tab {
   flex: 1;
@@ -49,7 +51,12 @@
   align-items: center;
   justify-content: center;
   gap: 2px;
-  min-height: 56px;
+  /* 高さはタップ領域 56px + ジェスチャーバーぶんを足して確保するが、padding では取らない。
+   * padding-bottom にすると中身がそのぶん上へ寄り、下だけ余白が大きい非対称な見た目になる
+   * (実機で指摘を受けた)。min-height だけ増やして justify-content: center に任せると、中身が
+   * バー全高の中央に来て上下が揃い、かつ箱は下端まで広がるのでタップ時のハイライトも下まで
+   * 塗られる。ラベル下端とジェスチャーバーの間隔もこの高さで確保できている。 */
+  min-height: calc(56px + env(safe-area-inset-bottom));
   background: transparent;
   border: none;
   color: var(--muted);
