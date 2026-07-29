@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- ダークモード時。既定でも暗い背景向けになるが、values/ 側と同じ指定を明示して
+         「システムのモードによらず常に白アイコン」であることをこの 1 組で読み取れるようにする。 -->
+    <style name="Theme.aurora_client" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>

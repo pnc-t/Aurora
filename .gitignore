@@ -1,7 +1,38 @@
 /target
 **/node_modules
 crates/client/dist
-crates/client/src-tauri/gen
+# Tauri のモバイル生成物。原則 git 管理しないが、以下の Android ファイルだけは例外的に追跡する。
+# - themes.xml: システムバーの明暗指定が再生成で消えると、ライトモード端末で時計が黒文字に
+#   なり暗い画面に埋もれ、下端に明るい帯が残る (実機 SM-X230 で確認)。
+# - MainActivity.kt: JNI クリップボード書き込み (setClipboardText) / システムバー配色の
+#   手編集を再生成で失わないため (generated/ 配下の自動生成ファイルとは別物)。
+# ディレクトリ単位で無視すると配下を戻せないため、階層ごとに ! で開けている。
+crates/client/src-tauri/gen/*
+!crates/client/src-tauri/gen/android/
+crates/client/src-tauri/gen/android/*
+!crates/client/src-tauri/gen/android/app/
+crates/client/src-tauri/gen/android/app/*
+!crates/client/src-tauri/gen/android/app/src/
+crates/client/src-tauri/gen/android/app/src/*
+!crates/client/src-tauri/gen/android/app/src/main/
+crates/client/src-tauri/gen/android/app/src/main/*
+!crates/client/src-tauri/gen/android/app/src/main/res/
+crates/client/src-tauri/gen/android/app/src/main/res/*
+!crates/client/src-tauri/gen/android/app/src/main/res/values/
+!crates/client/src-tauri/gen/android/app/src/main/res/values-night/
+crates/client/src-tauri/gen/android/app/src/main/res/values/*
+crates/client/src-tauri/gen/android/app/src/main/res/values-night/*
+!crates/client/src-tauri/gen/android/app/src/main/res/values/themes.xml
+!crates/client/src-tauri/gen/android/app/src/main/res/values-night/themes.xml
+!crates/client/src-tauri/gen/android/app/src/main/java/
+crates/client/src-tauri/gen/android/app/src/main/java/*
+!crates/client/src-tauri/gen/android/app/src/main/java/com/
+crates/client/src-tauri/gen/android/app/src/main/java/com/*
+!crates/client/src-tauri/gen/android/app/src/main/java/com/aurora/
+crates/client/src-tauri/gen/android/app/src/main/java/com/aurora/*
+!crates/client/src-tauri/gen/android/app/src/main/java/com/aurora/remote/
+crates/client/src-tauri/gen/android/app/src/main/java/com/aurora/remote/*
+!crates/client/src-tauri/gen/android/app/src/main/java/com/aurora/remote/MainActivity.kt
 *.log
 .env
 .env.*
