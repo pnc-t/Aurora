@@ -17,26 +17,30 @@ mod secret;
 mod stats;
 
 use net::SessionState;
-#[cfg(desktop)]
 use tauri::Manager;
 
-/// アプリ本体の起動。デスクトップは `main()` から、モバイルは OS が直接この関数を呼ぶ。
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    // ログを `%LOCALAPPDATA%\Aurora\logs\client.<日付>.log` へ日次ローテ (7 世代) + 非ブロッキング
-    // で残す。release は GUI サブシステム (コンソールなし) のため、ファイルに残さないと現地の
-    // 障害を後から調べられない。debug ビルドは加えて stdout にも出す。_guard は run() が返る
-    // (プロセス終了) まで保持する (drop すると以降のログが失われる)。
-    let _guard = aurora_common::logging::init(aurora_common::logging::LogOptions {
+/// ログ初期化。出力先ディレクトリの解決だけプラットフォームで分かれる:
+/// - デスクトップ: 従来通り `common::paths::data_dir()` (`%LOCALAPPDATA%\Aurora\logs`)。
+/// - モバイル: `common::paths::data_dir()` は `$HOME` 前提で Android では解決できず/書けない
+///   (`HOME` 環境変数が無い、あっても書き込み不可) ため、Tauri のプラットフォーム別パス解決
+///   (`app.path().app_log_dir()`) を使う。これには `AppHandle` が要る = `setup()` 内でしか
+///   呼べないため、ログ初期化全体をここまで遅らせている (起動ごく初期・setup 前のログは
+///   この変更で file には残らなくなるが、モバイルでログが一切出ない方が実害が大きいため許容)。
+///
+/// 返す `LogGuard` は呼び出し側が `app.manage()` してプロセス終了までライフタイムを繋ぐこと
+/// (drop すると非ブロッキング writer が止まり以降のログが失われる)。
+fn init_logging(app: &tauri::AppHandle) -> aurora_common::logging::LogGuard {
+    let guard = aurora_common::logging::init(aurora_common::logging::LogOptions {
         file_stem: "client",
         filter: tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "aurora=info".into()),
-        dir: aurora_common::logging::default_log_dir(),
+        dir: resolve_log_dir(app),
         console: cfg!(debug_assertions),
     });
 
     // panic を client.log へ残す (release は WebView/コンソールが無く既定フックの stderr 出力が
-    // 捨てられるため)。既定フックも連鎖させ debug 時の挙動は維持する。
+    // 捨てられるため)。既定フックも連鎖させ debug 時の挙動は維持する。setup() 内で毎回呼ばれる
+    // 関数だが、フック登録自体はプロセスに 1 度でよく、run() は 1 回しか呼ばれない前提。
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!(panic = %info, "client panicked");
@@ -49,6 +53,24 @@ pub fn run() {
         "aurora-client starting"
     );
 
+    guard
+}
+
+/// ログ出力先ディレクトリの解決。デスクトップ/モバイルで方式が異なるため cfg で分ける
+/// ([`init_logging`] のドキュメント参照)。
+#[cfg(desktop)]
+fn resolve_log_dir(_app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    aurora_common::logging::default_log_dir()
+}
+
+#[cfg(not(desktop))]
+fn resolve_log_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_log_dir().ok()
+}
+
+/// アプリ本体の起動。デスクトップは `main()` から、モバイルは OS が直接この関数を呼ぶ。
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
     // モバイルは #[cfg(desktop)] ブロックで再代入しないため mut が不要になる。デスクトップ側の
     // 再代入は必要なので allow で吸収する (cfg ごとの mut 要否を個別に書き分けない)。
     #[allow(unused_mut)]
@@ -123,6 +145,15 @@ pub fn run() {
     }
 
     let builder = builder.manage(SessionState::default());
+
+    // ログ初期化はここ (setup) まで遅らせる: モバイルの出力先解決 (app_log_dir) に
+    // AppHandle が要るため ([`init_logging`] のドキュメント参照)。LogGuard は state として
+    // 管理し、app (= プロセス) の生存期間ぶら下げる (drop すると以降のログが失われる)。
+    let builder = builder.setup(|app| {
+        let guard = init_logging(app.handle());
+        app.manage(guard);
+        Ok(())
+    });
 
     // invoke_handler は `tauri::generate_handler!` がマクロのためチェーン中で条件分岐できず、
     // デスクトップ/モバイルで 2 本のリストを用意する。差分はウィンドウ生成・複数ウィンドウ間の

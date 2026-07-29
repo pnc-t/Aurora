@@ -1,13 +1,20 @@
-//! Aurora のローカル状態ディレクトリ解決 (host / client 共通)。
+//! Aurora のローカル状態ディレクトリ解決 (host / client デスクトップ共通)。
 //!
 //! 秘密ストア・設定・ログ・トポロジ保存など、プロセスが書くローカル状態は全てこの配下に
 //! 置く。解決を 1 箇所に集約するのは、保存先の変更 (アプリ名変更・ポータブル化等) の際に
 //! 一部のファイルだけ旧パスへ取り残されて状態が分裂する事故を防ぐため。
+//!
+//! **Android では使えない**: [`data_dir`] は `$HOME` の存在を前提にしており、Android には
+//! 書き込み可能な `$HOME` が無い (環境変数自体が無いか、あっても書けない)。Android クライアント
+//! は代わりに Tauri のプラットフォーム別パス解決 (`AppHandle::path().app_log_dir()` 等) を
+//! 直接使う (`crates/client/src-tauri/src/lib.rs::resolve_log_dir` 参照)。iOS も未検証だが
+//! 同様に非対応と見なす。
 
 use std::path::PathBuf;
 
-/// Aurora のローカル状態ベースディレクトリ (`%LOCALAPPDATA%\Aurora`、非 Windows は
-/// `~/.local/share/Aurora`) を返す。環境変数が無ければ `None`。
+/// Aurora のローカル状態ベースディレクトリ (`%LOCALAPPDATA%\Aurora`、非 Windows デスクトップ
+/// (Mac/Linux) は `~/.local/share/Aurora`) を返す。環境変数が無ければ `None`。
+/// Android/iOS では意味のあるパスを返さない (モジュール doc 参照)。
 ///
 /// ディレクトリの作成は呼び出し側の責務 (読むだけの経路で余計な作成をしないため)。
 pub fn data_dir() -> Option<PathBuf> {
