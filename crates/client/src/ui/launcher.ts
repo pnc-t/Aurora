@@ -1173,15 +1173,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   function renderHosts(hosts: HostEntry[]): void {
     currentHosts = hosts;
     if (hosts.length === 0) {
-      // 初回利用者は「何をどこに入れればいいか」で詰まるため、一行ヒントではなく
-      // 手順ガイドを出す (.empty-hint は wol-panel と共有のため触らず新クラスにする)。
+      // 手順3行の説教くさいガイドは不評だったため撤廃し、見出し+一行ヒントのみにする
+      // (.empty-hint は wol-panel と共有のため触らず新クラスにする)。
       hostList.innerHTML = `<div class="empty-guide">
+        <div class="empty-guide-icon">${icon("hosts")}</div>
         <div class="empty-guide-title">まだホストがありません</div>
-        <ol class="empty-guide-steps">
-          <li class="empty-guide-step"><span class="empty-guide-badge">1</span><span>操作される PC に Aurora Host をインストール</span></li>
-          <li class="empty-guide-step"><span class="empty-guide-badge">2</span><span>両方の PC を Tailscale で同じ Tailnet に入れる</span></li>
-          <li class="empty-guide-step"><span class="empty-guide-badge">3</span><span>右上の ＋ から IP とパスワードを登録</span></li>
-        </ol>
+        <div class="empty-guide-hint">右上の ＋ からホストを登録できます</div>
       </div>`;
       return;
     }
