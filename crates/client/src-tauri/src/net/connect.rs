@@ -367,20 +367,49 @@ async fn connect_inner(
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
-    // モバイル専用: tcp_reader_loop が clip_apply_tx へ流したリモート適用要求は、デスクトップでは
-    // clipboard アクタースレッドがそのままローカルクリップボードへ書き込むが、モバイルは
-    // arboard 非対応のため誰も消費しない。ここでフロントへ転送するタスクを立てる
-    // (実際の端末クリップボードへの書き込みは mobile-main.ts の navigator.clipboard.writeText)。
-    #[cfg(mobile)]
-    let clip_forward_to_front_task = {
-        let sink_clip = sink.clone();
+    // Android 専用: tcp_reader_loop が clip_apply_tx へ流したリモート適用要求は、デスクトップでは
+    // clipboard アクタースレッドがそのままローカルクリップボードへ書き込むが、Android は
+    // arboard 非対応のため誰も消費しない。ここで JNI 経由の端末クリップボード書き込み
+    // (`mobile_clipboard::write`) を呼ぶタスクを立てる。WebView の navigator.clipboard.writeText
+    // はユーザー操作を伴わない呼び出しを拒否するため使わない (mobile_clipboard 冒頭コメント参照)。
+    // `mobile_clipboard::write` は JNI 経由で ClipboardManager (binder IPC) を叩く同期・
+    // ブロッキング呼び出しなので、tokio ワーカーを塞がないよう呼び出し毎に spawn_blocking へ
+    // 委譲する (CLAUDE.md: tokio::spawn 内で同期 I/O を呼ばない。書き方は save_host_mac 等の
+    // 既存 spawn_blocking に揃える)。
+    // ホストがコピーするたびに来るため、成否ともセッションごとに 1 度だけ log する
+    // (実機で client.log が 9.7MB まで膨れた実績があるため)。
+    #[cfg(target_os = "android")]
+    let mobile_clip_apply_task = {
         let clip_handle_for_apply = clip_handle.clone();
         tokio::spawn(async move {
             let Some(mut apply_rx) = clip_handle_for_apply.take_apply_rx().await else {
                 return;
             };
+            let mut logged = false;
             while let Some(text) = apply_rx.recv().await {
-                sink_clip.send_event(ClientEvent::ClipboardUpdate { text });
+                let res =
+                    tokio::task::spawn_blocking(move || crate::mobile_clipboard::write(&text))
+                        .await;
+                match res {
+                    Ok(Ok(())) => {
+                        if !logged {
+                            logged = true;
+                            tracing::info!("clipboard write from host succeeded");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if !logged {
+                            logged = true;
+                            tracing::warn!(error = %e, "clipboard write from host failed");
+                        }
+                    }
+                    Err(e) => {
+                        if !logged {
+                            logged = true;
+                            tracing::warn!(error = %e, "clipboard write task failed");
+                        }
+                    }
+                }
             }
         })
     };
@@ -613,8 +642,8 @@ async fn connect_inner(
         ctrl_tx,
         file_tx,
         tasks: {
-            // mut は #[cfg(mobile)] の push でのみ使う (デスクトップ build では未使用になる)。
-            #[cfg_attr(not(mobile), allow(unused_mut))]
+            // mut は #[cfg(target_os = "android")] の push でのみ使う (それ以外の build では未使用になる)。
+            #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
             let mut tasks = vec![
                 writer_task,
                 reader_task,
@@ -625,8 +654,8 @@ async fn connect_inner(
                 pong_watchdog_task,
                 udp_watchdog_task,
             ];
-            #[cfg(mobile)]
-            tasks.push(clip_forward_to_front_task);
+            #[cfg(target_os = "android")]
+            tasks.push(mobile_clip_apply_task);
             tasks
         },
         clipboard: clip_handle,

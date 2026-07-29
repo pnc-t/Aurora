@@ -116,12 +116,6 @@ pub enum ClientEvent {
     VideoCodecChanged {
         codec: String,
     },
-    /// モバイル専用: ホスト→端末のクリップボード適用要求。デスクトップは arboard が直接
-    /// ローカルクリップボードへ書き込むため構築されない (net/connect.rs 参照)。
-    #[cfg(mobile)]
-    ClipboardUpdate {
-        text: String,
-    },
 }
 
 /// TS の `["h264","hevc","av1"]` のような小文字文字列を `VideoCodec` へ変換する

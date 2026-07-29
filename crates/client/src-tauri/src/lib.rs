@@ -8,10 +8,16 @@
 // 新たに追加する unsafe ブロックには直上に `// SAFETY:` を必須化する (規約の機械強制)。
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+// JNI 共有基盤 (JNI_OnLoad は 1 プロセスに 1 つしかエクスポートできないため集約) と
+// クリップボード書き込みは Android 専用 (jni クレート自体が Android ターゲットのみの依存)。
+#[cfg(target_os = "android")]
+mod android_jni;
 mod audio;
 mod config;
 mod keyboard_grab;
 mod log;
+#[cfg(target_os = "android")]
+mod mobile_clipboard;
 mod net;
 mod secret;
 mod stats;

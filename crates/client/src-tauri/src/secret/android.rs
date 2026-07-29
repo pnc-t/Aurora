@@ -8,36 +8,18 @@
 //!     Java スレッドではないため、呼び出しの都度 `attach_current_thread` する。
 //! (c) `setUserAuthenticationRequired` は呼ばない: デスクトップ側 DPAPI と同じく無操作で
 //!     復号できる設計とするため (指紋/PIN 認証を毎回要求しない)。
-//! (d) `ndk_context` クレートは使わない: `android_context()` は未初期化だと `expect` で
-//!     panic する実装であり、Tauri v2 のスタック (tao/wry) はこれを初期化しない
-//!     (`ndk-glue` 系のみが初期化するが Tauri は使っていない)。代わりに自前の `JNI_OnLoad`
-//!     で `JavaVM` を受け取ってキャッシュする (Keystore 操作は `Context` を必要とせず
-//!     `JavaVM` だけで足りる)。
-
-use std::sync::atomic::{AtomicPtr, Ordering};
+//! (d) `JavaVM` の取得・attach は `crate::android_jni` に集約されている。`JNI_OnLoad` は
+//!     プロセスに 1 つしかエクスポートできないため、ここでは定義せず共有モジュールへ委譲する
+//!     (`mobile_clipboard` も同じ経路を使う)。
 
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JObject, JObjectArray, JValue};
 
+use crate::android_jni::{clear_pending_exception, with_env};
+
 const ALIAS: &str = "aurora_secret";
 /// 保存フォーマットのバージョン。`[version][iv_len][iv][ciphertext]`。
 const FORMAT_VERSION: u8 = 1;
-
-/// `JNI_OnLoad` でキャッシュする `JavaVM`。Android では `System.loadLibrary` がこの
-/// cdylib を読み込んだ時点で JVM から一度だけ呼ばれるため、以降はここから再取得する。
-static JAVA_VM: AtomicPtr<jni::sys::JavaVM> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Android の JVM がこの cdylib をロードした際に一度だけ呼ぶエントリポイント。
-/// `ndk_context` (Tauri のスタックでは初期化されない) の代わりに、ここでしか安全に
-/// `JavaVM` を受け取れないため専用のエクスポート関数として実装する。
-#[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(
-    vm: *mut jni::sys::JavaVM,
-    _reserved: *mut std::ffi::c_void,
-) -> jni::sys::jint {
-    JAVA_VM.store(vm, Ordering::Release);
-    jni::sys::JNI_VERSION_1_6
-}
 
 pub(super) fn protect(plain: &[u8]) -> Result<Vec<u8>, String> {
     encrypt(plain)
@@ -47,35 +29,10 @@ pub(super) fn unprotect(enc: &[u8]) -> Option<Vec<u8>> {
     decrypt(enc).ok()
 }
 
-/// JNI 呼び出しが例外を投げた場合、pending exception を残すと以降の JNI 呼び出しが
-/// 全て壊れるため、エラー化する前に必ずクリアする。
-fn clear_pending_exception(env: &mut JNIEnv) {
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_clear();
-    }
-}
-
 fn jni_err(env: &mut JNIEnv, context: &str, e: jni::errors::Error) -> String {
     clear_pending_exception(env);
     // 値そのもの (鍵/パスワード) は含めず事象のみ記す。
     format!("android keystore: {context} failed: {e}")
-}
-
-/// `JavaVM` を取得してカレントスレッドに attach し、`f` に `JNIEnv` を渡して実行する。
-/// `AttachGuard` は `JavaVM` を借用するため、両者のライフタイムをこの関数内に閉じ込める。
-fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T, String>) -> Result<T, String> {
-    let vm_ptr = JAVA_VM.load(Ordering::Acquire);
-    if vm_ptr.is_null() {
-        return Err("android keystore: JavaVM が未初期化です (JNI_OnLoad 未呼び出し)".into());
-    }
-    // SAFETY: vm_ptr は JNI_OnLoad で JVM から渡された JavaVM* をそのまま保持したものなので、
-    // 現在のプロセスで有効なポインタであることが保証されている。
-    let vm = unsafe { jni::JavaVM::from_raw(vm_ptr) }
-        .map_err(|e| format!("android keystore: JavaVM の取得に失敗: {e}"))?;
-    let mut guard = vm
-        .attach_current_thread()
-        .map_err(|e| format!("android keystore: スレッド attach に失敗: {e}"))?;
-    f(&mut guard)
 }
 
 /// Keystore に `ALIAS` の鍵があればそれを、無ければ生成してから返す。

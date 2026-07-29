@@ -30,9 +30,7 @@ export type ClientEvent =
   | { kind: "file_result"; id: number; ok: boolean; message: string }
   | { kind: "file_progress"; id: number; done: number; total: number }
   | { kind: "video_codec_changed"; codec: CodecId }
-  | { kind: "disconnected"; reason: string }
-  /** モバイル専用: ホスト→端末のクリップボード適用要求 (デスクトップは発火しない)。 */
-  | { kind: "clipboard_update"; text: string };
+  | { kind: "disconnected"; reason: string };
 
 export type InputEvent =
   | { MouseMove: { x: number; y: number } }
