@@ -689,15 +689,13 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
     currentHosts = hosts;
     hostList.replaceChildren();
     if (hosts.length === 0) {
+      // 手順3行の説教くさいガイドは不評だったため撤廃し、見出し+一行ヒントのみにする。
       const div = document.createElement("div");
       div.className = "empty-guide";
       div.innerHTML = `
+        <div class="empty-guide-icon">${icon("hosts")}</div>
         <div class="empty-guide-title">まだホストがありません</div>
-        <ol class="empty-guide-steps">
-          <li class="empty-guide-step"><span class="empty-guide-badge">1</span><span>操作される PC に Aurora Host をインストール</span></li>
-          <li class="empty-guide-step"><span class="empty-guide-badge">2</span><span>両方の端末を Tailscale で同じ Tailnet に入れる</span></li>
-          <li class="empty-guide-step"><span class="empty-guide-badge">3</span><span>右上の ＋ から IP とパスワードを登録</span></li>
-        </ol>`;
+        <div class="empty-guide-hint">右上の「追加」からホストを登録できます</div>`;
       hostList.appendChild(div);
       return;
     }
