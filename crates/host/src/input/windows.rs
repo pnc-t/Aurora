@@ -2,6 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use aurora_common::proto::{InputEvent, MouseButton};
+use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
@@ -10,7 +11,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
 
 use super::{DisplayGeom, InputInjector};
@@ -106,13 +108,24 @@ impl InputInjector for WinInjector {
                 })
             }
             InputEvent::MouseMoveRelative { dx, dy } => {
-                // ポインタロック中の相対移動。ABSOLUTE を付けず MOUSEEVENTF_MOVE のみ。
-                // 注: Windows のポインタ加速がかかり 1:1 にはならない (MVP では許容)。
+                // 相対移動も「現在位置 + 差分」の絶対座標に直してから注入する。
+                // MOUSEEVENTF_MOVE 単体 (ABSOLUTE 無し) だと OS のポインタ速度と「ポインターの
+                // 精度を高める」(既定 ON の加速) が掛かり、送った量と実際の移動量が一致しない。
+                // クライアントは自前で描くカーソルを指の移動量ぶん動かすため、加速が入ると
+                // 動かすほど両者がずれていく (モバイルの相対追従で実測。速度依存の係数なので
+                // クライアント側の補正では合わせられない)。絶対座標なら OS の加工を受けない。
+                let mut pt = POINT::default();
+                // SAFETY: 出力先は自前のスタック変数。失敗時は Err が返るだけで副作用は無い。
+                unsafe { GetCursorPos(&mut pt) }?;
+                let abs_x = (pt.x + dx).clamp(self.vx, self.vx + self.vw - 1);
+                let abs_y = (pt.y + dy).clamp(self.vy, self.vy + self.vh - 1);
+                let cx = ((abs_x - self.vx) as i64 * 65535 / (self.vw as i64 - 1).max(1)) as i32;
+                let cy = ((abs_y - self.vy) as i64 * 65535 / (self.vh as i64 - 1).max(1)) as i32;
                 let mi = MOUSEINPUT {
-                    dx,
-                    dy,
+                    dx: cx,
+                    dy: cy,
                     mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time: 0,
                     dwExtraInfo: 0,
                 };
