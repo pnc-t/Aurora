@@ -38,8 +38,24 @@ type Pt = { x: number; y: number };
 type ClickButton = "Left" | "Middle" | "Right";
 
 // タップ判定のしきい値 (core/touch-input.ts の TAP_MAX_MS/MOVE_THRESHOLD_PX と同じ値)。
+// スティックのタップと 2 本指タップ (右クリック) の判定に使う。
 const TAP_MAX_MS = 300;
 const MOVE_THRESHOLD_PX = 10;
+// パッド面の 1 本指タップだけは上記より緩い値を使う。実機評価で「タップしても最初のタッチが
+// 反応せずタップ&ドラッグに入れない」となったため。指を置いて離すまでは 300ms を超えやすく、
+// 小さなパッド面では指も 10px 程度は滑るので、そのままだとクリックも送られず「直前のタップ」
+// としても記録されず (= タップ&ドラッグの起点が永久に作れない) という二重の失敗になっていた。
+const PAD_TAP_MAX_MS = 450;
+const PAD_TAP_MOVE_MAX_PX = 14;
+// タップ&ドラッグ (laptop のタッチパッドと同じ「タップ直後に触れっぱなしでドラッグ」) の判定は
+// 「1回目のタップを離してから2回目に触れ直すまでの猶予」だけで行う。Windows の精密タッチパッドが
+// ダブルクリック速度 (既定 500ms) でこれを判定していることに揃えた値。
+// **位置のしきい値は意図的に持たない**: 物理タッチパッドは 2 回目の接地がパッド上のどこでも
+// よく、同じ場所を要求するのは画面を直接触るダブルタップ (core/touch-input.ts の
+// DBLTAP_MAX_MOVE_PX) の作法。実機の指の動きを CDP で実測したところ、2 回目の接地は 1 回目から
+// 31〜34px ずれる試行が多く、30px 制限では半数が落ちていた (幅 164px のパッドで 30px 以内は
+// 厳しすぎる)。時間だけで判定すれば「タップしてから普通の速さで触れ直す」が確実に成立する。
+const TAPDRAG_GAP_MAX_MS = 500;
 // 2 本指ホイールの px→ノッチ換算。core/touch-input.ts の WHEEL_PX_PER_NOTCH と揃える。
 const WHEEL_PX_PER_NOTCH = 100;
 // スティックモードの土台半径に対する不感帯の比率。指を置いただけで動き出さないようにする。
@@ -282,14 +298,30 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
   let singleLast: Pt = { x: 0, y: 0 };
   let singleStartTime = 0;
   let singleMoved = false;
+  // タップ&ドラッグ (トラックパッドモードのみ): 直前のタップから TAPDRAG_GAP_MAX_MS 以内に
+  // 触れ直したら、その場で左ボタンを押して離すまで保持する。位置は見ない (定数のコメント参照)。
+  let tapDragActive = false;
+  let lastPadTapTime = 0;
 
   let multiActive = false;
   let multiIds: [number, number] | null = null;
+  let multiStartTime = 0;
+  let multiStartMid: Pt = { x: 0, y: 0 };
   let multiLastMid: Pt = { x: 0, y: 0 };
+  let multiMoved = false;
   let wheelAccX = 0;
   let wheelAccY = 0;
 
+  /** タップドラッグ中に保持している左ボタンを強制的に離す (consumeOnce は呼ばない。
+   *  clickReleasers と同じ理由: 押しっぱなし解消が目的で、通常のクリック確定ではないため)。 */
+  function releaseTapDrag(): void {
+    if (!tapDragActive) return;
+    tapDragActive = false;
+    opts.sendInput({ MouseButton: { button: "Left", down: false } });
+  }
+
   function abortSingle(): void {
+    releaseTapDrag();
     singleActive = false;
     singleId = null;
     singleMoved = false;
@@ -509,16 +541,30 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
           if (padMode === "stick") {
             startStick(id);
           } else {
+            const now = performance.now();
+            // 直前のタップから TAPDRAG_GAP_MAX_MS 以内の touchstart なら、触れた場所を問わず
+            // タップ&ドラッグ (laptop のタッチパッドと同じ)。その場で左ボタンを押し、離すまで
+            // 保持する。3回目以降が連鎖してドラッグにならないよう判定に使ったら即クリアする
+            // (core/touch-input.ts の dblDrag 判定と同じ考え方)。
+            const isTapDrag = lastPadTapTime > 0 && now - lastPadTapTime <= TAPDRAG_GAP_MAX_MS;
             singleActive = true;
             singleId = id;
             singleStart = pt;
             singleLast = pt;
-            singleStartTime = performance.now();
+            singleStartTime = now;
             singleMoved = false;
+            if (isTapDrag) {
+              lastPadTapTime = 0;
+              tapDragActive = true;
+              opts.sendInput({ MouseButton: { button: "Left", down: true } });
+            } else {
+              tapDragActive = false;
+            }
           }
         }
       } else if (padTouches.size === 2) {
-        // 1本指操作の途中で2本目が触れたら、タップ/クリックを誤発火させないよう打ち切る。
+        // 1本指操作の途中で2本目が触れたら、タップ/クリックを誤発火させないよう打ち切る
+        // (タップドラッグ中なら押しっぱなしの左ボタンも abortSingle 内で必ず離す)。
         if (padMode === "stick") abortStickTouch();
         else abortSingle();
         const ids = Array.from(padTouches.keys()) as [number, number];
@@ -526,7 +572,11 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         multiIds = ids;
         const p1 = padTouches.get(ids[0]);
         const p2 = padTouches.get(ids[1]);
-        multiLastMid = p1 && p2 ? midpoint(p1, p2) : { x: 0, y: 0 };
+        const mid = p1 && p2 ? midpoint(p1, p2) : { x: 0, y: 0 };
+        multiStartMid = mid;
+        multiLastMid = mid;
+        multiStartTime = performance.now();
+        multiMoved = false;
         wheelAccX = 0;
         wheelAccY = 0;
       }
@@ -547,6 +597,13 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
         const p2 = padTouches.get(multiIds[1]);
         if (!p1 || !p2) return;
         const mid = midpoint(p1, p2);
+        // 中点が MOVE_THRESHOLD_PX 以上動いたら、ホイールへ確定したジェスチャとして扱い
+        // 2本指タップ=右クリック (onPadTouchEnd) を送らせない (core/touch-input.ts の
+        // endMulti/multiMoved と同じ判定規則)。
+        const midMoved = Math.hypot(mid.x - multiStartMid.x, mid.y - multiStartMid.y);
+        if (!multiMoved && midMoved >= MOVE_THRESHOLD_PX) {
+          multiMoved = true;
+        }
         updateWheel(mid);
         multiLastMid = mid;
       } else if (padMode === "stick" && stickTouchId !== null) {
@@ -562,7 +619,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
           opts.sendInput({ MouseMoveRelative: { dx, dy } });
         }
         singleLast = cur;
-        if (Math.hypot(cur.x - singleStart.x, cur.y - singleStart.y) >= MOVE_THRESHOLD_PX) {
+        if (Math.hypot(cur.x - singleStart.x, cur.y - singleStart.y) >= PAD_TAP_MOVE_MAX_PX) {
           singleMoved = true;
         }
       }
@@ -577,6 +634,14 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
 
     if (multiActive && multiIds) {
       if (endedIds.includes(multiIds[0]) || endedIds.includes(multiIds[1])) {
+        const duration = performance.now() - multiStartTime;
+        // 2本指タップ=右クリック。トラックパッドモードのみ (スティックモードでは仕様どおり
+        // 有効にしない)。ホイールへ確定済み (multiMoved) のジェスチャでは送らない。
+        if (padMode === "pad" && !cancelled && !multiMoved && duration < TAP_MAX_MS) {
+          opts.sendInput({ MouseButton: { button: "Right", down: true } });
+          opts.sendInput({ MouseButton: { button: "Right", down: false } });
+          opts.mods.consumeOnce();
+        }
         multiActive = false;
         multiIds = null;
         wheelAccX = 0;
@@ -585,13 +650,25 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
     } else if (padMode === "stick" && stickTouchId !== null && endedIds.includes(stickTouchId)) {
       endStick(cancelled);
     } else if (singleActive && singleId !== null && endedIds.includes(singleId)) {
-      const duration = performance.now() - singleStartTime;
-      // 移動量 10px 未満かつ 300ms 未満で離した場合だけタップ=左クリックとして扱う。
-      if (!cancelled && !singleMoved && duration < TAP_MAX_MS) {
-        opts.sendInput({ MouseButton: { button: "Left", down: true } });
+      if (tapDragActive) {
+        // タップドラッグ中に指を離した (touchcancel でも): 保持していた左ボタンを必ず離す。
+        tapDragActive = false;
         opts.sendInput({ MouseButton: { button: "Left", down: false } });
-        // L/M/R ボタンの release と同じ理由: once 状態の修飾キーをこのタップへ適用して消費する。
         opts.mods.consumeOnce();
+      } else {
+        const duration = performance.now() - singleStartTime;
+        // 移動量 PAD_TAP_MOVE_MAX_PX 未満かつ PAD_TAP_MAX_MS 未満で離した場合だけタップ=
+        // 左クリックとして扱う。
+        if (!cancelled && !singleMoved && duration < PAD_TAP_MAX_MS) {
+          opts.sendInput({ MouseButton: { button: "Left", down: true } });
+          opts.sendInput({ MouseButton: { button: "Left", down: false } });
+          // L/M/R ボタンの release と同じ理由: once 状態の修飾キーをこのタップへ適用して消費する。
+          opts.mods.consumeOnce();
+          // タップ&ドラッグ判定用に、このタップの終了時刻を憶えておく。ドラッグとして消費した
+          // 直後 (isTapDrag 成立時) は 3 回目の連鎖を防ぐため上の touchstart 側で既にクリア済み、
+          // ここに来るのは純粋な単発タップのときだけ。
+          lastPadTapTime = performance.now();
+        }
       }
       abortSingle();
     }
@@ -628,6 +705,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       // 押しっぱなしが残ると実害が出るため、非表示にする瞬間に必ず解除する。
       // スティックの rAF ループも、非表示のまま回り続けないようここで必ず止める。
       abortStickTouch();
+      abortSingle(); // タップドラッグ中の左ボタン保持もここで必ず離す。
       for (const release of clickReleasers) release();
       opts.mods.releaseAll();
     },
