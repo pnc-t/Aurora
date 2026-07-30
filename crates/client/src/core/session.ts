@@ -148,6 +148,10 @@ export class Session {
   // toolbar 再同期用に保持する接続情報。
   private connLabel = "";
   private audioAvailable = false;
+  // ミュートの現在値。ツールバー UI 側にしか状態が無いと、syncSharedUi での復元時に必ず
+  // 未ミュートへ戻ってしまう (モバイルは activate() 経由の syncSharedUi が唯一の初期化経路の
+  // ため、ミュートしても再接続で毎回解除される実機バグの原因になっていた)。
+  private audioMuted = false;
   // effectiveSettings で接続時に上書きされるが、初期値も既定設定 (core/ipc.ts) に揃えておく。
   private videoFps = DEFAULT_SETTINGS.fps;
   private videoMbps = DEFAULT_SETTINGS.max_mbps;
@@ -390,6 +394,7 @@ export class Session {
     this.host.toast(this, maxHeight === 0 ? "解像度: フル" : `解像度: ${maxHeight}p`);
   }
   setAudioMuted(muted: boolean): void {
+    this.audioMuted = muted;
     void setAudioMuted(this.id, muted);
     this.host.toast(this, muted ? "音声ミュート" : "音声ミュート解除");
   }
@@ -460,7 +465,11 @@ export class Session {
     tb.setConnected(true, this.host.getSettings().toolbar_pinned);
     tb.setDisplays(this.toolbarDisplayList(), this.currentDisplay?.id);
     tb.setConnLabel(this.connLabel);
-    tb.setAudioAvailable(this.audioAvailable);
+    // ミュートと再生音量も必ず復元する。モバイルは activate() が start() の後に来るため
+    // onHostInfo の `if (this.active)` ブロックが初回接続では丸ごと飛び、この syncSharedUi が
+    // 唯一の初期化経路になる。ここで渡さないとミュートは解除・音量は 100% に戻ってしまう。
+    tb.setAudioAvailable(this.audioAvailable, this.audioMuted);
+    tb.setAudioVolume(this.host.getSettings().audio_volume);
     tb.setClipboardSyncState(this.clipboardSync);
     tb.setVideoParams(this.videoFps, this.videoMbps);
     tb.setCaptureToggled(this.input.isCaptured());
@@ -792,7 +801,8 @@ export class Session {
       void setFileSharing(this.id, true).catch((e) => logger.warn("setFileSharing failed", e));
     }
     // 接続時に音声をミュートで始める設定なら、ホストへも初期状態として送る (ツールバー表示は
-    // 下の setAudioAvailable(initialMuted) 側で揃える)。
+    // 下の setAudioAvailable(initialMuted) / syncSharedUi 側で揃える)。
+    this.audioMuted = settings.audio_muted;
     if (settings.audio_muted) {
       void setAudioMuted(this.id, true).catch((e) => logger.warn("setAudioMuted failed", e));
     }

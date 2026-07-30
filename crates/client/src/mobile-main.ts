@@ -330,7 +330,12 @@ const controls: MobileControlsHandle = mountMobileControls({
   onSelectDisplay: (d) => session?.switchDisplay(d),
   onResetZoom: () => touchInput.resetZoom(),
   onTogglePad: () => setPadVisible(!padVisible),
-  onToggleMute: (muted) => session?.setAudioMuted(muted),
+  onToggleMute: (muted) => {
+    session?.setAudioMuted(muted);
+    // 保存しないと再接続のたびに解除される (デスクトップのツールバーは保存しない挙動のまま。
+    // あちらの audio_muted はランチャー設定「接続時にミュートで始める」として使われている)。
+    updateSettings({ audio_muted: muted });
+  },
   onSetVolume: (volume) => {
     audioPlayer.setVolume(volume);
     updateSettings({ audio_volume: volume });
