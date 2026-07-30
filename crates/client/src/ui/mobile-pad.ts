@@ -44,10 +44,10 @@ const MOVE_THRESHOLD_PX = 10;
 const WHEEL_PX_PER_NOTCH = 100;
 // スティックモードの土台半径に対する不感帯の比率。指を置いただけで動き出さないようにする。
 const STICK_DEADZONE_RATIO = 0.12;
-// スティック最大速度 [px/秒] (デッドゾーン外の正規化量が 1 のとき)。
-const STICK_MAX_SPEED = 1400;
-// 傾け始めは細かく、大きく傾けると素早く動けるようにするための速度カーブの指数。
-const STICK_SPEED_EXP = 1.8;
+// スティック最大速度 [px/秒] (デッドゾーン外の正規化量が 1 のとき)。傾き量に比例 (線形)。
+// 以前は指数 1.8 の加速カーブだったが、実機で外周付近の急加速が狙った位置で止められず
+// 使いにくいとの評価だったため線形にした (最大速度も 1400→1000 に下げて全体を落ち着かせた)。
+const STICK_MAX_SPEED = 1000;
 // パッド面の余白 (px)。スティック半径をこの分だけ内側に取り、土台が枠に接しないようにする。
 const STICK_EDGE_MARGIN = 6;
 
@@ -406,7 +406,7 @@ export function mountMobilePad(opts: MobilePadOpts): MobilePadHandle {
       stickVY = 0;
       return;
     }
-    const speed = STICK_MAX_SPEED * Math.pow(n, STICK_SPEED_EXP);
+    const speed = STICK_MAX_SPEED * n;
     stickVX = ux * speed;
     stickVY = uy * speed;
   }
