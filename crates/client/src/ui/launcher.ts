@@ -308,8 +308,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               <div class="setting-card">
               <div class="setting-row">
                 <div class="s-meta">
-                  <div class="s-title">接続時に音声をミュート</div>
-                  <div class="s-desc">接続直後の音声をミュートで始める。ツールバーからいつでも解除できる</div>
+                  <div class="s-title">音声をミュート</div>
+                  <div class="s-desc">接続直後の音声をミュートで始める。ツールバーで切り替えるとここにも反映され、次の接続へ引き継がれる</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-audio-muted" /><span class="slider"></span></label>
               </div>
