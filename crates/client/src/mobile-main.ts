@@ -22,6 +22,7 @@ import {
   loadSettings,
   saveSettings,
   sendInput,
+  setCursorOverlay,
   stageSession,
   type ClientSettings,
   type DisplayDto,
@@ -308,6 +309,12 @@ function setPadVisible(on: boolean): void {
   // 操作用キーボードはコントローラに属する UI (パッドの修飾キーボタンから開く) なので、
   // コントローラを隠したまま操作用キーボードだけ残すと閉じる出口が無くなる。
   if (!on) keyboard.close();
+  // コントローラ (スティック/パッド) は MouseMoveRelative で動かすため、ホストの実カーソル位置が
+  // クライアント側からは分からない (DXGI は映像にカーソルを含めない)。表示中だけホスト側合成
+  // (set_cursor_overlay) を ON にして見えるようにする。直接タップ時はタップ位置=着地点で自明な
+  // ので焼き込まない。この設定は全クライアント共有のため、他に接続中のデスクトップクライアントで
+  // カーソルが二重に見える影響もコントローラ表示中だけに抑える。
+  if (session) void setCursorOverlay(session.id, on).catch((e) => logger.warn("setCursorOverlay failed", e));
 }
 
 // --- 下部操作バー ---
