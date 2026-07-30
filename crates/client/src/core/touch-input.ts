@@ -4,6 +4,7 @@
 // 全ハンドラで e.preventDefault() して抑止しないと Input 側と二重送信になる。
 
 import { type InputEvent } from "./ipc";
+import { icon } from "../ui/icons";
 
 type DisplaySize = { width: number; height: number };
 
@@ -20,14 +21,20 @@ export type TouchInputOpts = {
 
 // タップ/長押し判定のしきい値。
 const TAP_MAX_MS = 300;
-// 長押しでメニューが開くまでの時間。350ms 仕様は実機評価で「メニューが出るまでの猶予が
-// 短い」と評価されたため、500ms へ戻した。
-const LONG_PRESS_MS = 500;
+// 長押しでメニューが開くまでの時間。500ms は実機評価で「なぞっている途中で一瞬止まった
+// だけでメニューが開いてしまう」と評価されたため、700ms へ緩めた。
+const LONG_PRESS_MS = 700;
 const MOVE_THRESHOLD_PX = 10;
 // 長押しタイマーの再武装判定に使う移動量のしきい値。これが無いと指の微振動 (touchmove が
 // 1px 未満の揺れでも発火する) のたびにタイマーが張り直され、実質的に長押しが永久に成立
-// しなくなる。
-const SETTLE_JITTER_PX = 3;
+// しなくなる。3px では「なぞっている途中の一瞬の静止」もタイマー未再武装のまま長押しへ
+// 成立してしまったため、8px へ緩めて緩やかな移動中は静止と見なさないようにした。
+const SETTLE_JITTER_PX = 8;
+// 進捗リングを出すまでの静止時間。移動のたびに長押しタイマーを張り直す設計上、リングも同時に
+// 出し直すと「なぞっている間ずっと指先にリングが付いてくる」ことになり実機で邪魔だと評価された。
+// 静止してから少し遅らせて出すことで、移動中は一切出さず、意図的に止めたときだけ「もうすぐ
+// メニューが開く」予告として機能させる。リングは残り時間 (LONG_PRESS_MS - RING_DELAY_MS) で埋まる。
+const RING_DELAY_MS = 250;
 // 2本目の指の着地を待つ猶予。ピンチは両指が完全同時には着地しないため、1本目だけが
 // 先に動くと精密モード (MouseMove 送信) へ入ってしまい、直後に2本目が来てピンチへ
 // 切り替わっても送信済み MouseMove は取り消せずカーソルが飛ぶ。2本目の着地は通常
@@ -47,15 +54,19 @@ const ZOOM_MAX = 4.0;
 const MENU_RADIUS_PX = 64;
 // 原点からこの距離未満は無選択 (キャンセル)。
 const MENU_SELECT_MIN_PX = 48;
-// この距離を超えたらメニューを閉じて drag (カーソル追従) へ戻す (案X)。メニュー表示中の
-// 指の移動は「方向でセクタを選ぶ」と「カーソルを動かす」という 2 つの意味を同時には
-// 持てないため、原点からの距離で担当を切り替える: 近距離はセクタ選択、遠距離に抜けたら
-// 選択をやめてカーソル移動チャネルへ切り替える、という設計。
+// この距離を超えたらメニューを閉じて dragRel (相対追従でのカーソル移動) へ抜ける (案X)。
+// メニュー表示中の指の移動は「方向でセクタを選ぶ」と「カーソルを動かす」という 2 つの意味を
+// 同時には持てないため、原点からの距離で担当を切り替える: 近距離はセクタ選択、遠距離に
+// 抜けたら選択をやめてカーソル移動チャネルへ切り替える、という設計。抜けた先が絶対座標の
+// "drag" ではなく "dragRel" なのは、メニュー表示中 host へ MouseMove を送っていないため、
+// 抜けた瞬間に指の絶対位置へ飛ばすとホスト側カーソルが古い位置から指位置へワープして
+// しまうため (それを避けて指の移動量だけを送る)。
 const MENU_EXIT_PX = 120;
-const MENU_ITEMS: { button: MenuButton; label: string; angleDeg: number }[] = [
-  { button: "Left", label: "左", angleDeg: 210 },
-  { button: "Middle", label: "中", angleDeg: 270 },
-  { button: "Right", label: "右", angleDeg: 330 },
+// アイコンはパッドの L/M/R ボタン (ui/mobile-pad.ts) と同じ絵柄で統一する。
+const MENU_ITEMS: { button: MenuButton; iconHtml: string; angleDeg: number }[] = [
+  { button: "Left", iconHtml: icon("mouse-left"), angleDeg: 210 },
+  { button: "Middle", iconHtml: icon("mouse-middle"), angleDeg: 270 },
+  { button: "Right", iconHtml: icon("mouse-right"), angleDeg: 330 },
 ];
 
 // --- ダブルタップ&ホールド (= 左ドラッグ) ---
@@ -121,22 +132,55 @@ export class TouchInput {
   private singleLast: Pt = { x: 0, y: 0 };
   private singleMoved = false;
   private singleLongPressTimer: number | null = null;
+  // 進捗リングを出すための遅延タイマー (RING_DELAY_MS)。長押しタイマーと必ず対で張り/畳みする
+  // (片方だけ残すと、指を離した後にリングだけ遅れて出るという分かりにくい残留になる)。
+  private ringDelayTimer: number | null = null;
+  // 長押しタイマーを最後に張った位置。静止判定はここからの「累積移動量」で行う。直前の
+  // touchmove からの差分で判定すると、ゆっくり動かしている間は 1 イベントあたりの移動量が
+  // しきい値に届かず一度も再武装されないため、動かし続けているのに静止と見なされてリングと
+  // メニューが出てしまう (実機で発生)。
+  private longPressArmPos: Pt = { x: 0, y: 0 };
   // "pending" = まだ短いタップ/ドラッグ/長押しのどれか未確定。移動しきい値超過で "drag" (即カーソル
   // 表示・相対追従) へ、長押しタイマー発火で "menu" (扇メニュー) へ、直前タップからのダブルタップ
   // 判定成立で "dblDrag" (即座に左ボタン押下、指の動きに絶対座標で追従する左ドラッグ) へ遷移する。
   // "dblDrag" は指を離すまで固定 (微調整中にクリック種別が変わると誤操作になるため)。"pending"/
-  // "drag" は長押し成立で "menu" へ、"menu" は MENU_EXIT_PX を超えた移動で "drag" へ戻れる
-  // (案X)。指を離すと必ず "pending" へ戻り、メニューを常駐させない。
-  private singleMode: "pending" | "drag" | "menu" | "dblDrag" = "pending";
+  // "drag" は長押し成立で "menu" へ、"menu" は MENU_EXIT_PX を超えた移動で "dragRel" (host へ
+  // MouseMove を送らず、以後は指の移動量だけを MouseMoveRelative で送る相対追従) へ抜ける
+  // (案X、MENU_EXIT_PX 定義のコメント参照)。dragRel 中も pending/drag と同じ規則で長押し
+  // タイマーを再武装しており、静止すれば dragRel からもメニューを開き直せる (実機評価で
+  // 「一度メニューを出して抜けると指を離すまで二度と開かない」と不評だったため)。ただし
+  // dragRel 由来のときは指位置 (menuOrigin) と表示カーソル位置 (dragRelPos) が食い違って
+  // いる可能性があるため、表示カーソルは動かさない特別扱いをする (onLongPress/menuFromRel
+  // 参照)。指を離すと必ず "pending" へ戻り、メニューを常駐させない。
+  private singleMode: "pending" | "drag" | "menu" | "dblDrag" | "dragRel" = "pending";
   // 現在のカーソル位置 (client 座標) に対応するホスト座標。カーソルが映像外で無効なときは null。
   private singleCursorHost: { x: number; y: number } | null = null;
+  // --- dragRel (相対追従) の状態: メニュー原点からの累積差分でクライアント側のカーソル表示
+  // 位置を描く (host 座標が不明なため、表示位置はここだけの管理になる)。 ---
+  private dragRelPos: Pt = { x: 0, y: 0 };
+  // 直前の touchmove 時点の生の指位置。次の move との差分を MouseMoveRelative として送る基準。
+  private dragRelLastTouch: Pt = { x: 0, y: 0 };
+  // 縮尺で割ったあとの端数 (ホストpx)。切り捨てずに次フレームへ持ち越す。
+  private dragRelAccX = 0;
+  private dragRelAccY = 0;
 
   // --- 扇メニューの状態 (singleMode === "menu" のときのみ意味を持つ) ---
   // 長押しが成立した瞬間の指位置 (singleLast。動いた末に静止した位置で開くため singleStart
   // ではない)。メニュー表示中は指が動いてもこの原点は動かさない (セクタ判定の基準・確定時の
-  // クリック先の両方に使う。原点まで動くと選択方向の意味が壊れる)。
+  // クリック先の両方に使う。原点まで動くと選択方向の意味が壊れる)。ただし menuFromRel が
+  // true のときは「クリック先の座標」の意味を持たない (host 座標を知らないため MouseMove に
+  // は使わない)。その場合はセクタ判定の基準点としてのみ使う。
   private menuOrigin: Pt = { x: 0, y: 0 };
+  // メニュー (と進捗リング) を実際に描く位置。menuOrigin と分けているのは dragRel のため:
+  // 相対追従中は指とカーソルが離れているので、指の位置に描くと「見えているメニューの中心」と
+  // 「実際に押される場所 (= カーソル)」が食い違い、狙っていない場所がクリックされる (実機で
+  // 発生)。描画はカーソル位置、方向 (セクタ) の計算は指の変位、と役割を分ける。通常経路では
+  // カーソルは指の位置にあるため両者は一致する。
+  private menuAnchor: Pt = { x: 0, y: 0 };
   private menuHighlight: MenuButton | null = null;
+  // dragRel から開いた長押しメニューかどうか。true のときは endSingle 確定時に MouseMove を
+  // 送らない (dragRel はホスト座標を知らないため) 等、通常経路と扱いを分ける必要がある。
+  private menuFromRel = false;
 
   // --- ダブルタップ判定用: 直前に完了した単発タップ (pending のまま離れて左クリックを送った
   // タップ) の終了時刻/位置。2 回目の touchstart がこれの近傍・近時刻なら dblDrag へ入る。 ---
@@ -206,7 +250,8 @@ export class TouchInput {
       const angleRad = (def.angleDeg * Math.PI) / 180;
       const item = document.createElement("div");
       item.className = "touch-menu-item";
-      item.textContent = def.label;
+      // アイコンは icons.ts 定数由来の SVG のみ (ホスト由来文字列ではない) なので innerHTML でよい。
+      item.innerHTML = def.iconHtml;
       item.style.left = `${MENU_RADIUS_PX * Math.cos(angleRad)}px`;
       item.style.top = `${MENU_RADIUS_PX * Math.sin(angleRad)}px`;
       menu.appendChild(item);
@@ -282,11 +327,7 @@ export class TouchInput {
 
   /** 進行中の 1本指/2本指ジェスチャを中断する。 */
   private abortGestures(): void {
-    if (this.singleLongPressTimer !== null) {
-      clearTimeout(this.singleLongPressTimer);
-      this.singleLongPressTimer = null;
-    }
-    this.hideRing();
+    this.disarmLongPress();
     // dblDrag 中の detach/切断は、down を送ったまま消えると必ずホスト側に押しっぱなしが残る。
     if (this.singleMode === "dblDrag") this.releaseDblDown();
     this.hideMenu();
@@ -295,6 +336,11 @@ export class TouchInput {
     this.singleMode = "pending";
     this.singleCursorHost = null;
     this.menuHighlight = null;
+    this.menuFromRel = false;
+    this.dragRelPos = { x: 0, y: 0 };
+    this.dragRelLastTouch = { x: 0, y: 0 };
+    this.dragRelAccX = 0;
+    this.dragRelAccY = 0;
     this.hideCursor();
     this.multiActive = false;
     this.multiIds = null;
@@ -392,30 +438,51 @@ export class TouchInput {
     this.singleMoved = false;
     this.singleMode = "pending";
     this.singleCursorHost = null;
-    if (this.singleLongPressTimer !== null) clearTimeout(this.singleLongPressTimer);
-    this.singleLongPressTimer = window.setTimeout(() => this.onLongPress(), LONG_PRESS_MS);
-    this.showRingAt(p);
+    this.armLongPress(p);
   }
 
   private onLongPress(): void {
     this.singleLongPressTimer = null;
-    // pending (静止直後) と drag (動いた末に静止) のどちらからでもメニューへ入れる。
-    // dblDrag/menu からは移行しない (dblDrag は左ドラッグ確定済み、menu は既にメニュー中)。
-    if (!this.singleActive || (this.singleMode !== "pending" && this.singleMode !== "drag")) return;
-    // 映像外 (レターボックスの黒帯) を長押ししてもホストには押せる場所が無い。メニューへ
-    // 入る前に弾く (押せる場所が無い袋小路を作らない)。
-    if (!this.toHostPoint(this.singleLast)) return;
-    this.hideRing();
+    // ガードで弾かれる場合も含め、進捗リングを出しっぱなしにしない (実機で映像外長押し等の
+    // 早期 return 時にリングが残り続けるバグがあったため、ガード判定より前で必ず消す)。
+    this.disarmLongPress();
+    // pending (静止直後)・drag (動いた末に静止)・dragRel (相対追従中に静止) のいずれからでも
+    // メニューへ入れる。dblDrag/menu からは移行しない (dblDrag は左ドラッグ確定済み、menu は
+    // 既にメニュー中のため)。
+    if (
+      !this.singleActive ||
+      (this.singleMode !== "pending" && this.singleMode !== "drag" && this.singleMode !== "dragRel")
+    ) {
+      return;
+    }
+    const cameFromRel = this.singleMode === "dragRel";
+    // 映像外 (レターボックスの黒帯) を長押ししてもホストには押せる場所が無い、というガードは
+    // 通常経路のみ課す。dragRel はホスト座標を使わない (down/up だけを送る) ため、黒帯の上で
+    // 長押ししてもクリックとして有効にしてよい。
+    if (!cameFromRel && !this.toHostPoint(this.singleLast)) return;
+    this.menuFromRel = cameFromRel;
     this.singleMode = "menu";
     // 原点は「最後に動いてから静止した位置」= singleLast に固定する。以後指が動いても
-    // 原点は動かさない (セクタ判定の基準)。
+    // 原点は動かさない (セクタ判定の基準)。dragRel 由来のときはクリック先の座標としては
+    // 使わない (menuOrigin 宣言のコメント参照)。
     this.menuOrigin = this.singleLast;
+    // 描画位置はカーソルの居る場所に合わせる (menuAnchor 宣言のコメント参照)。
+    this.menuAnchor = cameFromRel ? this.dragRelPos : this.singleLast;
     this.menuHighlight = null;
-    // host への MouseMove は送らない (見た目だけ静止位置にカーソルを出す)。host 側は
-    // endSingle の確定時に 1 回だけ動かす (MENU_EXIT_PX を超えて drag へ戻らない限り、
-    // メニュー表示中は MouseMove を止めている設計)。
-    this.showCursorAt(this.singleLast, false, false);
-    this.showMenu(this.singleLast);
+    if (cameFromRel) {
+      // dragRel 由来のときは表示カーソルを指位置へ動かさない。相対追従で dragRelPos の位置に
+      // 既にカーソルが居るため、動かすと「カーソルが飛ぶ」問題 (直前に修正済み) が復活する。
+      this.renderRelativeCursor(this.dragRelPos);
+    } else {
+      // 通常経路ではここで host のカーソルを長押し位置へ合わせる (MouseMove を 1 回送る)。
+      // pending (指を置いたまま動かさず長押し) では MouseMove を一度も送っていないため、
+      // host のカーソルは長押しした場所ではなく以前の位置に残ったままになる。その状態で
+      // メニューを抜けて dragRel の相対移動に入ると、こちらが描く十字と host のカーソルが
+      // ずれたまま平行移動してしまう (実機で発生)。開いた時点で合わせておけば以後は一致する。
+      this.showCursorAt(this.singleLast, false);
+    }
+    // セクタ選択は指の移動方向 (menuOrigin からの変位) で行うが、描くのはカーソル位置。
+    this.showMenu(this.menuAnchor);
   }
 
   private onSingleMove(): void {
@@ -431,26 +498,64 @@ export class TouchInput {
 
     if (this.singleMode === "menu") {
       // メニュー表示中は距離で担当を分ける (案X、MENU_EXIT_PX 定義のコメント参照)。近距離は
-      // セクタ選択、MENU_EXIT_PX を超えたら選択をやめて drag (カーソル移動) へ抜ける。
+      // セクタ選択、MENU_EXIT_PX を超えたら選択をやめて dragRel (相対追従) へ抜ける。
       this.singleLast = cur;
       this.updateMenuHighlight(cur);
       return;
     }
 
-    // pending/drag は、直前位置 (singleLast) から SETTLE_JITTER_PX 以上動くたびに長押し
-    // タイマーを張り直す。これにより「最後に指が動いた時点から LONG_PRESS_MS 静止」で
-    // メニューが開くようになり、長押し前に少し動かしてから止めても開けるようになる
-    // (旧仕様は最初の移動でタイマーを破棄したきり二度と張り直さず、開かなくなっていた)。
-    if (this.singleMode === "pending" || this.singleMode === "drag") {
-      const settleDist = Math.hypot(cur.x - this.singleLast.x, cur.y - this.singleLast.y);
-      if (settleDist >= SETTLE_JITTER_PX) {
-        if (this.singleLongPressTimer !== null) clearTimeout(this.singleLongPressTimer);
-        this.singleLongPressTimer = window.setTimeout(() => this.onLongPress(), LONG_PRESS_MS);
-        // 古い rAF ループを確実に止めてから新しい位置で張り直す (2重ループでの
-        // progress competing を防ぐ)。
-        this.hideRing();
-        this.showRingAt(cur);
+    if (this.singleMode === "dragRel") {
+      // 直前の指位置からの差分だけを相対移動として送る (絶対座標は使わない)。
+      const dxView = cur.x - this.dragRelLastTouch.x;
+      const dyView = cur.y - this.dragRelLastTouch.y;
+      this.dragRelLastTouch = cur;
+      // MouseMoveRelative の単位はホストのピクセルだが、指の移動量は縮小表示された映像上の
+      // 画面ピクセル。縮尺 (contain スケール。ズーム中は transform 込みの矩形から求まる) で
+      // 割ってから送らないと、ホスト側カーソルは画面上で縮尺ぶんしか動かず、こちらが描く
+      // カーソルとの差が動かすほど開いていく (2560→1280 表示なら丁度 2 倍ずれる。実機で発生)。
+      const scale = this.containScale();
+      if (scale !== null && scale > 0 && (dxView !== 0 || dyView !== 0)) {
+        // 割り算で出た小数は捨てずに累積し、整数になったぶんだけ送る (毎回切り捨てると
+        // ゆっくり動かしたときの移動が消え、それ自体が新たなずれになる)。
+        this.dragRelAccX += dxView / scale;
+        this.dragRelAccY += dyView / scale;
+        const dx = Math.trunc(this.dragRelAccX);
+        const dy = Math.trunc(this.dragRelAccY);
+        if (dx !== 0 || dy !== 0) {
+          this.dragRelAccX -= dx;
+          this.dragRelAccY -= dy;
+          this.opts.sendInput({ MouseMoveRelative: { dx, dy } });
+        }
+        // 表示カーソルは指の移動量そのぶん動かす (ホスト側は上で縮尺を戻して送っているので、
+        // 画面上の見た目は一致する)。
+        this.dragRelPos = this.clampToViewport({
+          x: this.dragRelPos.x + dxView,
+          y: this.dragRelPos.y + dyView,
+        });
+        this.renderRelativeCursor(this.dragRelPos);
       }
+      // dragRel 中も pending/drag と同じ規則で長押しタイマーを再武装する。これが無いと
+      // 「メニューを一度出して抜けると指を離すまで二度と開かない」となり実機で不評だった。
+      // 最後に張った位置 (longPressArmPos) からの累積移動量で判定する規則は pending/drag 側の
+      // 同種ブロックと揃える。
+      const settleDist = Math.hypot(cur.x - this.longPressArmPos.x, cur.y - this.longPressArmPos.y);
+      // リングはカーソル側に出す (指の位置に出すとメニューの出る場所と食い違う)。
+      if (settleDist >= SETTLE_JITTER_PX) this.armLongPress(cur, this.dragRelPos);
+      this.singleLast = cur;
+      return;
+    }
+
+    // pending/drag は、最後にタイマーを張った位置 (longPressArmPos) から SETTLE_JITTER_PX 以上
+    // 動いたら張り直す。これにより「最後に指が動いた時点から LONG_PRESS_MS 静止」でメニューが
+    // 開くようになり、長押し前に少し動かしてから止めても開ける (旧仕様は最初の移動でタイマーを
+    // 破棄したきり二度と張り直さず、開かなくなっていた)。判定を「直前の touchmove からの差分」に
+    // すると、ゆっくり動かしている間は 1 イベントあたりの移動量がしきい値に届かず一度も再武装
+    // されず、動かし続けているのにリングとメニューが出てしまう (実機で発生したため累積で判定する)。
+    if (this.singleMode === "pending" || this.singleMode === "drag") {
+      const settleDist = Math.hypot(cur.x - this.longPressArmPos.x, cur.y - this.longPressArmPos.y);
+      // armLongPress が古い rAF ループも確実に止めてから張り直す (2重ループでの
+      // progress competing を防ぐ)。
+      if (settleDist >= SETTLE_JITTER_PX) this.armLongPress(cur);
     }
 
     const distFromStart = Math.hypot(cur.x - this.singleStart.x, cur.y - this.singleStart.y);
@@ -487,16 +592,29 @@ export class TouchInput {
     const dist = Math.hypot(dx, dy);
 
     if (dist > MENU_EXIT_PX) {
-      // メニューを閉じて drag へ戻す。カーソル/MouseMove をここから再開し、静止すれば
-      // 新しい位置で再びメニューが開くよう長押しタイマーも張り直す。
+      // メニューを閉じて dragRel (相対追従) へ抜ける。host への MouseMove は送らない
+      // (MENU_EXIT_PX 定義のコメント参照: 送るとホスト側カーソルが古い位置から指位置へ
+      // ワープする)。
       this.hideMenu();
       this.menuHighlight = null;
-      this.singleMode = "drag";
-      this.showCursorAt(cur, false);
-      if (this.singleLongPressTimer !== null) clearTimeout(this.singleLongPressTimer);
-      this.singleLongPressTimer = window.setTimeout(() => this.onLongPress(), LONG_PRESS_MS);
-      this.hideRing();
-      this.showRingAt(cur);
+      this.singleMode = "dragRel";
+      if (!this.menuFromRel) {
+        // 通常経路 (pending/drag からメニューへ入った場合): 表示カーソルはメニュー原点
+        // (host へ最後に反映済みの位置) から描き直す。
+        this.dragRelPos = { ...this.menuOrigin };
+      }
+      // dragRel 由来のメニューを抜けた場合は dragRelPos (表示カーソル位置) をここで
+      // 上書きしない。メニュー表示中はカーソルを一切動かしていないので、開く前の値が
+      // そのまま正しい現在位置として残っている (menuOrigin は指位置でしかなく、表示
+      // カーソル位置とは限らないため代入すると飛んでしまう)。
+      this.dragRelLastTouch = cur;
+      // 前の dragRel 区間で持ち越した端数は、メニューを挟んだ時点で意味を失うので捨てる。
+      this.dragRelAccX = 0;
+      this.dragRelAccY = 0;
+      this.renderRelativeCursor(this.dragRelPos);
+      // dragRel 中も長押しタイマーを再武装できるようにしたため (onSingleMove の dragRel
+      // ブロック参照)、抜けた直後もここで即座に張り直す。リングはカーソル側に出す。
+      this.armLongPress(cur, this.dragRelPos);
       return;
     }
 
@@ -514,11 +632,7 @@ export class TouchInput {
   }
 
   private endSingle(cancelled: boolean): void {
-    if (this.singleLongPressTimer !== null) {
-      clearTimeout(this.singleLongPressTimer);
-      this.singleLongPressTimer = null;
-    }
-    this.hideRing();
+    this.disarmLongPress();
 
     if (this.singleMode === "dblDrag") {
       // touchcancel (cancelled===true) でも必ず up を送る。ここで送り漏らすと、次のジェスチャが
@@ -530,10 +644,16 @@ export class TouchInput {
 
     if (this.singleMode === "menu") {
       if (!cancelled && this.menuHighlight) {
-        // メニュー表示中は MouseMove を止めていたため、ホスト側カーソルは長押し前の古い位置に
-        // 残ったまま。先に MouseMove で原点へ合わせてから押さないと、古い位置が押されてしまう。
-        const host = this.toHostPoint(this.menuOrigin);
-        if (host) this.opts.sendInput({ MouseMove: host });
+        if (!this.menuFromRel) {
+          // メニュー表示中は MouseMove を止めていたため、ホスト側カーソルは長押し前の古い
+          // 位置に残ったまま。先に MouseMove で原点へ合わせてから押さないと、古い位置が
+          // 押されてしまう。
+          const host = this.toHostPoint(this.menuOrigin);
+          if (host) this.opts.sendInput({ MouseMove: host });
+        }
+        // menuFromRel のときは MouseMove を送らない: dragRel ではホスト側カーソルが既に
+        // ユーザーの狙った位置にあり (相対移動で追従済み)、こちらはホスト座標を知らない
+        // ため送れない/送る必要がない。down/up だけで足りる。
         const button = this.menuHighlight;
         this.opts.sendInput({ MouseButton: { button, down: true } });
         this.opts.sendInput({ MouseButton: { button, down: false } });
@@ -575,6 +695,13 @@ export class TouchInput {
         this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
         this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
       }
+    } else if (this.singleMode === "dragRel") {
+      // 相対モードでは host 座標が不明で singleCursorHost は意味を持たない (常に null のまま)。
+      // drag のような有効判定は行わず、無条件にクリックを送る。
+      if (!cancelled) {
+        this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
+        this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
+      }
     }
 
     this.finishSingle();
@@ -582,11 +709,7 @@ export class TouchInput {
 
   /** 2本目の指が触れて割り込まれた場合の単発ジェスチャの後始末 (クリックは確定させない)。 */
   private endSingleAbrupt(): void {
-    if (this.singleLongPressTimer !== null) {
-      clearTimeout(this.singleLongPressTimer);
-      this.singleLongPressTimer = null;
-    }
-    this.hideRing();
+    this.disarmLongPress();
     // dblDrag 中に2本目の指が触れた場合も、down を送ったまま放置しない (押しっぱなし防止)。
     if (this.singleMode === "dblDrag") this.releaseDblDown();
     this.hideMenu();
@@ -610,6 +733,11 @@ export class TouchInput {
     this.singleMode = "pending";
     this.singleCursorHost = null;
     this.menuHighlight = null;
+    this.menuFromRel = false;
+    this.dragRelPos = { x: 0, y: 0 };
+    this.dragRelLastTouch = { x: 0, y: 0 };
+    this.dragRelAccX = 0;
+    this.dragRelAccY = 0;
     this.hideCursor();
   }
 
@@ -644,7 +772,59 @@ export class TouchInput {
     this.cursorEl?.classList.remove("visible", "pressed", "invalid");
   }
 
-  /** 長押し進捗リングを client 座標 p の位置に表示し、LONG_PRESS_MS かけて 0→100% 埋める。 */
+  /**
+   * dragRel (相対追従) 中のカーソル表示だけを更新する。host 座標が不明なため MouseMove は
+   * 送らず、映像外判定もできないので invalid クラスは付けない (常に有効として描画する)。
+   */
+  private renderRelativeCursor(pt: Pt): void {
+    const el = this.cursorEl;
+    if (!el) return;
+    const parent = this.canvas?.parentElement;
+    if (parent) {
+      const parentRect = parent.getBoundingClientRect();
+      el.style.left = `${pt.x - parentRect.left}px`;
+      el.style.top = `${pt.y - parentRect.top}px`;
+    }
+    el.classList.add("visible");
+    el.classList.remove("pressed", "invalid");
+  }
+
+  /** dragRel の表示カーソルがビューポート外へ出ないようクランプする。 */
+  private clampToViewport(pt: Pt): Pt {
+    const v = this.viewportRect();
+    return { x: clamp(pt.x, v.left, v.right), y: clamp(pt.y, v.top, v.bottom) };
+  }
+
+  /**
+   * 長押しタイマーと進捗リングの遅延タイマーをまとめて張り直す。長押しの再武装は「指が動いた
+   * 時点から LONG_PRESS_MS 静止」を意味するため、この 2 つは必ず同じ瞬間に張る。p は静止判定の
+   * 基準 (= 指の位置)、ringPos はリングを描く位置。dragRel では指とカーソルが離れており、
+   * リングはメニューと同じくカーソル側に出さないと「押される場所」と食い違う (menuAnchor 参照)。
+   */
+  private armLongPress(p: Pt, ringPos: Pt = p): void {
+    this.disarmLongPress();
+    this.longPressArmPos = p;
+    this.singleLongPressTimer = window.setTimeout(() => this.onLongPress(), LONG_PRESS_MS);
+    this.ringDelayTimer = window.setTimeout(() => {
+      this.ringDelayTimer = null;
+      this.showRingAt(ringPos);
+    }, RING_DELAY_MS);
+  }
+
+  /** 長押し/リングのタイマーを畳み、表示中のリングも消す。再武装・中断・確定のすべてで通る。 */
+  private disarmLongPress(): void {
+    if (this.singleLongPressTimer !== null) {
+      clearTimeout(this.singleLongPressTimer);
+      this.singleLongPressTimer = null;
+    }
+    if (this.ringDelayTimer !== null) {
+      clearTimeout(this.ringDelayTimer);
+      this.ringDelayTimer = null;
+    }
+    this.hideRing();
+  }
+
+  /** 長押し進捗リングを client 座標 p の位置に表示し、残り時間かけて 0→100% 埋める。 */
   private showRingAt(p: Pt): void {
     const el = this.ringEl;
     if (!el) return;
@@ -657,13 +837,19 @@ export class TouchInput {
     el.style.setProperty("--progress", "0");
     el.classList.add("visible");
     const start = performance.now();
+    // RING_DELAY_MS 待ってから出しているので、埋まりきるまでの残り時間はその分短い。
+    const fillMs = Math.max(1, LONG_PRESS_MS - RING_DELAY_MS);
     const step = (now: number): void => {
-      const pct = Math.min(1, (now - start) / LONG_PRESS_MS);
+      const pct = Math.min(1, (now - start) / fillMs);
       el.style.setProperty("--progress", String(pct));
-      // pending/drag から外れた (成立/指を離した) 後に古いフレームが積まれていても空回り
-      // だけで済むよう、singleMode を都度確認して自然に止める。drag 中も長押しの再武装が
-      // 効くため、pending だけでなく drag でも継続させる。
-      if (pct < 1 && this.singleActive && (this.singleMode === "pending" || this.singleMode === "drag")) {
+      // pending/drag/dragRel から外れた (成立/指を離した) 後に古いフレームが積まれていても
+      // 空回りだけで済むよう、singleMode を都度確認して自然に止める。長押しの再武装は
+      // dragRel でも効くため、pending/drag だけでなくそちらでも継続させる。
+      if (
+        pct < 1 &&
+        this.singleActive &&
+        (this.singleMode === "pending" || this.singleMode === "drag" || this.singleMode === "dragRel")
+      ) {
         this.ringRaf = requestAnimationFrame(step);
       } else {
         this.ringRaf = null;
