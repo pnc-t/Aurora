@@ -88,9 +88,13 @@ keystore の作り方は docs\mobile.md の「リリース署名」を参照し�
 
     # build-tools のパスは署名節でも使うのでスクリプトスコープに保持し、二重解決しない。
     $sdkRoot = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+    # 文字列順ソートだと "9.0.0" が "34.0.0" より新しいと判定されるため [version] で比較する
+    # (CI の `sort -V` と同じ意味)。`-as [version]` で弾いているのは "24.0.0-preview" のような
+    # バージョンとして解釈できないディレクトリ名で、これをキャストするとソート自体が落ちるため。
     $buildTools = if ($sdkRoot) {
         Get-ChildItem (Join-Path $sdkRoot 'build-tools') -Directory -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+            Where-Object { $_.Name -as [version] } |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1 -ExpandProperty FullName
     }
     else { $null }
     if (-not $buildTools -or -not (Test-Path (Join-Path $buildTools 'zipalign.exe')) -or -not (Test-Path (Join-Path $buildTools 'apksigner.bat'))) {
