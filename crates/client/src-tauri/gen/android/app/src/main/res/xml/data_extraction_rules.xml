@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 31 以上で有効。cloud-backup (Google ドライブ等へのバックアップ) と device-transfer
+     (端末間の直接移行) の両方を除外する。device-transfer まで書くのが主眼:
+     android:allowBackup="false" だけで端末間転送まで止まるかは公式ドキュメントの記述が
+     曖昧なため、ここで明示的に落とす。
+     同じディレクトリの file_paths.xml は Tauri が生成する FileProvider 用で追跡対象外
+     (このファイルだけ .gitignore で開けている)。 -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+    </device-transfer>
+</data-extraction-rules>

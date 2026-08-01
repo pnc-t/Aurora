@@ -8,6 +8,11 @@ crates/client/dist
 #   手編集を再生成で失わないため (generated/ 配下の自動生成ファイルとは別物)。
 # - proguard-aurora.pro: release ビルド (ProGuard/R8) が MainActivity を難読化して JNI の
 #   名前解決を壊さないための keep ルール。再生成で消えるとクリップボード書き込みが無言で壊れる。
+# - AndroidManifest.xml: allowBackup="false" / dataExtractionRules の指定。再生成で消えると
+#   アプリデータが黙って Google ドライブへバックアップされるようになる (recent_hosts.json の
+#   Tailscale IP、wol_targets.json の MAC が平文で載る)。
+# - res/xml/data_extraction_rules.xml: 上記の実体。cloud-backup と device-transfer の両方を
+#   除外する。
 # ディレクトリ単位で無視すると配下を戻せないため、階層ごとに ! で開けている。
 crates/client/src-tauri/gen/*
 !crates/client/src-tauri/gen/android/
@@ -19,14 +24,18 @@ crates/client/src-tauri/gen/android/app/*
 crates/client/src-tauri/gen/android/app/src/*
 !crates/client/src-tauri/gen/android/app/src/main/
 crates/client/src-tauri/gen/android/app/src/main/*
+!crates/client/src-tauri/gen/android/app/src/main/AndroidManifest.xml
 !crates/client/src-tauri/gen/android/app/src/main/res/
 crates/client/src-tauri/gen/android/app/src/main/res/*
 !crates/client/src-tauri/gen/android/app/src/main/res/values/
 !crates/client/src-tauri/gen/android/app/src/main/res/values-night/
+!crates/client/src-tauri/gen/android/app/src/main/res/xml/
 crates/client/src-tauri/gen/android/app/src/main/res/values/*
 crates/client/src-tauri/gen/android/app/src/main/res/values-night/*
+crates/client/src-tauri/gen/android/app/src/main/res/xml/*
 !crates/client/src-tauri/gen/android/app/src/main/res/values/themes.xml
 !crates/client/src-tauri/gen/android/app/src/main/res/values-night/themes.xml
+!crates/client/src-tauri/gen/android/app/src/main/res/xml/data_extraction_rules.xml
 !crates/client/src-tauri/gen/android/app/src/main/java/
 crates/client/src-tauri/gen/android/app/src/main/java/*
 !crates/client/src-tauri/gen/android/app/src/main/java/com/

@@ -47,6 +47,15 @@ Android 版 [Tailscale アプリ](https://tailscale.com/) を入れて、ホス�
 この仕組みの対象外です。新版が出た場合は Releases から APK を取り直し、上書きインストールして
 ください。
 
+### バックアップ対象外
+
+アプリのデータは Android のバックアップ / 端末間転送の対象外にしてあります。接続先の
+Tailscale IP や WoL の MAC アドレスが平文でクラウドへ同期されるのを避けるためです。
+
+結果として、機種変更や再インストールではホスト一覧・WoL 設定・アプリ設定は引き継がれず、
+登録し直しになります。ただしパスワードと端末ID鍵はもともと Android Keystore で端末に紐づいて
+おり、バックアップがあっても復元できません (＝引き継ぎで失われる実利は元から小さいです)。
+
 ### モバイルで使えない機能
 
 以下はデスクトップ版のみの機能で、モバイル版では非対応です。
@@ -161,7 +170,7 @@ keystore ファイル自体は**絶対にコミットしないでください** 
 ### `gen/android` の管理方針
 
 `gen/android` は `cargo tauri android init` で再生成される Tauri のテンプレート生成物のため、
-原則 git 管理外です。ただし以下の 4 ファイルだけは `.gitignore` を階層ごとに `!` で開けて
+原則 git 管理外です。ただし以下の 6 ファイルだけは `.gitignore` を階層ごとに `!` で開けて
 追跡しています (再生成のたびに手編集内容やビルド設定が失われるのを防ぐため)。
 
 | ファイル | 追跡理由 |
@@ -169,6 +178,8 @@ keystore ファイル自体は**絶対にコミットしないでください** 
 | `app/src/main/res/values/themes.xml`<br>`app/src/main/res/values-night/themes.xml` | システムバー配色の手編集。再生成で消えるとライトモード端末で時計が黒文字になり暗い UI に埋もれる (実機 SM-X230 で確認) |
 | `app/src/main/java/com/aurora/remote/MainActivity.kt` | ホスト → 端末のクリップボード書き込み用 JNI エントリポイント (`setClipboardText`) とシステムバー配色の手編集。`generated/` 配下の自動生成ファイルとは別物 |
 | `app/proguard-aurora.pro` | release ビルドの ProGuard keep ルール。Rust 側がクリップボード書き込みを JNI で `MainActivity` / `setClipboardText` と**名前で**解決するため、難読化されると無言で壊れる。ファイル冒頭のコメントに理由を書いてある |
+| `app/src/main/AndroidManifest.xml` | `allowBackup="false"` / `dataExtractionRules` の指定。再生成で消えるとアプリデータが黙って OS のバックアップ対象に戻り、`recent_hosts.json` の Tailscale IP や `wol_targets.json` の MAC アドレスが平文でクラウドへ同期される |
+| `app/src/main/res/xml/data_extraction_rules.xml` | 上記の実体 (API 31+)。クラウドバックアップと端末間転送の両方を除外する |
 
 ---
 
