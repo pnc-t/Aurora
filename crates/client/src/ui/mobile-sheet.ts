@@ -39,8 +39,12 @@ export function openActionSheet(actions: SheetAction[]): void {
   const list = document.createElement("div");
   list.className = "ms-list";
 
+  // let にして宣言順への暗黙の依存を無くす (close は末尾の trapFocus 呼び出しより前に
+  // 定義されるが、実行順は「close が同期的に呼ばれない」という前提の上でしか成立しない)。
+  let releaseTrap: (() => void) | null = null;
+
   function close(): void {
-    releaseTrap();
+    releaseTrap?.();
     document.removeEventListener("keydown", onKeyDown);
     backdrop.remove();
     closeCurrent = null;
@@ -93,5 +97,5 @@ export function openActionSheet(actions: SheetAction[]): void {
   document.addEventListener("keydown", onKeyDown);
 
   document.body.appendChild(backdrop);
-  const releaseTrap = trapFocus(sheet);
+  releaseTrap = trapFocus(sheet);
 }
