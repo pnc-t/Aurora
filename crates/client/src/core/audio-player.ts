@@ -151,16 +151,24 @@ export class AudioPlayer {
       for (let ch = 0; ch < CHANNELS; ch++) {
         const channelData = buffer.getChannelData(ch);
         // AudioData のチャンネル数が host と食い違う場合の保険 (モノラルへフォールバック等)。
-        data.copyTo(channelData, { planeIndex: Math.min(ch, data.numberOfChannels - 1) });
+        // format を省略すると copyTo はソース形式のままバイトコピーするため、s16-planar/
+        // u8-planar が来た場合にサイズは足りて例外も出ずに雑音として再生されてしまう。
+        // format を明示して WebCodecs 側に f32 へ変換させる。
+        data.copyTo(channelData, {
+          planeIndex: Math.min(ch, data.numberOfChannels - 1),
+          format: "f32-planar",
+        });
       }
     } else {
       // Chromium の AudioDecoder (opus) は "f32" (インターリーブ) を返す。planar ではなく
       // plane は 0 番の 1 枚のみで、そこに全チャンネル分が [L0,R0,L1,R1,...] の順で詰まっている。
       // 必要バイト数は決め打ちせず allocationSize() に必ず従う (destination is not large enough
       // で 1 フレームも再生できなかった実機不具合の再発防止)。
-      const byteLength = data.allocationSize({ planeIndex: 0 });
+      // ここも同様に format を明示する。allocationSize と copyTo は同じ format でないと
+      // サイズ計算がずれるため、両方に "f32" を渡す必要がある。
+      const byteLength = data.allocationSize({ planeIndex: 0, format: "f32" });
       const interleaved = new Float32Array(byteLength / Float32Array.BYTES_PER_ELEMENT);
-      data.copyTo(interleaved, { planeIndex: 0 });
+      data.copyTo(interleaved, { planeIndex: 0, format: "f32" });
 
       const srcChannels = data.numberOfChannels;
       for (let ch = 0; ch < CHANNELS; ch++) {
