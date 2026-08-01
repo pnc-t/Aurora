@@ -19,7 +19,7 @@
 //   キーボード占有/ツールバー・タブ配置/ショートカット/ファイル共有/ログ) は出さない
 //   (呼び出し元 main.rs の invoke_handler から該当コマンドが除外されているものは、出すと必ず失敗する)。
 //   端末ID表示は `myDeviceFingerprint` が Android Keystore 対応 (2026-07-29) 済みのため出す。
-//   クリップボード同期はホスト→端末の一方向のみ (WebView `navigator.clipboard.writeText` 書き込み)
+//   クリップボード同期はホスト→端末の一方向のみ (Rust 側が JNI 経由で端末のクリップボードへ書く)
 //   のため、その旨を説明文に明記した上で出す。
 // - 更新チェック UI (`.update-banner`) はモバイルには無い (`tauri-plugin-updater` 無効化のため)。
 //
@@ -328,9 +328,9 @@ export function mountMobileLauncher(opts: MobileLauncherOpts): MobileLauncherHan
   const portError = $<HTMLElement>('[data-num-error="port"]');
 
   // WoL タブ: 中継 (raspi) 経由でマジックパケットを送るパネル。
-  // 旧 wol-panel の「起こして接続」は保存済みパスワード (DPAPI = Windows 専用) を前提にしており
-  // Android では必ず失敗するため使わない。モバイル専用パネルは到達確認のみ行い、到達したら
-  // 毎回パスワード入力を求める接続ダイアログ (openConnectDialog) を開く配線にする。
+  // モバイル専用パネル (ui/mobile-wol.ts) は「起こして到達を確認する」ところまでを担当し、
+  // 接続処理自体は呼び出し側の責務として分離している。そのため到達したら毎回パスワード入力を
+  // 求める接続ダイアログ (openConnectDialog) を開く配線にする。
   // openConnectDialog は下方で宣言されるため、参照時点でまだ定義されていない可能性がある
   // (宣言順の都合)。アロー関数で包んで呼び出し時まで評価を遅延させる。
   const wolRoot = $("#page-wol") as HTMLElement;

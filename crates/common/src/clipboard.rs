@@ -8,7 +8,8 @@
 //! Android/iOS は arboard が NDK クロスコンパイルに対応しないため、`imp` を
 //! デスクトップ実装とモバイル実装 (host→端末の一方向のみ) に分ける。`ClipboardHandle`/`spawn`
 //! は host/client 双方が同じ呼び出しで使える。モバイルの `ClipboardHandle` だけ持つ
-//! `take_apply_rx` (net/connect.rs がフロント通知に使う) はモバイル側呼び出し元で cfg 分岐する。
+//! `take_apply_rx` (net/connect.rs が JNI 経由の端末クリップボード書き込みに使う) はモバイル側
+//! 呼び出し元で cfg 分岐する。
 //!
 //! `common` crate は tauri-build を経由しないため `cfg(desktop)`/`cfg(mobile)` は使えず、
 //! Cargo.toml の target セレクタと揃えて `target_os` で直接分岐する。
@@ -103,12 +104,15 @@ mod imp {
     }
 }
 
-/// Android/iOS 向け実装。ネイティブ `ClipboardManager` は Activity Context 前提で未検証のため
-/// 使わず、host→端末の一方向だけを WebView 側 (`navigator.clipboard.writeText`) に委ねる。
-/// ここでは「リモートから適用要求されたテキストを外部へ引き渡す」導線 (`take_apply_rx`) だけを
-/// 持ち、実際にクリップボードへ書き込む処理はフロント (mobile-main.ts) が担う。
-/// ローカル変化の検出 (`change_rx` に流す側) は arboard 同様に行わない
-/// (= 端末→ホスト方向は自動化しない。ネイティブ ClipboardManager 未検証のスコープ外)。
+/// Android/iOS 向け実装。arboard が NDK クロスコンパイルに対応しないため、この実装に分かれる。
+/// host→端末の一方向のみ (端末→host は非対応。ローカル変化の検出は行わない)。ここでは
+/// 「リモートから適用要求されたテキストを外部へ引き渡す」導線 (`take_apply_rx`) だけを持つ。
+/// 実際の書き込みは client 側の `crates/client/src-tauri/src/mobile_clipboard.rs` が JNI 経由で
+/// `MainActivity.setClipboardText` を呼んで行う。
+///
+/// WebView の `navigator.clipboard.writeText` は使えない: ユーザー操作 (transient activation) を
+/// 伴わない呼び出しを WebView が拒否するため、ホスト受信イベント経由の書き込みは原理的に成功
+/// しない。詳細な経緯は `mobile_clipboard.rs` の冒頭コメント参照。
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod imp {
     use std::sync::Arc;
