@@ -673,12 +673,19 @@ export class TouchInput {
         this.singleMoved && performance.now() - this.singleStartTime < MULTI_GRACE_MS;
       if (!cancelled && (!this.singleMoved || movedWithinGrace)) {
         const host = this.toHostPoint(this.singleLast);
-        if (host) this.opts.sendInput({ MouseMove: host });
-        this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
-        this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
-        // ダブルタップ&ホールド判定用に、このタップの終了時刻/位置を憶えておく。
-        this.lastTapTime = performance.now();
-        this.lastTapPos = this.singleLast;
+        // 映像外 (レターボックスの黒帯) のタップは何も送らない。MouseMove だけ弾いて
+        // MouseButton を送ると、ホスト側カーソルが「たまたま居る位置」でクリックされて
+        // しまう (縦持ちで黒帯が広い端末では踏みやすい)。drag/dblDrag と同じ規則に揃える
+        // (toHostPoint の doc「黒帯のタッチはホストへ送らない」参照)。lastTap も記録しない
+        // のは、無効タップを起点にダブルタップ&ホールドが成立してしまうため。
+        if (host) {
+          this.opts.sendInput({ MouseMove: host });
+          this.opts.sendInput({ MouseButton: { button: "Left", down: true } });
+          this.opts.sendInput({ MouseButton: { button: "Left", down: false } });
+          // ダブルタップ&ホールド判定用に、このタップの終了時刻/位置を憶えておく。
+          this.lastTapTime = performance.now();
+          this.lastTapPos = this.singleLast;
+        }
       } else if (!cancelled) {
         // 猶予は「2本目の指の着地を待つ」ためのものであり、待った結果として単発操作を
         // 無効にしてはならない。ここに来るのは猶予経過後に touchmove が途絶えた場合だけで、
