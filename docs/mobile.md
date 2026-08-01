@@ -90,7 +90,14 @@ cargo tauri android build --apk
 
 # debug ビルド (実機での動作確認用)
 cargo tauri android build --apk --debug
+
+# 署名済み APK を installer\dist\ へ出力する (署名設定は下記「リリース署名」)
+.\installer\build-all.ps1 -Android
 ```
+
+`build-all.ps1 -Android` の出力は `installer\dist\Aurora_<ver>-arm64.apk` です。
+ローカルビルドは実機で使われる arm64-v8a 単体、CI (GitHub Release) は universal
+4 ABI という違いがあります。
 
 出力先は `gen/android/app/build/outputs/apk/` 配下です。
 
@@ -123,7 +130,18 @@ keystore の作成例:
 keytool -genkeypair -v -keystore aurora-release.keystore -alias aurora -keyalg RSA -keysize 2048 -validity 10000
 ```
 
-CI (release ワークフロー) はこの keystore を以下 4 つの GitHub Secrets から復元して署名します。
+ローカルで `installer\build-all.ps1 -Android` を使う場合は、keystore ファイルへの
+パスを直接指す以下 4 つの環境変数を設定してください。
+
+| 環境変数 | 内容 |
+|------|------|
+| `AURORA_ANDROID_KEYSTORE` | keystore ファイルのパス |
+| `AURORA_ANDROID_KEYSTORE_PASSWORD` | keystore のパスワード |
+| `AURORA_ANDROID_KEY_ALIAS` | キーのエイリアス |
+| `AURORA_ANDROID_KEY_PASSWORD` | キーのパスワード |
+
+CI (release ワークフロー) は同じ keystore を、ファイルではなく base64 化した文字列として
+以下 4 つの GitHub Secrets から復元して署名します (ランナーにファイルを直接置けないため)。
 
 | Secret | 内容 |
 |------|------|

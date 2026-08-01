@@ -1,12 +1,13 @@
 # 配布インストーラ
 
-Aurora は配布物が 3 つに分かれる。生成物はすべて **`installer\dist\`** に集約する。
+Aurora は配布物が 4 つに分かれる。生成物はすべて **`installer\dist\`** に集約する。
 
 | 配布物 | 中身 | インストーラ | 生成方法 |
 |--------|------|--------------|----------|
 | **client** | Tauri アプリ (`aurora-client`) | NSIS (per-user) | `cargo tauri build` |
 | **host** | 素のバイナリ (`aurora-host`) | NSIS (per-user) | `installer\host\build.ps1` |
 | **wol** | raspi 向け静的バイナリ (`aurora-wol`) | 不要 (`install` サブコマンド内蔵) | `cargo zigbuild` (build-all 内) |
+| **android** | Tauri Android アプリ (APK) | 不要 (APK 直接インストール) | `cargo tauri android build` (build-all の `-Android`) |
 
 ## 一括ビルド (推奨)
 
@@ -20,6 +21,15 @@ Aurora は配布物が 3 つに分かれる。生成物はすべて **`installer
 - `installer\dist\Aurora_0.1.0_x64-setup.exe` (client)
 - `installer\dist\aurora-host-setup-0.1.0.exe` (host)
 - `installer\dist\aurora-wol-0.1.0-aarch64` (wol / raspi 用)
+
+Android は既定ではビルドしない (前提が重いため opt-in)。含める場合:
+
+```powershell
+.\installer\build-all.ps1 -Android
+```
+
+出力に以下が加わる:
+- `installer\dist\Aurora_0.1.0-arm64.apk` (android / `-Android` 指定時のみ)
 
 個別に作る場合は以下の各節を参照 (出力先は同じ `installer\dist\`)。
 
@@ -120,3 +130,23 @@ sudo ./aurora-wol-0.1.0-aarch64 install
 
 前提ツール: cargo-zigbuild + zig (`cargo install cargo-zigbuild` /
 `winget install zig.zig`。`deploy-aurora-wol.ps1` を一度使っていれば導入済み)。
+
+---
+
+## android (APK)
+
+Tauri Android アプリを APK としてビルドし、`installer\dist\` へ署名済みで出力する。
+
+前提ツール: Android SDK / NDK、JBR21、rustup target `aarch64-linux-android`、
+Windows 開発者モード。導入手順は `docs\mobile.md` を参照。
+
+署名用の環境変数 (4 つとも必須):
+- `AURORA_ANDROID_KEYSTORE` (keystore ファイルのパス)
+- `AURORA_ANDROID_KEYSTORE_PASSWORD`
+- `AURORA_ANDROID_KEY_ALIAS`
+- `AURORA_ANDROID_KEY_PASSWORD`
+
+CI 版との違い: ローカルビルド (`-Android`) は実機で使われる arm64-v8a 単体、
+CI (GitHub Release) は universal 4 ABI。**配布する APK は CI 版を使うこと**。
+
+keystore ファイルはリポジトリ外に置き、絶対にコミットしないこと。
