@@ -144,7 +144,14 @@ fn save_map(app: &AppHandle, map: &BTreeMap<String, String>) -> Result<(), Strin
     }
     let plain = serde_json::to_vec(map).map_err(|e| format!("直列化に失敗: {e}"))?;
     let enc = encrypt(&plain)?;
-    std::fs::write(&path, enc).map_err(|e| format!("パスワード保存に失敗: {e}"))
+    // 直接上書き中にプロセスが落ちるとファイルが途中で切れる。load_map は仕様どおり
+    // 「復号できなければ空マップ」で握り潰すため、破損すると保存済みパスワードが全ホスト
+    // ぶん無言で消える。Android は OS がバックグラウンドのアプリを随時 kill するため踏み
+    // やすい。共通ヘルパーは作らず、load_or_create_identity と同じ一時ファイル→rename の
+    // パターンを踏襲する。
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, enc).map_err(|e| format!("パスワード保存に失敗: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("パスワード保存に失敗: {e}"))
 }
 
 /// 指定 host の保存済みパスワードを返す。無ければ `None`。
