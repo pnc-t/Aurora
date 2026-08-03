@@ -53,7 +53,7 @@ if (-not $NoSign -and -not $env:TAURI_SIGNING_PRIVATE_KEY) {
     throw @'
 署名鍵 (TAURI_SIGNING_PRIVATE_KEY) が未設定です。
 
-  $env:TAURI_SIGNING_PRIVATE_KEY = "$HOME\.tauri\aurora-updater.key"
+  $env:TAURI_SIGNING_PRIVATE_KEY = "$HOME\.aurora\aurora-updater.key"
   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "<鍵のパスワード>"
 
 インストーラの動作確認だけで配布しないなら -NoSign を付けてください
