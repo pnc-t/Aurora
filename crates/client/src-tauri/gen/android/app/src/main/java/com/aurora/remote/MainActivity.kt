@@ -1,10 +1,13 @@
 package com.aurora.remote
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
+import android.os.PersistableBundle
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 
@@ -21,7 +24,16 @@ class MainActivity : TauriActivity() {
       val context = appContext ?: return false
       return try {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("aurora", text))
+        val clip = ClipData.newPlainText("aurora", text)
+        // Android 13+ は setPrimaryClip のたびに中身のプレビューを画面に出す。クリップボード同期は
+        // 既定 ON なので、ホスト PC でパスワードをコピーしただけで端末画面に平文が表示されてしまう
+        // (覗き見・画面録画・キャストに乗る)。EXTRA_IS_SENSITIVE を立てるとプレビューが伏字になる。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+          clip.description.extras = PersistableBundle().apply {
+            putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+          }
+        }
+        cm.setPrimaryClip(clip)
         true
       } catch (e: Exception) {
         false
