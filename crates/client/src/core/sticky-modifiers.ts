@@ -44,6 +44,11 @@ export function createStickyModifiers(sendKey: (vk: number, down: boolean) => vo
   const modLongPressTimers = new Map<ModKey, number>();
   const modLongPressFired = new Set<ModKey>();
   const listeners = new Set<(key: ModKey, state: ModState) => void>();
+  // このキーを今指で押している最中か (ui/mobile-pad.ts の L/M/R ボタン・
+  // ui/mobile-keyboard.ts の通常キーと同じローカル押下ガード)。releaseAll() で
+  // modState が "off" に戻された後に指を離しても新規プレスと誤認しないよう、
+  // pressEnd はここに記録が残っている場合のみ処理する。
+  const modPressed = new Set<ModKey>();
 
   function setModState(key: ModKey, state: ModState): void {
     modState[key] = state;
@@ -51,6 +56,7 @@ export function createStickyModifiers(sendKey: (vk: number, down: boolean) => vo
   }
 
   function pressStart(key: ModKey): void {
+    modPressed.add(key);
     modLongPressFired.delete(key);
     const startState = modState[key];
     // locked からの長押しは未定義のため開始しない (locked は短押しでのみ off に戻す)。
@@ -65,6 +71,10 @@ export function createStickyModifiers(sendKey: (vk: number, down: boolean) => vo
   }
 
   function pressEnd(key: ModKey): void {
+    // releaseAll() が先に走ってこのキーの押下記録を消していれば、指を離しても何もしない。
+    // (押している間にコントローラが閉じて off に戻った後の指離しを新規プレスと誤認し、
+    // ホストへ down を送って残留させてしまうのを防ぐ)
+    if (!modPressed.delete(key)) return;
     const timer = modLongPressTimers.get(key);
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -87,6 +97,7 @@ export function createStickyModifiers(sendKey: (vk: number, down: boolean) => vo
   }
 
   function pressCancel(key: ModKey): void {
+    modPressed.delete(key);
     const timer = modLongPressTimers.get(key);
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -105,6 +116,9 @@ export function createStickyModifiers(sendKey: (vk: number, down: boolean) => vo
   }
 
   function releaseAll(): void {
+    // 押下記録も消す。これで進行中のタッチが後で pointerup/pointercancel を発火させても
+    // pressEnd/pressCancel は「押下中ではない」と判定し、新規プレスとして down を送らない。
+    modPressed.clear();
     for (const key of MOD_KEYS) {
       const timer = modLongPressTimers.get(key);
       if (timer !== undefined) {
