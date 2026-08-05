@@ -281,6 +281,20 @@ jobs:
           $manifest | ConvertTo-Json -Depth 6 | Set-Content dist-release/latest-host.json -Encoding utf8
           Get-Content dist-release/latest-host.json
 
+      # latest-host.json 自体を setup.exe と同じ minisign 鍵・同じツールで署名する。
+      # version と (download_url, signature) を暗号的に束ねていないと、書き込み権限だけを
+      # 持つ攻撃者が version を高く騙りつつ旧正規署名済み setup.exe を指す manifest を
+      # 差し替えて強制ダウングレードできてしまうため (host 側は latest-host.json.sig を
+      # fail-closed で検証する。update.rs 参照)。署名対象は直前の Set-Content が書き出した
+      # バイト列そのものであり、この後 latest-host.json を書き換える処理は無い
+      # (Get-Content での確認表示はファイルを変更しない)。
+      - name: Sign host updater manifest
+        shell: pwsh
+        run: cargo tauri signer sign dist-release/latest-host.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
       # build-android ジョブの成果物 (署名済み APK) を取り込む。Android は latest.json 系の
       # 自動アップデート対象外なので、ここでは Release への添付だけ行う。
       - name: Download Android APK artifact
@@ -297,6 +311,7 @@ jobs:
             dist-release/*-setup.exe
             dist-release/latest.json
             dist-release/latest-host.json
+            dist-release/latest-host.json.sig
             dist-release/aurora-wol-*-aarch64
             dist-release/*.apk
           generate_release_notes: true
