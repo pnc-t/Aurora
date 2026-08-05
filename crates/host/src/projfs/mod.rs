@@ -38,6 +38,15 @@ pub enum FsReply {
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// ディレクトリ一覧の短期キャッシュ TTL。Explorer の連続コールバックの往復を抑える。
 const DIR_CACHE_TTL: Duration = Duration::from_secs(2);
+/// `list_all` が積む総エントリ数の上限。悪意/不調なペアリング端末が `done:false` を
+/// 返し続けても、ProjFS コールバックスレッド (Explorer の応答性に直結) を無限にブロックし
+/// メモリを積み続けないための保険。一般的な共有ディレクトリは数百〜数千件で収まるため、
+/// 数万件あれば通常運用は打ち切らない。
+const MAX_LIST_ENTRIES: usize = 50_000;
+/// `list_all` の反復回数上限。client 側ページサイズ `LIST_PAGE = 128`
+/// (`crates/client/src-tauri/src/net/fileshare.rs`) を基準に、`MAX_LIST_ENTRIES` に
+/// 達し得る回数 + 余裕を持たせる (128 * 512 ≈ 65,536 > MAX_LIST_ENTRIES)。
+const MAX_LIST_PAGES: u32 = 512;
 
 /// ProjFS 同期コールバック ↔ tokio net ループの橋渡し。
 pub struct FsBridge {
@@ -161,7 +170,20 @@ impl FsBridge {
 
         let mut all = Vec::new();
         let mut offset = 0u32;
+        let mut pages = 0u32;
         loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES || all.len() >= MAX_LIST_ENTRIES {
+                // 打ち切りは黙って握り潰さない: ProjFS コールバックスレッドを異常に
+                // 長く塞いだ末の一覧欠落だと分かるようログに残す。
+                tracing::warn!(
+                    path,
+                    pages,
+                    entries = all.len(),
+                    "list_all aborted; page/entry cap reached"
+                );
+                return Err("directory listing too large".into());
+            }
             let reply = self.call(|req_id| ControlMsg::FsList {
                 req_id,
                 path: path.to_string(),
