@@ -44,6 +44,11 @@ if (-not (Test-Path $pnputil)) { $pnputil = Join-Path $env:SystemRoot 'System32\
 Log "pnputil = $pnputil (PS $($PSVersionTable.PSVersion), 64bit=$([Environment]::Is64BitProcess))"
 
 # 1) Stage driver files + rich settings into C:\VirtualDisplayDriver.
+# nefconw.exe は昇格したまま実行するため、標準ユーザーが書き込めない $dst に置いたまま
+# 実行する (step 3)。$src ($TEMP\AuroraVDDSetup) は非昇格の NSIS が書いた user-writable な
+# フォルダなので、そこから昇格実行してはいけない (aurora-host.nsi の「$TEMP はユーザー権限で
+# 書き込み可能」参照)。$dst が安全なのは step 1c で Users:Modify を vdd_settings.xml 単体に
+# 絞ったため (ProgramData のサブフォルダは既定で標準ユーザー読み取り専用)。
 foreach ($f in @('MttVDD.dll','MttVDD.inf','mttvdd.cat','nefconw.exe','vdd_settings.xml')) {
     $s = Join-Path $src $f
     if (Test-Path $s) { Copy-Item $s $dst -Force; Log "copied $f" }
@@ -56,11 +61,14 @@ if (-not (Test-Path (Join-Path $dst 'MttVDD.inf'))) { Log "FATAL: MttVDD.inf not
 #    device is created so the driver reads the right folder on first start.
 #  - ProgramData subfolders grant standard users read-only by default, but the host appends client
 #    resolutions / rewrites <friendlyname> in vdd_settings.xml at runtime WITHOUT elevation, so we
-#    grant Users Modify on this folder. (Scoped to $dst only, not all of C:\ProgramData\Aurora.)
+#    grant Users Modify -- but ONLY on vdd_settings.xml itself, not the whole folder with /T.
+#    フォルダ全体を広げると nefconw.exe / MttVDD.* まで標準ユーザーが書き換えられるようになり、
+#    step 3 で昇格実行するまでの間に差し替えられる (= 管理者権限で任意コード実行)。実行時に
+#    非昇格で書かれるのは vdd_settings.xml だけなので、付与もそれ 1 ファイルに限定する。
 & reg.exe add $vddRegPath /v VDDPATH /t REG_SZ /d $dst /reg:64 /f 2>&1 | ForEach-Object { Log "reg: $_" }
 Log "set (64-bit) $vddRegPath\VDDPATH = $dst (exit=$LASTEXITCODE)"
-& icacls $dst /grant '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | ForEach-Object { Log "icacls: $_" }
-Log "icacls grant Users:Modify exit=$LASTEXITCODE"
+& icacls (Join-Path $dst 'vdd_settings.xml') /grant '*S-1-5-32-545:(M)' 2>&1 | ForEach-Object { Log "icacls: $_" }
+Log "icacls grant Users:Modify on vdd_settings.xml exit=$LASTEXITCODE"
 
 # 1b) friendlyname (VDD render GPU) is intentionally left at the shipped default here.
 # Picking it via WMI VRAM-max is WRONG on muxless Optimus laptops: it selects the dGPU
@@ -77,8 +85,15 @@ $old = @(Get-PnpDevice | Where-Object { $_.HardwareID -match 'MttVDD' -or $_.Har
 foreach ($d in $old) { Log "removing stale node $($d.InstanceId)"; & $pnputil /remove-device $d.InstanceId /subtree | Out-Null }
 
 # 3) Create the Root\MttVDD device node (pnputil /add-driver alone does NOT create it).
+# nefconw.exe は昇格したまま実行するので、実行元は標準ユーザーが書き込めない場所でなければ
+# ならない。旧版は step 1c で $dst 全体に Users:Modify (/T) を与えた直後にここを実行しており、
+# その間 (step 2 のノード削除で数百ms〜数秒) に標準ユーザーが exe を差し替えれば管理者権限で
+# 任意コードを実行できた。1c の付与を vdd_settings.xml 単体に絞ったことで $dst は標準ユーザー
+# 読み取り専用のままになり、この窓は閉じている。
+$nefconw = Join-Path $dst 'nefconw.exe'
+if (-not (Test-Path $nefconw)) { Log "FATAL: nefconw.exe not staged at $nefconw"; exit 1 }
 Log "creating device node Root\MttVDD"
-& (Join-Path $dst 'nefconw.exe') --create-device-node --hardware-id Root\MttVDD --class-name Display --class-guid 4d36e968-e325-11ce-bfc1-08002be10318
+& $nefconw --create-device-node --hardware-id Root\MttVDD --class-name Display --class-guid 4d36e968-e325-11ce-bfc1-08002be10318
 Log "nefconw exit=$LASTEXITCODE"
 
 # 4) Add the driver to the store and bind it to the present node (/install binds).
