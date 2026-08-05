@@ -491,7 +491,11 @@ export class TouchInput {
 
     if (this.singleMode === "dblDrag") {
       // 絶対座標で追従する (相対追従ではなく指位置をそのままホスト座標へ変換する)。
-      this.showCursorAt(cur, true);
+      // 映像外 (黒帯) で始まった dblDrag は button-down を送っていない (dblDown 宣言参照)。
+      // その状態で指が映像内へ入ると host が非 null になり、down 無しで MouseMove だけが
+      // 届いてしまう (down 無しのカーソル移動は意図しない操作になる) ため、dblDown が
+      // true のときだけ MouseMove を送る。
+      this.showCursorAt(cur, true, this.dblDown);
       this.singleLast = cur;
       return;
     }
