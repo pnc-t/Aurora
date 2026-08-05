@@ -54,8 +54,8 @@ client (initiator)                        host (responder)
 | `SelectDisplay { id }` | C→H | キャプチャ対象ディスプレイの切替 |
 | `SetVideoParams { fps, max_bitrate_bps }` | C→H | 送出 fps 上限・ビットレート上限の実行時変更 (0 = 無制限) |
 | `SetResolution { max_height }` | C→H | 送出映像の最大高さ (px)。ホストが GPU で縮小 (アスペクト比維持) し帯域・負荷を下げる。0 = キャプチャ解像度のまま |
-| `SetClientViewport { width, height }` | C→H | クライアント表示領域サイズ (物理 px)。ホストはキャプチャ対象ディスプレイ解像度を最も近い対応モードへ変更する (RDP 風、黒帯解消)。詳細は [architecture.md](architecture.md) |
-| `DisplayResized { id, width, height }` | H→C | 解像度変更/ディスプレイ切替の結果、実解像度が変わったことを通知。クライアントは入力スケールとデコーダを更新する |
+| `SetClientViewport { width, height }` | C→H | クライアント表示領域サイズ (物理 px)。**アクティブが仮想ディスプレイ (MttVDD/IddCx) で、かつ登録済み端末がその仮想を明示選択済みのときだけ**、ホストは仮想ディスプレイをテイクオーバー (物理を全てデタッチし、仮想を primary としてこの viewport に最も近い解像度へ変更) する。物理ディスプレイをキャプチャしている場合は解像度を一切変更しない (はみ出しはクライアント側の object-fit/レターボックスで吸収)。詳細は [architecture.md](architecture.md) |
+| `DisplayResized { id, width, height }` | H→C | 仮想ディスプレイのテイクオーバーが成立し実解像度が確定/変化したことを通知 (物理ディスプレイ選択時は送られない)。クライアントは入力スケールとデコーダを更新する |
 | `SetVideoPaused { paused }` | C→H | 映像送出の一時停止/再開。マルチタブで非アクティブタブの帯域を止める。再開時は `RequestKeyframe` で復帰 |
 | `SetAudioMuted { muted }` | C→H | 音声送出のミュート切替。ミュート中はホストが音声 UDP を送らない |
 | `SetCursorOverlay { enabled }` | C→H | 映像へのカーソル合成 ON/OFF。DXGI はカーソルを含めないため、マウスキャプチャ (ポインタロック) 中だけ ON にして焼き込ませる |
@@ -64,6 +64,11 @@ client (initiator)                        host (responder)
 | `RequestKeyframe` | C→H | キーフレーム (IDR) 要求。ロス回復用 |
 | `Ping { ts_us }` / `Pong { ts_us }` | 双方向 | RTT 計測 |
 | `Stats { bitrate_kbps, fps, rtt_us, loss_permille }` | 双方向 | 適応ビットレート制御の入力 |
+
+仮想ディスプレイのテイクオーバーは**接続時に一度だけ**解像度を確定する。テイクオーバー中に
+`SetClientViewport` が再度届いても解像度追従は行わない (Desktop Duplication 中に仮想の解像度を
+変えると回復不能な `DXGI_ERROR_ACCESS_LOST` に陥るため)。ウィンドウサイズ差分はクライアント側の
+object-fit が吸収し、再フィットしたい場合は再接続する。
 
 ### 入力
 `Input(InputEvent)` で運びます。`InputEvent` は:
