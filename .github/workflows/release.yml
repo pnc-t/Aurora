@@ -55,7 +55,7 @@ jobs:
           echo "NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install tauri-cli (prebuilt)
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
       - run: cargo binstall -y tauri-cli
 
       - name: Install frontend deps
@@ -163,7 +163,7 @@ jobs:
           cache-dependency-path: crates/client/pnpm-lock.yaml
 
       - name: Install tauri-cli (prebuilt)
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
       - run: cargo binstall -y tauri-cli
 
       - name: Install frontend deps
