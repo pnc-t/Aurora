@@ -283,10 +283,14 @@ function jumpToTab(n: number): void {
 async function moveTabToNewWindow(id: string): Promise<void> {
   const s = sessions.get(id);
   if (!s || !s.isConnected) return;
+  // await 中に同じタブの × 等で closeByUser が競合すると、移譲先で adopt 直後に
+  // shutdown されてしまうため、確定 (detachForHandoff) までは無視させる。
+  s.beginMigration();
   try {
     // 現在窓から少しずらした位置に出す (どこへ出たか見失わないように)。
     await openSessionWindow(id, JSON.stringify(s.snapshot()), window.screenX + 80, window.screenY + 80);
   } catch (e) {
+    s.cancelMigration();
     showToast(`ウィンドウへの移動に失敗: ${String(e)}`, "error");
     return;
   }
@@ -301,6 +305,9 @@ async function splitTab(id: string, screenX: number, screenY: number): Promise<v
   if (!s || !s.isConnected) return;
   // ドロップ点が他の capture 窓の上なら新窓を作らず合流 (Brave 的)。判定失敗は分割へフォールバック。
   const targetLabel = await findCaptureWindowAt(screenX, screenY).catch(() => null);
+  // await 中に同じタブの × 等で closeByUser が競合すると、移譲先で adopt 直後に
+  // shutdown されてしまうため、確定 (detachForHandoff) までは無視させる。
+  s.beginMigration();
   try {
     if (targetLabel) {
       await handoffSessionToWindow(id, targetLabel, JSON.stringify(s.snapshot()));
@@ -308,6 +315,7 @@ async function splitTab(id: string, screenX: number, screenY: number): Promise<v
       await openSessionWindow(id, JSON.stringify(s.snapshot()), screenX, screenY);
     }
   } catch (e) {
+    s.cancelMigration();
     showToast(`分割に失敗: ${String(e)}`, "error");
     return;
   }

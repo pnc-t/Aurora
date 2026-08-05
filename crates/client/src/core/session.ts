@@ -197,6 +197,10 @@ export class Session {
   private pendingApproval = false;
   private pendingTimer: number | null = null;
 
+  // 別ウィンドウへの移譲 (分割/移動) 中フラグ。移譲確定 (detachForHandoff) 前に closeByUser が
+  // 競合すると、移譲先で adopt した直後にこの窓からの disconnect が届いて shutdown してしまう。
+  private migrating = false;
+
   constructor(
     id: string,
     entry: HostEntry,
@@ -265,6 +269,9 @@ export class Session {
 
   /** ユーザー操作の切断 (ツールバー切断ボタン)。恒久終了し、orchestrator がタブを除去する。 */
   closeByUser(): void {
+    // 移譲中 (splitTab/moveTabToNewWindow の await 中) は無視する。ここで disconnect すると
+    // 移譲先が adopt した直後にセッションが shutdown される競合になるため。
+    if (this.migrating) return;
     logger.info(`disconnect by user: ${this.entry.host}`);
     this.teardown();
     void disconnect(this.id);
@@ -272,6 +279,16 @@ export class Session {
   }
 
   // ---- タブのウィンドウ間移動 (Phase 3 ドラッグ分割) ----
+
+  /** 移譲 (別ウィンドウへの分割/移動) を開始する: 確定するまで closeByUser を無視させる。 */
+  beginMigration(): void {
+    this.migrating = true;
+  }
+
+  /** 移譲が失敗した: このタブを通常どおり (closeByUser 可能な状態に) 戻す。 */
+  cancelMigration(): void {
+    this.migrating = false;
+  }
 
   /** 移譲用の表示状態スナップショットを作る。接続中のみ意味を持つ。 */
   snapshot(): SessionSnapshot {
