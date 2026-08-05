@@ -157,6 +157,13 @@ fn parse_args() -> Result<Args, String> {
             "--max-bitrate" => {
                 // 引数は Mbps。内部 bps へ変換する。0 (以下) は無制限 (u32::MAX) を表す。
                 let mbps: f64 = parse_value(&mut it, "--max-bitrate", "N in Mbps (0 = unlimited)")?;
+                // NaN は比較が全て false になり `mbps <= 0.0` の 0/負値チェックをすり抜けるため、
+                // 有限値でなければ (NaN・±inf) ここで弾く。
+                if !mbps.is_finite() {
+                    return Err(format!(
+                        "error: --max-bitrate expects N in Mbps (0 = unlimited) (got '{mbps}')"
+                    ));
+                }
                 args.max_bitrate_bps = if mbps <= 0.0 {
                     u32::MAX
                 } else {
