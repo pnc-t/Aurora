@@ -681,6 +681,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // --- ページ切替 ---
   opts.root.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // 記録中に別ページへ移ると capture リスナーが全キーを飲み込み続け、遷移先の入力欄が無反応になる。
+      stopRecording();
       const page = btn.dataset.page;
       opts.root.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b === btn));
       opts.root.querySelectorAll(".page").forEach((p) => {
@@ -692,6 +694,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // --- Settings サブタブ切替 ---
   opts.root.querySelectorAll<HTMLButtonElement>(".settings-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // 記録中にサブタブを切ると capture リスナーが全キーを飲み込み続け、遷移先の入力欄が無反応になる。
+      stopRecording();
       const sect = btn.dataset.sect;
       opts.root.querySelectorAll(".settings-tab").forEach((b) => b.classList.toggle("active", b === btn));
       opts.root.querySelectorAll(".settings-sect").forEach((s) => {
@@ -706,6 +710,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 開いているダイアログのフォーカストラップ解除関数 (開くたびに張り、閉じると外す)。
   let releaseTrap: (() => void) | null = null;
   function openBackdrop(): void {
+    // 記録中にダイアログを開くと capture リスナーが全キーを飲み込み続け、ダイアログ内の入力欄が無反応になる。
+    stopRecording();
     backdrop.classList.add("visible");
     applyAriaLabels(backdrop);
     // 呼び出し側が select.value を入れるより前に差し替える (setter でラベルが追従するため)。
@@ -773,6 +779,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       closeCardMenu();
       return;
     }
+    // 記録中にメニューを開くと capture リスナーが全キーを飲み込み続け、↑↓ 等の操作が効かなくなる。
+    stopRecording();
     const newWinItem = isConnected(entry.host)
       ? `<button class="menu-item" data-m="newwin">${icon("add")} 新しいウィンドウで接続</button>`
       : "";
