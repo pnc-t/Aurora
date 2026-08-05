@@ -1337,6 +1337,7 @@ fn run_server(
     let (codec_status_tx, codec_status_rx) = mpsc::channel::<net::CodecStatus>(4);
 
     // encode スレッド
+    let encode_tray_bus = tray_bus.clone();
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
@@ -1349,6 +1350,7 @@ fn run_server(
                 max_bitrate_bps,
                 encode_gpu,
                 codec_status_tx,
+                encode_tray_bus,
             ) {
                 tracing::error!(error = %e, "encode loop ended");
             }
@@ -1771,6 +1773,58 @@ fn fallback_to_h264_on_push_failure(
     }
 }
 
+/// `poll_nal` の失敗 (エンコーダ内部の応答不能等) からの復旧。以前は `?` でこの関数 (=encode
+/// スレッド) を丸ごと終了させていたが、TCP/UDP は生きたまま映像だけ永久に止まり誰も気付けない
+/// 事故だった (H-7)。`encode::create` による再構築手順は `drain_cmds`/`fallback_to_h264_on_push_failure`
+/// と同じものを再利用する。capture_loop の 500ms リトライに合わせて間隔を空け、
+/// `MAX_POLL_RETRIES` 回失敗しても、encode スレッド自体は終了させず (push_frame 経路の既存
+/// H.264 フォールバックに次の機会を委ねる)、無人運用で気付けるよう tray へ一度だけ通知する
+/// (再構築に成功したら通知フラグをリセットし、次に尽きたら再度通知できるようにする)。
+#[allow(clippy::too_many_arguments)]
+fn recover_encoder_after_poll_nal_failure(
+    enc: &mut PlatformEncoder,
+    current_codec: &mut VideoCodec,
+    device: &capture::SharedDevice,
+    max_bitrate_bps: u32,
+    encode_gpu: Option<&str>,
+    codec_status_tx: &mpsc::Sender<net::CodecStatus>,
+    tray_bus: &tray::SharedTrayBus,
+    stall_notified: &mut bool,
+    err: anyhow::Error,
+) {
+    const MAX_POLL_RETRIES: u32 = 5;
+    const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+    tracing::warn!(error = %err, "poll_nal failed; attempting encoder recreation");
+    for attempt in 1..=MAX_POLL_RETRIES {
+        std::thread::sleep(POLL_RETRY_INTERVAL);
+        match encode::create(device.clone(), max_bitrate_bps, encode_gpu, *current_codec) {
+            Ok((new_enc, effective)) => {
+                *enc = new_enc;
+                *current_codec = effective;
+                let _ = codec_status_tx.blocking_send(net::CodecStatus::Active(effective));
+                tracing::info!(
+                    attempt,
+                    ?effective,
+                    "encoder recreated after poll_nal failure; encoding resumed"
+                );
+                *stall_notified = false;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "encoder recreation retry failed");
+            }
+        }
+    }
+    tracing::error!(
+        retries = MAX_POLL_RETRIES,
+        "encoder recreation exhausted retries after poll_nal failure; video delivery stalled"
+    );
+    if !*stall_notified {
+        tray_bus.on_encode_stalled();
+        *stall_notified = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_loop(
     device: capture::SharedDevice,
@@ -1781,6 +1835,7 @@ fn encode_loop(
     max_bitrate_bps: u32,
     encode_gpu: Option<String>,
     codec_status_tx: mpsc::Sender<net::CodecStatus>,
+    tray_bus: tray::SharedTrayBus,
 ) -> Result<()> {
     // 後続のコーデック切替/フォールバック時の再構築用に device を保持する (最初の create は
     // 所有権を消費するため clone しておく)。
@@ -1805,6 +1860,9 @@ fn encode_loop(
     // 取りこぼさず、後続フレームを待たずにフラッシュへ繋ぐため (要求は別チャネルで来るので
     // 強制送出フレームと到着順がずれうる)。フラッシュ実施時にクリアする。
     let mut pending_keyframe = false;
+    // poll_nal 失敗でリトライ上限に達したことを tray へ通知済みか。復旧するまで連打しない
+    // (再構築成功でリセットし、次に尽きたら再度通知できるようにする)。
+    let mut poll_stall_notified = false;
     loop {
         pending_keyframe |= drain_cmds(
             &mut enc,
@@ -1847,8 +1905,25 @@ fn encode_loop(
                 );
             } else {
                 nals.clear();
-                while let Some(nal) = enc.poll_nal()? {
-                    nals.push(nal);
+                loop {
+                    match enc.poll_nal() {
+                        Ok(Some(nal)) => nals.push(nal),
+                        Ok(None) => break,
+                        Err(e) => {
+                            recover_encoder_after_poll_nal_failure(
+                                &mut enc,
+                                &mut current_codec,
+                                &device_for_recreate,
+                                max_bitrate_bps,
+                                encode_gpu.as_deref(),
+                                &codec_status_tx,
+                                &tray_bus,
+                                &mut poll_stall_notified,
+                                e,
+                            );
+                            break;
+                        }
+                    }
                 }
                 if let Some(m) = meter.as_mut() {
                     let encode_us = t0.elapsed().as_micros() as u32;
@@ -1883,9 +1958,28 @@ fn encode_loop(
             if let Err(e) = enc.flush_pending() {
                 tracing::warn!(error = %e, "idle flush_pending failed");
             }
-            while let Some(nal) = enc.poll_nal()? {
-                if nal_tx.blocking_send(nal).is_err() {
-                    return Ok(());
+            loop {
+                match enc.poll_nal() {
+                    Ok(Some(nal)) => {
+                        if nal_tx.blocking_send(nal).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        recover_encoder_after_poll_nal_failure(
+                            &mut enc,
+                            &mut current_codec,
+                            &device_for_recreate,
+                            max_bitrate_bps,
+                            encode_gpu.as_deref(),
+                            &codec_status_tx,
+                            &tray_bus,
+                            &mut poll_stall_notified,
+                            e,
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1916,10 +2010,29 @@ fn encode_loop(
                 if let Err(e) = enc.flush_pending() {
                     tracing::warn!(error = %e, "encoder flush_pending failed");
                 }
-                while let Some(nal) = enc.poll_nal()? {
-                    keyframe_sent |= nal.keyframe;
-                    if nal_tx.blocking_send(nal).is_err() {
-                        return Ok(());
+                loop {
+                    match enc.poll_nal() {
+                        Ok(Some(nal)) => {
+                            keyframe_sent |= nal.keyframe;
+                            if nal_tx.blocking_send(nal).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            recover_encoder_after_poll_nal_failure(
+                                &mut enc,
+                                &mut current_codec,
+                                &device_for_recreate,
+                                max_bitrate_bps,
+                                encode_gpu.as_deref(),
+                                &codec_status_tx,
+                                &tray_bus,
+                                &mut poll_stall_notified,
+                                e,
+                            );
+                            break;
+                        }
                     }
                 }
             }
