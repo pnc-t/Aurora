@@ -227,6 +227,35 @@ impl Sink {
             *g = None;
         }
     }
+    /// 現在の表示先を複製して取り出す (ロールバック用のスナップショット)。`Channel` は Arc
+    /// 内部の安価な複製のため clone してもコストは軽い。`clear`/`restore` と対で使い、
+    /// ウィンドウ生成/emit 失敗時に手戻りできるよう呼び出し元 (net/window.rs) が保持する。
+    #[cfg(desktop)]
+    fn snapshot(
+        &self,
+    ) -> (
+        Option<Channel<ClientEvent>>,
+        Option<Channel<InvokeResponseBody>>,
+    ) {
+        let event = self.event.lock().ok().and_then(|g| g.clone());
+        let video = self.video.lock().ok().and_then(|g| g.clone());
+        (event, video)
+    }
+    /// `snapshot` で取り出した表示先を書き戻す (ロールバック)。`set`/`clear` と違い Option を
+    /// そのまま受け取り、デタッチ中だった状態 (None) もそのまま復元できる。
+    #[cfg(desktop)]
+    fn restore(
+        &self,
+        event: Option<Channel<ClientEvent>>,
+        video: Option<Channel<InvokeResponseBody>>,
+    ) {
+        if let Ok(mut g) = self.event.lock() {
+            *g = event;
+        }
+        if let Ok(mut g) = self.video.lock() {
+            *g = video;
+        }
+    }
 }
 
 /// セッションごとに保持するハンドル。
