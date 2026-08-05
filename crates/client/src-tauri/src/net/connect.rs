@@ -788,6 +788,27 @@ async fn tcp_reader_loop(
                     .unwrap_or(false);
                 if !solicited {
                     tracing::warn!(id, name = %name, "unsolicited FileOffer ignored (no matching request)");
+                } else if download.is_some() {
+                    // 進行中のダウンロードがある間に新しい FileOffer (別 id の割り込み、または
+                    // 同一 id の再送) を受理すると、単一スロット download を無条件で上書きしてしまい
+                    // (a) 同一 id 再送では File::create の truncate で受信済みバイトが無言で失われ、
+                    // (b) 別 id の割り込みでは先行転送の FileChunk が「offer に一致しない」として
+                    // 捨てられ FileResult も届かず進捗表示が永久にハングする。よって拒否する。
+                    tracing::warn!(
+                        id,
+                        name = %name,
+                        "FileOffer rejected: a download is already in progress"
+                    );
+                    // 拒否した新しい方の pending_downloads エントリを解放しないとリークし、
+                    // request_file を呼んだ側の進捗表示が永久にハングしたままになる。
+                    if let Ok(mut s) = pending_downloads.lock() {
+                        s.remove(&id);
+                    }
+                    sink.send_event(ClientEvent::FileResult {
+                        id,
+                        ok: false,
+                        message: "a download is already in progress".into(),
+                    });
                 } else {
                     match open_download(&name).await {
                         Ok((file, path)) => {
