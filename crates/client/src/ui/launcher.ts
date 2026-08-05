@@ -1069,6 +1069,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 現在表示中の並び (ドラッグ並べ替えの基準)。
   let currentHosts: HostEntry[] = [];
 
+  // ドラッグ中かどうか。renderHosts は hostList.innerHTML を丸ごと再構築するため、
+  // ドラッグ中に呼ばれると掴んでいるカード (startDrag のクロージャが握る DOM) が
+  // ツリーから孤立し、重複行/浮いたカードになる。ドラッグ中は再構築を保留する。
+  let isDragging = false;
+  // ドラッグ中に renderHosts が呼ばれたかどうか。プローブ結果や他ウィンドウの接続状態変化を
+  // 取りこぼさないよう、ドラッグ終了時にまとめて1回だけ反映する。
+  let pendingRenderHosts = false;
+
   // 到達性プローブ結果 (host 小文字 → online)。未判定はドット非表示。
   const probeMap = new Map<string, boolean>();
   let probing = false;
@@ -1101,6 +1109,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     }
   }
 
+  /** ドラッグ中に保留された renderHosts があれば、ドラッグ終了時に1回だけ反映する。 */
+  function flushPendingRenderHosts(): void {
+    if (pendingRenderHosts) {
+      pendingRenderHosts = false;
+      renderHosts(currentHosts);
+    }
+  }
+
   /** from の要素を to の位置へ移動し、保存して再描画する。 */
   function reorder(from: number, to: number): void {
     if (from === to || from < 0 || to < 0) return;
@@ -1118,6 +1134,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
    * HTML5 DnD は WebView2 で不安定なため pointer イベントで自前実装する。
    */
   function startDrag(from: number, downEvent: PointerEvent, card: HTMLElement): void {
+    isDragging = true;
     const rect = card.getBoundingClientRect();
     const offsetY = downEvent.clientY - rect.top;
     let targetPos = from;
@@ -1162,13 +1179,18 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       window.removeEventListener("pointercancel", onCancel);
       clone.remove();
       card.classList.remove("drag-placeholder");
+      // ここで確実に false へ戻す (pointerup/pointercancel どちらの経路でも通る)。
+      isDragging = false;
     };
     const onUp = (): void => {
       cleanup();
-      reorder(from, targetPos);
+      reorder(from, targetPos); // 並べ替え確定 (from === to なら内部で何もせず戻る)
+      // reorder が描画済みでも、そこで使われた並びより後に来た保留分だけを反映する
+      // (先に flush すると並べ替え前の順序で描き直してしまうため、必ず reorder の後に置く)。
+      flushPendingRenderHosts();
     };
     // pointercancel は pointerup が来ないまま中断されるため、確定はせず後始末のみ行い
-    // 見た目 (カード位置) は元の並び順で再描画して戻す。
+    // 見た目 (カード位置) は元の並び順で再描画して戻す (この呼び出しで pendingRenderHosts も消費される)。
     const onCancel = (): void => {
       cleanup();
       renderHosts(currentHosts);
@@ -1192,6 +1214,12 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   function renderHosts(hosts: HostEntry[]): void {
     currentHosts = hosts;
+    if (isDragging) {
+      // 保留: 掴んでいるカードを孤立させないよう再構築せず、ドラッグ終了時に描画し直す。
+      pendingRenderHosts = true;
+      return;
+    }
+    pendingRenderHosts = false;
     if (hosts.length === 0) {
       // 手順3行の説教くさいガイドは不評だったため撤廃し、見出し+一行ヒントのみにする
       // (.empty-hint は wol-panel と共有のため触らず新クラスにする)。
