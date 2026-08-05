@@ -268,25 +268,6 @@ export class Session {
     this.host.removed(this);
   }
 
-  /** タブ除去/窓終了時の資源解放。 */
-  destroy(): void {
-    window.removeEventListener("online", this.onNetworkOnline);
-    this.cancelReconnect();
-    if (this.viewportTimer !== null) {
-      clearTimeout(this.viewportTimer);
-      this.viewportTimer = null;
-    }
-    if (this.prepareTimer !== null) {
-      clearTimeout(this.prepareTimer);
-      this.prepareTimer = null;
-    }
-    this.preparingVirtual = false;
-    this.clearPending();
-    this.input.detach();
-    this.decoder.close();
-    void disconnect(this.id);
-  }
-
   // ---- タブのウィンドウ間移動 (Phase 3 ドラッグ分割) ----
 
   /** 移譲用の表示状態スナップショットを作る。接続中のみ意味を持つ。 */
@@ -872,6 +853,9 @@ export class Session {
   }
 
   private teardown(): void {
+    // "online" リスナを外さないと Session (と decoder/input の参照グラフ) が GC されず、
+    // 単一 WebView 常駐のモバイルではタブ開閉/ホスト切替ごとに単調増加してしまう。
+    window.removeEventListener("online", this.onNetworkOnline);
     this.disconnectHandled = true;
     this.cancelReconnect();
     this.clearPending();
