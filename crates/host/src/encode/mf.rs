@@ -285,6 +285,10 @@ impl Inner {
 
             // SAFETY: outs スライスは MFT が読み書きする。
             let r = unsafe { self.transform.ProcessOutput(0, &mut outs, &mut status) };
+            // pEvents は成功/失敗どちらでも MFT が書き込みうる out 引数。分岐に関わらず
+            // ここで一度だけ解放すれば各分岐で個別に drop する必要がなく、二重 drop も生まれない。
+            // SAFETY: outs[0].pEvents はこの後どの分岐でも読み書きしない。ここで手動 drop して解放する。
+            unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
             match r {
                 Ok(()) => {
                     // SAFETY: ProcessOutput 成功時 pSample は live。take で所有権を取り出す。
@@ -323,15 +327,11 @@ impl Inner {
                     // pSample をクリーンアップ (ManuallyDrop)
                     // SAFETY: NEED_MORE_INPUT では出力が無いので pSample を手動 drop して解放する。
                     unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
-                    // SAFETY: pEvents も同様に手動 drop して解放する。
-                    unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                     return Ok(());
                 }
                 Err(e) => {
                     // SAFETY: エラー時も出力サンプルは無い。pSample を手動 drop して解放する。
                     unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pSample) };
-                    // SAFETY: pEvents も同様に手動 drop して解放する。
-                    unsafe { std::mem::ManuallyDrop::drop(&mut outs[0].pEvents) };
                     return Err(anyhow!("ProcessOutput: {e}"));
                 }
             }
