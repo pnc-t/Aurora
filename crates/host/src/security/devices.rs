@@ -235,8 +235,15 @@ impl DeviceGuard {
             if let Some(existing) = pending.iter_mut().find(|d| d.pubkey == key) {
                 existing.label = label;
             } else {
+                // 上限到達時に先頭を FIFO で捨てると、正規デバイスが承認待ちに
+                // 入っている間に別の未知鍵で連続接続するだけでそれを押し出せてしまう
+                // (承認妨害)。溢れた分は古いものを捨てずに新規追加を拒否する。
                 if pending.len() >= MAX_PENDING {
-                    pending.remove(0);
+                    tracing::warn!(
+                        pending_count = pending.len(),
+                        "pending device list full, rejecting new pairing request"
+                    );
+                    return Admit::Rejected;
                 }
                 pending.push(PendingDevice {
                     pubkey: key.to_vec(),
