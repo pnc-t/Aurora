@@ -50,6 +50,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         shared,
         session_sem,
         registry,
+        takeover_pending,
         conn_id,
         force_frame,
         tray_bus,
@@ -372,10 +373,15 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 送って映像を復帰させる。これもクライアント毎ローカル。映像送信は専用タスクで走るため、
     // 制御ループ (ここ) とタスクで共有する atomic にする。
     let video_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // テイクオーバー (仮想ディスプレイ切替) 実施中フラグ。true の間はキャプチャがまだ物理を
-    // 撮っている固まりフレームを送らないよう映像 UDP 送出を止める。video_paused (クライアント
-    // 駆動のタブ pause) とは別軸なので、送出ゲートは両者の論理和にする (どちらかで停止)。
-    let takeover_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // takeover_pending (テイクオーバー実施中フラグ) は args から受け取る全接続共有の Arc
+    // (net/mod.rs で生成)。単一エンコーダ=共有映像なので、テイクオーバー中の物理固まりフレーム
+    // 抑止は要求元だけでなく全クライアントの映像送信タスクに効かせる必要があり、ここではローカル
+    // Arc を新規に作らない。この接続が SelectDisplay(仮想) で pending=true にした場合は、
+    // SetClientViewport 完了時に自分で false へ戻す (下記) のが通常経路だが、その前に本接続が
+    // 異常終了すると shared フラグが true のまま残り、全クライアントの映像が永久停止する
+    // (このセッションだけの話では済まない退行)。それを防ぐため、pending=true にしたのが
+    // 自分かどうかをこのローカル bool で追跡し、後始末で確実に戻す。
+    let mut takeover_pending_owned = false;
 
     // --- 映像 UDP 送信タスク (制御/入力から分離) ---
     // 映像送信を制御ループの select から外し、専用タスクで回す。同じ select に置くと、ドラッグ中の
@@ -598,6 +604,9 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                         virtual_selected,
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
+                                    // 自分が true にしたのなら、後始末で戻す責任も自分が持つ
+                                    // (SetClientViewport で false にできなかった場合の保険)。
+                                    takeover_pending_owned = virtual_selected;
                                     // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
                                     // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
                                     // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
@@ -752,6 +761,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                             // 置くと is_virtual=false 経路や失敗時に、直前の SelectDisplay で立てた
                             // takeover_pending=true が残り送出が永久固着する。
                             takeover_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+                            takeover_pending_owned = false;
                             // 物理ディスプレイのキャプチャ時はホスト解像度を一切変更しない
                             // (はみ出しはクライアント側の object-fit / レターボックスで吸収する)。
                         }
@@ -913,6 +923,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     .await;
 
     // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
+    // -0.5) この接続が SelectDisplay(仮想) で立てた takeover_pending=true を SetClientViewport
+    // で戻せずに終了した場合 (異常切断・ping タイムアウト等) の保険。shared フラグなので、戻さずに
+    // 抜けると他の全クライアントの映像送出が永久に止まる (このセッションだけの問題では済まない)。
+    if takeover_pending_owned {
+        tracing::warn!("connection ended while takeover was pending; clearing shared gate");
+        takeover_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     // 0) tray へ切断を通知する (切断バルーン + 接続数デクリメント)。確立時の on_connected と対。
     tray_bus.on_disconnected(peer_label);
     // 0.5) AURHELLO 登録簿から自分の枠を外す (自分の conn_id のときだけ除去)。

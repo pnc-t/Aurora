@@ -377,6 +377,8 @@ pub(crate) struct ClientArgs {
     /// 認証を通してから acquire する (認証前接続はこの枠に触れない)。
     session_sem: Arc<tokio::sync::Semaphore>,
     registry: Registry,
+    /// テイクオーバー実施中フラグ (全クライアント共有)。詳細は生成元コメント参照。
+    takeover_pending: Arc<std::sync::atomic::AtomicBool>,
     conn_id: u64,
     /// 接続/キーフレーム要求時に capture へ現在の画面の強制送出を促す共有フラグ ([`ServerConfig`])。
     force_frame: Arc<std::sync::atomic::AtomicBool>,
@@ -494,6 +496,14 @@ pub async fn run_server(
 
     // host→全クライアント push 用の登録簿。
     let registry: Registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // テイクオーバー (仮想ディスプレイ切替) 実施中フラグ。単一エンコーダ=共有映像なので、
+    // 「物理の固まりフレームを送らない」ゲートは全クライアントの映像送信タスクに効かせる必要が
+    // ある。フレーム毎に読む映像ホットパス (`video_task`) からロック無しで読めるよう、
+    // `SharedControl` (tokio Mutex) の外に単独の `Arc<AtomicBool>` として持つ。SharedControl は
+    // await を跨いでロックを保持する制御操作 (begin_takeover/end_takeover) があるため、そこに
+    // 混ぜると映像送出タスクが毎フレーム `shared.lock().await` する羽目になり遅延予算に反する。
+    let takeover_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // encode スレッド → net への実効コーデック報告を捌くタスク。CodecStatus::Active は
     // VideoCodecChanged の配信 (変化時のみ)、Fallback は host_codecs から失敗コーデックを
@@ -630,6 +640,7 @@ pub async fn run_server(
                 shared: shared.clone(),
                 session_sem: session_sem.clone(),
                 registry: registry.clone(),
+                takeover_pending: takeover_pending.clone(),
                 conn_id,
                 force_frame: cfg.force_frame.clone(),
                 tray_bus: cfg.tray_bus.clone(),
