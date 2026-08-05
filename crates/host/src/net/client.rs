@@ -20,6 +20,15 @@ fn display_label(device_name: &str, ip: std::net::IpAddr) -> String {
     }
 }
 
+/// アップロード異常終了時の書きかけファイルを削除する。正常完了ファイルと同名で
+/// 不完全データが残り、ユーザーが破損ファイルを正常品と誤認するのを防ぐため。
+/// 削除失敗は元のアップロードエラーを潰さないようログのみに留める。
+async fn cleanup_aborted_upload(path: &str) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        tracing::warn!(path = %path, error = %e, "failed to remove aborted upload file");
+    }
+}
+
 pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     let ClientArgs {
         peer,
@@ -748,6 +757,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // データ欠落/重複の可能性が高く、書き込むと破損ファイルを残すため中断する。
                                     let message = format!("chunk offset mismatch: expected {}, got {offset}", u.written);
                                     tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch, aborting upload");
+                                    cleanup_aborted_upload(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
@@ -757,12 +767,14 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // (total の検証が抜けており実質デッドだった)。
                                     let message = format!("upload exceeds declared size {}", u.total);
                                     tracing::warn!(id, total = u.total, written = u.written, got = data.len(), "upload exceeds declared size, aborting");
+                                    cleanup_aborted_upload(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
+                                    cleanup_aborted_upload(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
@@ -777,7 +789,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                                 tracing::info!(id, written, total, path = %path, "file upload complete");
                                                 ControlMsg::FileResult { id, ok: true, message: path }
                                             }
-                                            Err(e) => ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") },
+                                            Err(e) => {
+                                                tracing::warn!(id, error = %e, "file flush failed");
+                                                cleanup_aborted_upload(&path).await;
+                                                ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") }
+                                            }
                                         };
                                         send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                     }
