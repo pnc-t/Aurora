@@ -505,6 +505,17 @@ unsafe extern "system" fn get_file_data_cb(
         if bytes.is_empty() {
             break; // EOF
         }
+        // FFI コールバック内で panic するとプロセス全体が abort するため、
+        // remaining -= got as u32 が桁溢れしないことを事前検証で保証する。
+        if bytes.len() > want as usize {
+            tracing::warn!(
+                path = %path,
+                want,
+                got = bytes.len(),
+                "FsRead returned more data than requested"
+            );
+            return ERROR_IO_DEVICE.to_hresult();
+        }
         let got = bytes.len();
         // SAFETY: ctx は有効。確保失敗時は null。
         let buf = unsafe { PrjAllocateAlignedBuffer(ctx, got) };
