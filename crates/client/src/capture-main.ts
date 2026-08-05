@@ -40,7 +40,13 @@ import {
   updateStats,
 } from "./ui/stats-overlay";
 import { hideReconnectBadge, initReconnectBadge, showReconnectBadge } from "./ui/reconnect-badge";
-import { handleFileProgress, handleFileResult, mountFileTransfer } from "./ui/file-transfer";
+import {
+  clearTransferSession,
+  handleFileProgress,
+  handleFileResult,
+  mountFileTransfer,
+  setActiveTransferSession,
+} from "./ui/file-transfer";
 import {
   initCaptureOverlay,
   openConfirmOverlay,
@@ -91,12 +97,17 @@ function setActive(id: string): void {
   activeId = id;
   tabs.setActive(id);
   sessions.get(id)?.activate();
+  // file パネルは窓に 1 つしか無く、常に「今アクティブなタブ」の転送状態を表示する。
+  // 切替のたびに再同期しないと、非アクティブ中に完了したダウンロードの結果が
+  // ボタンの disabled 等に反映されず固着する (H-4)。
+  setActiveTransferSession(id);
 }
 
 /** セッションが恒久終了した: タブ除去・アクティブ付替え・最後なら窓を閉じる。 */
 function removeSession(s: Session): void {
   sessions.delete(s.id);
   tabs.remove(s.id);
+  clearTransferSession(s.id); // 転送状態の Map エントリを破棄 (リーク防止)
   if (sessions.size === 0) {
     void closeWindow();
     return;
@@ -135,10 +146,12 @@ const host: SessionHost = {
     if (activeId === s.id) clearStats();
   },
   fileResult: (s, id, ok, message) => {
-    if (activeId === s.id) handleFileResult(id, ok, message);
+    // 非アクティブタブの結果も取りこぼさないよう常に転送する (DOM 描画は file-transfer 側が
+    // アクティブタブに限定する)。
+    handleFileResult(s.id, id, ok, message);
   },
   fileProgress: (s, id, done, total) => {
-    if (activeId === s.id) handleFileProgress(id, done, total);
+    handleFileProgress(s.id, id, done, total);
   },
   reconnectBadge: (s, text) => {
     if (activeId === s.id) showReconnectBadge(text);

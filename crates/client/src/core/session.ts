@@ -84,9 +84,12 @@ export interface SessionHost {
   updateStats(s: Session, ev: StatsEvent): void;
   /** 統計 HUD クリア (アクティブ時のみ)。 */
   clearStats(s: Session): void;
-  /** ダウンロード結果を file パネルへ (アクティブ時のみ)。 */
+  /**
+   * ダウンロード結果を file パネルへ。取りこぼし防止のため非アクティブ時も必ず呼ばれる
+   * (状態更新は常に行い、DOM 描画をアクティブタブに限定するのは実装側の責務)。
+   */
   fileResult(s: Session, id: number, ok: boolean, message: string): void;
-  /** ファイル転送の進捗を file パネルへ (アクティブ時のみ)。done/total はバイト数。 */
+  /** ファイル転送の進捗を file パネルへ (fileResult と同様、非アクティブ時も呼ばれる)。done/total はバイト数。 */
   fileProgress(s: Session, id: number, done: number, total: number): void;
   /** 静かな再接続中の常駐バッジを表示する (アクティブ時のみ)。最後の映像を隠さない。 */
   reconnectBadge(s: Session, text: string): void;
