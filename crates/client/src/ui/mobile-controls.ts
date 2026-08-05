@@ -244,7 +244,12 @@ export function mountMobileControls(opts: MobileControlsOpts): MobileControlsHan
     }, AUDIO_LONG_PRESS_MS);
   });
   audioBtn?.addEventListener("pointerup", cancelAudioPressTimer);
-  audioBtn?.addEventListener("pointercancel", cancelAudioPressTimer);
+  audioBtn?.addEventListener("pointercancel", () => {
+    cancelAudioPressTimer();
+    // pointercancel の後は click が発火しないため、長押し成立後にここで
+    // フラグを戻さないと次の正当なタップが誤って1回無視される。
+    audioLongPressed = false;
+  });
   audioBtn?.addEventListener("click", () => {
     if (audioLongPressed) {
       // 長押しで開いた直後の click は消費するだけ (ミュートは切り替えない)。
