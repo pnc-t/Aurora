@@ -66,6 +66,17 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // accept ループが進まず正規ユーザーまで締め出される (認証前 DoS)。
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    // client 側 ping ループ (`crates/client/src-tauri/src/net/connect.rs` の ping_task) は
+    // 1 秒間隔で**無条件に** (映像一時停止中・バックグラウンド遷移中でも) Ping を送り続けるため、
+    // host 側もこれを生存証明として使える。機内モード等で FIN/RST を出さずにネットワークを失うと
+    // `read_tcp_frame` (reader_task 内) が永久にブロックし、MAX_CLIENTS の枠占有・ProjFS 単独所有の
+    // 固着・HeldInputs 解放漏れが起きる (後始末セクションに到達しないため)。無応答を検知して通常の
+    // 切断経路 (後始末を必ず通る break) へ抜ける。
+    // 猶予は client 側の PONG_TIMEOUT (5 秒) より意図的に長くとる。host が先に見切ると、client が
+    // まだ生きていると思っている接続を一方的に落とすことになり、モバイルの数秒のストールで
+    // 毎回セッションが飛ぶ。ここは「本当に死んだ相手の枠を解放する」のが目的なので緩くてよい。
+    const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     // ハンドシェイク 3 メッセージ + transport 確立を 1 ブロックにまとめ、失敗時に遅延を挟む。
     // 相手 (クライアント) の静的公開鍵は transport 確立で hs が消費される前に控える
     // (デバイスピン留めの許可リスト照合に使う)。
@@ -461,9 +472,22 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 本体終了 (切断・エラー) で映像送信タスクを確実に止める。
     let _video_guard = AbortOnDrop(video_task);
 
+    // 最後に Ping を受信した時刻。client の ping ループが無条件 (1 秒毎) なので、これだけで
+    // 生存証明として十分 (Input 等は静止中・無操作中に途絶えるため無応答判定の根拠にしない)。
+    let mut last_ping = std::time::Instant::now();
+    let mut ping_watchdog = tokio::time::interval(std::time::Duration::from_secs(1));
+
     let result: Result<()> = async {
     loop {
         tokio::select! {
+            // Ping 無応答ウォッチドッグ。1 秒毎に最後の Ping からの経過を確認し、PING_TIMEOUT を
+            // 超えたら通常の切断経路 (下の後始末セクション) へ抜ける。
+            _ = ping_watchdog.tick() => {
+                if last_ping.elapsed() > PING_TIMEOUT {
+                    tracing::warn!(peer = %peer, conn_id, "no ping received; treating as disconnected (network stall?)");
+                    break;
+                }
+            }
             // 制御メッセージ受信 (専用リーダタスクが読んだ生フレームをキャンセル安全に受け取る)
             maybe_frame = frame_rx.recv() => {
                 let Some(frame) = maybe_frame else {
@@ -474,6 +498,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                 let msg = decode_ctrl_msg(&session, &frame, &mut tcp_rx_nonce, &mut plain)?;
                 match msg {
                     ControlMsg::Ping { ts_us } => {
+                        last_ping = std::time::Instant::now();
                         send_ctrl_msg(&mut write_half, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
                     }
                     ControlMsg::RequestKeyframe => {
