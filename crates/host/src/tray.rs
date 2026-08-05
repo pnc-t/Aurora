@@ -2,6 +2,9 @@
 //! 行う。変更は DPAPI に保存し、共有 PSK ([`SharedPsk`]) を更新して **次の接続から** 反映する
 //! (既存セッションは現行 PSK のまま継続)。
 //!
+//! CLI (`--set-password` / `--clear-password`) からの変更は**別プロセス**のため、この
+//! 共有 PSK には届かない。稼働中ホストがある場合は再起動するまで反映されない (M-5)。
+//!
 //! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
 
 use std::collections::VecDeque;

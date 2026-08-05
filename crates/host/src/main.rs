@@ -289,6 +289,7 @@ fn main() -> Result<()> {
             require_password_change_authorization()?;
             security::clear_password()?;
             println!("stored password cleared");
+            warn_running_host_not_reloaded();
             Ok(())
         })();
         return finish_console_command(result, owns_console);
@@ -940,7 +941,17 @@ fn set_password_interactive() -> Result<()> {
     }
     security::save_password(&pw1)?;
     println!("password saved to secure store (DPAPI, current user)");
+    warn_running_host_not_reloaded();
     Ok(())
+}
+
+/// 稼働中の別プロセスがいても検知する手段が無い (プロセス起動有無を確認する既存の仕組みは
+/// 無く、`net::is_active` は「クライアント接続中」しか見ない)。よって常に注意書きを出す。
+/// M-5: CLI 側の変更はメモリ上の `SharedPsk` に届かず、稼働中ホストは再起動まで反映されない。
+fn warn_running_host_not_reloaded() {
+    eprintln!(
+        "warning: 稼働中のホストプロセスがある場合、この変更は再起動するまで反映されません。"
+    );
 }
 
 /// 推奨パスフレーズ候補を生成する (語彙から 4 語をランダムにハイフン連結)。パスワード設定時の
