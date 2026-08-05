@@ -580,9 +580,22 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   let settings: ClientSettings = { ...DEFAULT_SETTINGS };
 
   function persist(): void {
-    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
-    // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
-    void emit("aurora://settings-changed", settings);
+    // 保存の成否を待たずに同報すると、保存失敗時も他窓が新設定で動き続け、
+    // 次回起動時に未保存の古い設定へ巻き戻ってユーザーには「戻った」ように見える。
+    void saveSettings(settings)
+      .then(() => {
+        // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
+        void emit("aurora://settings-changed", settings);
+      })
+      .catch((e) => {
+        logger.error("save settings failed", e);
+        statusText.textContent = "設定の保存に失敗しました";
+        if (statusRevertTimer !== null) clearTimeout(statusRevertTimer);
+        statusRevertTimer = window.setTimeout(() => {
+          statusRevertTimer = null;
+          updateStatusBar();
+        }, 5000);
+      });
   }
 
   // --- ショートカットの編集 (「その他」タブ) ---
