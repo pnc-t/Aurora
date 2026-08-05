@@ -76,15 +76,43 @@ impl Drop for WinVirtualization {
     }
 }
 
-/// This PC に出すための空きドライブレターを探す。実ドライブ (C: 等) と衝突しないよう、
-/// `Z:` から `D:` に向かって最初の空きを返す。空きが無ければ None。
-fn pick_free_drive_letter() -> Option<char> {
+/// This PC に出すための空きドライブレターを探し、投影ルート `root` を subst マウントする。
+/// `Z:` から `D:` に向かって走査する。
+///
+/// `DefineDosDeviceW` にはレターが空きのときだけ作成する排他フラグが無く、既存の定義を
+/// 無条件に上書きする。そのため「空きレターを探す→マウントする」を単純に2手順に分けると、
+/// 探索とマウントの間に別プロセスが同じレターを subst/マウントしていた場合、それを黙って
+/// 上書きしてしまう (TOCTOU)。ここでは各候補レターについて `DefineDosDeviceW` 呼び出しの
+/// 直前に `GetLogicalDrives` を再チェックし、その時点で埋まっていれば上書きせず次の候補へ
+/// 進むことで窓を「再チェックから syscall まで」に縮める。再チェックと `DefineDosDeviceW`
+/// の間には依然理論上の窓が残るが、Win32 にこの2手順をアトミックにする API が存在しない
+/// ため、これは実用上許容する (競合は稀・実害は subst 上書きのみでファイルシステムの
+/// 整合性は損なわれない)。
+fn mount_first_free_drive(root: &Path) -> Option<char> {
     // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
-    let used = unsafe { GetLogicalDrives() };
-    (3..26u32)
+    let initial = unsafe { GetLogicalDrives() };
+    let candidates: Vec<u32> = (3..26u32)
         .rev()
-        .find(|i| used & (1 << i) == 0)
-        .map(|i| (b'A' + i as u8) as char)
+        .filter(|i| initial & (1 << i) == 0)
+        .collect();
+    for i in candidates {
+        let letter = (b'A' + i as u8) as char;
+        // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
+        // 直前の候補列挙から時間が経っている可能性があるため、実際に使う直前に取り直して
+        // 窓を最小化する。
+        let current = unsafe { GetLogicalDrives() };
+        if current & (1 << i) != 0 {
+            tracing::warn!(drive = %format!("{letter}:"), "drive letter taken by another process just before mount; trying next");
+            continue;
+        }
+        match mount_drive(letter, root) {
+            Ok(()) => return Some(letter),
+            Err(e) => {
+                tracing::warn!(drive = %format!("{letter}:"), error = %e, "failed to mount ProjFS drive letter; trying next");
+            }
+        }
+    }
+    None
 }
 
 /// 投影ルート `root` をドライブレター `letter` に subst してマウントする。
@@ -299,17 +327,11 @@ pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
 
     // This PC「デバイスとドライブ」に一時的なドライブとして出す。失敗してもフォルダ自体は
     // パスで参照できるので致命的ではない (ログのみ)。Drop でこのドライブを解除する。
-    let drive = match pick_free_drive_letter() {
-        Some(letter) => match mount_drive(letter, root) {
-            Ok(()) => {
-                tracing::info!(drive = %format!("{letter}:"), "ProjFS mounted as drive (visible in This PC)");
-                Some(letter)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to mount ProjFS drive; folder accessible by path only");
-                None
-            }
-        },
+    let drive = match mount_first_free_drive(root) {
+        Some(letter) => {
+            tracing::info!(drive = %format!("{letter}:"), "ProjFS mounted as drive (visible in This PC)");
+            Some(letter)
+        }
         None => {
             tracing::warn!("no free drive letter for ProjFS; folder accessible by path only");
             None
