@@ -46,12 +46,6 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         tray_bus,
         hello_registry,
     } = args;
-    // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
-    // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop) で
-    // 当該ハンドルが閉じる。名前付きイベントは「ハンドルが 1 つでも開いていれば生存」する
-    // ため、各接続が各々ガードを持つだけで「接続数 ≥ 1 の間 is_active=true」が成立する。
-    let _active = crate::net::ActiveGuard::new();
-
     // Noise XX-PSK レスポンダ。host 自身の静的鍵は使い捨て (None) でよい。デバイス識別は
     // 相手 (クライアント) の永続公開鍵 = remote_static で行う。
     let mut hs = HandshakeState::new_responder(&psk, None)?;
@@ -144,6 +138,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         }
         _ => {}
     }
+    // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
+    // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。PSK + デバイスピン留めの
+    // 認証を通過した後でのみ立てる (未認証の相手にハンドシェイクを引き延ばさせて is_active を
+    // 立てさせると、持ち主自身がトレイ/CLI から締め出されてしまうため)。セッション終了 (Drop)
+    // で当該ハンドルが閉じる。名前付きイベントは「ハンドルが 1 つでも開いていれば生存」する
+    // ため、各接続が各々ガードを持つだけで「接続数 ≥ 1 の間 is_active=true」が成立する。
+    let _active = crate::net::ActiveGuard::new();
     // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
     // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
