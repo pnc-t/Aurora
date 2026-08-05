@@ -311,12 +311,19 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
         clone.style.top = `${ev.clientY - grabY}px`;
       }
     };
-    const onUp = (ev: PointerEvent): void => {
-      el.releasePointerCapture(down.pointerId);
+    // リスナ解除とクローン/dragging クラスの後始末だけを共通化する。選択/分離の確定は onUp 側のみで行う。
+    const cleanup = (): void => {
+      // pointercancel 時はブラウザが既にキャプチャを解放しており、releasePointerCapture は
+      // NotFoundError を投げる。ここで抜けるとリスナ解除に到達せず本末転倒なので保持時のみ呼ぶ。
+      if (el.hasPointerCapture(down.pointerId)) el.releasePointerCapture(down.pointerId);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
       if (clone) clone.remove();
       el.classList.remove("tab-dragging");
+    };
+    const onUp = (ev: PointerEvent): void => {
+      cleanup();
       if (!dragging) {
         opts.onSelect(id); // 動いていない = クリック
         return;
@@ -330,8 +337,13 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
         opts.onDetach(id, window.screenX + ev.clientX, window.screenY + ev.clientY);
       }
     };
+    // pointercancel は pointerup が来ないまま中断されるため、選択/別ウィンドウ分離は確定させず後始末のみ行う。
+    const onCancel = (): void => {
+      cleanup();
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
   }
 
   return {

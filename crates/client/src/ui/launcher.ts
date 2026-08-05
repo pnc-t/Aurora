@@ -1155,15 +1155,27 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       if (pos >= others.length) hostList.appendChild(card);
       else hostList.insertBefore(card, others[pos]);
     };
-    const onUp = (): void => {
+    // リスナ解除とクローン/placeholder の後始末だけを共通化する。並べ替えの確定は onUp 側のみで行う。
+    const cleanup = (): void => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
       clone.remove();
       card.classList.remove("drag-placeholder");
+    };
+    const onUp = (): void => {
+      cleanup();
       reorder(from, targetPos);
+    };
+    // pointercancel は pointerup が来ないまま中断されるため、確定はせず後始末のみ行い
+    // 見た目 (カード位置) は元の並び順で再描画して戻す。
+    const onCancel = (): void => {
+      cleanup();
+      renderHosts(currentHosts);
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
   }
 
   /** 最終接続日時 (unix 秒) を「たった今/N分前/N時間前/N日前」に整形する。 */
