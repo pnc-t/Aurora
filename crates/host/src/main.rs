@@ -68,7 +68,7 @@ struct Args {
     /// インターフェースのみに公開して LAN/インターネットへの露出 (総当たり・接続枠 DoS) を
     /// 避ける。LAN テストや意図的な公開は `--bind <ip>` の明示指定 (例: LAN IP、全 NIC なら
     /// `--bind 0.0.0.0`) でオプトインする。
-    bind: Option<String>,
+    bind: Option<std::net::IpAddr>,
     /// ログオン時自動起動タスクを登録して終了する。
     install: bool,
     /// 自動起動タスクを解除して終了する。
@@ -116,29 +116,29 @@ impl Default for Args {
     }
 }
 
-/// `--flag <value>` の値を取り出す。欠落時はパニックせずフレンドリーに終了する
-/// (CLI 引数ミスはユーザーエラーなので panic のバックトレースより明示メッセージが親切)。
-fn take_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> String {
-    it.next().unwrap_or_else(|| {
-        eprintln!("error: {flag} requires a value");
-        std::process::exit(2);
-    })
+/// `--flag <value>` の値を取り出す。欠落時はエラー文字列を返す (呼び出し元の `parse_args` が
+/// 集約して呼び出し元へ返す。リリースはコンソールが無く `eprintln!` が消えるため、ここで
+/// `exit` せず `main` 側でコンソール確保後にメッセージを出す)。
+fn take_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> Result<String, String> {
+    it.next()
+        .ok_or_else(|| format!("error: {flag} requires a value"))
 }
 
-/// `--flag <value>` を取り出して `T` へパースする。欠落・不正値はクリーン終了する。
-fn parse_value<T, I>(it: &mut I, flag: &str, hint: &str) -> T
+/// `--flag <value>` を取り出して `T` へパースする。欠落・不正値はエラー文字列で返す。
+fn parse_value<T, I>(it: &mut I, flag: &str, hint: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
     I: Iterator<Item = String>,
 {
-    let raw = take_value(it, flag);
-    raw.parse().unwrap_or_else(|_| {
-        eprintln!("error: {flag} expects {hint} (got '{raw}')");
-        std::process::exit(2);
-    })
+    let raw = take_value(it, flag)?;
+    raw.parse()
+        .map_err(|_| format!("error: {flag} expects {hint} (got '{raw}')"))
 }
 
-fn parse_args() -> Args {
+/// CLI 引数をパースする。エラーはここで `exit` せず `Err(String)` として呼び出し元へ返す
+/// (リリースは GUI サブシステムでコンソールが無いため、ここで `eprintln!`/`exit` しても
+/// メッセージが誰にも見えずに消える。`main` がエラー時だけコンソールを確保してから表示する)。
+fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -149,14 +149,14 @@ fn parse_args() -> Args {
             "--vdd-test-restore" => args.vdd_test_restore = true,
             "--perf" => args.perf = true,
             "--dump-h264" => {
-                args.dump_h264 = Some(parse_value(&mut it, "--dump-h264", "an integer N"));
+                args.dump_h264 = Some(parse_value(&mut it, "--dump-h264", "an integer N")?);
             }
             "--fps" => {
-                args.fps_cap = parse_value(&mut it, "--fps", "N (0 = uncapped)");
+                args.fps_cap = parse_value(&mut it, "--fps", "N (0 = uncapped)")?;
             }
             "--max-bitrate" => {
                 // 引数は Mbps。内部 bps へ変換する。0 (以下) は無制限 (u32::MAX) を表す。
-                let mbps: f64 = parse_value(&mut it, "--max-bitrate", "N in Mbps (0 = unlimited)");
+                let mbps: f64 = parse_value(&mut it, "--max-bitrate", "N in Mbps (0 = unlimited)")?;
                 args.max_bitrate_bps = if mbps <= 0.0 {
                     u32::MAX
                 } else {
@@ -164,10 +164,9 @@ fn parse_args() -> Args {
                 };
             }
             "--port" => {
-                let port: u16 = parse_value(&mut it, "--port", "N (1..=65535)");
+                let port: u16 = parse_value(&mut it, "--port", "N (1..=65535)")?;
                 if port == 0 {
-                    eprintln!("error: --port must be 1..=65535");
-                    std::process::exit(2);
+                    return Err("error: --port must be 1..=65535".to_string());
                 }
                 args.port = port;
                 args.port_explicit = true;
@@ -177,13 +176,19 @@ fn parse_args() -> Args {
             "--set-password" => args.set_password = true,
             "--clear-password" => args.clear_password = true,
             "--log-level" => {
-                args.log_level = Some(take_value(&mut it, "--log-level"));
+                args.log_level = Some(take_value(&mut it, "--log-level")?);
             }
             "--bind" => {
-                args.bind = Some(take_value(&mut it, "--bind"));
+                // IP 形式の妥当性はここで検証する (従来は resolve_bind_spec まで遅延し、
+                // 通常のサーバ起動経路で失敗するとコンソール無しでメッセージが消えていた)。
+                let raw = take_value(&mut it, "--bind")?;
+                args.bind =
+                    Some(raw.parse().map_err(|_| {
+                        format!("error: --bind expects an IP address (got '{raw}')")
+                    })?);
             }
             "--encode-gpu" => {
-                args.encode_gpu = Some(take_value(&mut it, "--encode-gpu"));
+                args.encode_gpu = Some(take_value(&mut it, "--encode-gpu")?);
             }
             "--align-vdd" => args.align_vdd = true,
             other => {
@@ -191,7 +196,7 @@ fn parse_args() -> Args {
             }
         }
     }
-    args
+    Ok(args)
 }
 
 fn main() -> Result<()> {
@@ -209,7 +214,19 @@ fn main() -> Result<()> {
         }
     }
 
-    let args = parse_args();
+    // parse_args はエラーでも exit しない (リリースは GUI サブシステムでコンソールが無く、
+    // ここで eprintln!/exit してもメッセージが誰にも見えず消えるため)。エラー時だけ
+    // 親コンソールへ接続してから表示する。通常のサーバ起動 (パース成功) では、
+    // needs_console の判定に一切影響しないようコンソールを開かない。
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(msg) => {
+            #[cfg(windows)]
+            attach_console(false);
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
 
     // CLI サブコマンドは端末への入出力が要る。既定のサーバ起動はバックグラウンド
     // (トレイ常駐) で、リリースでは GUI サブシステムのためコンソールが無い。
@@ -296,7 +313,7 @@ fn main() -> Result<()> {
     } else {
         system::load_port().unwrap_or(args.port)
     };
-    let bind = resolve_bind_spec(args.bind.as_deref());
+    let bind = resolve_bind_spec(args.bind);
     run_server(
         args.perf,
         args.fps_cap,
@@ -318,15 +335,13 @@ fn main() -> Result<()> {
 /// Tailscale 未導入 (取得失敗) が続けば最終的に `127.0.0.1` に fail-close する (localhost の
 /// 動作確認フローは保つ一方、LAN/インターネットへは到達不能)。LAN テストや意図的な公開は
 /// `--bind <ip>` の明示オプトイン (`--bind 0.0.0.0` で全 NIC 公開も選べる)。
-fn resolve_bind_spec(explicit: Option<&str>) -> BindSpec {
+///
+/// IP 形式の妥当性は `parse_args` 側で検証済み (パースエラーをコンソール未確保のまま
+/// `exit` すると、通常のサーバ起動経路ではメッセージが誰にも見えず消えるため)。ここでは
+/// 検証済みの値をそのまま `BindSpec` へ変換するだけでよい。
+fn resolve_bind_spec(explicit: Option<std::net::IpAddr>) -> BindSpec {
     match explicit {
-        Some(s) => {
-            let ip = s.parse().unwrap_or_else(|_| {
-                eprintln!("error: --bind expects an IP address (got '{s}')");
-                std::process::exit(2);
-            });
-            BindSpec::Fixed(ip)
-        }
+        Some(ip) => BindSpec::Fixed(ip),
         None => BindSpec::Auto,
     }
 }
