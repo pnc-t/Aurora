@@ -379,6 +379,10 @@ pub(crate) struct ClientArgs {
     registry: Registry,
     /// テイクオーバー実施中フラグ (全クライアント共有)。詳細は生成元コメント参照。
     takeover_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// ディスプレイ トポロジ操作 (begin_takeover/end_takeover) の直列化ロック (全クライアント共有)。
+    /// 詳細は生成元コメント参照。**`shared` を保持したままこのロックを取ってはいけない**
+    /// (常に display_op → shared の順で取得する。逆順だとデッドロックしうる)。
+    display_op: Arc<tokio::sync::Mutex<()>>,
     conn_id: u64,
     /// 接続/キーフレーム要求時に capture へ現在の画面の強制送出を促す共有フラグ ([`ServerConfig`])。
     force_frame: Arc<std::sync::atomic::AtomicBool>,
@@ -504,6 +508,13 @@ pub async fn run_server(
     // await を跨いでロックを保持する制御操作 (begin_takeover/end_takeover) があるため、そこに
     // 混ぜると映像送出タスクが毎フレーム `shared.lock().await` する羽目になり遅延予算に反する。
     let takeover_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // ディスプレイ トポロジ操作 (begin_takeover/end_takeover) の直列化ロック。`SharedControl`
+    // (tokio Mutex) を保持したまま数十〜数百ms かかる spawn_blocking を await すると、他クライアントの
+    // Stats/SetVideoParams 等の低頻度制御パスまで丸ごと止まってしまう (MAX_CLIENTS 接続時に無関係な
+    // クライアントの適応制御が滞留する)。そのため `shared` は判断に必要な値を読んだ時点で手放し、
+    // トポロジ操作自体はこの専用ロックで直列化する (2 接続が同時に begin_takeover/end_takeover を
+    // 走らせるとディスプレイ状態が読めなくなるため、操作の排他は維持する)。
+    let display_op = Arc::new(tokio::sync::Mutex::new(()));
 
     // encode スレッド → net への実効コーデック報告を捌くタスク。CodecStatus::Active は
     // VideoCodecChanged の配信 (変化時のみ)、Fallback は host_codecs から失敗コーデックを
@@ -641,6 +652,7 @@ pub async fn run_server(
                 session_sem: session_sem.clone(),
                 registry: registry.clone(),
                 takeover_pending: takeover_pending.clone(),
+                display_op: display_op.clone(),
                 conn_id,
                 force_frame: cfg.force_frame.clone(),
                 tray_bus: cfg.tray_bus.clone(),
