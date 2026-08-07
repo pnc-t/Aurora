@@ -2,6 +2,9 @@
 //! 行う。変更は DPAPI に保存し、共有 PSK ([`SharedPsk`]) を更新して **次の接続から** 反映する
 //! (既存セッションは現行 PSK のまま継続)。
 //!
+//! CLI (`--set-password` / `--clear-password`) からの変更は**別プロセス**のため、この
+//! 共有 PSK には届かない。稼働中ホストがある場合は再起動するまで反映されない (M-5)。
+//!
 //! Windows のみ実体を持つ。非 Windows では [`spawn`] は何もしない。
 
 use std::collections::VecDeque;
@@ -42,6 +45,8 @@ pub enum TrayEvent {
     PendingDevice { fingerprint: String, label: String },
     /// 新しいバージョンが利用可能になった (update スレッドが検知)。
     UpdateAvailable(String),
+    /// エンコーダが `poll_nal` 失敗からの再構築リトライを使い果たし、映像配信が止まった。
+    EncodeStalled,
 }
 
 /// 最大保持イベント数。あふれたら古いものを捨てる (常駐 UI なので無限に溜めない)。
@@ -118,6 +123,12 @@ impl TrayBus {
     /// 新しいバージョンが利用可能になったことを記録する (update スレッドが呼ぶ)。
     pub fn on_update_available(&self, version: String) {
         self.push(TrayEvent::UpdateAvailable(version));
+    }
+
+    /// エンコーダの再構築リトライが尽き、映像配信が止まったことを記録する (encode スレッドが呼ぶ)。
+    /// TCP/UDP 自体は生きたままなので、無人運用で気付けるようこのバルーンが唯一の手がかりになる。
+    pub fn on_encode_stalled(&self) {
+        self.push(TrayEvent::EncodeStalled);
     }
 
     /// 溜まった通知イベントを取り出す (tray の `WM_TIMER` が呼ぶ)。
@@ -554,6 +565,12 @@ mod imp {
                         "新しいバージョン v{version} が利用できます。\nトレイメニューの「更新」からインストールできます。"
                     ),
                     false,
+                ),
+                TrayEvent::EncodeStalled => balloon(
+                    hwnd,
+                    "Aurora Host — 映像配信が停止",
+                    "映像エンコーダの再構築に失敗し、映像配信が止まりました。\n接続は維持されますが映像は届きません。ホストの再起動を検討してください。",
+                    true,
                 ),
             }
         }

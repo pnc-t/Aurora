@@ -68,7 +68,7 @@ struct Args {
     /// インターフェースのみに公開して LAN/インターネットへの露出 (総当たり・接続枠 DoS) を
     /// 避ける。LAN テストや意図的な公開は `--bind <ip>` の明示指定 (例: LAN IP、全 NIC なら
     /// `--bind 0.0.0.0`) でオプトインする。
-    bind: Option<String>,
+    bind: Option<std::net::IpAddr>,
     /// ログオン時自動起動タスクを登録して終了する。
     install: bool,
     /// 自動起動タスクを解除して終了する。
@@ -116,29 +116,29 @@ impl Default for Args {
     }
 }
 
-/// `--flag <value>` の値を取り出す。欠落時はパニックせずフレンドリーに終了する
-/// (CLI 引数ミスはユーザーエラーなので panic のバックトレースより明示メッセージが親切)。
-fn take_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> String {
-    it.next().unwrap_or_else(|| {
-        eprintln!("error: {flag} requires a value");
-        std::process::exit(2);
-    })
+/// `--flag <value>` の値を取り出す。欠落時はエラー文字列を返す (呼び出し元の `parse_args` が
+/// 集約して呼び出し元へ返す。リリースはコンソールが無く `eprintln!` が消えるため、ここで
+/// `exit` せず `main` 側でコンソール確保後にメッセージを出す)。
+fn take_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> Result<String, String> {
+    it.next()
+        .ok_or_else(|| format!("error: {flag} requires a value"))
 }
 
-/// `--flag <value>` を取り出して `T` へパースする。欠落・不正値はクリーン終了する。
-fn parse_value<T, I>(it: &mut I, flag: &str, hint: &str) -> T
+/// `--flag <value>` を取り出して `T` へパースする。欠落・不正値はエラー文字列で返す。
+fn parse_value<T, I>(it: &mut I, flag: &str, hint: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
     I: Iterator<Item = String>,
 {
-    let raw = take_value(it, flag);
-    raw.parse().unwrap_or_else(|_| {
-        eprintln!("error: {flag} expects {hint} (got '{raw}')");
-        std::process::exit(2);
-    })
+    let raw = take_value(it, flag)?;
+    raw.parse()
+        .map_err(|_| format!("error: {flag} expects {hint} (got '{raw}')"))
 }
 
-fn parse_args() -> Args {
+/// CLI 引数をパースする。エラーはここで `exit` せず `Err(String)` として呼び出し元へ返す
+/// (リリースは GUI サブシステムでコンソールが無いため、ここで `eprintln!`/`exit` しても
+/// メッセージが誰にも見えずに消える。`main` がエラー時だけコンソールを確保してから表示する)。
+fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -149,14 +149,21 @@ fn parse_args() -> Args {
             "--vdd-test-restore" => args.vdd_test_restore = true,
             "--perf" => args.perf = true,
             "--dump-h264" => {
-                args.dump_h264 = Some(parse_value(&mut it, "--dump-h264", "an integer N"));
+                args.dump_h264 = Some(parse_value(&mut it, "--dump-h264", "an integer N")?);
             }
             "--fps" => {
-                args.fps_cap = parse_value(&mut it, "--fps", "N (0 = uncapped)");
+                args.fps_cap = parse_value(&mut it, "--fps", "N (0 = uncapped)")?;
             }
             "--max-bitrate" => {
                 // 引数は Mbps。内部 bps へ変換する。0 (以下) は無制限 (u32::MAX) を表す。
-                let mbps: f64 = parse_value(&mut it, "--max-bitrate", "N in Mbps (0 = unlimited)");
+                let mbps: f64 = parse_value(&mut it, "--max-bitrate", "N in Mbps (0 = unlimited)")?;
+                // NaN は比較が全て false になり `mbps <= 0.0` の 0/負値チェックをすり抜けるため、
+                // 有限値でなければ (NaN・±inf) ここで弾く。
+                if !mbps.is_finite() {
+                    return Err(format!(
+                        "error: --max-bitrate expects N in Mbps (0 = unlimited) (got '{mbps}')"
+                    ));
+                }
                 args.max_bitrate_bps = if mbps <= 0.0 {
                     u32::MAX
                 } else {
@@ -164,10 +171,9 @@ fn parse_args() -> Args {
                 };
             }
             "--port" => {
-                let port: u16 = parse_value(&mut it, "--port", "N (1..=65535)");
+                let port: u16 = parse_value(&mut it, "--port", "N (1..=65535)")?;
                 if port == 0 {
-                    eprintln!("error: --port must be 1..=65535");
-                    std::process::exit(2);
+                    return Err("error: --port must be 1..=65535".to_string());
                 }
                 args.port = port;
                 args.port_explicit = true;
@@ -177,13 +183,19 @@ fn parse_args() -> Args {
             "--set-password" => args.set_password = true,
             "--clear-password" => args.clear_password = true,
             "--log-level" => {
-                args.log_level = Some(take_value(&mut it, "--log-level"));
+                args.log_level = Some(take_value(&mut it, "--log-level")?);
             }
             "--bind" => {
-                args.bind = Some(take_value(&mut it, "--bind"));
+                // IP 形式の妥当性はここで検証する (従来は resolve_bind_spec まで遅延し、
+                // 通常のサーバ起動経路で失敗するとコンソール無しでメッセージが消えていた)。
+                let raw = take_value(&mut it, "--bind")?;
+                args.bind =
+                    Some(raw.parse().map_err(|_| {
+                        format!("error: --bind expects an IP address (got '{raw}')")
+                    })?);
             }
             "--encode-gpu" => {
-                args.encode_gpu = Some(take_value(&mut it, "--encode-gpu"));
+                args.encode_gpu = Some(take_value(&mut it, "--encode-gpu")?);
             }
             "--align-vdd" => args.align_vdd = true,
             other => {
@@ -191,7 +203,7 @@ fn parse_args() -> Args {
             }
         }
     }
-    args
+    Ok(args)
 }
 
 fn main() -> Result<()> {
@@ -209,7 +221,19 @@ fn main() -> Result<()> {
         }
     }
 
-    let args = parse_args();
+    // parse_args はエラーでも exit しない (リリースは GUI サブシステムでコンソールが無く、
+    // ここで eprintln!/exit してもメッセージが誰にも見えず消えるため)。エラー時だけ
+    // 親コンソールへ接続してから表示する。通常のサーバ起動 (パース成功) では、
+    // needs_console の判定に一切影響しないようコンソールを開かない。
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(msg) => {
+            #[cfg(windows)]
+            attach_console(false);
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
 
     // CLI サブコマンドは端末への入出力が要る。既定のサーバ起動はバックグラウンド
     // (トレイ常駐) で、リリースでは GUI サブシステムのためコンソールが無い。
@@ -265,6 +289,7 @@ fn main() -> Result<()> {
             require_password_change_authorization()?;
             security::clear_password()?;
             println!("stored password cleared");
+            warn_running_host_not_reloaded();
             Ok(())
         })();
         return finish_console_command(result, owns_console);
@@ -296,7 +321,7 @@ fn main() -> Result<()> {
     } else {
         system::load_port().unwrap_or(args.port)
     };
-    let bind = resolve_bind_spec(args.bind.as_deref());
+    let bind = resolve_bind_spec(args.bind);
     run_server(
         args.perf,
         args.fps_cap,
@@ -318,15 +343,13 @@ fn main() -> Result<()> {
 /// Tailscale 未導入 (取得失敗) が続けば最終的に `127.0.0.1` に fail-close する (localhost の
 /// 動作確認フローは保つ一方、LAN/インターネットへは到達不能)。LAN テストや意図的な公開は
 /// `--bind <ip>` の明示オプトイン (`--bind 0.0.0.0` で全 NIC 公開も選べる)。
-fn resolve_bind_spec(explicit: Option<&str>) -> BindSpec {
+///
+/// IP 形式の妥当性は `parse_args` 側で検証済み (パースエラーをコンソール未確保のまま
+/// `exit` すると、通常のサーバ起動経路ではメッセージが誰にも見えず消えるため)。ここでは
+/// 検証済みの値をそのまま `BindSpec` へ変換するだけでよい。
+fn resolve_bind_spec(explicit: Option<std::net::IpAddr>) -> BindSpec {
     match explicit {
-        Some(s) => {
-            let ip = s.parse().unwrap_or_else(|_| {
-                eprintln!("error: --bind expects an IP address (got '{s}')");
-                std::process::exit(2);
-            });
-            BindSpec::Fixed(ip)
-        }
+        Some(ip) => BindSpec::Fixed(ip),
         None => BindSpec::Auto,
     }
 }
@@ -918,7 +941,17 @@ fn set_password_interactive() -> Result<()> {
     }
     security::save_password(&pw1)?;
     println!("password saved to secure store (DPAPI, current user)");
+    warn_running_host_not_reloaded();
     Ok(())
+}
+
+/// 稼働中の別プロセスがいても検知する手段が無い (プロセス起動有無を確認する既存の仕組みは
+/// 無く、`net::is_active` は「クライアント接続中」しか見ない)。よって常に注意書きを出す。
+/// M-5: CLI 側の変更はメモリ上の `SharedPsk` に届かず、稼働中ホストは再起動まで反映されない。
+fn warn_running_host_not_reloaded() {
+    eprintln!(
+        "warning: 稼働中のホストプロセスがある場合、この変更は再起動するまで反映されません。"
+    );
 }
 
 /// 推奨パスフレーズ候補を生成する (語彙から 4 語をランダムにハイフン連結)。パスワード設定時の
@@ -1325,6 +1358,7 @@ fn run_server(
     let (codec_status_tx, codec_status_rx) = mpsc::channel::<net::CodecStatus>(4);
 
     // encode スレッド
+    let encode_tray_bus = tray_bus.clone();
     std::thread::Builder::new()
         .name("encode".into())
         .spawn(move || {
@@ -1337,6 +1371,7 @@ fn run_server(
                 max_bitrate_bps,
                 encode_gpu,
                 codec_status_tx,
+                encode_tray_bus,
             ) {
                 tracing::error!(error = %e, "encode loop ended");
             }
@@ -1759,6 +1794,58 @@ fn fallback_to_h264_on_push_failure(
     }
 }
 
+/// `poll_nal` の失敗 (エンコーダ内部の応答不能等) からの復旧。以前は `?` でこの関数 (=encode
+/// スレッド) を丸ごと終了させていたが、TCP/UDP は生きたまま映像だけ永久に止まり誰も気付けない
+/// 事故だった (H-7)。`encode::create` による再構築手順は `drain_cmds`/`fallback_to_h264_on_push_failure`
+/// と同じものを再利用する。capture_loop の 500ms リトライに合わせて間隔を空け、
+/// `MAX_POLL_RETRIES` 回失敗しても、encode スレッド自体は終了させず (push_frame 経路の既存
+/// H.264 フォールバックに次の機会を委ねる)、無人運用で気付けるよう tray へ一度だけ通知する
+/// (再構築に成功したら通知フラグをリセットし、次に尽きたら再度通知できるようにする)。
+#[allow(clippy::too_many_arguments)]
+fn recover_encoder_after_poll_nal_failure(
+    enc: &mut PlatformEncoder,
+    current_codec: &mut VideoCodec,
+    device: &capture::SharedDevice,
+    max_bitrate_bps: u32,
+    encode_gpu: Option<&str>,
+    codec_status_tx: &mpsc::Sender<net::CodecStatus>,
+    tray_bus: &tray::SharedTrayBus,
+    stall_notified: &mut bool,
+    err: anyhow::Error,
+) {
+    const MAX_POLL_RETRIES: u32 = 5;
+    const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+    tracing::warn!(error = %err, "poll_nal failed; attempting encoder recreation");
+    for attempt in 1..=MAX_POLL_RETRIES {
+        std::thread::sleep(POLL_RETRY_INTERVAL);
+        match encode::create(device.clone(), max_bitrate_bps, encode_gpu, *current_codec) {
+            Ok((new_enc, effective)) => {
+                *enc = new_enc;
+                *current_codec = effective;
+                let _ = codec_status_tx.blocking_send(net::CodecStatus::Active(effective));
+                tracing::info!(
+                    attempt,
+                    ?effective,
+                    "encoder recreated after poll_nal failure; encoding resumed"
+                );
+                *stall_notified = false;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "encoder recreation retry failed");
+            }
+        }
+    }
+    tracing::error!(
+        retries = MAX_POLL_RETRIES,
+        "encoder recreation exhausted retries after poll_nal failure; video delivery stalled"
+    );
+    if !*stall_notified {
+        tray_bus.on_encode_stalled();
+        *stall_notified = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_loop(
     device: capture::SharedDevice,
@@ -1769,6 +1856,7 @@ fn encode_loop(
     max_bitrate_bps: u32,
     encode_gpu: Option<String>,
     codec_status_tx: mpsc::Sender<net::CodecStatus>,
+    tray_bus: tray::SharedTrayBus,
 ) -> Result<()> {
     // 後続のコーデック切替/フォールバック時の再構築用に device を保持する (最初の create は
     // 所有権を消費するため clone しておく)。
@@ -1793,6 +1881,9 @@ fn encode_loop(
     // 取りこぼさず、後続フレームを待たずにフラッシュへ繋ぐため (要求は別チャネルで来るので
     // 強制送出フレームと到着順がずれうる)。フラッシュ実施時にクリアする。
     let mut pending_keyframe = false;
+    // poll_nal 失敗でリトライ上限に達したことを tray へ通知済みか。復旧するまで連打しない
+    // (再構築成功でリセットし、次に尽きたら再度通知できるようにする)。
+    let mut poll_stall_notified = false;
     loop {
         pending_keyframe |= drain_cmds(
             &mut enc,
@@ -1835,8 +1926,25 @@ fn encode_loop(
                 );
             } else {
                 nals.clear();
-                while let Some(nal) = enc.poll_nal()? {
-                    nals.push(nal);
+                loop {
+                    match enc.poll_nal() {
+                        Ok(Some(nal)) => nals.push(nal),
+                        Ok(None) => break,
+                        Err(e) => {
+                            recover_encoder_after_poll_nal_failure(
+                                &mut enc,
+                                &mut current_codec,
+                                &device_for_recreate,
+                                max_bitrate_bps,
+                                encode_gpu.as_deref(),
+                                &codec_status_tx,
+                                &tray_bus,
+                                &mut poll_stall_notified,
+                                e,
+                            );
+                            break;
+                        }
+                    }
                 }
                 if let Some(m) = meter.as_mut() {
                     let encode_us = t0.elapsed().as_micros() as u32;
@@ -1871,9 +1979,28 @@ fn encode_loop(
             if let Err(e) = enc.flush_pending() {
                 tracing::warn!(error = %e, "idle flush_pending failed");
             }
-            while let Some(nal) = enc.poll_nal()? {
-                if nal_tx.blocking_send(nal).is_err() {
-                    return Ok(());
+            loop {
+                match enc.poll_nal() {
+                    Ok(Some(nal)) => {
+                        if nal_tx.blocking_send(nal).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        recover_encoder_after_poll_nal_failure(
+                            &mut enc,
+                            &mut current_codec,
+                            &device_for_recreate,
+                            max_bitrate_bps,
+                            encode_gpu.as_deref(),
+                            &codec_status_tx,
+                            &tray_bus,
+                            &mut poll_stall_notified,
+                            e,
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1904,10 +2031,29 @@ fn encode_loop(
                 if let Err(e) = enc.flush_pending() {
                     tracing::warn!(error = %e, "encoder flush_pending failed");
                 }
-                while let Some(nal) = enc.poll_nal()? {
-                    keyframe_sent |= nal.keyframe;
-                    if nal_tx.blocking_send(nal).is_err() {
-                        return Ok(());
+                loop {
+                    match enc.poll_nal() {
+                        Ok(Some(nal)) => {
+                            keyframe_sent |= nal.keyframe;
+                            if nal_tx.blocking_send(nal).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            recover_encoder_after_poll_nal_failure(
+                                &mut enc,
+                                &mut current_codec,
+                                &device_for_recreate,
+                                max_bitrate_bps,
+                                encode_gpu.as_deref(),
+                                &codec_status_tx,
+                                &tray_bus,
+                                &mut poll_stall_notified,
+                                e,
+                            );
+                            break;
+                        }
                     }
                 }
             }

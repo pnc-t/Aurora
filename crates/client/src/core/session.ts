@@ -84,9 +84,12 @@ export interface SessionHost {
   updateStats(s: Session, ev: StatsEvent): void;
   /** 統計 HUD クリア (アクティブ時のみ)。 */
   clearStats(s: Session): void;
-  /** ダウンロード結果を file パネルへ (アクティブ時のみ)。 */
+  /**
+   * ダウンロード結果を file パネルへ。取りこぼし防止のため非アクティブ時も必ず呼ばれる
+   * (状態更新は常に行い、DOM 描画をアクティブタブに限定するのは実装側の責務)。
+   */
   fileResult(s: Session, id: number, ok: boolean, message: string): void;
-  /** ファイル転送の進捗を file パネルへ (アクティブ時のみ)。done/total はバイト数。 */
+  /** ファイル転送の進捗を file パネルへ (fileResult と同様、非アクティブ時も呼ばれる)。done/total はバイト数。 */
   fileProgress(s: Session, id: number, done: number, total: number): void;
   /** 静かな再接続中の常駐バッジを表示する (アクティブ時のみ)。最後の映像を隠さない。 */
   reconnectBadge(s: Session, text: string): void;
@@ -148,6 +151,10 @@ export class Session {
   // toolbar 再同期用に保持する接続情報。
   private connLabel = "";
   private audioAvailable = false;
+  // ミュートの現在値。ツールバー UI 側にしか状態が無いと、syncSharedUi での復元時に必ず
+  // 未ミュートへ戻ってしまう (モバイルは activate() 経由の syncSharedUi が唯一の初期化経路の
+  // ため、ミュートしても再接続で毎回解除される実機バグの原因になっていた)。
+  private audioMuted = false;
   // effectiveSettings で接続時に上書きされるが、初期値も既定設定 (core/ipc.ts) に揃えておく。
   private videoFps = DEFAULT_SETTINGS.fps;
   private videoMbps = DEFAULT_SETTINGS.max_mbps;
@@ -189,6 +196,10 @@ export class Session {
   // デバイスピン留め承認待ち (host のペアリング窓中)。承認/拒否/窓終了まで固定間隔で再試行する。
   private pendingApproval = false;
   private pendingTimer: number | null = null;
+
+  // 別ウィンドウへの移譲 (分割/移動) 中フラグ。移譲確定 (detachForHandoff) 前に closeByUser が
+  // 競合すると、移譲先で adopt した直後にこの窓からの disconnect が届いて shutdown してしまう。
+  private migrating = false;
 
   constructor(
     id: string,
@@ -258,32 +269,26 @@ export class Session {
 
   /** ユーザー操作の切断 (ツールバー切断ボタン)。恒久終了し、orchestrator がタブを除去する。 */
   closeByUser(): void {
+    // 移譲中 (splitTab/moveTabToNewWindow の await 中) は無視する。ここで disconnect すると
+    // 移譲先が adopt した直後にセッションが shutdown される競合になるため。
+    if (this.migrating) return;
     logger.info(`disconnect by user: ${this.entry.host}`);
     this.teardown();
     void disconnect(this.id);
     this.host.removed(this);
   }
 
-  /** タブ除去/窓終了時の資源解放。 */
-  destroy(): void {
-    window.removeEventListener("online", this.onNetworkOnline);
-    this.cancelReconnect();
-    if (this.viewportTimer !== null) {
-      clearTimeout(this.viewportTimer);
-      this.viewportTimer = null;
-    }
-    if (this.prepareTimer !== null) {
-      clearTimeout(this.prepareTimer);
-      this.prepareTimer = null;
-    }
-    this.preparingVirtual = false;
-    this.clearPending();
-    this.input.detach();
-    this.decoder.close();
-    void disconnect(this.id);
+  // ---- タブのウィンドウ間移動 (Phase 3 ドラッグ分割) ----
+
+  /** 移譲 (別ウィンドウへの分割/移動) を開始する: 確定するまで closeByUser を無視させる。 */
+  beginMigration(): void {
+    this.migrating = true;
   }
 
-  // ---- タブのウィンドウ間移動 (Phase 3 ドラッグ分割) ----
+  /** 移譲が失敗した: このタブを通常どおり (closeByUser 可能な状態に) 戻す。 */
+  cancelMigration(): void {
+    this.migrating = false;
+  }
 
   /** 移譲用の表示状態スナップショットを作る。接続中のみ意味を持つ。 */
   snapshot(): SessionSnapshot {
@@ -390,6 +395,7 @@ export class Session {
     this.host.toast(this, maxHeight === 0 ? "解像度: フル" : `解像度: ${maxHeight}p`);
   }
   setAudioMuted(muted: boolean): void {
+    this.audioMuted = muted;
     void setAudioMuted(this.id, muted);
     this.host.toast(this, muted ? "音声ミュート" : "音声ミュート解除");
   }
@@ -460,7 +466,11 @@ export class Session {
     tb.setConnected(true, this.host.getSettings().toolbar_pinned);
     tb.setDisplays(this.toolbarDisplayList(), this.currentDisplay?.id);
     tb.setConnLabel(this.connLabel);
-    tb.setAudioAvailable(this.audioAvailable);
+    // ミュートと再生音量も必ず復元する。モバイルは activate() が start() の後に来るため
+    // onHostInfo の `if (this.active)` ブロックが初回接続では丸ごと飛び、この syncSharedUi が
+    // 唯一の初期化経路になる。ここで渡さないとミュートは解除・音量は 100% に戻ってしまう。
+    tb.setAudioAvailable(this.audioAvailable, this.audioMuted);
+    tb.setAudioVolume(this.host.getSettings().audio_volume);
     tb.setClipboardSyncState(this.clipboardSync);
     tb.setVideoParams(this.videoFps, this.videoMbps);
     tb.setCaptureToggled(this.input.isCaptured());
@@ -792,7 +802,8 @@ export class Session {
       void setFileSharing(this.id, true).catch((e) => logger.warn("setFileSharing failed", e));
     }
     // 接続時に音声をミュートで始める設定なら、ホストへも初期状態として送る (ツールバー表示は
-    // 下の setAudioAvailable(initialMuted) 側で揃える)。
+    // 下の setAudioAvailable(initialMuted) / syncSharedUi 側で揃える)。
+    this.audioMuted = settings.audio_muted;
     if (settings.audio_muted) {
       void setAudioMuted(this.id, true).catch((e) => logger.warn("setAudioMuted failed", e));
     }
@@ -862,6 +873,9 @@ export class Session {
   }
 
   private teardown(): void {
+    // "online" リスナを外さないと Session (と decoder/input の参照グラフ) が GC されず、
+    // 単一 WebView 常駐のモバイルではタブ開閉/ホスト切替ごとに単調増加してしまう。
+    window.removeEventListener("online", this.onNetworkOnline);
     this.disconnectHandled = true;
     this.cancelReconnect();
     this.clearPending();

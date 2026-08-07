@@ -78,6 +78,34 @@ ID 鍵を生成・DPAPI 保存して毎回同じ鍵で接続し (`identity.bin`)
   ある鍵を確立します。パラメータ (`NOISE_PARAMS` / Argon2 設定 / `PSK_SALT`) を変えると
   PSK が変わり旧クライアントと非互換になります。
 
+### FileRequest にパス制限がない理由 (by-design)
+
+`ControlMsg::FileRequest` (`crates/host/src/net/client.rs` の該当ハンドラ →
+`stream_file_to_client`、`crates/host/src/net/files.rs`) は、Noise 認証を通過した接続で
+あれば**任意の絶対パスをそのまま `tokio::fs::File::open` に渡し**ます。許可ディレクトリへの
+制限やパスのサニタイズは行っていません。これは見落としではなく意図的な設計です。
+
+- 認証済みクライアントは、この時点で既に画面キャプチャ・キーボード・マウスを完全に掌握して
+  います。`FileRequest` にパス制限を掛けても、攻撃者は画面越しに同じファイルをテキスト
+  エディタ等で開いて内容を読めるため、**得られる防御が実質ゼロ**です (攻撃者の実効的な能力は
+  減りません)。したがって本機能の防御の要は認証境界そのものであり、認証後のパス制限は
+  コストに対して効果のない対策と判断しています。
+- 一方、**ProjFS ドライブ投影と仮想ディスプレイのテイクオーバーには `client_trusted`
+  (デバイスピン留め登録済み端末のみ) のゲートを掛けています** (`crates/host/src/net/client.rs`)。
+  これは「読み取り」ではなく「ホストの状態を作り変える/専有する」操作だからです:
+  - ProjFS ドライブは接続が確立した**最初の 1 本だけが所有**し、セッション中はホストの
+    「PC」上にドライブとして持続的に現れます (複数 mount は衝突するため単一所有、かつ
+    one-shot の要求ではなく持続する共有資源)。
+  - 仮想ディスプレイのテイクオーバーは物理ディスプレイのデタッチ/暗転を伴う破壊的な副作用
+    があり、実機では GDI 名衝突時に要求していないテイクオーバーが走った事象もありました
+    (`SetClientViewport` 付近のコメント参照)。トポロジ変更はホスト全体に影響し、他の接続
+    (他クライアント) にも波及します。
+  - この 2 つは「その接続がすでに見えているものを読むだけ」ではなく「ホストの共有資源を
+    専有/変更する」操作である点で `FileRequest` と性質が異なるため、追加の所持要素
+    (デバイスピン留め) でゲートする価値があります。
+  - したがって `FileRequest` が非制限で ProjFS/仮想ディスプレイが `client_trusted` 必須、
+    という非対称は矛盾ではなく、それぞれの操作が持つ影響範囲の違いに対応しています。
+
 ### nonce ドメイン分離 (クロスチャネル注入の多重防御)
 
 TCP 制御・UDP 映像・UDP 音声は**同一 Noise 方向 (= 同一鍵)** を共有します。ChaCha20-Poly1305 は
@@ -181,6 +209,9 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
   設定します。Aurora 自体は IP allowlist を持ちません。
 - **ホスト OS ユーザーの信頼**。DPAPI 鍵を持つユーザーや管理者は保存パスワードを扱えます。
 - **物理アクセス・マルウェア感染済みホスト**は対象外。
+- **`FileRequest` によるホスト上の任意ファイル読み取り**。認証済み接続に対してパスの制限を
+  掛けていません (by-design、根拠は「デバイスピン留め」節の「FileRequest にパス制限がない
+  理由」参照)。
 - **DoS 全般**。Tailnet 内からの妨害は想定の主眼ではありません (露出を絞ることで緩和)。
 
 ## 既知の制約
@@ -221,6 +252,7 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
 | パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray.rs` |
 | パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net/auth.rs` (`AuthThrottle`) / `crates/wol/src/main.rs` (`WolThrottle`) |
 | デバイスピン留め (静的鍵許可リスト) | `crates/host/src/security/devices.rs` / `crates/host/src/net/client.rs` (`remote_static` 照合) / `crates/host/src/tray.rs` |
+| `FileRequest` (パス制限なし、by-design) | `crates/host/src/net/client.rs` (`ControlMsg::FileRequest` ハンドラ) / `crates/host/src/net/files.rs` (`stream_file_to_client`) |
 | クライアント永続 ID 鍵 (静的鍵) | `crates/common/src/noise.rs` (`generate_static_keypair`/`remote_static`) / `crates/client/src-tauri/src/secret.rs` |
 | 受信ファイル名サニタイズ | `crates/common/src/fsname.rs` |
 | WoL 中継デーモン (Noise ハンドシェイク・マジックパケット送出) | `crates/wol/src/main.rs` |

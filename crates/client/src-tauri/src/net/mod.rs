@@ -24,7 +24,11 @@ use aurora_common::noise::{
 use aurora_common::proto::{ControlMsg, Display, FsEntry, InputEvent, VideoCodec};
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewWindow};
+// capture ウィンドウ生成 (WebviewWindowBuilder/WebviewUrl) はデスクトップ限定
+// (net/window.rs の cfg(desktop) 関数群でのみ使う。モバイルは単一 WebView でウィンドウを作らない)。
+#[cfg(desktop)]
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use crate::audio::{self, AudioPlayer};
 use crate::stats::{StatsCollector, StatsWindow};
@@ -153,6 +157,10 @@ pub(crate) fn codec_to_str(codec: VideoCodec) -> &'static str {
 pub struct Sink {
     event: Arc<std::sync::Mutex<Option<Channel<ClientEvent>>>>,
     video: Arc<std::sync::Mutex<Option<Channel<InvokeResponseBody>>>>,
+    /// モバイル専用: 音声 (Opus) フレームの転送先。デスクトップは cpal ネイティブ再生のため
+    /// 使わない (#1 音声再生、方式A: デコードせず WebView の WebCodecs AudioDecoder へ渡す)。
+    #[cfg(mobile)]
+    audio: Arc<std::sync::Mutex<Option<Channel<InvokeResponseBody>>>>,
 }
 
 impl Sink {
@@ -160,6 +168,8 @@ impl Sink {
         Self {
             event: Arc::new(std::sync::Mutex::new(Some(event))),
             video: Arc::new(std::sync::Mutex::new(Some(video))),
+            #[cfg(mobile)]
+            audio: Arc::new(std::sync::Mutex::new(None)),
         }
     }
     /// 現在の表示先へイベントを送る (未アタッチ = デタッチ中なら捨てる)。
@@ -178,7 +188,26 @@ impl Sink {
             let _ = ch.send(body);
         }
     }
-    /// 表示先を差し替える (新ウィンドウのアタッチ)。
+    /// モバイル専用: 音声フレームの転送先を設定する (接続/再接続ごとに `attach_audio_channel`
+    /// から呼ばれる)。
+    #[cfg(mobile)]
+    pub(crate) fn set_audio(&self, ch: Channel<InvokeResponseBody>) {
+        if let Ok(mut g) = self.audio.lock() {
+            *g = Some(ch);
+        }
+    }
+    /// モバイル専用: 現在の表示先へ音声フレームを送る (未アタッチなら捨てる)。
+    #[cfg(mobile)]
+    pub(crate) fn send_audio(&self, body: InvokeResponseBody) {
+        if let Ok(g) = self.audio.lock()
+            && let Some(ch) = g.as_ref()
+        {
+            let _ = ch.send(body);
+        }
+    }
+    /// 表示先を差し替える (新ウィンドウのアタッチ)。タブのウィンドウ間移動 (Phase 3) は
+    /// デスクトップのマルチウィンドウ機能のため呼び出し元 (net/window.rs) ごとデスクトップ限定。
+    #[cfg(desktop)]
     fn set(&self, event: Channel<ClientEvent>, video: Channel<InvokeResponseBody>) {
         if let Ok(mut g) = self.event.lock() {
             *g = Some(event);
@@ -187,13 +216,44 @@ impl Sink {
             *g = Some(video);
         }
     }
-    /// 表示先を外す (旧ウィンドウのデタッチ)。ネットワークは継続する。
+    /// 表示先を外す (旧ウィンドウのデタッチ)。ネットワークは継続する。呼び出し元と同じ理由で
+    /// デスクトップ限定。
+    #[cfg(desktop)]
     fn clear(&self) {
         if let Ok(mut g) = self.event.lock() {
             *g = None;
         }
         if let Ok(mut g) = self.video.lock() {
             *g = None;
+        }
+    }
+    /// 現在の表示先を複製して取り出す (ロールバック用のスナップショット)。`Channel` は Arc
+    /// 内部の安価な複製のため clone してもコストは軽い。`clear`/`restore` と対で使い、
+    /// ウィンドウ生成/emit 失敗時に手戻りできるよう呼び出し元 (net/window.rs) が保持する。
+    #[cfg(desktop)]
+    fn snapshot(
+        &self,
+    ) -> (
+        Option<Channel<ClientEvent>>,
+        Option<Channel<InvokeResponseBody>>,
+    ) {
+        let event = self.event.lock().ok().and_then(|g| g.clone());
+        let video = self.video.lock().ok().and_then(|g| g.clone());
+        (event, video)
+    }
+    /// `snapshot` で取り出した表示先を書き戻す (ロールバック)。`set`/`clear` と違い Option を
+    /// そのまま受け取り、デタッチ中だった状態 (None) もそのまま復元できる。
+    #[cfg(desktop)]
+    fn restore(
+        &self,
+        event: Option<Channel<ClientEvent>>,
+        video: Option<Channel<InvokeResponseBody>>,
+    ) {
+        if let Ok(mut g) = self.event.lock() {
+            *g = event;
+        }
+        if let Ok(mut g) = self.video.lock() {
+            *g = video;
         }
     }
 }
@@ -296,9 +356,13 @@ pub struct SessionState {
     /// タブのウィンドウ分割 (Phase 3) の引き継ぎデータ。`open_session_window` が移譲元の
     /// セッション表示状態 (JSON) を session_id をキーに積み、移譲先ウィンドウの JS が
     /// `take_handoff` で取り出して `Session` を復元する。networking は継続したまま表示先だけ移す。
+    /// マルチウィンドウ前提の機能でモバイルには存在しないためデスクトップ限定。
+    #[cfg(desktop)]
     pub adopt: Mutex<HashMap<String, String>>,
     /// 最後にフォーカスされた capture ウィンドウのラベル。launcher からの接続を
     /// 既存窓のタブへルーティングするために使う (同期ハンドラから触るので std::sync::Mutex)。
+    /// `adopt` と同じ理由でデスクトップ限定。
+    #[cfg(desktop)]
     pub last_focused_capture: std::sync::Mutex<Option<String>>,
 }
 
@@ -307,6 +371,8 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// クエリ文字列値の最小 percent-encode (unreserved 以外を %XX に)。URL に host 等を
 /// 載せるとき IPv6 のコロンや空白で壊れないようにする。JS 側は URLSearchParams が復号する。
+/// capture ウィンドウの URL 生成 (net/window.rs、デスクトップ限定) でのみ使う。
+#[cfg(desktop)]
 fn q(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

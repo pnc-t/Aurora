@@ -210,24 +210,21 @@
 .empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
 
 /* 初回利用者向け空状態ガイド (.empty-hint とは別クラス。wol-panel は使わない前提)。
- * ホスト一覧の余白に馴染ませつつ手順を目立たせるため、カードとして中央寄せする。 */
-.empty-guide {
-  max-width: 360px; margin: 32px auto; padding: 22px 20px;
-  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
-  text-align: center;
+ * 枠/バッジ/手順が「主張しすぎ・説教くさい」と不評だったため、枠なし・見出し+一行ヒント
+ * のみの控えめな表示にする。 */
+.empty-guide { text-align: center; }
+/* ホストが 0 件のときだけ一覧領域の縦横中央に寄せたい。通常時 (カード一覧) の
+ * flex-start レイアウトを壊さないよう、host-list 自体ではなく :has() で空状態の
+ * 子要素が居るときだけ効かせる。 */
+.host-list:has(.empty-guide) { flex: 1; justify-content: center; align-items: center; }
+/* アイコンは base.css の `.launcher svg.icon { display: block }` でブロック化されるため
+ * 親の text-align では中央に寄らない。デスクトップだけ左に寄るのを避けて flex で中央に置く。 */
+.empty-guide-icon {
+  display: flex; justify-content: center; margin-bottom: 12px;
+  font-size: 48px; color: var(--muted); opacity: 0.5;
 }
-.empty-guide-title { font-size: 15px; font-weight: 600; color: var(--fg); margin-bottom: 16px; }
-.empty-guide-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
-.empty-guide-step {
-  display: flex; align-items: center; gap: 10px; text-align: left;
-  font-size: 13px; color: var(--fg);
-}
-.empty-guide-badge {
-  flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 12px; font-weight: 700;
-  color: var(--accent-fg); background: var(--accent);
-}
+.empty-guide-title { font-size: 14px; font-weight: 500; color: var(--fg); margin-bottom: 6px; }
+.empty-guide-hint { font-size: 13px; color: var(--muted); }
 
 /* 設定ページ: 間延び防止のため 1 カラムに幅上限を設ける。スクロールバーは画面右端に
  * 出したいので #page-settings 全体ではなく、幅を持つ内側の要素 (タブバー/各セクション)

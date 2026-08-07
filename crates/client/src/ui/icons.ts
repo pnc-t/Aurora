@@ -26,6 +26,12 @@ export type IconName =
   | "power"
   | "fullscreen"
   | "mouse"
+  | "mouse-left"
+  | "mouse-middle"
+  | "mouse-right"
+  | "modifier"
+  | "keyboard"
+  | "zoom-reset"
   | "files"
   | "stats"
   | "display"
@@ -40,7 +46,9 @@ export type IconName =
   | "key"
   | "check"
   | "bolt"
-  | "clipboard";
+  | "clipboard"
+  | "touchpad"
+  | "stick";
 
 // viewBox 0 0 24 24 の path/shape 部分のみ (共通の <svg> ラッパーは icon() で付与)。
 const PATHS: Record<IconName, string> = {
@@ -59,6 +67,16 @@ const PATHS: Record<IconName, string> = {
   power: `<path d="M12 2v9"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>`,
   fullscreen: `<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>`,
   mouse: `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/>`,
+  "mouse-left": `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/><path d="M12 3a6 6 0 0 0-6 6h6z" fill="currentColor" stroke="none"/>`,
+  "mouse-middle": `<rect x="6" y="3" width="12" height="18" rx="6"/><rect x="10.8" y="6" width="2.4" height="5" rx="1.2" fill="currentColor" stroke="none"/>`,
+  "mouse-right": `<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/><path d="M12 3a6 6 0 0 1 6 6h-6z" fill="currentColor" stroke="none"/>`,
+  modifier: `<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M8 14l4-4 4 4"/>`,
+  // 文字入力 (IME) 用。キーの点とスペースバーまで描き、枠だけの touchpad や modifier と
+  // 一目で見分けられるようにする。
+  keyboard: `<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/>`,
+  // ズームを等倍へ戻す用。クライアント側ズームは 1.0 が下限で「リセット = 縮小方向」に
+  // しかならないため、虫眼鏡 + マイナスがそのまま動作を表す。
+  "zoom-reset": `<circle cx="11" cy="11" r="7"/><path d="M20.5 20.5 16 16"/><path d="M8 11h6"/>`,
   files: `<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>`,
   stats: `<path d="M3 3v18h18"/><path d="M19 9l-5 5-3-3-4 4"/>`,
   display: `<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>`,
@@ -74,6 +92,8 @@ const PATHS: Record<IconName, string> = {
   check: `<path d="M20 6L9 17l-5-5"/>`,
   bolt: `<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>`,
   clipboard: `<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
+  touchpad: `<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>`,
+  stick: `<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3.2" fill="currentColor" stroke="none"/>`,
 };
 
 // assets/icons/ 配下の画像を URL として一括取り込み (ビルド時に解決)。

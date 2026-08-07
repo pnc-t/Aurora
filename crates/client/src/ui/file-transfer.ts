@@ -40,11 +40,47 @@ let downloadBarEl: HTMLElement | null = null;
 let uploadProgressEl: HTMLElement | null = null;
 let uploadBarEl: HTMLElement | null = null;
 let pathListEl: HTMLDataListElement | null = null;
-// ダウンロードボタン (結果受信で再有効化するためモジュールに保持)。
+// ダウンロードボタン (状態再同期で有効/無効を切り替えるためモジュールに保持)。
 let downloadBtn: HTMLButtonElement | null = null;
-// 進行中ダウンロードの id と要求パス (FileResult 照合・成功時の履歴保存用)。
-let activeDownloadId: number | null = null;
-let activeDownloadPath = "";
+
+/**
+ * ダウンロード状態はタブ (セッション) 単位。file パネルの DOM は窓に 1 つしか無いが、
+ * 進行中の要求は「どのタブが開始したか」に紐づく。単一のモジュール変数のままだと、
+ * タブ A で開始したダウンロードが完了する前に B へ切り替えると FileResult が握り潰され、
+ * A に戻っても再同期する経路が無いため `activeDownloadId`/ボタンの disabled が永久に
+ * 残ってしまう (H-4)。そのためセッション id をキーにした Map で保持する。
+ */
+interface DownloadState {
+  /** 進行中の要求 id。未実施/完了後は null。 */
+  id: number | null;
+  /** 要求パス (完了時の履歴保存に使う)。 */
+  path: string;
+  /** ステータス文言 ("" は非表示)。 */
+  progressText: string;
+  /** 進捗バー比率 (0..1)。 */
+  ratio: number;
+  /** 進捗バー行を表示するか。 */
+  barVisible: boolean;
+}
+
+function freshDownloadState(): DownloadState {
+  return { id: null, path: "", progressText: "", ratio: 0, barVisible: false };
+}
+
+const downloadStates = new Map<string, DownloadState>();
+
+function stateFor(sessionId: string): DownloadState {
+  let st = downloadStates.get(sessionId);
+  if (!st) {
+    st = freshDownloadState();
+    downloadStates.set(sessionId, st);
+  }
+  return st;
+}
+
+// 現在パネルに表示中 (= アクティブタブ) のセッション id。イベントは全セッションから届くが
+// DOM 更新はこのセッションのものだけに限定する。
+let currentSessionId: string | null = null;
 
 function renderPathHistory(): void {
   if (!pathListEl) return;
@@ -91,24 +127,60 @@ export function mountFileTransfer(panel: HTMLElement): void {
   renderPathHistory();
 
   downloadBtn?.addEventListener("click", () => {
+    // パネルは常にアクティブタブの状態を表示しているため、要求の所有者は「今表示中の
+    // セッション」で確定する (ボタンは非アクティブタブでは操作できない)。
+    const sessionId = currentSessionId;
+    if (!sessionId) return;
     const path = pathInput?.value?.trim();
     if (!path) {
       setDownloadProgress("パスを入力");
       return;
     }
     const id = Date.now() >>> 0;
-    activeDownloadId = id;
-    activeDownloadPath = path;
-    if (downloadBtn) downloadBtn.disabled = true; // 結果待ちの二重要求を防ぐ
-    setDownloadProgress("要求中…");
-    setBar("download", 0);
+    const st = stateFor(sessionId);
+    st.id = id;
+    st.path = path;
+    st.progressText = "要求中…";
+    st.ratio = 0;
+    st.barVisible = true;
+    renderDownloadUi(sessionId);
     void requestFile(id, path).catch((err) => {
-      activeDownloadId = null;
-      if (downloadBtn) downloadBtn.disabled = false;
-      hideBar("download");
-      setDownloadProgress(`エラー: ${String(err)}`);
+      st.id = null;
+      st.barVisible = false;
+      st.progressText = `エラー: ${String(err)}`;
+      if (sessionId === currentSessionId) renderDownloadUi(sessionId);
     });
   });
+}
+
+/** 指定セッションのダウンロード状態を DOM (進捗バー/ボタン) へ反映する。 */
+function renderDownloadUi(sessionId: string): void {
+  const st = stateFor(sessionId);
+  setDownloadProgress(st.progressText);
+  if (st.barVisible) setBar("download", st.ratio);
+  else hideBar("download");
+  if (downloadBtn) downloadBtn.disabled = st.id !== null; // 進行中の再要求を防ぐ
+}
+
+/**
+ * タブ切替時に orchestrator (capture-main) が呼ぶ: パネルの表示対象を切り替え先セッションへ
+ * 揃え、その場でダウンロード状態 (進行中/完了/未実施) を再同期する。これが無いと、非アクティブ
+ * 中に完了したダウンロードの結果がボタンの disabled 等に反映されず固着したままになる。
+ */
+export function setActiveTransferSession(sessionId: string | null): void {
+  currentSessionId = sessionId;
+  if (sessionId) {
+    renderDownloadUi(sessionId);
+  } else {
+    setDownloadProgress("");
+    hideBar("download");
+    if (downloadBtn) downloadBtn.disabled = false;
+  }
+}
+
+/** セッション終了/タブクローズ時に、そのセッションのダウンロード状態を破棄する (Map リーク防止)。 */
+export function clearTransferSession(sessionId: string): void {
+  downloadStates.delete(sessionId);
 }
 
 function setBar(kind: "download" | "upload", ratio: number): void {
@@ -126,35 +198,45 @@ function hideBar(kind: "download" | "upload"): void {
 /**
  * host からの FileResult を反映する (ダウンロード)。アップロード (D&D) の結果は main.ts が
  * トーストで通知するため、ここではダウンロードの照合とアップロード進捗バーの後始末のみ行う。
+ * イベントは非アクティブタブからも届くため、状態更新 (`sessionId` の Map エントリ) は常に行い、
+ * DOM 描画だけを現在表示中のタブに限定する (取りこぼし防止)。
  */
-export function handleFileResult(id: number, ok: boolean, message: string): void {
-  if (id === activeDownloadId) {
-    setDownloadProgress(ok ? `保存: ${message}` : `失敗: ${message}`);
-    hideBar("download");
-    if (ok && activeDownloadPath) {
-      savePathHistory(activeDownloadPath);
+export function handleFileResult(sessionId: string, id: number, ok: boolean, message: string): void {
+  const st = downloadStates.get(sessionId);
+  if (st && id === st.id) {
+    st.progressText = ok ? `保存: ${message}` : `失敗: ${message}`;
+    st.barVisible = false;
+    if (ok && st.path) savePathHistory(st.path);
+    st.id = null;
+    st.path = "";
+    if (sessionId === currentSessionId) {
+      renderDownloadUi(sessionId);
       renderPathHistory();
     }
-    activeDownloadId = null;
-    activeDownloadPath = "";
-    if (downloadBtn) downloadBtn.disabled = false; // 次の要求を受け付ける
   } else {
-    // ダウンロード以外の id はアップロード。完了/失敗でバーを畳む。
-    hideBar("upload");
-    if (uploadProgressEl) uploadProgressEl.textContent = "";
+    // ダウンロード以外の id はアップロード。完了/失敗でバーを畳む (表示中タブのみ)。
+    if (sessionId === currentSessionId) {
+      hideBar("upload");
+      if (uploadProgressEl) uploadProgressEl.textContent = "";
+    }
   }
 }
 
-/** host からの FileProgress (done/total バイト) を進捗バーへ反映する。 */
-export function handleFileProgress(id: number, done: number, total: number): void {
+/**
+ * host からの FileProgress (done/total バイト) を進捗バーへ反映する。
+ * FileResult と同様、状態更新は常に行い DOM 描画のみ表示中タブに限定する。
+ */
+export function handleFileProgress(sessionId: string, id: number, done: number, total: number): void {
   const ratio = total > 0 ? done / total : 0;
-  const pct = `${Math.round(ratio * 100)}%`;
-  if (id === activeDownloadId) {
-    setBar("download", ratio);
-    setDownloadProgress(`受信中… ${pct}`);
-  } else {
+  const st = downloadStates.get(sessionId);
+  if (st && id === st.id) {
+    st.ratio = ratio;
+    st.progressText = `受信中… ${Math.round(ratio * 100)}%`;
+    st.barVisible = true;
+    if (sessionId === currentSessionId) renderDownloadUi(sessionId);
+  } else if (sessionId === currentSessionId) {
     setBar("upload", ratio);
-    if (uploadProgressEl) uploadProgressEl.textContent = pct;
+    if (uploadProgressEl) uploadProgressEl.textContent = `${Math.round(ratio * 100)}%`;
   }
 }
 

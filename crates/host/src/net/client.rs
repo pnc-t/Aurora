@@ -20,6 +20,15 @@ fn display_label(device_name: &str, ip: std::net::IpAddr) -> String {
     }
 }
 
+/// アップロード異常終了時の書きかけファイルを削除する。正常完了ファイルと同名で
+/// 不完全データが残り、ユーザーが破損ファイルを正常品と誤認するのを防ぐため。
+/// 削除失敗は元のアップロードエラーを潰さないようログのみに留める。
+async fn cleanup_aborted_upload(path: &str) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        tracing::warn!(path = %path, error = %e, "failed to remove aborted upload file");
+    }
+}
+
 pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     let ClientArgs {
         peer,
@@ -41,17 +50,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         shared,
         session_sem,
         registry,
+        takeover_pending,
+        display_op,
         conn_id,
         force_frame,
         tray_bus,
         hello_registry,
     } = args;
-    // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
-    // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。セッション終了 (Drop) で
-    // 当該ハンドルが閉じる。名前付きイベントは「ハンドルが 1 つでも開いていれば生存」する
-    // ため、各接続が各々ガードを持つだけで「接続数 ≥ 1 の間 is_active=true」が成立する。
-    let _active = crate::net::ActiveGuard::new();
-
     // Noise XX-PSK レスポンダ。host 自身の静的鍵は使い捨て (None) でよい。デバイス識別は
     // 相手 (クライアント) の永続公開鍵 = remote_static で行う。
     let mut hs = HandshakeState::new_responder(&psk, None)?;
@@ -62,6 +67,17 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // TCP 接続だけして何も送らないとここで永久にブロックし、単一クライアントモデルでは
     // accept ループが進まず正規ユーザーまで締め出される (認証前 DoS)。
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    // client 側 ping ループ (`crates/client/src-tauri/src/net/connect.rs` の ping_task) は
+    // 1 秒間隔で**無条件に** (映像一時停止中・バックグラウンド遷移中でも) Ping を送り続けるため、
+    // host 側もこれを生存証明として使える。機内モード等で FIN/RST を出さずにネットワークを失うと
+    // `read_tcp_frame` (reader_task 内) が永久にブロックし、MAX_CLIENTS の枠占有・ProjFS 単独所有の
+    // 固着・HeldInputs 解放漏れが起きる (後始末セクションに到達しないため)。無応答を検知して通常の
+    // 切断経路 (後始末を必ず通る break) へ抜ける。
+    // 猶予は client 側の PONG_TIMEOUT (5 秒) より意図的に長くとる。host が先に見切ると、client が
+    // まだ生きていると思っている接続を一方的に落とすことになり、モバイルの数秒のストールで
+    // 毎回セッションが飛ぶ。ここは「本当に死んだ相手の枠を解放する」のが目的なので緩くてよい。
+    const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     // ハンドシェイク 3 メッセージ + transport 確立を 1 ブロックにまとめ、失敗時に遅延を挟む。
     // 相手 (クライアント) の静的公開鍵は transport 確立で hs が消費される前に控える
@@ -144,6 +160,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         }
         _ => {}
     }
+    // 接続中であることを名前付きイベントで公開する。トレイ/CLI はこれを見て、接続中の
+    // パスワード変更 (リモートからの締め出し/乗っ取り) を拒否する。PSK + デバイスピン留めの
+    // 認証を通過した後でのみ立てる (未認証の相手にハンドシェイクを引き延ばさせて is_active を
+    // 立てさせると、持ち主自身がトレイ/CLI から締め出されてしまうため)。セッション終了 (Drop)
+    // で当該ハンドルが閉じる。名前付きイベントは「ハンドルが 1 つでも開いていれば生存」する
+    // ため、各接続が各々ガードを持つだけで「接続数 ≥ 1 の間 is_active=true」が成立する。
+    let _active = crate::net::ActiveGuard::new();
     // 認証成功 (PSK + デバイス)。この IP の連続失敗履歴を消す (誤入力後に正しく入れた正規
     // ユーザーを罰しない)。
     throttle.record_success(peer.ip());
@@ -351,10 +374,15 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 送って映像を復帰させる。これもクライアント毎ローカル。映像送信は専用タスクで走るため、
     // 制御ループ (ここ) とタスクで共有する atomic にする。
     let video_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // テイクオーバー (仮想ディスプレイ切替) 実施中フラグ。true の間はキャプチャがまだ物理を
-    // 撮っている固まりフレームを送らないよう映像 UDP 送出を止める。video_paused (クライアント
-    // 駆動のタブ pause) とは別軸なので、送出ゲートは両者の論理和にする (どちらかで停止)。
-    let takeover_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // takeover_pending (テイクオーバー実施中フラグ) は args から受け取る全接続共有の Arc
+    // (net/mod.rs で生成)。単一エンコーダ=共有映像なので、テイクオーバー中の物理固まりフレーム
+    // 抑止は要求元だけでなく全クライアントの映像送信タスクに効かせる必要があり、ここではローカル
+    // Arc を新規に作らない。この接続が SelectDisplay(仮想) で pending=true にした場合は、
+    // SetClientViewport 完了時に自分で false へ戻す (下記) のが通常経路だが、その前に本接続が
+    // 異常終了すると shared フラグが true のまま残り、全クライアントの映像が永久停止する
+    // (このセッションだけの話では済まない退行)。それを防ぐため、pending=true にしたのが
+    // 自分かどうかをこのローカル bool で追跡し、後始末で確実に戻す。
+    let mut takeover_pending_owned = false;
 
     // --- 映像 UDP 送信タスク (制御/入力から分離) ---
     // 映像送信を制御ループの select から外し、専用タスクで回す。同じ select に置くと、ドラッグ中の
@@ -451,9 +479,22 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 本体終了 (切断・エラー) で映像送信タスクを確実に止める。
     let _video_guard = AbortOnDrop(video_task);
 
+    // 最後に Ping を受信した時刻。client の ping ループが無条件 (1 秒毎) なので、これだけで
+    // 生存証明として十分 (Input 等は静止中・無操作中に途絶えるため無応答判定の根拠にしない)。
+    let mut last_ping = std::time::Instant::now();
+    let mut ping_watchdog = tokio::time::interval(std::time::Duration::from_secs(1));
+
     let result: Result<()> = async {
     loop {
         tokio::select! {
+            // Ping 無応答ウォッチドッグ。1 秒毎に最後の Ping からの経過を確認し、PING_TIMEOUT を
+            // 超えたら通常の切断経路 (下の後始末セクション) へ抜ける。
+            _ = ping_watchdog.tick() => {
+                if last_ping.elapsed() > PING_TIMEOUT {
+                    tracing::warn!(peer = %peer, conn_id, "no ping received; treating as disconnected (network stall?)");
+                    break;
+                }
+            }
             // 制御メッセージ受信 (専用リーダタスクが読んだ生フレームをキャンセル安全に受け取る)
             maybe_frame = frame_rx.recv() => {
                 let Some(frame) = maybe_frame else {
@@ -464,6 +505,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                 let msg = decode_ctrl_msg(&session, &frame, &mut tcp_rx_nonce, &mut plain)?;
                 match msg {
                     ControlMsg::Ping { ts_us } => {
+                        last_ping = std::time::Instant::now();
                         send_ctrl_msg(&mut write_half, &session, &ControlMsg::Pong { ts_us }, &mut tcp_tx_nonce).await?;
                     }
                     ControlMsg::RequestKeyframe => {
@@ -545,9 +587,19 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                         }
                     }
                     ControlMsg::SelectDisplay { id } => {
-                        // 共有トポロジ (全クライアント共有)。last-writer-wins で active_idx を更新。
-                        let mut sc = shared.lock().await;
-                        match sc.displays.iter().position(|d| d.id == id) {
+                        // ロック順序は必ず display_op → shared (逆順は取らない。デッドロック防止)。
+                        // このアームは end_takeover (数十〜数百ms の spawn_blocking) を伴いうるため、
+                        // `shared` を保持したまま await せず、ディスプレイ操作専用の直列化ロックで
+                        // 他接続のトポロジ操作 (begin_takeover/end_takeover) と排他する。`shared` 自体は
+                        // 判断に必要な値を読んだら即座に手放し、Stats 等の低頻度制御パスを止めない。
+                        let _display_guard = display_op.lock().await;
+                        let (target, need_end_takeover, prev_active_idx, prev_taken_over) = {
+                            let sc = shared.lock().await;
+                            let target = sc.displays.iter().position(|d| d.id == id);
+                            let need_end_takeover = sc.taken_over && id != VIRTUAL_SENTINEL_ID;
+                            (target, need_end_takeover, sc.active_idx, sc.taken_over)
+                        };
+                        match target {
                             Some(idx) => {
                                 if id == VIRTUAL_SENTINEL_ID && !client_trusted {
                                     // 未登録端末は仮想ディスプレイ (テイクオーバー) を選べない。
@@ -563,18 +615,38 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                         virtual_selected,
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
+                                    // 自分が true にしたのなら、後始末で戻す責任も自分が持つ
+                                    // (SetClientViewport で false にできなかった場合の保険)。
+                                    takeover_pending_owned = virtual_selected;
                                     // テイクオーバー中に物理ディスプレイへ切り替えるなら、先に
                                     // end_takeover で全トポロジを復元 (物理を再アタッチ) する。これを
                                     // 怠ると物理デタッチが残ったまま物理を選ぶことになり暗転が残る (穴③)。
-                                    if sc.taken_over && id != VIRTUAL_SENTINEL_ID {
+                                    // `shared` を手放して実行する (display_op が他接続のトポロジ操作を
+                                    // 排他しているので end_takeover 自体は直列化されている)。
+                                    if need_end_takeover {
                                         let _ = tokio::task::spawn_blocking(
                                             crate::display::end_takeover,
                                         )
                                         .await;
-                                        sc.taken_over = false;
-                                        tracing::info!(
-                                            "ended takeover: switching to physical display"
-                                        );
+                                    }
+                                    // shared を取り直して適用する。display_op を保持し続けているため
+                                    // 他接続のトポロジ操作はこの間走れないはずだが、念のため手放していた
+                                    // 間に active_idx/taken_over が変わっていないか検証してから適用する。
+                                    let mut sc = shared.lock().await;
+                                    if need_end_takeover {
+                                        if sc.active_idx != prev_active_idx
+                                            || sc.taken_over != prev_taken_over
+                                        {
+                                            tracing::warn!(
+                                                id,
+                                                "display topology changed while ending takeover; discarding end_takeover result"
+                                            );
+                                        } else {
+                                            sc.taken_over = false;
+                                            tracing::info!(
+                                                "ended takeover: switching to physical display"
+                                            );
+                                        }
                                     }
                                     // 物理ディスプレイの解像度は変更しないので、切替時の復元は不要。
                                     sc.active_idx = idx;
@@ -610,92 +682,110 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                         // アクティブが仮想ディスプレイなら RDP 風テイクオーバー (物理オフ+仮想 primary)、
                         // そうでなければ物理ディスプレイの解像度変更 (方式B) を行う。
                         if width > 0 && height > 0 {
-                            // 共有トポロジ (全クライアント共有)。ロックして適用する。
-                            let mut sc = shared.lock().await;
-                            let ai = sc.active_idx;
-                            let active_name = sc.displays[ai].name.clone();
-                            // 仮想ディスプレイのテイクオーバーは登録済み端末のみ (特権ゲート)、かつ
-                            // この接続が SelectDisplay で仮想を明示選択済みのときのみ発動する。名前一致
-                            // だけで判定すると、VDD の GDI 名が物理と衝突した場合にクライアントが要求
-                            // していないテイクオーバー (物理暗転) が走る実機事象があったため。
-                            let is_virtual = client_trusted
-                                && virtual_selected
-                                && sc.vdd_gdi_name.as_deref() == Some(active_name.as_str());
+                            // ロック順序は必ず display_op → shared。begin_takeover (数十〜数百ms の
+                            // spawn_blocking) を `shared` を保持したまま await すると、他接続の Stats
+                            // 等の低頻度制御パスまで丸ごと止まるため、`shared` は判断に必要な値を
+                            // 読んだら手放し、操作自体はディスプレイ操作専用の直列化ロックで排他する。
+                            let _display_guard = display_op.lock().await;
+                            let (ai, active_name, is_virtual, prev_taken_over) = {
+                                let sc = shared.lock().await;
+                                let ai = sc.active_idx;
+                                let active_name = sc.displays[ai].name.clone();
+                                // 仮想ディスプレイのテイクオーバーは登録済み端末のみ (特権ゲート)、かつ
+                                // この接続が SelectDisplay で仮想を明示選択済みのときのみ発動する。名前
+                                // 一致だけで判定すると、VDD の GDI 名が物理と衝突した場合にクライアントが
+                                // 要求していないテイクオーバー (物理暗転) が走る実機事象があったため。
+                                let is_virtual = client_trusted
+                                    && virtual_selected
+                                    && sc.vdd_gdi_name.as_deref() == Some(active_name.as_str());
+                                (ai, active_name, is_virtual, sc.taken_over)
+                            };
                             // 「リサイズで固まる」のライブ再現用 (RUST_LOG=aurora=debug)。どの viewport が
                             // いつ来てテイクオーバー/リサイズのどちらに入ったかを追える。
                             tracing::info!(
                                 width,
                                 height,
-                                taken_over = sc.taken_over,
+                                taken_over = prev_taken_over,
                                 is_virtual,
                                 virtual_selected,
                                 active = %active_name,
                                 "SetClientViewport"
                             );
-                            if is_virtual {
+                            // begin_takeover/detect は `shared` を手放した状態で実行する
+                            // (display_op が他接続のトポロジ操作を排他しているので直列性は保たれる)。
+                            let mut applied: Option<(String, i32, i32, u32, u32)> = None;
+                            if is_virtual && !prev_taken_over {
                                 // --- 仮想ディスプレイ: テイクオーバー ---
-                                let applied = if !sc.taken_over {
-                                    let vn = active_name.clone();
-                                    let r = tokio::task::spawn_blocking(move || {
-                                        crate::display::begin_takeover(&vn, width, height)
-                                    })
-                                    .await;
-                                    match r {
-                                        Ok(Ok((vx, vy, vw, vh))) => {
-                                            sc.taken_over = true;
-                                            // CCD で物理を落とすと仮想の GDI 名が変わることがあるため
-                                            // MTT1337 で再検出し、capture 対象 (名前ベース) を更新する。
-                                            let new_name = tokio::task::spawn_blocking(
-                                                crate::display::detect,
-                                            )
-                                            .await
-                                            .ok()
-                                            .flatten()
-                                            .map(|v| v.gdi_name)
-                                            .unwrap_or_else(|| active_name.clone());
-                                            sc.displays[ai].name = new_name.clone();
-                                            // 仮想の**実位置**を入力座標系に使う。stage2 の (0,0) 移動が
-                                            // 失敗すると仮想は右端 (例 5120,0) に残るため、決め打ち (0,0)
-                                            // だとマウスがずれる (実機で確認)。begin_takeover が読み戻した
-                                            // 実ジオメトリ (vx,vy,vw,vh) を信頼する。
-                                            sc.displays[ai].x = vx;
-                                            sc.displays[ai].y = vy;
-                                            let _ = cap_select_tx.send(new_name);
-                                            Some((vw, vh))
-                                        }
-                                        Ok(Err(e)) => {
-                                            tracing::warn!(error = %e, "begin_takeover failed");
-                                            None
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "begin_takeover task failed");
-                                            None
-                                        }
+                                let vn = active_name.clone();
+                                let r = tokio::task::spawn_blocking(move || {
+                                    crate::display::begin_takeover(&vn, width, height)
+                                })
+                                .await;
+                                match r {
+                                    Ok(Ok((vx, vy, vw, vh))) => {
+                                        // CCD で物理を落とすと仮想の GDI 名が変わることがあるため
+                                        // MTT1337 で再検出し、capture 対象 (名前ベース) を更新する。
+                                        let new_name =
+                                            tokio::task::spawn_blocking(crate::display::detect)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .map(|v| v.gdi_name)
+                                                .unwrap_or_else(|| active_name.clone());
+                                        applied = Some((new_name, vx, vy, vw, vh));
                                     }
-                                } else {
-                                    // テイクオーバー中のリサイズ追従 (仮想解像度の動的変更) は**行わない**。
-                                    // アクティブな Desktop Duplication 中に仮想ディスプレイの解像度を
-                                    // 変えると、duplication が回復不能の DXGI_ERROR_ACCESS_LOST に陥り
-                                    // (同じ共有 D3D11 デバイス上では作り直しても復帰しない)、テイクオーバー中の
-                                    // re-exec 抑止と相まって映像が永久固着する (実機ログ 2026-06-19 で確定)。
-                                    // 解像度は接続時テイクオーバーで一度だけ確定し、以降の窓サイズ差は
-                                    // クライアントの object-fit が吸収する。再フィットしたい場合は再接続する。
-                                    tracing::debug!(
-                                        width,
-                                        height,
-                                        "resize ignored during takeover (virtual resolution is fixed at connect to avoid capture ACCESS_LOST)"
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(error = %e, "begin_takeover failed");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "begin_takeover task failed");
+                                    }
+                                }
+                            } else if is_virtual {
+                                // テイクオーバー中のリサイズ追従 (仮想解像度の動的変更) は**行わない**。
+                                // アクティブな Desktop Duplication 中に仮想ディスプレイの解像度を
+                                // 変えると、duplication が回復不能の DXGI_ERROR_ACCESS_LOST に陥り
+                                // (同じ共有 D3D11 デバイス上では作り直しても復帰しない)、テイクオーバー中の
+                                // re-exec 抑止と相まって映像が永久固着する (実機ログ 2026-06-19 で確定)。
+                                // 解像度は接続時テイクオーバーで一度だけ確定し、以降の窓サイズ差は
+                                // クライアントの object-fit が吸収する。再フィットしたい場合は再接続する。
+                                tracing::debug!(
+                                    width,
+                                    height,
+                                    "resize ignored during takeover (virtual resolution is fixed at connect to avoid capture ACCESS_LOST)"
+                                );
+                            }
+                            // shared を取り直して適用する。display_op を保持し続けているため他接続の
+                            // トポロジ操作はこの間走れないはずだが、念のため手放していた間に active_idx/
+                            // taken_over が変わっていないか検証してから適用する (変わっていたら
+                            // begin_takeover の結果は捨てて warn する。takeover_pending は下で必ず false
+                            // に戻すので送出は固着しない)。
+                            if let Some((new_name, vx, vy, vw, vh)) = applied {
+                                let mut sc = shared.lock().await;
+                                if sc.active_idx != ai || sc.taken_over != prev_taken_over {
+                                    tracing::warn!(
+                                        id = ai,
+                                        "display topology changed during begin_takeover; discarding takeover result"
                                     );
-                                    None
-                                };
-                                if let Some((nw, nh)) = applied {
-                                    sc.displays[ai].width = nw;
-                                    sc.displays[ai].height = nh;
+                                } else {
+                                    sc.taken_over = true;
+                                    // 仮想の**実位置**を入力座標系に使う。stage2 の (0,0) 移動が
+                                    // 失敗すると仮想は右端 (例 5120,0) に残るため、決め打ち (0,0)
+                                    // だとマウスがずれる (実機で確認)。begin_takeover が読み戻した
+                                    // 実ジオメトリ (vx,vy,vw,vh) を信頼する。
+                                    sc.displays[ai].name = new_name.clone();
+                                    sc.displays[ai].x = vx;
+                                    sc.displays[ai].y = vy;
+                                    sc.displays[ai].width = vw;
+                                    sc.displays[ai].height = vh;
                                     let d = sc.displays[ai].clone();
+                                    drop(sc);
+                                    let _ = cap_select_tx.send(new_name);
                                     let geom = DisplayGeom {
                                         x: d.x,
                                         y: d.y,
-                                        width: nw,
-                                        height: nh,
+                                        width: vw,
+                                        height: vh,
                                     };
                                     let _ = input_tx.send(InputCmd::SetDisplay(geom)).await;
                                     // 解像度追従を全クライアントへ配信する (要求元以外の canvas も合わせる)。
@@ -703,20 +793,21 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                         &registry,
                                         &ControlMsg::DisplayResized {
                                             id: d.id,
-                                            width: nw,
-                                            height: nh,
+                                            width: vw,
+                                            height: vh,
                                         },
                                     );
                                     let _ = enc_tx.send(EncoderCommand::RequestKeyframe).await;
-                                    tracing::info!(id = d.id, nw, nh, "virtual display takeover/resize");
+                                    tracing::info!(id = d.id, vw, vh, "virtual display takeover/resize");
                                 }
                             }
                             // is_virtual 判定に関わらず、この viewport 処理を抜ける時点で
-                            // テイクオーバーは完了 (begin_takeover は上の is_virtual ブロック内で
-                            // await 済み) または非該当なので、送出停止を必ず解除する。ブロック内に
-                            // 置くと is_virtual=false 経路や失敗時に、直前の SelectDisplay で立てた
-                            // takeover_pending=true が残り送出が永久固着する。
+                            // テイクオーバーは完了 (begin_takeover は上のブロックで await 済み) または
+                            // 非該当なので、送出停止を必ず解除する。ここより上で早期リターンしないため
+                            // is_virtual=false 経路や失敗時にも必ず到達し、直前の SelectDisplay で立てた
+                            // takeover_pending=true が残って送出が永久固着することはない。
                             takeover_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+                            takeover_pending_owned = false;
                             // 物理ディスプレイのキャプチャ時はホスト解像度を一切変更しない
                             // (はみ出しはクライアント側の object-fit / レターボックスで吸収する)。
                         }
@@ -747,6 +838,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // データ欠落/重複の可能性が高く、書き込むと破損ファイルを残すため中断する。
                                     let message = format!("chunk offset mismatch: expected {}, got {offset}", u.written);
                                     tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch, aborting upload");
+                                    cleanup_aborted_upload(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
@@ -756,12 +848,14 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // (total の検証が抜けており実質デッドだった)。
                                     let message = format!("upload exceeds declared size {}", u.total);
                                     tracing::warn!(id, total = u.total, written = u.written, got = data.len(), "upload exceeds declared size, aborting");
+                                    cleanup_aborted_upload(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
+                                    cleanup_aborted_upload(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
@@ -776,7 +870,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                                 tracing::info!(id, written, total, path = %path, "file upload complete");
                                                 ControlMsg::FileResult { id, ok: true, message: path }
                                             }
-                                            Err(e) => ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") },
+                                            Err(e) => {
+                                                tracing::warn!(id, error = %e, "file flush failed");
+                                                cleanup_aborted_upload(&path).await;
+                                                ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") }
+                                            }
                                         };
                                         send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                     }
@@ -871,6 +969,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     .await;
 
     // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
+    // -0.5) この接続が SelectDisplay(仮想) で立てた takeover_pending=true を SetClientViewport
+    // で戻せずに終了した場合 (異常切断・ping タイムアウト等) の保険。shared フラグなので、戻さずに
+    // 抜けると他の全クライアントの映像送出が永久に止まる (このセッションだけの問題では済まない)。
+    if takeover_pending_owned {
+        tracing::warn!("connection ended while takeover was pending; clearing shared gate");
+        takeover_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     // 0) tray へ切断を通知する (切断バルーン + 接続数デクリメント)。確立時の on_connected と対。
     tray_bus.on_disconnected(peer_label);
     // 0.5) AURHELLO 登録簿から自分の枠を外す (自分の conn_id のときだけ除去)。
@@ -893,6 +998,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     fs_req_rx.close();
     // 3) 登録解除 + 接続数減算 + ProjFS 所有解放。最後の 1 本かどうかとテイクオーバー復元の要否を
     //    ロック下で原子的に判定する (複数同時切断でも復元は 1 回だけ走る)。
+    // ロック順序は必ず display_op → shared。この後の end_takeover (数十〜数百ms の
+    // spawn_blocking) を SelectDisplay/SetClientViewport の begin_takeover と同じ直列化ロックで
+    // 排他する (このロックを取らずに end_takeover すると、切断処理中に別の新規接続が
+    // begin_takeover を同時に走らせうる)。restore_takeover の判定自体もこのロックの中で行う
+    // (判定後にロックを取ると、判定〜取得の間に新規接続の begin_takeover が割り込む余地が残る)。
+    let _display_guard = display_op.lock().await;
     registry.lock().expect("registry poisoned").remove(&conn_id);
     let (is_last, restore_takeover, codec_recompute) = {
         let mut sc = shared.lock().await;

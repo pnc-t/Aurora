@@ -14,6 +14,7 @@ export default defineConfig({
       input: {
         main: entry("src/index.html"),
         capture: entry("src/capture.html"),
+        mobile: entry("src/mobile.html"),
       },
     },
   },

@@ -204,6 +204,11 @@ export function setRecordingActive(active: boolean): void {
 /** KeyboardEvent からローカルホットキーを判定する (該当なしは null)。 */
 export function matchHotkey(e: KeyboardEvent): LocalHotkey | null {
   if (recordingActive) return null;
+  // オートリピートはローカル UI 操作としては無視する (キー判定はここが唯一の経路)。
+  // 押しっぱなし中に toggleFullscreen 等を連発させないための入口ガード。
+  // input.ts へのホスト転送は別の window リスナー (このガードの対象外) が担うため、
+  // 通常のリモート入力のキーリピートはここでは弾かれず素通りする。
+  if (e.repeat) return null;
   // F11 単独は標準のフルスクリーンキーとして転用 (変更不可)。
   if (e.key === "F11") return "toggle-fullscreen";
   for (const s of SHORTCUTS) {

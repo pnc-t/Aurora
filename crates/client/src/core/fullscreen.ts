@@ -7,19 +7,32 @@ import { logger } from "./log";
 
 let fullscreen = false;
 
+// setFullscreen の await 中に再入した呼び出しを無視するガード。キーリピートを
+// shortcuts.ts 側で弾いても、別経路 (ツールバーボタン連打等) からの再入や、
+// IPC 往復がリピート間隔より遅い端末は残るため、ここでも二重に塞ぐ。
+// フラグと実ウィンドウ状態がずれると、連動する lockSystemKeys/unlockSystemKeys も
+// 実状態と食い違い、全画面でないのに Keyboard Lock が掛かったままになり得る。
+let toggling = false;
+
 export async function toggleFullscreen(): Promise<boolean> {
-  fullscreen = !fullscreen;
+  if (toggling) return fullscreen;
+  toggling = true;
   try {
-    await getCurrentWindow().setFullscreen(fullscreen);
-  } catch (e) {
-    // 失敗したら状態を戻す。
     fullscreen = !fullscreen;
-    logger.warn("setFullscreen failed", e);
+    try {
+      await getCurrentWindow().setFullscreen(fullscreen);
+    } catch (e) {
+      // 失敗したら状態を戻す。
+      fullscreen = !fullscreen;
+      logger.warn("setFullscreen failed", e);
+    }
+    // 全画面没入中だけ OS 予約キー (Alt+Tab / Win / Esc 等) をページへ捕まえ、ホストへ転送する。
+    if (fullscreen) await lockSystemKeys();
+    else unlockSystemKeys();
+    return fullscreen;
+  } finally {
+    toggling = false;
   }
-  // 全画面没入中だけ OS 予約キー (Alt+Tab / Win / Esc 等) をページへ捕まえ、ホストへ転送する。
-  if (fullscreen) void lockSystemKeys();
-  else unlockSystemKeys();
-  return fullscreen;
 }
 
 export async function exitFullscreen(): Promise<void> {

@@ -12,7 +12,134 @@ permissions:
   contents: write # Release 作成 + アセット添付に必要
 
 jobs:
+  # --- Android クライアント (APK) ---
+  # windows-latest 側の build-and-release とは別ジョブにする (Android SDK/NDK が最初から入って
+  # いる ubuntu-latest の方が用意が軽い)。build-and-release は `needs: build-android` で
+  # このジョブの完了を待つ = Android のビルドや署名が失敗すれば Release 自体を作らない。
+  # 成果物が 1 つ欠けた中途半端なリリースを公開しないことを優先している。
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust (stable) + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: crates/client/pnpm-lock.yaml
+
+      # ローカル開発環境 (docs/mobile.md) と NDK バージョンを揃えるため、ランナー既定の NDK に
+      # 依存せず明示的にインストールする (ランナーイメージ更新でデフォルト NDK が変わっても
+      # ビルドが揺れないようにする)。
+      - name: Install NDK 27.2.12479018
+        run: |
+          echo "y" | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          # Tauri CLI (cargo-mobile2) が読むのは NDK_HOME で、ANDROID_NDK_HOME は Gradle/AGP 側の
+          # 名前。ubuntu ランナーは ANDROID_NDK_HOME を既定で設定するが NDK_HOME は設定しないため、
+          # これが無いと cargo tauri android init の時点で失敗する。
+          echo "NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install tauri-cli (prebuilt)
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
+      - run: cargo binstall -y tauri-cli
+
+      - name: Install frontend deps
+        working-directory: crates/client
+        run: pnpm install --frozen-lockfile
+
+      # 署名鍵未設定のまま署名ステップまで進むと、どこで何が足りず失敗したのか分かりにくい。
+      # ビルドに入る前に必須 Secret の有無だけ先に検出して即座に落とす。
+      # Secret は `${{ }}` でスクリプトへ展開せず env 経由で渡す (値に " や $ が含まれると
+      # 展開後のシェル構文が壊れるため。以下の署名ステップも同じ理由)。
+      - name: Verify Android signing secrets are set
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for name in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            # eval + コマンド置換だと値に空白や glob 文字が含まれた場合に単語分割/展開が起きる。
+            # bash の間接展開 (${!name}) ならそれを避けられる。
+            if [ -z "${!name}" ]; then
+              echo "::error::Android 署名用の GitHub Secrets が未設定です ($name に対応する ANDROID_* を確認してください)"
+              exit 1
+            fi
+          done
+
+      # gen/android 配下は git 管理外の生成物だが、themes.xml ×2 / MainActivity.kt /
+      # proguard-aurora.pro の 4 ファイルだけ .gitignore の ! で追跡している (docs/mobile.md
+      # 参照)。init はテンプレートをまるごと書き戻すため、この 4 ファイルが上書きされうる。
+      # 上書きされたかどうかに関わらず checkout で追跡版に戻し、手編集内容を確定させる。
+      - name: Init Android project
+        working-directory: crates/client/src-tauri
+        run: cargo tauri android init
+      - name: Restore tracked gen/android files
+        run: git checkout -- crates/client/src-tauri/gen/android
+
+      # --target 4 種を並べると Tauri CLI が全 ABI を含む universal APK を 1 本出力する。
+      - name: Build Android APK (unsigned)
+        working-directory: crates/client/src-tauri
+        run: cargo tauri android build --apk --target aarch64 armv7 i686 x86_64
+
+      # gen/android は再生成されるため gradle の signingConfigs にキーストアを設定しても
+      # 消えてしまう。そのためビルドは unsigned のまま出し、Android SDK build-tools の
+      # zipalign / apksigner で後署名する (gradle 編集に依存しない方式)。
+      - name: Sign APK
+        working-directory: crates/client/src-tauri
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -eu
+          BUILD_TOOLS="$(ls -d ${ANDROID_SDK_ROOT}/build-tools/*/ | sort -V | tail -n1)"
+          UNSIGNED="$(find gen/android/app/build/outputs/apk -name 'app-universal-release-unsigned.apk' | head -n1)"
+          if [ -z "$UNSIGNED" ]; then
+            echo "::error::app-universal-release-unsigned.apk が見つかりません"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > aurora-release.keystore
+          "${BUILD_TOOLS}zipalign" -p -f 4 "$UNSIGNED" aligned.apk
+          "${BUILD_TOOLS}apksigner" sign \
+            --ks aurora-release.keystore \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --out signed.apk \
+            aligned.apk
+          "${BUILD_TOOLS}apksigner" verify signed.apk
+          rm -f aurora-release.keystore
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p ../../../dist-android
+          cp signed.apk "../../../dist-android/Aurora_${ver}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurora-android-apk
+          path: dist-android/Aurora_*.apk
+
   build-and-release:
+    needs: build-android
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +163,7 @@ jobs:
           cache-dependency-path: crates/client/pnpm-lock.yaml
 
       - name: Install tauri-cli (prebuilt)
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
       - run: cargo binstall -y tauri-cli
 
       - name: Install frontend deps
@@ -154,6 +281,28 @@ jobs:
           $manifest | ConvertTo-Json -Depth 6 | Set-Content dist-release/latest-host.json -Encoding utf8
           Get-Content dist-release/latest-host.json
 
+      # latest-host.json 自体を setup.exe と同じ minisign 鍵・同じツールで署名する。
+      # version と (download_url, signature) を暗号的に束ねていないと、書き込み権限だけを
+      # 持つ攻撃者が version を高く騙りつつ旧正規署名済み setup.exe を指す manifest を
+      # 差し替えて強制ダウングレードできてしまうため (host 側は latest-host.json.sig を
+      # fail-closed で検証する。update.rs 参照)。署名対象は直前の Set-Content が書き出した
+      # バイト列そのものであり、この後 latest-host.json を書き換える処理は無い
+      # (Get-Content での確認表示はファイルを変更しない)。
+      - name: Sign host updater manifest
+        shell: pwsh
+        run: cargo tauri signer sign dist-release/latest-host.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # build-android ジョブの成果物 (署名済み APK) を取り込む。Android は latest.json 系の
+      # 自動アップデート対象外なので、ここでは Release への添付だけ行う。
+      - name: Download Android APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aurora-android-apk
+          path: dist-release
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -162,6 +311,8 @@ jobs:
             dist-release/*-setup.exe
             dist-release/latest.json
             dist-release/latest-host.json
+            dist-release/latest-host.json.sig
             dist-release/aurora-wol-*-aarch64
+            dist-release/*.apk
           generate_release_notes: true
           fail_on_unmatched_files: true

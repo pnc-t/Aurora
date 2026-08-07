@@ -580,9 +580,22 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   let settings: ClientSettings = { ...DEFAULT_SETTINGS };
 
   function persist(): void {
-    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
-    // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
-    void emit("aurora://settings-changed", settings);
+    // 保存の成否を待たずに同報すると、保存失敗時も他窓が新設定で動き続け、
+    // 次回起動時に未保存の古い設定へ巻き戻ってユーザーには「戻った」ように見える。
+    void saveSettings(settings)
+      .then(() => {
+        // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
+        void emit("aurora://settings-changed", settings);
+      })
+      .catch((e) => {
+        logger.error("save settings failed", e);
+        statusText.textContent = "設定の保存に失敗しました";
+        if (statusRevertTimer !== null) clearTimeout(statusRevertTimer);
+        statusRevertTimer = window.setTimeout(() => {
+          statusRevertTimer = null;
+          updateStatusBar();
+        }, 5000);
+      });
   }
 
   // --- ショートカットの編集 (「その他」タブ) ---
@@ -681,6 +694,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // --- ページ切替 ---
   opts.root.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // 記録中に別ページへ移ると capture リスナーが全キーを飲み込み続け、遷移先の入力欄が無反応になる。
+      stopRecording();
       const page = btn.dataset.page;
       opts.root.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b === btn));
       opts.root.querySelectorAll(".page").forEach((p) => {
@@ -692,6 +707,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // --- Settings サブタブ切替 ---
   opts.root.querySelectorAll<HTMLButtonElement>(".settings-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // 記録中にサブタブを切ると capture リスナーが全キーを飲み込み続け、遷移先の入力欄が無反応になる。
+      stopRecording();
       const sect = btn.dataset.sect;
       opts.root.querySelectorAll(".settings-tab").forEach((b) => b.classList.toggle("active", b === btn));
       opts.root.querySelectorAll(".settings-sect").forEach((s) => {
@@ -706,6 +723,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 開いているダイアログのフォーカストラップ解除関数 (開くたびに張り、閉じると外す)。
   let releaseTrap: (() => void) | null = null;
   function openBackdrop(): void {
+    // 記録中にダイアログを開くと capture リスナーが全キーを飲み込み続け、ダイアログ内の入力欄が無反応になる。
+    stopRecording();
     backdrop.classList.add("visible");
     applyAriaLabels(backdrop);
     // 呼び出し側が select.value を入れるより前に差し替える (setter でラベルが追従するため)。
@@ -773,6 +792,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       closeCardMenu();
       return;
     }
+    // 記録中にメニューを開くと capture リスナーが全キーを飲み込み続け、↑↓ 等の操作が効かなくなる。
+    stopRecording();
     const newWinItem = isConnected(entry.host)
       ? `<button class="menu-item" data-m="newwin">${icon("add")} 新しいウィンドウで接続</button>`
       : "";
@@ -1061,6 +1082,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   // 現在表示中の並び (ドラッグ並べ替えの基準)。
   let currentHosts: HostEntry[] = [];
 
+  // ドラッグ中かどうか。renderHosts は hostList.innerHTML を丸ごと再構築するため、
+  // ドラッグ中に呼ばれると掴んでいるカード (startDrag のクロージャが握る DOM) が
+  // ツリーから孤立し、重複行/浮いたカードになる。ドラッグ中は再構築を保留する。
+  let isDragging = false;
+  // ドラッグ中に renderHosts が呼ばれたかどうか。プローブ結果や他ウィンドウの接続状態変化を
+  // 取りこぼさないよう、ドラッグ終了時にまとめて1回だけ反映する。
+  let pendingRenderHosts = false;
+
   // 到達性プローブ結果 (host 小文字 → online)。未判定はドット非表示。
   const probeMap = new Map<string, boolean>();
   let probing = false;
@@ -1093,6 +1122,14 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     }
   }
 
+  /** ドラッグ中に保留された renderHosts があれば、ドラッグ終了時に1回だけ反映する。 */
+  function flushPendingRenderHosts(): void {
+    if (pendingRenderHosts) {
+      pendingRenderHosts = false;
+      renderHosts(currentHosts);
+    }
+  }
+
   /** from の要素を to の位置へ移動し、保存して再描画する。 */
   function reorder(from: number, to: number): void {
     if (from === to || from < 0 || to < 0) return;
@@ -1110,6 +1147,7 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
    * HTML5 DnD は WebView2 で不安定なため pointer イベントで自前実装する。
    */
   function startDrag(from: number, downEvent: PointerEvent, card: HTMLElement): void {
+    isDragging = true;
     const rect = card.getBoundingClientRect();
     const offsetY = downEvent.clientY - rect.top;
     let targetPos = from;
@@ -1147,15 +1185,32 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
       if (pos >= others.length) hostList.appendChild(card);
       else hostList.insertBefore(card, others[pos]);
     };
-    const onUp = (): void => {
+    // リスナ解除とクローン/placeholder の後始末だけを共通化する。並べ替えの確定は onUp 側のみで行う。
+    const cleanup = (): void => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
       clone.remove();
       card.classList.remove("drag-placeholder");
-      reorder(from, targetPos);
+      // ここで確実に false へ戻す (pointerup/pointercancel どちらの経路でも通る)。
+      isDragging = false;
+    };
+    const onUp = (): void => {
+      cleanup();
+      reorder(from, targetPos); // 並べ替え確定 (from === to なら内部で何もせず戻る)
+      // reorder が描画済みでも、そこで使われた並びより後に来た保留分だけを反映する
+      // (先に flush すると並べ替え前の順序で描き直してしまうため、必ず reorder の後に置く)。
+      flushPendingRenderHosts();
+    };
+    // pointercancel は pointerup が来ないまま中断されるため、確定はせず後始末のみ行い
+    // 見た目 (カード位置) は元の並び順で再描画して戻す (この呼び出しで pendingRenderHosts も消費される)。
+    const onCancel = (): void => {
+      cleanup();
+      renderHosts(currentHosts);
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
   }
 
   /** 最終接続日時 (unix 秒) を「たった今/N分前/N時間前/N日前」に整形する。 */
@@ -1172,16 +1227,19 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
 
   function renderHosts(hosts: HostEntry[]): void {
     currentHosts = hosts;
+    if (isDragging) {
+      // 保留: 掴んでいるカードを孤立させないよう再構築せず、ドラッグ終了時に描画し直す。
+      pendingRenderHosts = true;
+      return;
+    }
+    pendingRenderHosts = false;
     if (hosts.length === 0) {
-      // 初回利用者は「何をどこに入れればいいか」で詰まるため、一行ヒントではなく
-      // 手順ガイドを出す (.empty-hint は wol-panel と共有のため触らず新クラスにする)。
+      // 手順3行の説教くさいガイドは不評だったため撤廃し、見出し+一行ヒントのみにする
+      // (.empty-hint は wol-panel と共有のため触らず新クラスにする)。
       hostList.innerHTML = `<div class="empty-guide">
+        <div class="empty-guide-icon">${icon("hosts")}</div>
         <div class="empty-guide-title">まだホストがありません</div>
-        <ol class="empty-guide-steps">
-          <li class="empty-guide-step"><span class="empty-guide-badge">1</span><span>操作される PC に Aurora Host をインストール</span></li>
-          <li class="empty-guide-step"><span class="empty-guide-badge">2</span><span>両方の PC を Tailscale で同じ Tailnet に入れる</span></li>
-          <li class="empty-guide-step"><span class="empty-guide-badge">3</span><span>右上の ＋ から IP とパスワードを登録</span></li>
-        </ol>
+        <div class="empty-guide-hint">右上の ＋ からホストを登録できます</div>
       </div>`;
       return;
     }

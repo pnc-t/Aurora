@@ -51,7 +51,7 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 2. **両方の PC**: [Tailscale](https://tailscale.com/) をインストールし、同じ Tailnet に参加させます (`tailscale ip -4` でホストの `100.x.x.x` を控えておきます)
 3. **操作する PC (クライアント)**: `Aurora_<ver>_x64-setup.exe` を実行してインストールし、ランチャーの ＋ からホストの `100.x.x.x` / ポート (既定 7000) / パスワードを登録して接続します
 
-自宅 PC を無人で起動しておく構成 (自動起動 + WoL) は [docs/remote-access-setup.md](docs/remote-access-setup.md)、うまく繋がらないときは [docs/troubleshooting.md](docs/troubleshooting.md) を参照してください。
+自宅 PC を無人で起動しておく構成 (自動起動 + WoL) は [docs/remote-access-setup.md](docs/remote-access-setup.md)、スマホ (Android) から使いたい場合は [docs/mobile.md](docs/mobile.md)、うまく繋がらないときは [docs/troubleshooting.md](docs/troubleshooting.md) を参照してください。
 
 ---
 

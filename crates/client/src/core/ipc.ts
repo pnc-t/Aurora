@@ -294,6 +294,18 @@ export async function setAudioVolume(sessionId: string, volume: number): Promise
   await invoke("set_audio_volume", { sessionId, volume });
 }
 
+/**
+ * モバイル専用: 音声 (Opus) フレームを流す Channel をセッションへアタッチする。
+ * デスクトップは cpal ネイティブ再生のため呼ばない (呼んでも該当コマンド未登録でエラーになる)。
+ * `connect_to_host` はセッション置換のたびに新しい表示先を作るため、接続/再接続のたびに呼び直す。
+ */
+export async function attachAudioChannel(
+  sessionId: string,
+  audioChannel: Channel<ArrayBuffer>,
+): Promise<void> {
+  await invoke("attach_audio_channel", { sessionId, audioChannel });
+}
+
 /** クリップボード同期のセッション毎トグル (OFF 中は送受信とも一時停止)。 */
 export async function setClipboardSync(sessionId: string, enabled: boolean): Promise<void> {
   await invoke("set_clipboard_sync", { sessionId, enabled });
@@ -468,6 +480,11 @@ export type ClientSettings = {
   shortcuts: Record<string, string>;
   /** クリップボード同期を行うか。接続時のセッションゲート初期値になる。 */
   clipboard_sync: boolean;
+  /** モバイルのオンスクリーンコントローラのうち、トラックパッドの表示位置。
+   *  画面サイズに対する比率 (0〜1) の [x, y]。null は未配置 (既定位置に出す)。 */
+  mobile_pad_pos: [number, number] | null;
+  /** クリックボタン群の表示位置。扱いは mobile_pad_pos と同じ。 */
+  mobile_pad_buttons_pos: [number, number] | null;
 };
 
 /** ClientSettings の既定値。設定未保存時のフォールバックや capture 窓の未読込中フォールバックで使う
@@ -494,6 +511,8 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   stats_position: "tr",
   shortcuts: {},
   clipboard_sync: true,
+  mobile_pad_pos: null,
+  mobile_pad_buttons_pos: null,
 };
 
 /** 接続先 host の履歴を読み込む (最新が先頭)。 */

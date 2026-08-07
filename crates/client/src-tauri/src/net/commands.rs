@@ -16,6 +16,9 @@ pub async fn disconnect(
             s.shutdown();
         }
     }
+    // セッションが恒久的に終了するため、staging に保持していた接続資格情報も破棄する
+    // (connect_inner が再接続用に remove せず保持する方針にした分、ここで対称に消す)。
+    state.staging.lock().await.remove(&session_id);
     // ランチャーへ接続中 host 一覧を通知 (切断表示・接続中バッジ除去)。
     emit_connections(&app, &state).await;
     Ok(())
@@ -32,17 +35,27 @@ pub async fn disconnect_host(
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     let target = host.trim().to_lowercase();
-    {
+    let stopped_ids: Vec<String> = {
         let mut guard = state.inner.lock().await;
         let ids: Vec<String> = guard
             .iter()
             .filter(|(_, h)| h.host.trim().to_lowercase() == target)
             .map(|(id, _)| id.clone())
             .collect();
+        let mut stopped = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(h) = guard.remove(&id) {
                 h.shutdown();
+                stopped.push(id);
             }
+        }
+        stopped
+    };
+    // 停止した全セッション分、staging に保持していた接続資格情報も破棄する。
+    {
+        let mut staging = state.staging.lock().await;
+        for id in &stopped_ids {
+            staging.remove(id);
         }
     }
     emit_connections(&app, &state).await;
@@ -118,6 +131,23 @@ pub async fn set_audio_muted(
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     send_ctrl(&state, &session_id, ControlMsg::SetAudioMuted { muted }).await
+}
+
+/// モバイル専用: 音声 (Opus) フレームを流すための Channel をセッションへアタッチする。
+/// デスクトップは cpal ネイティブ再生のため呼ばない。接続/再接続のたびに (フロントの
+/// `setAudioAvailable` から) 呼び直す必要がある: `connect_to_host` はセッション置換のたびに
+/// 新しい `Sink` を作るため、以前アタッチした Channel は引き継がれない。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn attach_audio_channel(
+    session_id: String,
+    audio_channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, SessionState>,
+) -> Result<(), String> {
+    let guard = state.inner.lock().await;
+    let s = guard.get(&session_id).ok_or("unknown session")?;
+    s.sink.set_audio(audio_channel);
+    Ok(())
 }
 
 /// クライアント再生音量を設定する (0.0〜1.0)。host へは送らず client 内部のゲインのみ変更する。

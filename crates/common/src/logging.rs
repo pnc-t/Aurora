@@ -40,8 +40,10 @@ pub struct LogOptions {
 #[must_use = "drop すると非ブロッキングログのワーカーが止まり、以降のログが失われる"]
 pub struct LogGuard(#[allow(dead_code)] Option<WorkerGuard>);
 
-/// 標準のログ用ディレクトリ (`%LOCALAPPDATA%\Aurora\logs`, 非 Windows は
-/// `~/.local/share/Aurora/logs`) を返す。環境変数が無ければ `None`。
+/// 標準のログ用ディレクトリ (`%LOCALAPPDATA%\Aurora\logs`, 非 Windows デスクトップ
+/// (Mac/Linux) は `~/.local/share/Aurora/logs`) を返す。環境変数が無ければ `None`。
+/// **Android/iOS では使えない** (`paths::data_dir` のモジュール doc 参照)。モバイルクライアントは
+/// これを使わず、Tauri のプラットフォーム別パス解決から得たディレクトリを直接 [`init`] へ渡す。
 ///
 /// 「ログフォルダを開く」等の運用導線からも参照する。
 pub fn default_log_dir() -> Option<PathBuf> {

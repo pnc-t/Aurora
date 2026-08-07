@@ -123,6 +123,12 @@ host/client とも GitHub Releases から自動アップデートします。
 - host / client は**同一の minisign 鍵**で署名・検証しており、方式も共通です。この署名は
   更新配信物の真正性検証が目的で、配布インストーラ自体の Authenticode コード署名とは
   別物です (未署名のままなので SmartScreen / Defender の警告は従来どおり出ます)。
+- **host は `latest-host.json` 自体も `latest-host.json.sig` で署名検証します** (setup.exe
+  だけでなく version/URL を含む manifest 本体を署名し、書き込み権限のみの攻撃者による
+  ダウングレード誘導を防ぐため)。取得または検証に失敗した場合は fail-closed で
+  チェック自体をエラーとし、更新を適用しません (「更新なし」とは区別してログに残します)。
+  **移行注意**: `.sig` を同梱した次のリリースが出るまでは、この対応後の host は
+  自己更新チェックが常に失敗します (旧リリースに `latest-host.json.sig` が無いため)。
 
 ## Tailscale 接続確認
 

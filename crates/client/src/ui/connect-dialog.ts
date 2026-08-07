@@ -69,16 +69,20 @@ export function openConnectPicker(root: HTMLElement, opts: ConnectPickerOpts): v
   };
   document.addEventListener("keydown", onKeydown);
 
+  // root は永続 DOM (呼び出しごとに再利用される) なので、ここで貼るリスナは close() で必ず解除する。
+  const onBackdropClick = (e: Event): void => {
+    if (e.target === root) close();
+  };
+  root.addEventListener("click", onBackdropClick);
+
   function close(): void {
     releaseTrap();
     document.removeEventListener("keydown", onKeydown);
+    root.removeEventListener("click", onBackdropClick);
     root.classList.remove("visible");
     root.innerHTML = "";
   }
   root.querySelector("#pk-cancel")?.addEventListener("click", close);
-  root.addEventListener("click", (e) => {
-    if (e.target === root) close();
-  });
 
   function setError(msg: string): void {
     if (statusEl) {

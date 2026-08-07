@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,11 +19,19 @@ use crate::tray::SharedTrayBus;
 
 const MANIFEST_URL: &str =
     "https://github.com/pnc-t/Aurora/releases/latest/download/latest-host.json";
+/// manifest 本体の署名 (CI が setup.exe と同じ鍵で生成)。version と (url, signature) を
+/// 暗号的に束ねるためのもので、これが無いと書き込み権限だけの攻撃者が version を騙って
+/// 旧正規署名済み setup.exe へのダウングレードを誘導できる (J-2 対応)。
+const MANIFEST_SIG_URL: &str =
+    "https://github.com/pnc-t/Aurora/releases/latest/download/latest-host.json.sig";
 const PLATFORM_KEY: &str = "windows-x86_64";
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const APPLY_POLL: Duration = Duration::from_secs(3);
 /// ダウンロードした setup.exe がこのサイズ未満なら破損/エラーページとみなし適用を中止する下限。
 const MIN_VALID_EXE_BYTES: u64 = 200 * 1024;
+/// latest-host.json / .sig は数百バイト程度。誤ってエラーページ等の巨大レスポンスを丸ごと
+/// メモリに読み込まないための上限 (OOM 対策)。
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 
 // client (crates/client/src-tauri/tauri.conf.json の plugins.updater.pubkey) と同一の埋め込み
 // 公開鍵。host/client を同じリリース鍵で署名するため値を揃える。
@@ -151,15 +160,21 @@ pub fn run(state: SharedUpdate, bus: SharedTrayBus, _port: Arc<std::sync::atomic
 }
 
 /// `latest-host.json` マニフェストを確認する。現行版より新しければ `Some` を返す。
+///
+/// fail-closed: manifest 本体の署名 (`latest-host.json.sig`) を取得・検証できない限り、
+/// 更新ありなし判定を一切行わず `Err` を返す (`Ok(None)` にすると「取得できなかった」と
+/// 「更新なし」を呼び出し側で混同してしまうため)。
 fn check_latest(current: &str) -> Result<Option<AvailableUpdate>> {
-    let resp = ureq::get(MANIFEST_URL)
-        .set("User-Agent", "aurora-host-updater")
-        .timeout(Duration::from_secs(15))
-        .call()
-        .context("update manifest request failed")?;
-    let manifest: Manifest = resp
-        .into_json()
-        .context("invalid JSON in update manifest")?;
+    let manifest_bytes = fetch_capped(MANIFEST_URL).context("update manifest request failed")?;
+    let sig_bytes =
+        fetch_capped(MANIFEST_SIG_URL).context("update manifest signature request failed")?;
+    let sig_text =
+        String::from_utf8(sig_bytes).context("update manifest signature is not valid UTF-8")?;
+    verify_signature(&manifest_bytes, &sig_text)
+        .context("update manifest signature verification failed")?;
+
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).context("invalid JSON in update manifest")?;
 
     let latest = semver::Version::parse(&manifest.version)
         .with_context(|| format!("invalid semver in manifest version '{}'", manifest.version))?;
@@ -179,6 +194,25 @@ fn check_latest(current: &str) -> Result<Option<AvailableUpdate>> {
         download_url: platform.url.clone(),
         signature: platform.signature.clone(),
     }))
+}
+
+/// URL の内容をバイト列として取得する。manifest/署名は数百バイトのはずなので、エラーページ等の
+/// 想定外に大きいレスポンスで OOM しないよう `MAX_MANIFEST_BYTES` で読み出し上限を設ける。
+fn fetch_capped(url: &str) -> Result<Vec<u8>> {
+    let resp = ureq::get(url)
+        .set("User-Agent", "aurora-host-updater")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .context("request failed")?;
+    let mut buf = Vec::new();
+    let mut reader = resp.into_reader().take(MAX_MANIFEST_BYTES + 1);
+    reader
+        .read_to_end(&mut buf)
+        .context("failed to read response body")?;
+    if buf.len() as u64 > MAX_MANIFEST_BYTES {
+        anyhow::bail!("response exceeds {MAX_MANIFEST_BYTES} byte limit");
+    }
+    Ok(buf)
 }
 
 /// マニフェストの `signature` (minisign 署名ファイル全体を base64 化したもの) と埋め込み公開鍵で

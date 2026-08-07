@@ -203,9 +203,14 @@ async fn connect_inner(
     state: tauri::State<'_, SessionState>,
 ) -> Result<ConnectOutcome, String> {
     // 接続資格情報は staging マップ (open_capture_window が積む) から取り出す。平文を
-    // ウィンドウ URL に載せないための受け渡し。再接続は staging が空なので None 扱いになり、
-    // 下の分岐で保存済みパスワード (DPAPI) を使う。
-    let staged = state.staging.lock().await.remove(&session_id);
+    // ウィンドウ URL に載せないための受け渡し。remove ではなく参照コピーにし、このセッションが
+    // 生きている間は staging に残す (自動/手動再接続でも同じ session_id で再度ここを通るため。
+    // Android は Keystore 対応済みで保存済みパスワードなら secret::get で取れるが、「今回だけ
+    // 接続」(未保存) の場合は依然 secret::get が None になるため、remove すると再接続が
+    // 必ず失敗する)。トレードオフとして平文パスワードをセッション終了までメモリに保持する。
+    // 恒久的な終了 (disconnect/disconnect_host/ウィンドウ破棄/孤児セッション停止) 側で明示的に
+    // staging.remove する運用とする。
+    let staged = state.staging.lock().await.get(&session_id).cloned();
     let password = match staged.flatten() {
         Some(p) => p,
         // secret ストアは同期 I/O + OS 呼び出し (Windows: ファイル読み + DPAPI、Android:
@@ -383,6 +388,52 @@ async fn connect_inner(
     // クリップボード同期 (このセッション専用に起動、disconnect で shutdown)
     let (clip_handle, mut clip_change_rx) = clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
+    // Android 専用: tcp_reader_loop が clip_apply_tx へ流したリモート適用要求は、デスクトップでは
+    // clipboard アクタースレッドがそのままローカルクリップボードへ書き込むが、Android は
+    // arboard 非対応のため誰も消費しない。ここで JNI 経由の端末クリップボード書き込み
+    // (`mobile_clipboard::write`) を呼ぶタスクを立てる。WebView の navigator.clipboard.writeText
+    // はユーザー操作を伴わない呼び出しを拒否するため使わない (mobile_clipboard 冒頭コメント参照)。
+    // `mobile_clipboard::write` は JNI 経由で ClipboardManager (binder IPC) を叩く同期・
+    // ブロッキング呼び出しなので、tokio ワーカーを塞がないよう呼び出し毎に spawn_blocking へ
+    // 委譲する (CLAUDE.md: tokio::spawn 内で同期 I/O を呼ばない。書き方は save_host_mac 等の
+    // 既存 spawn_blocking に揃える)。
+    // ホストがコピーするたびに来るため、成否ともセッションごとに 1 度だけ log する
+    // (実機で client.log が 9.7MB まで膨れた実績があるため)。
+    #[cfg(target_os = "android")]
+    let mobile_clip_apply_task = {
+        let clip_handle_for_apply = clip_handle.clone();
+        tokio::spawn(async move {
+            let Some(mut apply_rx) = clip_handle_for_apply.take_apply_rx().await else {
+                return;
+            };
+            let mut logged = false;
+            while let Some(text) = apply_rx.recv().await {
+                let res =
+                    tokio::task::spawn_blocking(move || crate::mobile_clipboard::write(&text))
+                        .await;
+                match res {
+                    Ok(Ok(())) => {
+                        if !logged {
+                            logged = true;
+                            tracing::info!("clipboard write from host succeeded");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if !logged {
+                            logged = true;
+                            tracing::warn!(error = %e, "clipboard write from host failed");
+                        }
+                    }
+                    Err(e) => {
+                        if !logged {
+                            logged = true;
+                            tracing::warn!(error = %e, "clipboard write task failed");
+                        }
+                    }
+                }
+            }
+        })
+    };
     // クリップボード同期の可否ゲート。設定の初期値をここで直接反映する (TS 側の後追い適用に
     // 依存すると、起動直後の数回分がレースで漏れうるため Rust 側で初期化する)。設定読み込み
     // 失敗時は安全側の既定 (ON) にする。
@@ -453,8 +504,18 @@ async fn connect_inner(
         .instrument(tracing::Span::current()),
     );
 
-    // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。
+    // 音声再生 (ベストエフォート)。失敗しても映像のみで継続する。デスクトップは cpal ネイティブ
+    // 再生、モバイルは sink 経由で WebView へ転送する (audio.rs 参照、方式A)。
+    #[cfg(desktop)]
     let audio_player = match audio::spawn() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "audio playback disabled");
+            None
+        }
+    };
+    #[cfg(mobile)]
+    let audio_player = match audio::spawn(sink.clone()) {
         Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(error = %e, "audio playback disabled");
@@ -601,16 +662,23 @@ async fn connect_inner(
         host: host.clone(),
         ctrl_tx,
         file_tx,
-        tasks: vec![
-            writer_task,
-            reader_task,
-            udp_task,
-            ping_task,
-            stats_task,
-            clip_forward_task,
-            pong_watchdog_task,
-            udp_watchdog_task,
-        ],
+        tasks: {
+            // mut は #[cfg(target_os = "android")] の push でのみ使う (それ以外の build では未使用になる)。
+            #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+            let mut tasks = vec![
+                writer_task,
+                reader_task,
+                udp_task,
+                ping_task,
+                stats_task,
+                clip_forward_task,
+                pong_watchdog_task,
+                udp_watchdog_task,
+            ];
+            #[cfg(target_os = "android")]
+            tasks.push(mobile_clip_apply_task);
+            tasks
+        },
         clipboard: clip_handle,
         audio: audio_player,
         pending_downloads,
@@ -627,6 +695,8 @@ async fn connect_inner(
         if app.get_webview_window(&handle.window_label).is_none() {
             drop(guard);
             handle.shutdown();
+            // このセッションは永続せず終了するため、staging に残した接続資格情報も破棄する。
+            state.staging.lock().await.remove(&session_id);
             return Err("ウィンドウが閉じられました".to_string());
         }
         guard.insert(session_id.clone(), handle);
@@ -739,6 +809,27 @@ async fn tcp_reader_loop(
                     .unwrap_or(false);
                 if !solicited {
                     tracing::warn!(id, name = %name, "unsolicited FileOffer ignored (no matching request)");
+                } else if download.is_some() {
+                    // 進行中のダウンロードがある間に新しい FileOffer (別 id の割り込み、または
+                    // 同一 id の再送) を受理すると、単一スロット download を無条件で上書きしてしまい
+                    // (a) 同一 id 再送では File::create の truncate で受信済みバイトが無言で失われ、
+                    // (b) 別 id の割り込みでは先行転送の FileChunk が「offer に一致しない」として
+                    // 捨てられ FileResult も届かず進捗表示が永久にハングする。よって拒否する。
+                    tracing::warn!(
+                        id,
+                        name = %name,
+                        "FileOffer rejected: a download is already in progress"
+                    );
+                    // 拒否した新しい方の pending_downloads エントリを解放しないとリークし、
+                    // request_file を呼んだ側の進捗表示が永久にハングしたままになる。
+                    if let Ok(mut s) = pending_downloads.lock() {
+                        s.remove(&id);
+                    }
+                    sink.send_event(ClientEvent::FileResult {
+                        id,
+                        ok: false,
+                        message: "a download is already in progress".into(),
+                    });
                 } else {
                     match open_download(&name).await {
                         Ok((file, path)) => {

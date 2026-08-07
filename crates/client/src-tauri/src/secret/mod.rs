@@ -7,12 +7,29 @@
 //! 中身は `{ host(小文字): password }` の JSON マップを丸ごと暗号化したもの。host を
 //! キーにするのは `recent_hosts` の重複排除 (大文字小文字無視) と揃えるため。
 //!
-//! 非 Windows は未対応 (Windows 優先)。`get` は `None`、`put` はエラー、`delete` は no-op。
+//! Android: Android Keystore (`secret::android`) で端末に紐づけて暗号化する。
+//! それ以外の非対応 OS (iOS 等) は `secret::unsupported` に落ち、`get` は `None`、
+//! `put` はエラー、`delete` は no-op になる。
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager};
+
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(not(any(windows, target_os = "android")))]
+mod unsupported;
+#[cfg(windows)]
+mod windows;
+
+// `use windows as backend;` は windows クレートと曖昧になるため self:: を明示する
+#[cfg(target_os = "android")]
+use self::android as backend;
+#[cfg(not(any(windows, target_os = "android")))]
+use self::unsupported as backend;
+#[cfg(windows)]
+use self::windows as backend;
 
 const FILE: &str = "passwords.bin";
 const IDENTITY_FILE: &str = "identity.bin";
@@ -127,7 +144,14 @@ fn save_map(app: &AppHandle, map: &BTreeMap<String, String>) -> Result<(), Strin
     }
     let plain = serde_json::to_vec(map).map_err(|e| format!("直列化に失敗: {e}"))?;
     let enc = encrypt(&plain)?;
-    std::fs::write(&path, enc).map_err(|e| format!("パスワード保存に失敗: {e}"))
+    // 直接上書き中にプロセスが落ちるとファイルが途中で切れる。load_map は仕様どおり
+    // 「復号できなければ空マップ」で握り潰すため、破損すると保存済みパスワードが全ホスト
+    // ぶん無言で消える。Android は OS がバックグラウンドのアプリを随時 kill するため踏み
+    // やすい。共通ヘルパーは作らず、load_or_create_identity と同じ一時ファイル→rename の
+    // パターンを踏襲する。
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, enc).map_err(|e| format!("パスワード保存に失敗: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("パスワード保存に失敗: {e}"))
 }
 
 /// 指定 host の保存済みパスワードを返す。無ければ `None`。
@@ -158,16 +182,14 @@ pub fn delete_host_password(app: AppHandle, host: String) -> Result<(), String> 
     Ok(())
 }
 
-// --- DPAPI バイト列の暗号化/復号 ---
+// --- 秘密バイト列の暗号化/復号 (Port) ---
 //
-// DPAPI 呼び出しは [`aurora_common::dpapi`] に集約 (host/client 共通、unsafe FFI は 1 箇所)。
-// 非 Windows は `protect`/`unprotect` が `Unsupported` を返すので、従来どおり `encrypt` は
-// Err、`decrypt` は None になる。
+// 実体は OS 別 Adapter (`secret::windows` / `secret::android` / `secret::unsupported`) へ委譲する。
 
 fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
-    aurora_common::dpapi::protect(plain).map_err(|e| format!("CryptProtectData failed: {e}"))
+    backend::protect(plain)
 }
 
 fn decrypt(enc: &[u8]) -> Option<Vec<u8>> {
-    aurora_common::dpapi::unprotect(enc).ok()
+    backend::unprotect(enc)
 }
