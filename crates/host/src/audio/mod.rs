@@ -10,10 +10,21 @@
 //! はストリーム再生成をまたいで連続させる必要がある (下記 nonce 連続性コメント参照) ため、
 //! 個々のストリーム生成の外側 (`Arc<Mutex<EncodeState>>`) に持ち上げて共有する。
 //! エンコード済みフレームのみ `tokio::sync::mpsc` でネットワーク層へ渡す。
+//!
+//! **デバイス形式は決め打ちにしない**: 実機で既定出力デバイスが 44100Hz だった環境があり、
+//! 48000Hz/2ch/f32 固定の `StreamConfig` では `build_input_stream` が
+//! "requested stream configuration is not supported" で失敗し、音声機能ごと無効になった
+//! (2026-07-29)。ループバックで開く形式は必ず `device.default_output_config()` の値を使う。
+//!
+//! **cpal 0.15 の罠**: 出力デバイスに対して `default_input_config()` /
+//! `supported_input_configs()` を呼んではいけない (エラーまたは空を返す)。ループバック用の
+//! 形式の正本は常に `default_output_config()` である。
 
 use anyhow::{Result, anyhow};
 use aurora_common::framing::MAX_PAYLOAD;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, Sample, SizedSample};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -26,7 +37,7 @@ const CHANNELS: u16 = 2;
 const FRAME_SAMPLES: usize = (SAMPLE_RATE as usize / 1000) * 20;
 /// インターリーブされた 1 フレームの f32 サンプル数。
 const FRAME_INTERLEAVED: usize = FRAME_SAMPLES * CHANNELS as usize;
-/// 既定出力デバイス変更を検知するポーリング間隔。
+/// 既定出力デバイス変更を検知する/初回失敗をリトライするポーリング間隔。
 /// cpal に Windows 向けの変更通知 API が無いための次善策。
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -44,6 +55,10 @@ pub struct EncodedAudio {
 /// seq がストリーム再生成のたびに 0 へ戻ると同一セッション鍵で nonce が再利用され
 /// ChaChaPoly の機密性・完全性が破れる。そのため seq (と exhausted 枯渇フラグ、
 /// Opus encoder 本体) はストリームの生成/破棄をまたいで単調に持ち越す。
+///
+/// リサンプラ状態 ([`Resampler`]) はここには含めない。デバイスごとにソースレートが
+/// 変わるため、EncodeState (プロセス生存中ずっと 1 つ) ではなく 1 ストリームごとに
+/// 作り直す ([`open_stream_for_default_device`] のローカル変数として持つ)。
 struct EncodeState {
     encoder: opus::Encoder,
     acc: Vec<f32>,
@@ -77,91 +92,203 @@ impl EncodeState {
             exhausted: false,
         })
     }
-}
 
-/// 音声キャプチャを開始する。成功すれば専用スレッドでストリームが回り続ける。
-/// 初期化 (デバイス取得 / ストリーム生成 / Opus 初期化) の成否は同期的に返す。
-pub fn spawn_capture(tx: mpsc::Sender<EncodedAudio>) -> Result<()> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-    std::thread::Builder::new()
-        .name("audio-capture".into())
-        .spawn(move || run_capture_loop(tx, ready_tx))?;
-
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow!("audio capture init failed: {e}")),
-        Err(_) => Err(anyhow!("audio capture thread exited before init")),
+    /// 48kHz/ステレオ済みのサンプルを蓄積し、20ms フレームが貯まるたびに Opus エンコードして
+    /// `tx` へ送る。cpal コールバック本体から呼ぶ (T→f32 変換とリサンプルは呼び出し側の責務)。
+    fn push_and_encode(&mut self, samples: &[f32], tx: &mpsc::Sender<EncodedAudio>) {
+        if self.exhausted {
+            return;
+        }
+        self.acc.extend_from_slice(samples);
+        while self.acc.len() >= FRAME_INTERLEAVED {
+            match self
+                .encoder
+                .encode_float(&self.acc[..FRAME_INTERLEAVED], &mut self.out_buf)
+            {
+                Ok(n) => {
+                    let frame = EncodedAudio {
+                        seq: self.seq,
+                        data: self.out_buf[..n].to_vec(),
+                    };
+                    self.seq = match self.seq.checked_add(1) {
+                        Some(s) => s,
+                        None => {
+                            tracing::error!("audio nonce space exhausted; stopping audio capture");
+                            self.exhausted = true;
+                            self.acc.clear();
+                            return;
+                        }
+                    };
+                    // バックプレッシャ時は捨てる (音声は次フレームで自然回復)。
+                    let _ = tx.try_send(frame);
+                }
+                Err(e) => tracing::warn!(error = %e, "opus encode failed"),
+            }
+            self.acc.drain(..FRAME_INTERLEAVED);
+        }
     }
 }
 
-/// 専用スレッド本体。初回ストリーム生成の成否を `ready_tx` で返した後、
-/// 既定出力デバイスの変化をポーリングし続けてストリームを追従させる。
+/// デバイスのネイティブ形式 (任意チャンネル数/任意サンプルレート) から Opus 前提の
+/// 48kHz/ステレオへ変換するリサンプラ。ストリーム 1 本ごとに生成し (`EncodeState` には
+/// 混ぜない)、コールバックをまたいで小数位置 (`pos`) と未消費サンプル (`pending`) を
+/// 持ち越すことで、20ms 境界ごとのプチノイズ (補間の不連続) を防ぐ。
+struct Resampler {
+    src_channels: u16,
+    /// 出力 1 サンプルあたり読み進める入力フレーム数 (src_rate / 48000)。等倍なら 1.0。
+    step: f64,
+    /// 次に生成する出力フレームに対応する `pending` 内の読み取り位置 (フレーム単位、小数)。
+    pos: f64,
+    /// ダウンミックス済み (2ch) だがまだリサンプルしていない、入力レートのままの
+    /// インターリーブ蓄積バッファ。
+    pending: Vec<f32>,
+}
+
+impl Resampler {
+    fn new(src_channels: u16, src_rate: u32) -> Self {
+        Self {
+            src_channels,
+            step: src_rate as f64 / SAMPLE_RATE as f64,
+            pos: 0.0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// f32 変換済み・デバイスのネイティブチャンネル数でインターリーブされた入力を、
+    /// ダウンミックス + 線形補間リサンプルして `out` (呼び出し側の `EncodeState.acc` 相当) へ
+    /// 追記する。
+    fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let ch = self.src_channels as usize;
+        if ch == 0 {
+            return;
+        }
+        for frame in input.chunks_exact(ch) {
+            match ch {
+                // モノラルは L/R へ複製。
+                1 => {
+                    self.pending.push(frame[0]);
+                    self.pending.push(frame[0]);
+                }
+                // ステレオはそのまま。
+                2 => {
+                    self.pending.push(frame[0]);
+                    self.pending.push(frame[1]);
+                }
+                // 3ch 以上 (5.1 サラウンド等) はチャンネルレイアウト情報が無いと正しい
+                // ダウンミックスができない。音声は本アプリの主機能ではないため、先頭 2ch
+                // (大抵は フロント L/R) をそのまま採用する簡易近似で割り切る。
+                _ => {
+                    self.pending.push(frame[0]);
+                    self.pending.push(frame[1]);
+                }
+            }
+        }
+
+        // 線形補間でソースレート → 48kHz へ。等倍 (step == 1.0) のときは frac が常に 0 に
+        // なり実質コピーになる (無変換パスを別途持たない簡略化。オーディオは軽量なので許容)。
+        loop {
+            let idx = self.pos.floor() as usize;
+            if idx + 1 >= self.pending.len() / 2 {
+                break;
+            }
+            let frac = (self.pos - idx as f64) as f32;
+            let (l0, r0) = (self.pending[idx * 2], self.pending[idx * 2 + 1]);
+            let (l1, r1) = (self.pending[idx * 2 + 2], self.pending[idx * 2 + 3]);
+            out.push(l0 + (l1 - l0) * frac);
+            out.push(r0 + (r1 - r0) * frac);
+            self.pos += self.step;
+        }
+
+        // 消費済みフレームを破棄し pos を巻き戻す。次コールバックへ持ち越すのは補間に
+        // 必要な直近フレーム分の余白のみ (= 境界をまたいだ連続性の根拠)。
+        let consumed = (self.pos.floor() as usize).min(self.pending.len() / 2);
+        if consumed > 0 {
+            self.pending.drain(..consumed * 2);
+            self.pos -= consumed as f64;
+        }
+    }
+}
+
+/// 音声キャプチャを開始する。成功すれば専用スレッドでストリームが回り続ける。
 ///
-/// `current_stream` はポーリングのたびに使い回すだけで明示的に読み出すことはないが、
-/// 生存させ続けること自体が目的 (drop されるとキャプチャが止まる) なので
-/// `unused_assignments` の誤検知を許容する。
-#[allow(unused_assignments, unused_variables)]
-fn run_capture_loop(
-    tx: mpsc::Sender<EncodedAudio>,
-    ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
-) {
+/// 返り値の `Arc<AtomicBool>` は「今この瞬間キャプチャが動いているか」を表す動的フラグ。
+/// 初回オープンに失敗しても `Err` にはせず (デバイス側の一時的な問題は致命的ではない)、
+/// フラグ `false` のまま返して以後バックグラウンドでリトライを続ける。`Err` になるのは
+/// Opus エンコーダ初期化やスレッド起動そのものが失敗する、本当に回復不能な場合のみ。
+pub fn spawn_capture(tx: mpsc::Sender<EncodedAudio>) -> Result<Arc<AtomicBool>> {
     // seq/encoder/exhausted はデバイス再生成をまたいで連続させる必要があるため、
     // 個々のストリーム生成の外側 (このスレッド関数のスコープ) で保持し、
     // cpal コールバックとは Arc<Mutex<_>> で共有する。
-    let state = match EncodeState::new() {
-        Ok(s) => Arc::new(Mutex::new(s)),
-        Err(e) => {
-            let _ = ready_tx.send(Err(e.to_string()));
-            return;
-        }
-    };
+    let state = Arc::new(Mutex::new(EncodeState::new()?));
+    let available = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
 
+    let thread_state = state.clone();
+    let thread_available = available.clone();
+    std::thread::Builder::new()
+        .name("audio-capture".into())
+        .spawn(move || run_capture_loop(tx, thread_state, thread_available, ready_tx))?;
+
+    // 初回オープン試行 (成否問わず) の完了だけを待つ。失敗していてもここでは Err にせず、
+    // available=false のまま返す (呼び出し元の起動ログ整合のための同期待ちに過ぎない)。
+    let _ = ready_rx.recv();
+
+    Ok(available)
+}
+
+/// 専用スレッド本体。初回ストリーム生成を試みた後 (成否は `ready_tx` へ一度だけ通知)、
+/// 既定出力デバイスの変化とストリーム断を `DEVICE_POLL_INTERVAL` ごとにポーリングして
+/// 追従・再試行し続ける。
+fn run_capture_loop(
+    tx: mpsc::Sender<EncodedAudio>,
+    state: Arc<Mutex<EncodeState>>,
+    available: Arc<AtomicBool>,
+    ready_tx: std::sync::mpsc::Sender<()>,
+) {
     let host = cpal::default_host();
-
-    let (mut current_stream, mut current_device_name) =
-        match open_stream_for_default_device(&host, &state, &tx) {
-            Ok((stream, name)) => {
-                tracing::info!(device = %name, "audio loopback device");
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                (stream, name)
-            }
-            Err(e) => {
-                let _ = ready_tx.send(Err(e.to_string()));
-                return;
-            }
-        };
+    let mut current_stream: Option<cpal::Stream> = None;
+    let mut current_device_name = String::new();
+    let mut ready_sent = false;
 
     loop {
-        std::thread::sleep(DEVICE_POLL_INTERVAL);
-
-        // cpal は Windows で既定出力デバイス変更の通知 API を持たないため、
-        // ポーリングで検知するしかない。
         let latest_name = host
             .default_output_device()
             .and_then(|d| d.name().ok())
             .unwrap_or_default();
 
-        if latest_name != current_device_name {
+        // 再オープンする条件は「デバイス名が変わった」だけでなく「今ストリームを持って
+        // いない」も含める。初回失敗後や、ストリーム断後にデバイス名が変わらないまま
+        // 復旧させたいケース (同じデバイスの一時的な使用不可等) を取りこぼさないため。
+        if current_stream.is_none() || latest_name != current_device_name {
             match open_stream_for_default_device(&host, &state, &tx) {
                 Ok((stream, name)) => {
-                    tracing::info!(device = %name, "audio loopback device switched");
+                    if current_stream.is_some() {
+                        tracing::info!(device = %name, "audio loopback device switched");
+                    } else {
+                        tracing::info!(device = %name, "audio loopback device");
+                    }
                     current_device_name = name;
-                    // 旧ストリームはここで drop されて停止する。
-                    current_stream = stream;
+                    current_stream = Some(stream);
+                    available.store(true, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    // デバイス取得/構築失敗は致命的にしない。旧ストリーム (あれば)
-                    // をそのまま保持し、次のポーリングで再試行する。
-                    tracing::warn!(
-                        error = %e,
-                        "failed to switch audio loopback device; will retry"
-                    );
+                    // 失敗は致命的にしない。旧ストリーム (あれば) はそのまま保持し、
+                    // 次のポーリングで再試行する。旧ストリームが無い (初回 or 断後) なら
+                    // 「今は使えない」ことをフラグへ反映する。
+                    tracing::warn!(error = %e, "failed to open audio loopback stream; will retry");
+                    if current_stream.is_none() {
+                        available.store(false, Ordering::Relaxed);
+                    }
                 }
             }
         }
+
+        if !ready_sent {
+            ready_sent = true;
+            let _ = ready_tx.send(());
+        }
+
+        std::thread::sleep(DEVICE_POLL_INTERVAL);
     }
 }
 
@@ -178,70 +305,95 @@ fn open_stream_for_default_device(
         .ok_or_else(|| anyhow!("no default output device"))?;
     let name = device.name().unwrap_or_default();
 
-    let config = cpal::StreamConfig {
-        channels: CHANNELS,
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Default,
-    };
+    // 形式は `default_output_config()` から取る (決め打ちしない)。
+    // cpal 0.15 では出力デバイスに `default_input_config()` / `supported_input_configs()` を
+    // 呼んではいけない (エラー/空を返す。ファイル冒頭のモジュール doc 参照)。
+    let supported = device
+        .default_output_config()
+        .map_err(|e| anyhow!("default_output_config: {e}"))?;
+    let src_channels = supported.channels();
+    let src_rate = supported.sample_rate().0;
+    let sample_format = supported.sample_format();
+    let config = supported.config();
+
+    let needs_resample = src_channels != CHANNELS || src_rate != SAMPLE_RATE;
+    tracing::info!(
+        device = %name,
+        input_rate = src_rate,
+        input_channels = src_channels,
+        sample_format = %sample_format,
+        resampling = needs_resample,
+        "opening audio loopback stream"
+    );
 
     let cb_state = Arc::clone(state);
     let cb_tx = tx.clone();
+    let resampler = Resampler::new(src_channels, src_rate);
+
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            build_typed_stream::<f32>(&device, &config, cb_state, cb_tx, resampler)
+        }
+        cpal::SampleFormat::I16 => {
+            build_typed_stream::<i16>(&device, &config, cb_state, cb_tx, resampler)
+        }
+        cpal::SampleFormat::U16 => {
+            build_typed_stream::<u16>(&device, &config, cb_state, cb_tx, resampler)
+        }
+        other => Err(anyhow!("unsupported sample format: {other}")),
+    }?;
+
+    stream.play().map_err(|e| anyhow!("stream play: {e}"))?;
+    Ok((stream, name))
+}
+
+/// サンプル型 `T` (f32/i16/u16) 固定でループバック入力ストリームを構築する。
+/// `resampler` は `FnMut` クロージャに `move` して閉じ込め、コールバックをまたいで
+/// 状態 (小数位置・持ち越しサンプル) を保持する (`EncodeState` の `Arc<Mutex<_>>` とは
+/// 別に、1 ストリームだけが所有するため Mutex 不要)。
+fn build_typed_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    state: Arc<Mutex<EncodeState>>,
+    tx: mpsc::Sender<EncodedAudio>,
+    mut resampler: Resampler,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
     let err_fn = |e| tracing::warn!(error = %e, "audio input stream error");
+    // T→f32 変換の作業バッファ。コールバックをまたいで再利用し毎回の確保を避ける。
+    let mut float_buf: Vec<f32> = Vec::new();
+    // リサンプル後 (48kHz/ステレオ) の出力を一旦ここへ溜め、まとめて EncodeState へ渡す。
+    let mut resampled: Vec<f32> = Vec::new();
 
     let stream = device
         .build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // ロックは 1 フレーム分の処理中のみ保持する (20ms 粒度なので許容範囲)。
-                let mut guard = match cb_state.lock() {
+            config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                float_buf.clear();
+                float_buf.extend(data.iter().map(|s| f32::from_sample(*s)));
+
+                resampled.clear();
+                resampler.push(&float_buf, &mut resampled);
+                if resampled.is_empty() {
+                    return;
+                }
+
+                // ロックは 1 コールバック分の処理中のみ保持する (20ms 粒度なので許容範囲)。
+                let mut guard = match state.lock() {
                     Ok(g) => g,
                     // Mutex poisoning は実質発生しない前提 (コールバック内 panic 禁止)。
                     // 万一発生してもこのフレームを諦めるだけに留め、スレッドを落とさない。
                     Err(_) => return,
                 };
-                let EncodeState {
-                    encoder,
-                    acc,
-                    out_buf,
-                    seq,
-                    exhausted,
-                } = &mut *guard;
-
-                if *exhausted {
-                    acc.clear();
-                    return;
-                }
-                acc.extend_from_slice(data);
-                while acc.len() >= FRAME_INTERLEAVED {
-                    match encoder.encode_float(&acc[..FRAME_INTERLEAVED], out_buf) {
-                        Ok(n) => {
-                            let frame = EncodedAudio {
-                                seq: *seq,
-                                data: out_buf[..n].to_vec(),
-                            };
-                            *seq = match seq.checked_add(1) {
-                                Some(s) => s,
-                                None => {
-                                    tracing::error!(
-                                        "audio nonce space exhausted; stopping audio capture"
-                                    );
-                                    *exhausted = true;
-                                    return;
-                                }
-                            };
-                            // バックプレッシャ時は捨てる (音声は次フレームで自然回復)。
-                            let _ = cb_tx.try_send(frame);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "opus encode failed"),
-                    }
-                    acc.drain(..FRAME_INTERLEAVED);
-                }
+                guard.push_and_encode(&resampled, &tx);
             },
             err_fn,
             None,
         )
         .map_err(|e| anyhow!("build_input_stream: {e}"))?;
 
-    stream.play().map_err(|e| anyhow!("stream play: {e}"))?;
-    Ok((stream, name))
+    Ok(stream)
 }

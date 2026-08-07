@@ -1264,15 +1264,25 @@ fn run_server(
     let (clip_handle, clip_change_rx) = aurora_common::clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
 
-    // 音声ループバック取り込み。失敗してもホストは映像のみで継続する。
-    let audio_enabled = match audio::spawn_capture(audio_tx) {
-        Ok(()) => {
-            tracing::info!("audio loopback capture started");
-            true
+    // 音声ループバック取り込み。Err はスレッド起動/Opus 初期化そのものの失敗など回復不能な
+    // 場合のみ (デバイス側の問題は audio::spawn_capture 内でリトライされ続ける)。
+    // audio_available は「今この瞬間キャプチャが動いているか」を表す動的フラグで、HostInfo を
+    // 組み立てる時点 (net/client.rs) で読む。デバイスが後から使えるようになれば次の接続で
+    // 音声が有効になる (initial-failure = 永久無効、という非対称を解消するための仕組み)。
+    let audio_available = match audio::spawn_capture(audio_tx) {
+        Ok(flag) => {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("audio loopback capture started");
+            } else {
+                tracing::warn!(
+                    "audio loopback capture not yet available; will retry in background"
+                );
+            }
+            flag
         }
         Err(e) => {
-            tracing::warn!(error = %e, "audio capture disabled");
-            false
+            tracing::warn!(error = %e, "audio capture disabled (fatal init failure)");
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
         }
     };
 
@@ -1384,7 +1394,7 @@ fn run_server(
             reload,
             psk,
             displays,
-            audio: audio_enabled,
+            audio: audio_available,
             mac: primary_mac(),
             max_bitrate_bps,
             auth_failures,

@@ -221,7 +221,15 @@ const toolbar: ToolbarHandle = mountToolbar({
     const s = active();
     if (s) s.setCaptureMode(!s.isCaptured());
   },
-  onToggleMute: (muted) => active()?.setAudioMuted(muted),
+  onToggleMute: (muted) => {
+    active()?.setAudioMuted(muted);
+    // 即時保存し、他窓へも同報する。保存しないと再接続のたびにミュートが解除され、ミュート
+    // したまま席を外せない。同報しないとランチャーの設定トグルが古い値を表示したままになり、
+    // そちらが次に保存したときにこの変更が巻き戻る (persistVideoParams と同じ理由)。
+    settings = { ...getSettings(), audio_muted: muted };
+    void saveSettings(settings).catch((e) => logger.warn("save settings failed", e));
+    void emit("aurora://settings-changed", settings);
+  },
   onSetVolume: (volume) => {
     active()?.setAudioVolume(volume);
     // fps/Mbps と同じパターンで即時保存し、他窓 (次接続時の初期値) にも同報する。

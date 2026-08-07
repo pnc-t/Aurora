@@ -91,7 +91,11 @@ pub struct ServerConfig {
     /// 各接続は受理時にスナップショットを取り、その値でハンドシェイクする。
     pub psk: std::sync::Arc<std::sync::Mutex<[u8; 32]>>,
     pub displays: Vec<DisplayInfo>,
-    pub audio: bool,
+    /// 音声キャプチャが「今この瞬間動いているか」の動的フラグ。デバイス切替/一時的な
+    /// オープン失敗をまたいで host プロセス生存中ずっと共有され、`audio::spawn_capture` が
+    /// 更新し続ける。接続受理時 (HostInfo 組み立て時) に読むことで、起動直後は音声が
+    /// 使えなくても後から使えるようになれば次の接続から有効になる。
+    pub audio: Arc<std::sync::atomic::AtomicBool>,
     /// プライマリ NIC の MAC アドレス (WoL 用)。取得失敗時は `None`。起動時に 1 度だけ取得し
     /// 全接続へ配る (実行中に変わらない値のため接続毎の再取得はしない)。
     pub mac: Option<[u8; 6]>,
@@ -634,7 +638,8 @@ pub async fn run_server(
             let args = ClientArgs {
                 peer,
                 psk,
-                audio: cfg.audio,
+                // HostInfo を組み立てる時点 (この接続の受理時) の最新状態を読む。
+                audio: cfg.audio.load(Ordering::Relaxed),
                 mac: cfg.mac,
                 udp: udp.clone(),
                 enc_tx: enc_tx.clone(),

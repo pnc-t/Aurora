@@ -213,8 +213,16 @@ async fn connect_inner(
     let staged = state.staging.lock().await.get(&session_id).cloned();
     let password = match staged.flatten() {
         Some(p) => p,
-        None => crate::secret::get(&app, &host)
-            .ok_or_else(|| "保存済みパスワードがありません".to_string())?,
+        // secret ストアは同期 I/O + OS 呼び出し (Windows: ファイル読み + DPAPI、Android:
+        // Keystore の同期 Binder IPC)。tokio ワーカーを塞がないよう spawn_blocking へ逃がす
+        // (同ファイルの save_host_mac / save_host_last_connected と同じ扱い)。
+        None => {
+            let (app2, host2) = (app.clone(), host.clone());
+            tokio::task::spawn_blocking(move || crate::secret::get(&app2, &host2))
+                .await
+                .map_err(|e| format!("パスワードの読み出しに失敗: {e}"))?
+                .ok_or_else(|| "保存済みパスワードがありません".to_string())?
+        }
     };
     // 同 id の既存セッションがあれば閉じる (再接続・置換)。
     {
@@ -251,7 +259,14 @@ async fn connect_inner(
 
     // この端末の永続 ID 鍵を読み込む (無ければ生成保存)。host のデバイスピン留めで端末を
     // 識別できるよう、毎回同じ静的公開鍵で接続する。取得失敗時は None=従来の使い捨て鍵。
-    let identity = crate::secret::load_or_create_identity(&app);
+    // 初回は鍵生成 + 保存 (Android は Keystore の TEE/StrongBox 生成まで走る) を伴う同期処理
+    // なので spawn_blocking へ逃がす。join 失敗も「取得できなかった」と同じ扱いで None。
+    let identity = {
+        let app2 = app.clone();
+        tokio::task::spawn_blocking(move || crate::secret::load_or_create_identity(&app2))
+            .await
+            .unwrap_or(None)
+    };
     let identity_priv = identity.as_ref().map(|id| id.private.as_slice());
     // 端末ID (フィンガープリント)。ハンドシェイク以降の失敗メッセージに併記し、ユーザーが
     // ホスト側トレイの承認 UI と照合できるようにする (下の hs_fail 参照)。
@@ -297,8 +312,14 @@ async fn connect_inner(
     // DPAPI 暗号化保存する (無断永続化を避け「今回だけ接続」を可能にする)。失敗してもログ
     // のみで接続は続行する (保存は補助機能)。`save=false` (今回だけ/保存済み即接続/再接続) は
     // 既存の保存値に触れない (= 保存済みなら維持、未保存なら未保存のまま)。
-    if save && let Err(e) = crate::secret::put(&app, &host, &password) {
-        tracing::warn!(error = %e, "failed to save host password");
+    if save {
+        // 読み出し側と同じ理由で spawn_blocking (保存は暗号化 + ファイル書き込みを伴う)。
+        let (app2, host2, pw2) = (app.clone(), host.clone(), password.clone());
+        match tokio::task::spawn_blocking(move || crate::secret::put(&app2, &host2, &pw2)).await {
+            Ok(Err(e)) => tracing::warn!(error = %e, "failed to save host password"),
+            Err(e) => tracing::warn!(error = %e, "save host password task failed"),
+            Ok(Ok(())) => {}
+        }
     }
 
     // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
