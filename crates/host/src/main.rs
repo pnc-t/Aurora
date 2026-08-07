@@ -89,7 +89,44 @@ struct Args {
     /// クロス GPU keyed mutex 固着を避ける (WMI の VRAM 最大推測では dGPU を誤選択するため、
     /// 実際にキャプチャする GPU を run_server と同じ経路で判定する)。
     align_vdd: bool,
+    /// 使い方を表示して終了する (`--help` / `-h`)。
+    help: bool,
 }
+
+/// `--help` で出す使い方。フラグを増やしたらここも足す。
+const USAGE: &str = "\
+aurora-host - Aurora リモートデスクトップのホスト (操作される側)
+
+USAGE:
+    aurora-host [OPTIONS]
+
+引数なしで起動するとトレイに常駐し、接続を待ち受ける。
+
+OPTIONS:
+    -h, --help              この使い方を表示して終了する
+        --port <N>          待受ポート (TCP 制御 / UDP 映像で共用、1..=65535)
+        --bind <IP>         待受アドレス。既定は Tailscale IP、無ければ 127.0.0.1。
+                            LAN へ公開するなら明示指定する (全 NIC は 0.0.0.0)
+        --fps <N>           送出フレームレート上限 (0 = 無制限)
+        --max-bitrate <N>   ビットレート上限 Mbps (0 = 無制限)
+        --encode-gpu <NAME> エンコード GPU の名前部分一致指定 (auto で既定へ戻す)
+        --log-level <LEVEL> ファイルログのレベル (debug 等、または aurora=debug,snow=warn)
+        --perf              エンコード遅延・ビットレートを 1 秒窓で info ログに出す
+
+サブコマンド (実行して終了する):
+        --install           ログオン時自動起動を登録する
+        --uninstall         自動起動を解除する
+        --set-password      接続パスワードを対話入力して暗号化保存する
+        --clear-password    保存済みパスワードを削除する
+        --list-displays     ディスプレイ一覧を表示する
+        --align-vdd         仮想ディスプレイの描画 GPU をキャプチャ GPU に揃える
+
+開発用:
+        --dump-bmp          1 フレームを BMP に出力する
+        --dump-h264 <N>     N フレームを H.264 で出力する
+        --vdd-enrich        VDD 設定を投入する
+        --vdd-test-restore  VDD テイクオーバーの復元を試す
+";
 
 impl Default for Args {
     fn default() -> Self {
@@ -112,6 +149,7 @@ impl Default for Args {
             bind: None,
             encode_gpu: None,
             align_vdd: false,
+            help: false,
         }
     }
 }
@@ -198,8 +236,14 @@ fn parse_args() -> Result<Args, String> {
                 args.encode_gpu = Some(take_value(&mut it, "--encode-gpu")?);
             }
             "--align-vdd" => args.align_vdd = true,
+            "--help" | "-h" => args.help = true,
             other => {
-                eprintln!("unknown arg: {other}");
+                // 未知の引数は fail-closed で弾く。従来は警告を出して**そのまま起動**していたが、
+                // 綴り違い (`--bind` を `--bnid` 等) が既定値での起動として通ってしまい、
+                // 例えば公開範囲を絞ったつもりが既定のまま待ち受ける、という取り違えを招く。
+                return Err(format!(
+                    "error: unknown argument '{other}'\n\nsee `aurora-host --help`"
+                ));
             }
         }
     }
@@ -234,6 +278,18 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+
+    // `--help` はサーバを起動せずに使い方だけ出して抜ける。パースエラーと同じ理由で、
+    // リリース (GUI サブシステム) はコンソールが無いため親コンソールへ接続してから出す。
+    if args.help {
+        #[cfg(windows)]
+        attach_console(false);
+        print!("{USAGE}");
+        // 標準出力がファイル/パイプへ向いていると block buffered になり、`process::exit` は
+        // デストラクタを走らせないためバッファごと消える。明示的に flush してから抜ける。
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(0);
+    }
 
     // CLI サブコマンドは端末への入出力が要る。既定のサーバ起動はバックグラウンド
     // (トレイ常駐) で、リリースでは GUI サブシステムのためコンソールが無い。
