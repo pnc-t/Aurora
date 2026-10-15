@@ -839,6 +839,14 @@ async fn tcp_reader_loop(
                 }
             }
             ControlMsg::FileResult { id, ok, message } => {
+                // ダウンロード中に host 側で読めなくなった等の失敗通知。受信状態を残すと以後の
+                // FileOffer が全て「進行中」で拒否されるため、ここで畳む (drop で書きかけも消える)。
+                if !ok && download.as_ref().is_some_and(|d| d.id == id) {
+                    download = None;
+                    if let Ok(mut s) = pending_downloads.lock() {
+                        s.remove(&id);
+                    }
+                }
                 sink.send_event(ClientEvent::FileResult { id, ok, message });
             }
             // --- ダウンロード受信 (ホスト → クライアント) ---
@@ -883,6 +891,7 @@ async fn tcp_reader_loop(
                                 total: size,
                                 path,
                                 last_progress: None,
+                                keep: false,
                             });
                         }
                         Err(e) => {
@@ -974,13 +983,30 @@ async fn tcp_reader_loop(
                             });
                         }
                         if last {
-                            let (written, path) = (d.written, d.path.clone());
+                            let (written, total, path) = (d.written, d.total, d.path.clone());
                             let res = d.file.flush().await;
+                            // 告知サイズに届かずに終わった = 欠損。保存を確定せず drop で消す。
+                            d.keep = res.is_ok() && written >= total;
                             download = None;
                             if let Ok(mut s) = pending_downloads.lock() {
                                 s.remove(&id);
                             }
                             let ev = match res {
+                                Ok(()) if written < total => {
+                                    tracing::warn!(
+                                        id,
+                                        written,
+                                        total,
+                                        "download ended short of declared size"
+                                    );
+                                    ClientEvent::FileResult {
+                                        id,
+                                        ok: false,
+                                        message: format!(
+                                            "incomplete download: {written}/{total} bytes"
+                                        ),
+                                    }
+                                }
                                 Ok(()) => {
                                     tracing::info!(id, written, path = %path, "download complete");
                                     ClientEvent::FileResult {

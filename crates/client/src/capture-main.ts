@@ -516,6 +516,12 @@ void getCurrentWebviewWindow().listen<{ vk: number; down: boolean }>("grabbed-ke
 
 // --- キャプチャ画面へのファイル D&D アップロード (client → host、アクティブ Session 宛) ---
 let nextUploadId = Date.now() >>> 0;
+// ドロップごとのアップロードを 1 本の列に並べる。並走させると host が受ける FileOffer が重なり、
+// 後発は「進行中」で拒否される (host は 1 セッション 1 受信)。
+let uploadQueue: Promise<void> = Promise.resolve();
+function enqueueUpload(paths: string[]): void {
+  uploadQueue = uploadQueue.then(() => uploadDroppedPaths(paths));
+}
 async function uploadDroppedPaths(paths: string[]): Promise<void> {
   for (const path of paths) {
     const id = nextUploadId;
@@ -542,7 +548,7 @@ void getCurrentWebview().onDragDropEvent((event) => {
     showDropHint(false);
   } else if (p.type === "drop") {
     showDropHint(false);
-    if (p.paths.length > 0) void uploadDroppedPaths(p.paths);
+    if (p.paths.length > 0) enqueueUpload(p.paths);
   }
 });
 

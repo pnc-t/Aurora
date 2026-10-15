@@ -13,6 +13,29 @@ pub(crate) struct DownloadState {
     /// 直近の FileProgress emit 時刻。チャンク毎の emit は Tauri IPC (JSON) コストが高いため、
     /// 転送 id ごとに 100ms 以上間隔を空けて間引く (最終チャンクは間引かず必ず emit する)。
     pub(crate) last_progress: Option<Instant>,
+    /// 完了して保存を確定したか。false のまま drop されたら書きかけを消す。
+    pub(crate) keep: bool,
+}
+
+/// 完了以外の終わり方 (中断・ホストの失敗通知・セッション終了) では書きかけファイルを消す。
+/// セッション終了時の reader タスクは abort で止まりループ後の後始末が走らないため、drop で
+/// 拾う。std のファイルは FILE_SHARE_DELETE で開かれるので、ハンドルが閉じる前の削除予約で足りる。
+impl Drop for DownloadState {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        let path = std::mem::take(&mut self.path);
+        tracing::info!(
+            id = self.id,
+            written = self.written,
+            total = self.total,
+            "discarding incomplete download"
+        );
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { aurora_common::fsname::discard_incoming_file(&path).await });
+        }
+    }
 }
 
 /// `%USERPROFILE%\Aurora\downloads` 配下に保存先ファイルを作る。ディレクトリ解決・
