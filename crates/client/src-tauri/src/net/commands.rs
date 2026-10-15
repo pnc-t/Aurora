@@ -5,20 +5,25 @@ use super::*;
 pub async fn disconnect(
     app: tauri::AppHandle,
     session_id: String,
+    // タブごと恒久終了するときだけ true。切断検知→再接続の経路は false で呼ばれ、
+    // 「今回だけ接続」(未保存) の再接続が staging の資格情報に依存するため残す必要がある。
+    forget_credentials: bool,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     {
         let mut guard = state.inner.lock().await;
         if let Some(s) = guard.remove(&session_id) {
-            tracing::info!(session = %session_id, host = %s.host, "disconnected (by user)");
+            tracing::info!(session = %session_id, host = %s.host, "disconnected");
             // task abort だけでなくクリップボードスレッドにも shutdown を伝える
             // (connect_to_host のセッション置換経路と同じ後始末に統一)。
             s.shutdown();
         }
     }
-    // セッションが恒久的に終了するため、staging に保持していた接続資格情報も破棄する
+    // 恒久終了なら staging に保持していた接続資格情報も破棄する
     // (connect_inner が再接続用に remove せず保持する方針にした分、ここで対称に消す)。
-    state.staging.lock().await.remove(&session_id);
+    if forget_credentials {
+        state.staging.lock().await.remove(&session_id);
+    }
     // ランチャーへ接続中 host 一覧を通知 (切断表示・接続中バッジ除去)。
     emit_connections(&app, &state).await;
     Ok(())

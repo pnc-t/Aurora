@@ -215,8 +215,12 @@ export async function myDeviceFingerprint(): Promise<string> {
   return await invoke<string>("my_device_fingerprint");
 }
 
-export async function disconnect(sessionId: string): Promise<void> {
-  await invoke("disconnect", { sessionId });
+/**
+ * セッションを停止する。`forgetCredentials` はタブごと恒久終了するときだけ true にする
+ * (切断検知→再接続では false。staging の資格情報を消すと「今回だけ接続」が再接続できない)。
+ */
+export async function disconnect(sessionId: string, forgetCredentials: boolean): Promise<void> {
+  await invoke("disconnect", { sessionId, forgetCredentials });
 }
 
 /**
