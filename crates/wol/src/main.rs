@@ -36,6 +36,9 @@ const SEND_REPEAT: usize = 3;
 /// 同時ハンドシェイク接続数の上限。accept ごとの無制限 spawn によるコネクション
 /// フラッド DoS (D-3) を抑える。
 const MAX_WOL_CLIENTS: usize = 8;
+/// 送信元 IP あたりの同時ハンドシェイク数の上限。全体枠だけだと単一ピアが無言接続で全体を
+/// 埋められるため重ねる (host の PREAUTH_PER_IP と対称)。正規クライアントの起床要求は 1 接続。
+const MAX_WOL_PER_IP: usize = 2;
 
 struct Args {
     port: u16,
@@ -268,26 +271,28 @@ async fn run_server(bind: Option<IpAddr>, port: u16, psk: [u8; 32]) -> Result<()
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(%addr, "listening");
 
-    // コネクションフラッド DoS (D-3) を抑える同時接続数上限。
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_WOL_CLIENTS));
+    // コネクションフラッド DoS (D-3) を抑える同時接続数上限 (全体 + 送信元 IP 別)。
+    let preauth = aurora_common::preauth::PreauthLimiter::new(MAX_WOL_CLIENTS, MAX_WOL_PER_IP);
     // 送信元 IP 単位の認証スロットル (D-1)。全接続で共有する。
     let throttle = Arc::new(WolThrottle::new());
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let permit = match sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!(%peer, max = MAX_WOL_CLIENTS, "connection limit reached; rejecting");
+        let slot = match preauth.try_acquire(peer.ip()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%peer, max = MAX_WOL_CLIENTS, per_ip = MAX_WOL_PER_IP, reason = %e, "connection limit reached; rejecting");
                 drop(stream);
                 continue;
             }
         };
         let throttle = throttle.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            match tokio::time::timeout(SESSION_TIMEOUT, handle_conn(stream, psk, peer, throttle))
-                .await
+            match tokio::time::timeout(
+                SESSION_TIMEOUT,
+                handle_conn(stream, psk, peer, throttle, slot),
+            )
+            .await
             {
                 Ok(Ok(())) => tracing::info!(%peer, "session complete"),
                 Ok(Err(e)) => tracing::warn!(%peer, error = %e, "session failed"),
@@ -304,6 +309,7 @@ async fn handle_conn(
     psk: [u8; 32],
     peer: SocketAddr,
     throttle: Arc<WolThrottle>,
+    slot: aurora_common::preauth::PreauthSlot,
 ) -> Result<()> {
     let mut hs = HandshakeState::new_responder(&psk, None)?;
     let mut buf = Vec::new();
@@ -334,10 +340,14 @@ async fn handle_conn(
     .await
     {
         Ok(s) => {
+            // 認証後の Wake/Ack は SESSION_TIMEOUT で抑えられるので、認証前枠はここで返す。
+            drop(slot);
             throttle.record_success(peer.ip());
             s
         }
         Err(e) => {
+            // バックオフ待ちの前に枠を返す。待つ間も握ると、1 ピアの失敗連投で枠が埋まる。
+            drop(slot);
             // PSK 不一致は最終メッセージの復号失敗として出る。送信元 IP 単位の指数バックオフで
             // オンライン総当たりレートを落とす (host と対称)。
             let delay = throttle.record_failure(peer.ip());
@@ -462,7 +472,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
             let throttle = Arc::new(WolThrottle::new());
-            handle_conn(stream, psk, peer, throttle).await.unwrap();
+            let slot = aurora_common::preauth::PreauthLimiter::new(1, 1)
+                .try_acquire(peer.ip())
+                .unwrap();
+            handle_conn(stream, psk, peer, throttle, slot)
+                .await
+                .unwrap();
         });
 
         // クライアント役 (initiator) を手動でハンドシェイクさせ、Wake を送って Ack を待つ。
