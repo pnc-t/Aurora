@@ -349,9 +349,24 @@ function openAddTab(): void {
       }
       // session_id 発番 + password を staging へ積む (窓は作らない)。
       const id = await stageSession(password);
-      await addSession(id, entry, save, /*activate=*/ true);
+      // 失敗はダイアログ側がエラー表示し、そのまま再試行できる。
+      await addTabSession(id, entry, save);
     },
   });
+}
+
+/**
+ * 既存の窓へタブを追加して接続する。初回接続に失敗したらタブごと破棄する: 残すと connecting の
+ * まま止まった死にタブが同一 host 判定に引っかかり、再試行が「既に接続中」で弾かれ続ける。
+ * (窓の最初のタブは addSession を直接使い、エラー画面から再接続/閉じるを選ばせる。)
+ */
+async function addTabSession(id: string, entry: HostEntry, save: boolean): Promise<void> {
+  try {
+    await addSession(id, entry, save, /*activate=*/ true);
+  } catch (e) {
+    sessions.get(id)?.closeByUser();
+    throw e;
+  }
 }
 
 /** Session を生成してタブに追加し、接続を開始する。 */
@@ -459,7 +474,7 @@ void getCurrentWebviewWindow().listen<AddTabPayload>("aurora://add-tab", (e) => 
       return;
     }
     try {
-      await addSession(p.session_id, { host: p.host, port: p.port, label: p.label }, p.save, true);
+      await addTabSession(p.session_id, { host: p.host, port: p.port, label: p.label }, p.save);
     } catch (e) {
       showToast(`接続に失敗しました: ${String(e)}`, "error");
     }
