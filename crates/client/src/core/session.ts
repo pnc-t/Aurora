@@ -274,7 +274,7 @@ export class Session {
     if (this.migrating) return;
     logger.info(`disconnect by user: ${this.entry.host}`);
     this.teardown();
-    void disconnect(this.id);
+    void disconnect(this.id, true);
     this.host.removed(this);
   }
 
@@ -842,7 +842,8 @@ export class Session {
     this.disconnectHandled = true;
     logger.info(`session down: ${this.entry.host} — ${reason}`);
     this.clearStabilizeTimer();
-    void disconnect(this.id);
+    // タブは残り自動/手動再接続が同じ session_id で connect_to_host を通るため、資格情報は保持する。
+    void disconnect(this.id, false);
     this.connected = false;
     if (this.viewportTimer !== null) {
       clearTimeout(this.viewportTimer);
