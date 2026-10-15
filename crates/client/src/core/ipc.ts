@@ -374,6 +374,15 @@ export async function uploadFileFromPath(id: number, path: string): Promise<void
  * **このPC (client) の This PC 全体 (全ドライブ)** をホストの仮想ドライブへ公開する。
  * 設定は接続成立時に session が自分の id で適用する (登録端末のみホストにドライブが出る)。
  */
+/**
+ * タブのウィンドウ間ドラッグの追跡を Rust 側へ移す (ゴースト窓の追従・離した座標の通知)。
+ * `hideSource` はタブ 1 枚の窓で、ドラッグ中は元窓を隠して合流先を見えるようにする。
+ * 非対応 OS / 開始失敗は reject し、呼び出し側は DOM のドラッグを続ける。
+ */
+export async function beginTabDrag(sessionId: string, label: string, hideSource: boolean): Promise<void> {
+  await invoke("begin_tab_drag", { sessionId, label, hideSource });
+}
+
 export async function setFileSharing(
   sessionId: string,
   enabled: boolean,

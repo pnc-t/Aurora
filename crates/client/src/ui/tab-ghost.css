@@ -1,0 +1,23 @@
+/* タブのドラッグ中にカーソルへ追従するゴースト窓 (tab-ghost.html)。窓自体が 220x34 の小窓。 */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--raised);
+}
+#ghost {
+  box-sizing: border-box;
+  height: 100%;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  border-left: 3px solid var(--accent);
+  color: var(--fg);
+  font: 13px/1 system-ui, sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+  cursor: grabbing;
+}

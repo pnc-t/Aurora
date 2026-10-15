@@ -397,7 +397,7 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 /// 載せるとき IPv6 のコロンや空白で壊れないようにする。JS 側は URLSearchParams が復号する。
 /// capture ウィンドウの URL 生成 (net/window.rs、デスクトップ限定) でのみ使う。
 #[cfg(desktop)]
-fn q(s: &str) -> String {
+pub(crate) fn q(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

@@ -17,6 +17,11 @@ type TabsOpts = {
   onAdd: () => void;
   /** タブをウィンドウ外へドラッグして離した (別ウィンドウへ分割)。座標は画面 px。 */
   onDetach: (id: string, screenX: number, screenY: number) => void;
+  /**
+   * ドラッグ開始。true で解決したら以降の追跡は外部 (Rust のゴースト追従) が引き取り、
+   * このモジュールは DOM のドラッグを打ち切る。false / reject なら従来の DOM ドラッグを続ける。
+   */
+  onDragStart?: (id: string) => Promise<boolean>;
   /** タブメニュー「他のタブを閉じる」。 */
   onCloseOthers: (id: string) => void;
   /** タブメニュー「新しいウィンドウへ移動」(接続確立済みのタブのみ表示)。 */
@@ -291,6 +296,8 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     const grabX = startX - grab.left;
     const grabY = startY - grab.top;
     let dragging = false;
+    // 選択/分離の確定または外部への引き渡しが済んだか (後から解決する onDragStart と onUp の二重処理防止)。
+    let finished = false;
     let clone: HTMLElement | null = null;
     el.setPointerCapture(down.pointerId);
 
@@ -305,6 +312,17 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
         clone.style.height = `${r.height}px`;
         document.body.appendChild(clone);
         el.classList.add("tab-dragging");
+        // 窓の外まで見た目を出せるよう追跡を外部へ渡す。引き取られたら DOM 側は後始末して終える
+        // (pointerup はこの窓に届かなくなりうる: タブ 1 枚の窓は隠されるため)。
+        void opts.onDragStart?.(id).then(
+          (taken) => {
+            if (taken && !finished) {
+              finished = true;
+              cleanup();
+            }
+          },
+          () => {},
+        );
       }
       if (clone) {
         clone.style.left = `${ev.clientX - grabX}px`;
@@ -323,6 +341,8 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
       el.classList.remove("tab-dragging");
     };
     const onUp = (ev: PointerEvent): void => {
+      if (finished) return;
+      finished = true;
       cleanup();
       if (!dragging) {
         opts.onSelect(id); // 動いていない = クリック
@@ -339,6 +359,7 @@ export function mountTabs(container: HTMLElement, opts: TabsOpts): TabsHandle {
     };
     // pointercancel は pointerup が来ないまま中断されるため、選択/別ウィンドウ分離は確定させず後始末のみ行う。
     const onCancel = (): void => {
+      finished = true;
       cleanup();
     };
     window.addEventListener("pointermove", onMove);
