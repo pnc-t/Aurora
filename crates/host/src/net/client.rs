@@ -49,6 +49,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         devices,
         shared,
         session_sem,
+        preauth,
         registry,
         takeover_pending,
         display_op,
@@ -112,8 +113,15 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     }
     .await
     {
-        Ok(triple) => triple,
+        Ok(triple) => {
+            // ハンドシェイク完了で認証前枠を返す。以降のデバイス拒否のバックオフ待ちや確立済み
+            // セッションは MAX_CLIENTS 側の管理で、認証前枠を握り続ける理由が無い。
+            drop(preauth);
+            triple
+        }
         Err(e) => {
+            // バックオフ待ちの前に認証前枠を返す。待つ間も握ると、1 ピアの失敗連投で枠が埋まる。
+            drop(preauth);
             // 認証/ハンドシェイク失敗。snow は PSK 不一致を最終メッセージの復号失敗として
             // 返すため、ここに来る = パスワード誤りかプロトコル不正。送信元 IP 単位の指数
             // バックオフ分だけ切断前に待たせ、ロックアウトの無い単一要素パスワードへの

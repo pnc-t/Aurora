@@ -274,10 +274,15 @@ async fn bind_listeners(addr: SocketAddr) -> Result<(TcpListener, Arc<UdpSocket>
 const MAX_CLIENTS: usize = 4;
 
 /// 認証前 (Noise ハンドシェイク中) の同時接続の上限。確立済みセッション枠 (MAX_CLIENTS) とは
-/// 別枠で、これより大きく取る。未認証の stall 接続や総当たり失敗のバックオフ待ちがこの枠を
-/// 占有しても、認証を通した正規クライアントの scarce な MAX_CLIENTS 枠には touch させない
-/// (認証前 DoS がセッション枠を食い潰すのを防ぐ 2 段構え)。
+/// 別枠で、これより大きく取る。未認証の stall 接続がこの枠を占有しても、認証を通した正規
+/// クライアントの scarce な MAX_CLIENTS 枠には touch させない (認証前 DoS がセッション枠を
+/// 食い潰すのを防ぐ 2 段構え)。
 const PREAUTH_SLOTS: usize = 32;
+
+/// 送信元 IP あたりの認証前同時接続の上限。全体枠 (PREAUTH_SLOTS) だけだと単一ピアが無言接続で
+/// 全体を埋められるため重ねる。正規クライアントは同一 IP から最大 MAX_CLIENTS 本を同時に張りうる
+/// (マルチタブの一斉再接続) ので、それを下回らない値にする。
+const PREAUTH_PER_IP: usize = MAX_CLIENTS;
 
 /// 映像 broadcast のリング容量。遅いクライアントが溢れたら Lagged で検知してキーフレーム要求で
 /// 復帰する (フレームは Arc 共有なのでバッファ自体は安価)。fan-out の drain 速度差を吸収できる
@@ -380,6 +385,8 @@ pub(crate) struct ClientArgs {
     /// 認証成功後に確立済みセッション枠を取得するためのセマフォ (MAX_CLIENTS)。handle_client が
     /// 認証を通してから acquire する (認証前接続はこの枠に触れない)。
     session_sem: Arc<tokio::sync::Semaphore>,
+    /// 認証前枠。handle_client が認証の成否確定時 (失敗のバックオフ待ちの前) に drop して返す。
+    preauth: aurora_common::preauth::PreauthSlot,
     registry: Registry,
     /// テイクオーバー実施中フラグ (全クライアント共有)。詳細は生成元コメント参照。
     takeover_pending: Arc<std::sync::atomic::AtomicBool>,
@@ -587,7 +594,7 @@ pub async fn run_server(
     }
 
     // 認証前ハンドシェイク枠 (大きめ) と確立済みセッション枠 (MAX_CLIENTS) を分離する。
-    let handshake_sem = Arc::new(tokio::sync::Semaphore::new(PREAUTH_SLOTS));
+    let preauth = aurora_common::preauth::PreauthLimiter::new(PREAUTH_SLOTS, PREAUTH_PER_IP);
     let session_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
 
     // 外側ループ: 現在のポートで TCP/UDP を bind する。tray でポートが変わると reload 通知で
@@ -619,12 +626,11 @@ pub async fn run_server(
                     break;
                 }
             };
-            // ハンドシェイク枠の上限。超過は受理直後に丁寧に閉じる (ハンドシェイク前)。permit は
-            // task の寿命とともに保持し、切断で解放される。
-            let handshake_permit = match handshake_sem.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::warn!(%peer, preauth_slots = PREAUTH_SLOTS, "handshake slots exhausted; rejecting connection");
+            // 認証前枠 (全体 + 送信元 IP 別)。超過は受理直後に丁寧に閉じる (ハンドシェイク前)。
+            let preauth_slot = match preauth.try_acquire(peer.ip()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(%peer, preauth_slots = PREAUTH_SLOTS, per_ip = PREAUTH_PER_IP, reason = %e, "rejecting connection before handshake");
                     drop(stream);
                     continue;
                 }
@@ -655,6 +661,7 @@ pub async fn run_server(
                 devices: cfg.devices.clone(),
                 shared: shared.clone(),
                 session_sem: session_sem.clone(),
+                preauth: preauth_slot,
                 registry: registry.clone(),
                 takeover_pending: takeover_pending.clone(),
                 display_op: display_op.clone(),
@@ -666,8 +673,6 @@ pub async fn run_server(
             // 各接続を独立 task で処理する (await で占有しない = 複数クライアント同時)。
             tokio::spawn(
                 async move {
-                    // ハンドシェイク枠を task 寿命まで保持 (drop で接続枠を解放)。
-                    let _handshake_permit = handshake_permit;
                     tracing::info!("TCP client connected");
                     match handle_client(stream, args).await {
                         Ok(()) => tracing::info!("client disconnected"),
