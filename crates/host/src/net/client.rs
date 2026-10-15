@@ -29,6 +29,37 @@ async fn cleanup_aborted_upload(path: &str) {
     }
 }
 
+/// UDP 送信失敗の連続を数え、ログを「失敗し始めた 1 回」と「回復時の 1 行」に絞る
+/// (60fps で失敗し続けると毎パケット warn がログを埋めるため)。
+struct UdpSendFailStreak {
+    stream: &'static str,
+    count: u32,
+}
+
+impl UdpSendFailStreak {
+    fn new(stream: &'static str) -> Self {
+        Self { stream, count: 0 }
+    }
+
+    fn failed(&mut self, e: &std::io::Error) {
+        if self.count == 0 {
+            tracing::warn!(stream = self.stream, error = %e, "UDP send failed; dropping packets until it recovers");
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn ok(&mut self) {
+        if self.count > 0 {
+            tracing::info!(
+                stream = self.stream,
+                dropped = self.count,
+                "UDP send recovered"
+            );
+            self.count = 0;
+        }
+    }
+}
+
 pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Result<()> {
     let ClientArgs {
         peer,
@@ -373,6 +404,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 検知したら以降の音声送出を止める (再接続で鍵が更新される)。
     let mut last_audio_seq: Option<u32> = None;
     let mut audio_nonce_exhausted = false;
+    let mut audio_send_fail = UdpSendFailStreak::new("audio");
     // この接続が SelectDisplay で仮想 (番兵 id) を明示選択したか。テイクオーバー発動はこれを
     // 必須条件にする (名前一致だけで発動すると、VDD の GDI 名が物理と衝突した際にクライアントが
     // 要求していないテイクオーバーが走る実機事象があった)。
@@ -408,6 +440,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         let mut nal_brx = nal_brx;
         tokio::spawn(async move {
             let mut seq: u32 = 0;
+            let mut send_fail = UdpSendFailStreak::new("video");
             loop {
                 let nal = match nal_brx.recv().await {
                     Ok(n) => n,
@@ -464,10 +497,10 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                         }
                     };
                     let addr = *peer_udp.lock().expect("peer_udp poisoned");
-                    if let Err(e) = udp.send_to(&dgram, addr).await {
-                        tracing::warn!(error = %e, "video UDP send failed; ending video sender");
-                        return;
-                    }
+                    let sent = udp.send_to(&dgram, addr).await;
+                    // 送信の成否に関わらず seq を進める: この nonce で暗号化は済んでおり、失敗後に同じ
+                    // nonce を別の平文へ使い回さないため。飛んだ seq は client がロスとして扱い、
+                    // キーフレーム要求で自然回復する。
                     // 映像 nonce は seq (u32) を下位に使うため、一周で再利用される。ChaChaPoly は nonce
                     // 再利用が致命的なので巻き戻る前に送信を止める (クライアント再接続で鍵が更新される)。
                     seq = match seq.checked_add(1) {
@@ -479,6 +512,15 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                             return;
                         }
                     };
+                    // 一過性の送信失敗 (経路切替中の ENETUNREACH / WSAENOBUFS 等) でタスクを畳むと、TCP は
+                    // 生きたまま映像だけ恒久停止し誰も検知できない。このフレームの残りを捨てて継続する。
+                    match sent {
+                        Ok(_) => send_fail.ok(),
+                        Err(e) => {
+                            send_fail.failed(&e);
+                            break;
+                        }
+                    }
                     first = false;
                 }
             }
@@ -957,7 +999,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     let nonce = NONCE_DOMAIN_AUDIO | au.seq as u64;
                     let dgram = encrypt_udp(&session, nonce, STREAM_AUDIO, &framed)?;
                     let addr = *peer_udp.lock().expect("peer_udp poisoned");
-                    udp.send_to(&dgram, addr).await.context("UDP send audio")?;
+                    // 一過性の送信失敗で接続ごと落とさない (映像と同じ扱い)。音声 1 パケットの欠落は
+                    // client 側で seq 欠落として処理される。
+                    match udp.send_to(&dgram, addr).await {
+                        Ok(_) => audio_send_fail.ok(),
+                        Err(e) => audio_send_fail.failed(&e),
+                    }
                 }
             }
             // client 側 UDP 自己修復の AURHELLO 再送 (TCP 生存中の UDP 途絶検知への対応)。
