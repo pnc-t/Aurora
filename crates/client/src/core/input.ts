@@ -28,6 +28,11 @@ export class Input {
   // ピクセル単位ホイールの軸ごと累積量。
   private wheelAccX = 0;
   private wheelAccY = 0;
+  // ポインタロック中の相対移動の端数。表示倍率 ≠100% の WebView2 は movementX/Y が小数になり、
+  // そのまま送ると host 側 i32 へのデシリアライズで send_input ごと拒否される。整数分だけ送り
+  // 端数は持ち越す (毎回切り捨てるとゆっくり動かしたときの移動が消える。touch-input.ts と同じ)。
+  private relAccX = 0;
+  private relAccY = 0;
 
   // ハンドラはインスタンスにバインドして add/remove の同一性を保つ。
   private readonly hMouseMove = (e: MouseEvent) => this.onMouseMove(e);
@@ -82,6 +87,8 @@ export class Input {
     // ホイールの端数累積をセッション/タブを跨いで持ち越さない。
     this.wheelAccX = 0;
     this.wheelAccY = 0;
+    this.relAccX = 0;
+    this.relAccY = 0;
     // キャプチャ中なら解除する。
     if (document.pointerLockElement) document.exitPointerLock();
     this.captured = false;
@@ -111,6 +118,8 @@ export class Input {
     this.captured = document.pointerLockElement === this.canvas;
     // ロック解除時 (Esc 含む) に押下中マウスボタンが残らないよう解放。
     if (!this.captured) {
+      this.relAccX = 0;
+      this.relAccY = 0;
       for (const button of this.pressedButtons) {
         this.dispatch({ MouseButton: { button, down: false } });
       }
@@ -175,9 +184,13 @@ export class Input {
   private onMouseMove(e: MouseEvent): void {
     if (this.captured) {
       // ポインタロック中は相対移動 (movementX/Y) を送る。
-      const dx = e.movementX;
-      const dy = e.movementY;
+      this.relAccX += e.movementX;
+      this.relAccY += e.movementY;
+      const dx = Math.trunc(this.relAccX);
+      const dy = Math.trunc(this.relAccY);
       if (dx === 0 && dy === 0) return;
+      this.relAccX -= dx;
+      this.relAccY -= dy;
       this.dispatch({ MouseMoveRelative: { dx, dy } });
       return;
     }
