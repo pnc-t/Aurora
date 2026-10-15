@@ -662,9 +662,18 @@ impl ScreenCapturer for DxgiCapturer {
                 .set_cursor_pos(p.Position.x, p.Position.y, p.Visible.as_bool());
         }
 
-        let resource =
-            resource.ok_or_else(|| anyhow!("AcquireNextFrame returned null resource"))?;
-        let src_tex: ID3D11Texture2D = resource.cast().context("cast ID3D11Texture2D")?;
+        let src_tex: ID3D11Texture2D = match resource
+            .ok_or_else(|| anyhow!("AcquireNextFrame returned null resource"))
+            .and_then(|r| r.cast().context("cast ID3D11Texture2D"))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // SAFETY: AcquireNextFrame 成功と対になる。解放せずに抜けると次の Acquire が
+                // DXGI_ERROR_INVALID_CALL になり、再構築まで映像が止まる。
+                let _ = unsafe { self.duplication.ReleaseFrame() };
+                return Err(e);
+            }
+        };
 
         // 診断: 取得テクスチャの実フォーマットを初回 1 回だけ出す。HDR オフ時に ACM が
         // FP16(scRGB linear) を渡すか BGRA8 を渡すかを確かめ、SDR 経路で OETF が要るか判定する。

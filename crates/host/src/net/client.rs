@@ -310,7 +310,14 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // 公開のため Tailnet 外からも到達しうる。IP 一致の要求でこの両方を遮断する
     // (register_hello は expected_ip = 自分の TCP peer IP でのみ登録する)。
     let mut hello_rx = register_hello(&hello_registry, peer.ip(), conn_id);
-    let peer_udp_first = wait_udp_hello(&mut hello_rx).await?;
+    let peer_udp_first = match wait_udp_hello(&mut hello_rx).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            // ここで抜けると下のセッション後始末 (0.5) を通らないため、登録をここで外す。
+            unregister_hello(&hello_registry, peer.ip(), conn_id);
+            return Err(e);
+        }
+    };
     tracing::info!(peer_udp = %peer_udp_first, "UDP peer registered");
     // client 側の UDP 自己修復 (TCP 生存中の UDP 途絶検知 + AURHELLO 再送) に対応するため、
     // 対向アドレスは固定値ではなく共有可変にする。再送 hello が同じ IP の別ポートから届いたら

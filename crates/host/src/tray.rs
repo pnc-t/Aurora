@@ -397,26 +397,9 @@ mod imp {
                 }
             };
 
-            // トレイアイコン登録。build.rs で exe へ埋め込んだ aurora アイコン (リソース
-            // ID = 1) を使う。万一読めなければ標準アプリアイコンへフォールバックする。
-            let hicon = LoadIconW(hinstance, int_resource(ICON_RESOURCE_ID))
-                .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))?;
-            let mut nid = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: hwnd,
-                uID: 1,
-                uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
-                uCallbackMessage: WM_TRAY,
-                hIcon: hicon,
-                ..Default::default()
-            };
-            // 初期ツールチップは待受ポートを含めた状態文。接続が成立したら WM_TIMER が更新する。
-            if let Some(state) = wnd_state(hwnd) {
-                let text = tooltip_text(0, state.port.load(Ordering::Relaxed), None);
-                let init_tip = to_wide_capped(&text, nid.szTip.len());
-                nid.szTip[..init_tip.len()].copy_from_slice(&init_tip);
-            }
-            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+            add_tray_icon(hwnd)?;
+            // explorer 再起動後の再登録通知を受けられるよう、メッセージ ID を先に確定させる。
+            let _ = taskbar_created_msg();
 
             // ステータス監視タイマを開始する。接続/切断/認証失敗を WM_TIMER でポーリングし、
             // ツールチップ更新とバルーン通知へ反映する (net→tray は bus 経由でポーリング結合)。
@@ -436,6 +419,12 @@ mod imp {
 
             // ループを抜けるのは「終了」メニューでウィンドウを破棄したときだけ
             // (初期化失敗時はループ前に return する)。アイコンを消して host 全体を終了する。
+            let nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                ..Default::default()
+            };
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
             drop(Box::from_raw(boxed));
         }
@@ -447,6 +436,48 @@ mod imp {
         crate::display::recover_takeover_if_any();
         tracing::info!("tray exit requested; shutting down host");
         std::process::exit(0);
+    }
+
+    /// トレイアイコンを登録する。起動時と、explorer 再起動 (TaskbarCreated) 後の再登録で共用する。
+    /// build.rs で exe へ埋め込んだ aurora アイコン (リソース ID = 1) を使い、読めなければ標準
+    /// アプリアイコンへフォールバックする。ツールチップは現在の接続状態で組み立てる。
+    fn add_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
+        // SAFETY: 自プロセスのモジュールハンドルとアイコンリソースの読み出し、および自前で組み立てた
+        // NOTIFYICONDATAW (szTip は NUL 終端で配列内に収める) を渡すだけ。hwnd は呼び出し元の生存窓。
+        unsafe {
+            let hinstance = HINSTANCE(GetModuleHandleW(None)?.0);
+            let hicon = LoadIconW(hinstance, int_resource(ICON_RESOURCE_ID))
+                .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))?;
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+                uCallbackMessage: WM_TRAY,
+                hIcon: hicon,
+                ..Default::default()
+            };
+            if let Some(state) = wnd_state(hwnd) {
+                let text = tooltip_text(
+                    state.bus.connected_count(),
+                    state.port.load(Ordering::Relaxed),
+                    state.bus.last_peer(),
+                );
+                let tip = to_wide_capped(&text, nid.szTip.len());
+                nid.szTip[..tip.len()].copy_from_slice(&tip);
+            }
+            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+        Ok(())
+    }
+
+    /// explorer (タスクバー) が起動し直したときに全トップレベル窓へ送られるメッセージの ID。
+    /// これを処理しないと explorer のクラッシュ/再起動でトレイアイコンが消え、コンソール無し常駐の
+    /// host が操作不能 (終了・パスワード変更・ペアリング承認ができない) になる。
+    fn taskbar_created_msg() -> u32 {
+        static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        // SAFETY: 静的な NUL 終端ワイド文字列を渡すだけ。
+        *ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) })
     }
 
     /// 隠しウィンドウのウィンドウプロシージャ。
@@ -508,6 +539,15 @@ mod imp {
                 WM_DESTROY => {
                     let _ = KillTimer(hwnd, TIMER_ID);
                     PostQuitMessage(0);
+                    LRESULT(0)
+                }
+                // RegisterWindowMessageW の失敗時は 0 なので、通常メッセージ 0 と取り違えない。
+                m if m != 0 && m == taskbar_created_msg() => {
+                    if let Err(e) = add_tray_icon(hwnd) {
+                        tracing::warn!(error = %e, "failed to re-add tray icon after explorer restart");
+                    } else {
+                        tracing::info!("tray icon re-added after explorer restart");
+                    }
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),

@@ -277,7 +277,15 @@ async fn run_server(bind: Option<IpAddr>, port: u16, psk: [u8; 32]) -> Result<()
     let throttle = Arc::new(WolThrottle::new());
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(a) => a,
+            Err(e) => {
+                // 一過性の失敗で常駐デーモンごと落とさない (host の accept ループと対称)。
+                tracing::warn!(error = %e, "accept failed; retrying");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let slot = match preauth.try_acquire(peer.ip()) {
             Ok(s) => s,
             Err(e) => {
