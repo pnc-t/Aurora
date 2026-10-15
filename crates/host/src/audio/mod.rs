@@ -249,8 +249,16 @@ fn run_capture_loop(
     let mut current_stream: Option<cpal::Stream> = None;
     let mut current_device_name = String::new();
     let mut ready_sent = false;
+    // ストリームのエラーコールバック (デバイス消失等) が立てる。立っていたら今のストリームを捨てて
+    // 開き直す。これが無いと、デバイス名が変わらないままストリームだけ死んだときに音声が
+    // 黙って止まり続ける (下の「ストリームを持っていない」条件に到達しない)。
+    let stream_failed = Arc::new(AtomicBool::new(false));
 
     loop {
+        if stream_failed.swap(false, Ordering::Relaxed) && current_stream.is_some() {
+            tracing::warn!("audio loopback stream failed; reopening");
+            current_stream = None;
+        }
         let latest_name = host
             .default_output_device()
             .and_then(|d| d.name().ok())
@@ -260,7 +268,7 @@ fn run_capture_loop(
         // いない」も含める。初回失敗後や、ストリーム断後にデバイス名が変わらないまま
         // 復旧させたいケース (同じデバイスの一時的な使用不可等) を取りこぼさないため。
         if current_stream.is_none() || latest_name != current_device_name {
-            match open_stream_for_default_device(&host, &state, &tx) {
+            match open_stream_for_default_device(&host, &state, &tx, &stream_failed) {
                 Ok((stream, name)) => {
                     if current_stream.is_some() {
                         tracing::info!(device = %name, "audio loopback device switched");
@@ -298,6 +306,7 @@ fn open_stream_for_default_device(
     host: &cpal::Host,
     state: &Arc<Mutex<EncodeState>>,
     tx: &mpsc::Sender<EncodedAudio>,
+    failed: &Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, String)> {
     // ループバック対象はシステムの既定出力デバイス。
     let device = host
@@ -332,13 +341,13 @@ fn open_stream_for_default_device(
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
-            build_typed_stream::<f32>(&device, &config, cb_state, cb_tx, resampler)
+            build_typed_stream::<f32>(&device, &config, cb_state, cb_tx, resampler, failed.clone())
         }
         cpal::SampleFormat::I16 => {
-            build_typed_stream::<i16>(&device, &config, cb_state, cb_tx, resampler)
+            build_typed_stream::<i16>(&device, &config, cb_state, cb_tx, resampler, failed.clone())
         }
         cpal::SampleFormat::U16 => {
-            build_typed_stream::<u16>(&device, &config, cb_state, cb_tx, resampler)
+            build_typed_stream::<u16>(&device, &config, cb_state, cb_tx, resampler, failed.clone())
         }
         other => Err(anyhow!("unsupported sample format: {other}")),
     }?;
@@ -357,12 +366,16 @@ fn build_typed_stream<T>(
     state: Arc<Mutex<EncodeState>>,
     tx: mpsc::Sender<EncodedAudio>,
     mut resampler: Resampler,
+    failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let err_fn = |e| tracing::warn!(error = %e, "audio input stream error");
+    let err_fn = move |e| {
+        tracing::warn!(error = %e, "audio input stream error");
+        failed.store(true, Ordering::Relaxed);
+    };
     // T→f32 変換の作業バッファ。コールバックをまたいで再利用し毎回の確保を避ける。
     let mut float_buf: Vec<f32> = Vec::new();
     // リサンプル後 (48kHz/ステレオ) の出力を一旦ここへ溜め、まとめて EncodeState へ渡す。

@@ -138,7 +138,8 @@ pub fn run(state: SharedUpdate, bus: SharedTrayBus, _port: Arc<std::sync::atomic
         if state.apply_requested.load(Ordering::Relaxed) {
             match state.available() {
                 Some(av) if !crate::net::is_active() => {
-                    // 成功時は戻らない (exit(0))。
+                    // 成功時は戻らない (exit(0))。Ok で戻るのはダウンロード中に接続が来て見送った
+                    // ときで、要求は保留のまま次回ポーリング (切断後) にやり直す。
                     if let Err(e) = apply(&av) {
                         tracing::error!(error = %e, "update apply failed");
                         // 無限リトライを防ぐ。ユーザーは再度メニューから要求できる。
@@ -242,7 +243,8 @@ fn verify_signature(data: &[u8], signature_b64: &str) -> Result<()> {
 }
 
 /// setup.exe をダウンロード・検証してサイレントインストールを起動する。差し替え + 再起動は
-/// NSIS 側のトランザクション責任 (別タスク)。成功すると戻らない (`exit(0)`)。
+/// NSIS 側のトランザクション責任 (別タスク)。成功すると戻らない (`exit(0)`)。`Ok` で戻るのは
+/// ダウンロード中に接続が来て適用を見送ったときだけ。
 fn apply(av: &AvailableUpdate) -> Result<()> {
     // インストール先は管理者専用の %ProgramFiles% で、setup も requireAdministrator。非昇格
     // (スタートメニューからの手動起動等) では setup を置けず、起動しても UAC が要りサイレント
@@ -283,6 +285,14 @@ fn apply(av: &AvailableUpdate) -> Result<()> {
         return Err(e).context("update signature verification failed; aborting update");
     }
     drop(data);
+
+    // ダウンロード (最大 180 秒) の間に接続が来ていたら、ここで入れ替えるとそのセッションを
+    // 一方的に切ってしまう (テイクオーバー中なら物理ディスプレイの復元も走らない)。見送る。
+    if crate::net::is_active() {
+        let _ = std::fs::remove_file(&setup);
+        tracing::info!("client connected during update download; postponing until idle");
+        return Ok(());
+    }
 
     // 実行中の自 exe は Windows 上でロックされ setup から上書きできないため、spawn できたら
     // 待たずに (detached) 自プロセスを速やかに終了する。setup 起動直後の失敗は検知できないが、

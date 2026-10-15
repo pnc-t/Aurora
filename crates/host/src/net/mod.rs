@@ -279,6 +279,9 @@ const MAX_CLIENTS: usize = 4;
 /// 食い潰すのを防ぐ 2 段構え)。
 const PREAUTH_SLOTS: usize = 32;
 
+/// accept 失敗時の再試行までの待ち。即再試行すると同じ失敗でループが空回りする。
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// 送信元 IP あたりの認証前同時接続の上限。全体枠 (PREAUTH_SLOTS) だけだと単一ピアが無言接続で
 /// 全体を埋められるため重ねる。正規クライアントは同一 IP から最大 MAX_CLIENTS 本を同時に張りうる
 /// (マルチタブの一斉再接続) ので、それを下回らない値にする。
@@ -619,7 +622,16 @@ pub async fn run_server(
         // (= 接続数 ≥ 1) には tray 側で拒否されるため、reload はセッション間 (idle) でのみ届く。
         loop {
             let (stream, peer) = tokio::select! {
-                accepted = tcp.accept() => accepted?,
+                accepted = tcp.accept() => match accepted {
+                    Ok(a) => a,
+                    Err(e) => {
+                        // 一過性 (リソース枯渇・接続直後の RST 等) で待受ごと落とすと、tray は残るのに
+                        // 誰も接続できない host になる。記録して少し待ってから受付を続ける。
+                        tracing::warn!(error = %e, "accept failed; retrying");
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                        continue;
+                    }
+                },
                 _ = cfg.reload.notified() => {
                     tracing::info!(new_port = cfg.port.load(Ordering::Relaxed), "port change requested; rebinding");
                     hello_task.abort();
