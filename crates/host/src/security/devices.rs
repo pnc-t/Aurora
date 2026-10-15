@@ -330,9 +330,20 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 
 // --- 永続化 (Windows) ---
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 fn store_path(file: &str) -> Option<std::path::PathBuf> {
     Some(aurora_common::paths::data_dir()?.join(file))
+}
+
+/// テストでは本物の `%LOCALAPPDATA%\Aurora` に書かない。承認/削除を通すテストが実データの
+/// 許可リストを上書きし、`cargo test` のたびに開発機の登録端末が全消去されていた (2026-10-16)。
+#[cfg(all(target_os = "windows", test))]
+fn store_path(file: &str) -> Option<std::path::PathBuf> {
+    Some(
+        std::env::temp_dir()
+            .join(format!("aurora-host-test-{}", std::process::id()))
+            .join(file),
+    )
 }
 
 #[cfg(target_os = "windows")]
