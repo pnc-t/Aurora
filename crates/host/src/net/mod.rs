@@ -688,6 +688,10 @@ pub async fn run_server(
                     tracing::info!("TCP client connected");
                     match handle_client(stream, args).await {
                         Ok(()) => tracing::info!("client disconnected"),
+                        // 到達性プローブ等で毎回起きるため WARN にしない (本物の異常を埋もれさせない)。
+                        Err(e) if e.downcast_ref::<client::EndedBeforeAuth>().is_some() => {
+                            tracing::info!(error = %e, "client session ended before authentication")
+                        }
                         Err(e) => tracing::warn!(error = %e, "client session ended"),
                     }
                 }
