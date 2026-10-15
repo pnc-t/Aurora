@@ -81,17 +81,23 @@ export class AudioPlayer {
         logger.warn("audio context resume failed", e);
       }
     }
-    if (!this.decoder || this.decoder.state === "closed") {
-      this.decoder = new AudioDecoder({
-        output: (data) => this.onAudioData(data),
-        error: (e) => logger.warn("audio decode error", e),
-      });
-      this.decoder.configure({
-        codec: "opus",
-        sampleRate: SAMPLE_RATE,
-        numberOfChannels: CHANNELS,
-      });
-    }
+    if (!this.decoder || this.decoder.state === "closed") this.createDecoder();
+  }
+
+  /** 直近にデコーダを作り直した時刻 (performance.now)。作り直しの頻度制限に使う。 */
+  private lastDecoderRecreateMs = -Infinity;
+
+  /** Opus デコーダを (作り直しを含め) 構成する。 */
+  private createDecoder(): void {
+    this.decoder = new AudioDecoder({
+      output: (data) => this.onAudioData(data),
+      error: (e) => logger.warn("audio decode error", e),
+    });
+    this.decoder.configure({
+      codec: "opus",
+      sampleRate: SAMPLE_RATE,
+      numberOfChannels: CHANNELS,
+    });
   }
 
   /** 再生ゲインを設定する (0.0〜1.0)。host へは送らないローカル適用のみ。 */
@@ -102,7 +108,19 @@ export class AudioPlayer {
 
   /** host から届いた Opus フレーム 1 個 (生バイト列) をデコードキューへ渡す。 */
   push(buf: ArrayBuffer): void {
-    if (this.closed || !this.decoder || this.decoder.state !== "configured") return;
+    if (this.closed || !this.decoder) return;
+    // デコードエラーで AudioDecoder は closed になり、以後のフレームを全て捨て続ける (再生は
+    // start() の再呼び出しまで無音)。Opus はフレーム独立なので作り直せば次のフレームから戻る。
+    if (this.decoder.state === "closed") {
+      // 壊れたストリームで毎フレーム作り直す→即エラーを繰り返すと、警告が IPC 経由でログを
+      // 埋めるため 1 秒に 1 回までに抑える (その間のフレームは捨てる)。
+      const now = performance.now();
+      if (now - this.lastDecoderRecreateMs < 1000) return;
+      this.lastDecoderRecreateMs = now;
+      logger.warn("audio decoder closed after error; recreating");
+      this.createDecoder();
+    }
+    if (this.decoder.state !== "configured") return;
     try {
       const chunk = new EncodedAudioChunk({
         // Opus はフレーム間参照が無い (各フレーム独立デコード可能) ため常に "key" 扱いでよい。

@@ -14,9 +14,9 @@ pub use imp::{AudioPlayer, spawn};
 #[cfg(desktop)]
 mod imp {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -28,6 +28,8 @@ mod imp {
     const MAX_BUFFERED: usize = (SAMPLE_RATE as usize) * CHANNELS as usize / 5;
     /// Opus 1 フレームの最大デコードサイズ (120ms/ch を上限とする) × ch。
     const MAX_DECODE_SAMPLES: usize = 5760 * CHANNELS as usize;
+    /// 出力デバイスの追従 (既定デバイス変更・ストリーム断) を確認する間隔。
+    const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
     /// 音声再生ハンドル。Opus フレームを再生スレッドへ渡す。
     pub struct AudioPlayer {
@@ -63,7 +65,15 @@ mod imp {
             .name("audio-playback".into())
             .spawn(move || {
                 let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-                let stream = match build_output_stream(ring.clone(), gain_thread) {
+                // 出力ストリームのエラーコールバック (デバイス消失等) が立てる。
+                let stream_failed = Arc::new(AtomicBool::new(false));
+                let host = cpal::default_host();
+                let (stream, device_name) = match build_output_stream(
+                    &host,
+                    ring.clone(),
+                    gain_thread.clone(),
+                    stream_failed.clone(),
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.to_string()));
@@ -80,10 +90,40 @@ mod imp {
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
-                let _stream = stream; // 再生スレッドが生きている間ストリームを保持
+                // 再生スレッドが生きている間ストリームを保持する。接続時の既定デバイスを握り続けると、
+                // ヘッドホンの抜き差しや既定デバイスの切替で無音になるため、定期的に追従して作り直す。
+                let mut stream = Some(stream);
+                let mut device_name = device_name;
+                let mut last_poll = Instant::now();
 
                 let mut pcm = vec![0f32; MAX_DECODE_SAMPLES];
                 loop {
+                    if last_poll.elapsed() >= DEVICE_POLL_INTERVAL {
+                        last_poll = Instant::now();
+                        let latest = host
+                            .default_output_device()
+                            .and_then(|d| d.name().ok())
+                            .unwrap_or_default();
+                        let failed = stream_failed.swap(false, Ordering::Relaxed);
+                        if failed || stream.is_none() || latest != device_name {
+                            // 旧ストリームを先に止めてから開き直す (同一デバイスの再オープン競合を避ける)。
+                            stream = None;
+                            match build_output_stream(
+                                &host,
+                                ring.clone(),
+                                gain_thread.clone(),
+                                stream_failed.clone(),
+                            ) {
+                                Ok((s, name)) => {
+                                    tracing::info!(device = %name, failed, "audio output stream reopened");
+                                    stream = Some(s);
+                                    device_name = name;
+                                }
+                                // 失敗しても次の確認で再試行する (その間は無音)。
+                                Err(e) => tracing::warn!(error = %e, "audio output reopen failed; will retry"),
+                            }
+                        }
+                    }
                     // stop を兼ねてタイムアウト付き recv。全送信端が閉じたら終了。
                     match rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(frame) => match decoder.decode_float(&frame, &mut pcm, false) {
@@ -112,17 +152,16 @@ mod imp {
     }
 
     fn build_output_stream(
+        host: &cpal::Host,
         ring: Arc<Mutex<VecDeque<f32>>>,
         gain: Arc<AtomicU32>,
-    ) -> Result<cpal::Stream> {
-        let host = cpal::default_host();
+        failed: Arc<AtomicBool>,
+    ) -> Result<(cpal::Stream, String)> {
         let device = host
             .default_output_device()
             .ok_or_else(|| anyhow!("no default output device"))?;
-        tracing::info!(
-            device = device.name().unwrap_or_default(),
-            "audio output device"
-        );
+        let name = device.name().unwrap_or_default();
+        tracing::info!(device = %name, "audio output device");
 
         let config = cpal::StreamConfig {
             channels: CHANNELS,
@@ -130,7 +169,10 @@ mod imp {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let err_fn = |e| tracing::warn!(error = %e, "audio output stream error");
+        let err_fn = move |e| {
+            tracing::warn!(error = %e, "audio output stream error");
+            failed.store(true, Ordering::Relaxed);
+        };
         let stream = device
             .build_output_stream(
                 &config,
@@ -147,7 +189,7 @@ mod imp {
             .map_err(|e| anyhow!("build_output_stream: {e}"))?;
 
         stream.play().map_err(|e| anyhow!("stream play: {e}"))?;
-        Ok(stream)
+        Ok((stream, name))
     }
 }
 
