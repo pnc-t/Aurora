@@ -1148,10 +1148,12 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     }
     // 5) VDD を再デタッチ: テイクオーバー復元後も VDD がデスクトップに残るため切り離す。
     //    未接続時にカーソルや Window が仮想ディスプレイへ迷い込む問題を防ぐ。最後の 1 本のみ。
-    if is_last && let Some(vdd) = crate::display::detect() {
-        let vn = vdd.gdi_name;
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::display::detach_vdd_if_attached(&vn);
+    //    detect (EnumDisplayDevices) も同期の OS 呼び出しなので、detach と一緒に spawn_blocking 内で行う。
+    if is_last {
+        let _ = tokio::task::spawn_blocking(|| {
+            if let Some(vdd) = crate::display::detect() {
+                crate::display::detach_vdd_if_attached(&vdd.gdi_name);
+            }
         })
         .await;
     }

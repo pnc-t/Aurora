@@ -465,8 +465,13 @@ async fn connect_inner(
     // クリップボード同期の可否ゲート。設定の初期値をここで直接反映する (TS 側の後追い適用に
     // 依存すると、起動直後の数回分がレースで漏れうるため Rust 側で初期化する)。設定読み込み
     // 失敗時は安全側の既定 (ON) にする。
+    // 設定読み込みは同期ファイル I/O のため tokio ワーカーを塞がないよう spawn_blocking へ逃がす。
+    let app_for_settings = app.clone();
     let clipboard_sync = Arc::new(AtomicBool::new(
-        crate::config::load_settings(app.clone())
+        tokio::task::spawn_blocking(move || crate::config::load_settings(app_for_settings))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
             .map(|s| s.clipboard_sync)
             .unwrap_or(true),
     ));
