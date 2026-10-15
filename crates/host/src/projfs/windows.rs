@@ -11,7 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{
-    BOOLEAN, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary, S_OK,
+    BOOLEAN, CloseHandle, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary,
+    HANDLE, S_OK,
+};
+use windows::Win32::Security::{
+    DuplicateTokenEx, SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+    TokenImpersonation,
 };
 use windows::Win32::Storage::FileSystem::{
     DDD_NO_BROADCAST_SYSTEM, DDD_REMOVE_DEFINITION, DefineDosDeviceW, FILE_ATTRIBUTE_DIRECTORY,
@@ -30,6 +35,10 @@ use windows::Win32::Storage::ProjectedFileSystem::{
     PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData, PrjWritePlaceholderInfo,
 };
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
+use windows::Win32::System::Threading::{
+    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadToken,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 use windows::core::{GUID, HRESULT, PCWSTR};
 
 use super::FsBridge;
@@ -68,8 +77,10 @@ pub struct WinVirtualization {
 impl Drop for WinVirtualization {
     fn drop(&mut self) {
         // 仮想化停止より先にドライブを外す (セッション終了で This PC から消える = 一時表示)。
+        // 非昇格シェル側にも作っているので両方の名前空間から外す。
         if let Some(letter) = self.drive {
             unmount_drive(letter);
+            let _ = in_shell_session(|| unmount_drive(letter));
         }
         // SAFETY: ctx は start() で得た有効な仮想化コンテキスト。停止は drop で 1 回のみ。
         unsafe { PrjStopVirtualizing(self.ctx) };
@@ -89,24 +100,44 @@ impl Drop for WinVirtualization {
 /// ため、これは実用上許容する (競合は稀・実害は subst 上書きのみでファイルシステムの
 /// 整合性は損なわれない)。
 fn mount_first_free_drive(root: &Path) -> Option<char> {
-    // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
-    let initial = unsafe { GetLogicalDrives() };
+    let initial = used_drives();
     let candidates: Vec<u32> = (3..26u32)
         .rev()
         .filter(|i| initial & (1 << i) == 0)
         .collect();
     for i in candidates {
         let letter = (b'A' + i as u8) as char;
-        // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
         // 直前の候補列挙から時間が経っている可能性があるため、実際に使う直前に取り直して
         // 窓を最小化する。
-        let current = unsafe { GetLogicalDrives() };
+        let current = used_drives();
         if current & (1 << i) != 0 {
             tracing::warn!(drive = %format!("{letter}:"), "drive letter taken by another process just before mount; trying next");
             continue;
         }
         match mount_drive(letter, root) {
-            Ok(()) => return Some(letter),
+            Ok(()) => {
+                // 昇格 host の subst は昇格側のログオンセッションにしか無く、非昇格の Explorer
+                // (= 利用者が見る This PC) から見えない。シェルのセッションにも同じレターで作る。
+                // 失敗してもフォルダ自体はパスで参照できるのでログのみ。
+                let shell = in_shell_session(|| match mount_drive(letter, root) {
+                    // 定義できたかをシェル側の名前空間で引き直して確かめる (見えない原因の切り分け用)。
+                    Ok(()) => tracing::info!(
+                        drive = %format!("{letter}:"),
+                        defined = query_dos_device(letter).is_some(),
+                        "ProjFS drive also defined in the shell session"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(drive = %format!("{letter}:"), error = %e, "failed to mount ProjFS drive in the shell session")
+                    }
+                });
+                if let Err(reason) = shell {
+                    tracing::info!(
+                        reason,
+                        "ProjFS drive defined in this process's session only"
+                    );
+                }
+                return Some(letter);
+            }
             Err(e) => {
                 tracing::warn!(drive = %format!("{letter}:"), error = %e, "failed to mount ProjFS drive letter; trying next");
             }
@@ -138,6 +169,13 @@ fn mount_drive(letter: char, root: &Path) -> windows::core::Result<()> {
 /// 残る (subst はログオンセッション存続)。起動時・セッション開始時・トレイ終了時にこれを呼び、
 /// 自分のルートを指す残骸ドライブを掃除して This PC に古いドライブが残らないようにする。
 pub(super) fn unmount_drives_for_root(root: &Path) {
+    unmount_drives_for_root_here(root);
+    // 昇格 host は非昇格シェル側にも作るので、そちらの残骸も掃除する。
+    let _ = in_shell_session(|| unmount_drives_for_root_here(root));
+}
+
+/// 現在の (偽装中ならそのトークンの) ログオンセッションで、`root` を指す subst を解除する。
+fn unmount_drives_for_root_here(root: &Path) {
     // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得 (bit0=A .. bit25=Z)。
     let used = unsafe { GetLogicalDrives() };
     let needle = root.to_string_lossy().to_lowercase();
@@ -173,6 +211,99 @@ fn unmount_drive(letter: char) {
             PCWSTR::null(),
         )
     };
+}
+
+/// 自プロセスと非昇格シェルの両方で使用中のドライブレター (bit0=A .. bit25=Z)。昇格 host は
+/// 両方の名前空間へ同じレターで作るため、どちらかで埋まっているレター (非昇格で割り当てた
+/// ネットワークドライブ等) は避ける。
+fn used_drives() -> u32 {
+    // SAFETY: GetLogicalDrives は副作用なしのビットマスク取得。
+    let mut used = unsafe { GetLogicalDrives() };
+    let _ = in_shell_session(|| {
+        // SAFETY: 同上 (偽装中はシェルのログオンセッションの定義を反映する)。
+        used |= unsafe { GetLogicalDrives() };
+    });
+    used
+}
+
+/// `letter:` の DOS デバイス定義 (subst ならその NT ターゲットパス)。未定義なら None。
+fn query_dos_device(letter: char) -> Option<String> {
+    let device = wide(&format!("{letter}:"));
+    let mut buf = [0u16; 1024];
+    // SAFETY: device は null 終端の有効な PCWSTR。buf は出力先 (NT ターゲットパス)。
+    let n = unsafe { QueryDosDeviceW(PCWSTR(device.as_ptr()), Some(&mut buf)) };
+    (n != 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
+}
+
+/// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: 取得に成功した有効なハンドルだけを保持し、1 度だけ閉じる。
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// 昇格プロセスのとき、非昇格シェル (explorer) のトークンを偽装した状態で `f` を実行する。
+/// 実行したら `Ok`。昇格していない (= 既にシェルと同じセッション) / シェルが見つからない /
+/// トークンを得られないときは実行せず、理由を `Err` で返す (ログでの切り分け用)。
+///
+/// DOS デバイス (subst) はログオンセッションごとの名前空間に属し、UAC の分割トークンでは
+/// 昇格側と非昇格側が別セッションになる。自動起動タスク (/RL HIGHEST) の host が作った Z: は
+/// 非昇格の Explorer から見えないため、シェルのトークンでも同じ定義を作る。`TokenLinkedToken`
+/// は SeTcb 権限が無いと識別レベルしか返らず偽装に使えないので、シェルのトークンを複製する。
+fn in_shell_session(f: impl FnOnce()) -> Result<(), &'static str> {
+    if !crate::display::process_is_elevated() {
+        return Err("not elevated");
+    }
+    let token = shell_impersonation_token()?;
+    // SAFETY: 複製した偽装トークンを現在のスレッドに設定する。f の後で必ず解除する
+    // (このスレッドは tokio / ProjFS と共有されうるため、偽装を残さない)。
+    unsafe { SetThreadToken(None, token.0) }.map_err(|_| "SetThreadToken failed")?;
+    f();
+    // SAFETY: スレッドの偽装を解除するだけ。
+    let _ = unsafe { SetThreadToken(None, HANDLE::default()) };
+    Ok(())
+}
+
+/// 非昇格シェル (デスクトップの explorer) のトークンを偽装用に複製する。
+fn shell_impersonation_token() -> Result<OwnedHandle, &'static str> {
+    // SAFETY: 引数なしでシェルのデスクトップウィンドウを得るだけ (無ければ null)。
+    let hwnd = unsafe { GetShellWindow() };
+    if hwnd.0.is_null() {
+        return Err("no shell window");
+    }
+    let mut pid = 0u32;
+    // SAFETY: hwnd は直前に得たウィンドウ。pid は出力先のスタック変数。
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return Err("no shell process");
+    }
+    // SAFETY: 同一ユーザーの explorer を問い合わせ権限だけで開く。
+    let process = OwnedHandle(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .map_err(|_| "OpenProcess(shell) failed")?,
+    );
+    let mut primary = HANDLE::default();
+    // SAFETY: process は有効なプロセスハンドル。primary は出力先。
+    unsafe { OpenProcessToken(process.0, TOKEN_DUPLICATE | TOKEN_QUERY, &mut primary) }
+        .map_err(|_| "OpenProcessToken(shell) failed")?;
+    let primary = OwnedHandle(primary);
+    let mut imp = HANDLE::default();
+    // SAFETY: primary は有効なトークン。スレッド偽装に使える偽装レベルのトークンを複製する。
+    unsafe {
+        DuplicateTokenEx(
+            primary.0,
+            TOKEN_IMPERSONATE | TOKEN_QUERY,
+            None,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut imp,
+        )
+    }
+    .map_err(|_| "DuplicateTokenEx failed")?;
+    Ok(OwnedHandle(imp))
 }
 
 // SAFETY: ctx はスレッド間で移動しても安全 (ProjFS が内部同期する)。
