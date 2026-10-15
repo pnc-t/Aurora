@@ -67,6 +67,9 @@ impl ListPage {
 
 /// 制御フレーム 64KB 上限に収めるための 1 ページあたりエントリ数上限。
 const LIST_PAGE: usize = 128;
+/// 1 ページの名前の総バイト数上限。エントリ毎の固定部 (bincode の長さ・size・is_dir) と AEAD タグを
+/// 128 件分足しても 64KiB に収まる余裕を残す。
+const LIST_PAGE_NAME_BYTES: usize = 48 * 1024;
 /// FsRead 1 回の上限。host は 32KB ずつ要求するが、悪意あるホストが大きい length を
 /// 送ってきても `FsReadReply` (data + bincode + AEAD タグ) が TCP フレーム上限
 /// (`u16::MAX`) を超えて自己切断しないよう、オーバーヘッド分を残してクランプする。
@@ -157,7 +160,22 @@ fn paginate(mut all: Vec<FsEntry>, offset: u32) -> ListPage {
     all.sort_by_key(|a| a.name.to_lowercase());
     let total = all.len();
     let start = (offset as usize).min(total);
-    let entries: Vec<FsEntry> = all.into_iter().skip(start).take(LIST_PAGE).collect();
+    // 件数だけでなく名前の総バイト数でも区切る。長い名前 (CJK 等) が 128 件並ぶと FsListReply が
+    // TCP フレーム上限 (64KiB) を超え、送信失敗で writer ごとセッションが落ちるため。host は返った
+    // 件数ぶん offset を進めるので、ページが短くなっても取りこぼさない。最低 1 件は返す。
+    let mut budget = LIST_PAGE_NAME_BYTES;
+    let entries: Vec<FsEntry> = all
+        .into_iter()
+        .skip(start)
+        .take(LIST_PAGE)
+        .enumerate()
+        .take_while(|(i, e)| {
+            let fits = *i == 0 || e.name.len() <= budget;
+            budget = budget.saturating_sub(e.name.len());
+            fits
+        })
+        .map(|(_, e)| e)
+        .collect();
     let done = start + entries.len() >= total;
     ListPage {
         entries,
@@ -300,6 +318,24 @@ pub(crate) async fn fs_rename(scope: &ShareScope, from: &str, to: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 長い名前が並ぶとバイト上限でページが短くなり、続きは offset で取れる。
+    #[test]
+    fn paginate_caps_page_by_name_bytes() {
+        let mk = |i: usize| FsEntry {
+            name: format!("{i:04}{}", "x".repeat(996)),
+            is_dir: false,
+            size: 0,
+        };
+        let all: Vec<FsEntry> = (0..LIST_PAGE).map(mk).collect();
+        let p = paginate(all.clone(), 0);
+        let bytes: usize = p.entries.iter().map(|e| e.name.len()).sum();
+        assert!(p.entries.len() < LIST_PAGE && !p.done);
+        assert!(bytes <= LIST_PAGE_NAME_BYTES);
+        let next = all[p.entries.len()].name.clone();
+        let rest = paginate(all, p.entries.len() as u32);
+        assert_eq!(rest.entries[0].name, next);
+    }
 
     /// 読み取り専用共有では書き戻し系の解決を全て拒否し、読み取り系は通す。
     #[test]

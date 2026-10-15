@@ -252,25 +252,32 @@ async fn connect_inner(
     }
 
     // ホスト名 (Tailscale MagicDNS 名等) も解決する。SocketAddr::parse は数値 IP しか
-    // 受け付けないため、lookup_host で名前解決し IPv4/IPv6 の最初のアドレスを採る。
+    // 受け付けないため lookup_host で名前解決し、得たアドレスを順に試す。先頭だけだと、AAAA を
+    // 先に返す環境で IPv4 のみ待受の host に繋がらない (到達性プローブは全アドレスを試すため
+    // 「オンライン表示なのに接続できない」になる)。
     let target = format!("{host}:{port}");
-    let tcp_addr: SocketAddr = tokio::net::lookup_host(&target)
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&target)
         .await
         .map_err(|e| {
             tracing::debug!(error = %e, "dns resolve failed");
             format!("ホスト名を解決できません: {host}")
         })?
-        .next()
-        .ok_or_else(|| format!("ホスト名を解決できません: {host}"))?;
-    let udp_addr = tcp_addr;
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("ホスト名を解決できません: {host}"));
+    }
 
-    tracing::info!(%tcp_addr, "connecting");
-    let mut tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp_addr))
+    tracing::info!(?addrs, "connecting");
+    let mut tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addrs.as_slice()))
         .await
         .map_err(|_| {
             "接続がタイムアウトしました (ホストが起動していないか、ネットワークに到達できません)"
                 .to_string()
         })?
+        .map_err(|e| format!("ホストに接続できません: {e}"))?;
+    // UDP も TCP が実際につながったアドレスへ送る (映像/音声と制御で宛先を揃える)。
+    let udp_addr = tcp
+        .peer_addr()
         .map_err(|e| format!("ホストに接続できません: {e}"))?;
     tcp.set_nodelay(true).ok();
 
@@ -642,6 +649,11 @@ async fn connect_inner(
     let udp_watchdog_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(UDP_STALL_TIMEOUT);
         interval.tick().await;
+        // 現在の無受信期間で既にキーフレームを要求したか。画面静止 + 無音でも UDP は途絶する
+        // (host は変化が無いと送らない) ため、毎回要求すると静止中ずっと 3 秒ごとに IDR を
+        // 生成させてしまう。要求は途絶 1 回につき 1 度にし、以降は AURHELLO (8B) だけ再送する。
+        // 経路が本当に切れて戻った場合は、seq の飛びから受信側がキーフレームを要求する。
+        let mut keyframe_requested = false;
         loop {
             interval.tick().await;
             if udp_health_for_watchdog.is_paused() {
@@ -649,9 +661,14 @@ async fn connect_inner(
             }
             let now_ms = session_start.elapsed().as_millis() as u64;
             if udp_health_for_watchdog.elapsed_ms(now_ms) >= UDP_STALL_TIMEOUT.as_millis() as u64 {
-                tracing::warn!("no UDP video/audio for 3s while TCP alive; resending AURHELLO");
                 let _ = udp_for_resend.send(b"AURHELLO").await;
-                let _ = keyframe_tx_for_udp_watchdog.send(ControlMsg::RequestKeyframe);
+                if !keyframe_requested {
+                    keyframe_requested = true;
+                    tracing::warn!("no UDP video/audio for 3s while TCP alive; resending AURHELLO");
+                    let _ = keyframe_tx_for_udp_watchdog.send(ControlMsg::RequestKeyframe);
+                }
+            } else {
+                keyframe_requested = false;
             }
         }
     });
