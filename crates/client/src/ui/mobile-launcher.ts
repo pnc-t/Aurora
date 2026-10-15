@@ -28,6 +28,7 @@
 // 「パスワードを忘れる」を実装する。
 
 import {
+  MAX_MBPS,
   DEFAULT_SETTINGS,
   deleteHostPassword,
   deleteRecentHost,
@@ -117,7 +118,7 @@ function parseFps(raw: string): number {
 /** ビットレート上限 (Mbps): 1 以上の整数。 */
 function parseMbps(raw: string): number {
   const n = Math.floor(Number(raw));
-  return Number.isFinite(n) && n >= 1 ? n : DEFAULT_SETTINGS.max_mbps;
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, MAX_MBPS) : DEFAULT_SETTINGS.max_mbps;
 }
 /** ポート番号: 1〜65535。範囲外は null (呼び出し側でエラー表示)。 */
 function parsePort(raw: string): number | null {

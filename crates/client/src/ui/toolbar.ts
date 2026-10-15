@@ -9,7 +9,7 @@
 // 掴んでもウィンドウ移動できる。
 // 接続先情報は省スペース化のためバーの title (ホバー tooltip) に退避し、行内には常駐させない。
 
-import { formatDisplayName, type DisplayDto, type ToolbarPosition } from "../core/ipc";
+import { formatDisplayName, MAX_MBPS, type DisplayDto, type ToolbarPosition } from "../core/ipc";
 import { CUSTOM_PRESET_ID, VIDEO_PRESETS, matchPreset } from "../core/video-presets";
 import { applyAriaLabels } from "../core/a11y";
 import { shortcutLabel } from "../core/shortcuts";
@@ -210,7 +210,7 @@ export function mountToolbar(opts: ToolbarOpts): ToolbarHandle {
   }
   function emitVideoParams(): void {
     const fps = Math.max(0, Math.floor(Number(fpsInput?.value) || 0));
-    const mbps = Math.max(1, Math.floor(Number(mbpsInput?.value) || 1));
+    const mbps = Math.min(MAX_MBPS, Math.max(1, Math.floor(Number(mbpsInput?.value) || 1)));
     if (fpsInput) fpsInput.value = String(fps);
     if (mbpsInput) mbpsInput.value = String(mbps);
     syncPreset(fps, mbps);

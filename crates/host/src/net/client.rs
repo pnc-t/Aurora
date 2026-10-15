@@ -1165,7 +1165,8 @@ struct HeldInputs {
 impl HeldInputs {
     fn observe(&mut self, ev: &InputEvent) {
         match *ev {
-            InputEvent::Key { vk, down } => {
+            // 注入側が拒否する範囲外の vk は記録しない (任意の値で集合を際限なく膨らませない)。
+            InputEvent::Key { vk, down } if vk <= 0xFF => {
                 if down {
                     self.keys.insert(vk);
                 } else {
