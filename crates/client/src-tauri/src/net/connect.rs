@@ -213,6 +213,22 @@ async fn connect_inner(
     // 必ず失敗する)。トレードオフとして平文パスワードをセッション終了までメモリに保持する。
     // 恒久的な終了 (disconnect/disconnect_host/ウィンドウ破棄/孤児セッション停止) 側で明示的に
     // staging.remove する運用とする。
+    // 接続処理中として登録する (完了・失敗のどちらでも guard の drop で外れる)。
+    state
+        .connecting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            session_id.clone(),
+            Connecting {
+                host: host.clone(),
+                cancelled: false,
+            },
+        );
+    let _connecting = ConnectingGuard {
+        state: &state,
+        session_id: session_id.clone(),
+    };
     let staged = state.staging.lock().await.get(&session_id).cloned();
     let password = match staged.flatten() {
         Some(p) => p,
@@ -709,7 +725,24 @@ async fn connect_inner(
             state.staging.lock().await.remove(&session_id);
             return Err("ウィンドウが閉じられました".to_string());
         }
-        guard.insert(session_id.clone(), handle);
+        // 接続処理中に切断要求 (タブの × / キャンセル / ランチャーの切断) が来ていたら登録しない。
+        // inner ロック下で確認するので、disconnect 側の印付けと取りこぼし無く直列化される。
+        let cancelled = state
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id)
+            .is_some_and(|c| c.cancelled);
+        if cancelled {
+            drop(guard);
+            handle.shutdown();
+            tracing::info!("connect cancelled while in progress");
+            return Err("接続はキャンセルされました".to_string());
+        }
+        if let Some(old) = guard.insert(session_id.clone(), handle) {
+            // 同 id の並行接続は UI 側で防いでいるが、来た場合も旧ハンドルを孤児にしない。
+            old.shutdown();
+        }
     }
 
     // ハンドル格納後に HostInfo を通知する (上部のレース回避)。これでフロントが host_info を
@@ -1061,4 +1094,20 @@ fn log_write_back_failure(read_only_logged: &mut bool, op: &str, path: &str, err
         return;
     }
     tracing::warn!(op, path = %path, error = %error, "write-back failed");
+}
+
+/// 接続処理中の登録 ([`SessionState::connecting`]) を、connect_inner のどの return 経路でも外す。
+struct ConnectingGuard<'a> {
+    state: &'a SessionState,
+    session_id: String,
+}
+
+impl Drop for ConnectingGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.session_id);
+    }
 }
