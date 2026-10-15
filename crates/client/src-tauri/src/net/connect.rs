@@ -334,7 +334,19 @@ async fn connect_inner(
     let session = Arc::new(hs.into_transport().map_err(|e| hs_fail(fp.as_deref(), e))?);
     tracing::info!("noise handshake complete");
 
-    // ハンドシェイク成功 = PSK (パスワード) 一致。ユーザーが「保存する」を選んだときだけ
+    // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
+    // 以降の TCP 受信は reader ループが nonce 1 から続ける。
+    hs_io(read_tcp_frame(&mut tcp, &mut buf))
+        .await
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+    let mut plain = Vec::new();
+    let mut hostinfo_rx_nonce: u64 = 0;
+    let host_info = decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain)
+        .map_err(|e| hs_fail(fp.as_deref(), e))?;
+
+    // HostInfo (相手の暗号文) を復号できた = PSK (パスワード) 一致が確定。XXpsk3 の initiator は
+    // ハンドシェイク完了だけでは相手が PSK を知っている保証が無いため、保存はここまで待つ
+    // (誤ったパスワードを「保存済み」にしない)。ユーザーが「保存する」を選んだときだけ
     // DPAPI 暗号化保存する (無断永続化を避け「今回だけ接続」を可能にする)。失敗してもログ
     // のみで接続は続行する (保存は補助機能)。`save=false` (今回だけ/保存済み即接続/再接続) は
     // 既存の保存値に触れない (= 保存済みなら維持、未保存なら未保存のまま)。
@@ -347,16 +359,6 @@ async fn connect_inner(
             Ok(Ok(())) => {}
         }
     }
-
-    // 最初の制御メッセージ (HostInfo) を受け取る。CTRL ドメインの nonce 0 で復号し、
-    // 以降の TCP 受信は reader ループが nonce 1 から続ける。
-    hs_io(read_tcp_frame(&mut tcp, &mut buf))
-        .await
-        .map_err(|e| hs_fail(fp.as_deref(), e))?;
-    let mut plain = Vec::new();
-    let mut hostinfo_rx_nonce: u64 = 0;
-    let host_info = decode_ctrl_msg(&session, &buf, &mut hostinfo_rx_nonce, &mut plain)
-        .map_err(|e| hs_fail(fp.as_deref(), e))?;
 
     // 承認待ちは接続確立ではないので、sink 生成・Connected 通知の前に早期 return する
     // (Connected イベントを先に飛ばすと client 側で承認待ち画面と handshake 表示がちらつく)。
@@ -875,7 +877,8 @@ async fn tcp_reader_loop(
                     .map(|s| s.contains(&id))
                     .unwrap_or(false);
                 if !solicited {
-                    tracing::warn!(id, name = %name, "unsolicited FileOffer ignored (no matching request)");
+                    // ホスト由来の文字列は Debug 形式で出し、改行で偽のログ行を作らせない。
+                    tracing::warn!(id, name = ?name, "unsolicited FileOffer ignored (no matching request)");
                 } else if download.is_some() {
                     // 進行中のダウンロードがある間に新しい FileOffer (別 id の割り込み、または
                     // 同一 id の再送) を受理すると、単一スロット download を無条件で上書きしてしまい
@@ -884,7 +887,7 @@ async fn tcp_reader_loop(
                     // 捨てられ FileResult も届かず進捗表示が永久にハングする。よって拒否する。
                     tracing::warn!(
                         id,
-                        name = %name,
+                        name = ?name,
                         "FileOffer rejected: a download is already in progress"
                     );
                     // 拒否した新しい方の pending_downloads エントリを解放しないとリークし、
@@ -900,7 +903,7 @@ async fn tcp_reader_loop(
                 } else {
                     match open_download(&name).await {
                         Ok((file, path)) => {
-                            tracing::info!(id, name = %name, size, path = %path, "download start");
+                            tracing::info!(id, name = ?name, size, path = %path, "download start");
                             download = Some(DownloadState {
                                 id,
                                 file,
@@ -1132,11 +1135,11 @@ fn log_write_back_failure(read_only_logged: &mut bool, op: &str, path: &str, err
     if error == READ_ONLY_SHARE {
         if !*read_only_logged {
             *read_only_logged = true;
-            tracing::info!(op, path = %path, "write-back rejected: share is read-only (further rejections not logged)");
+            tracing::info!(op, path = ?path, "write-back rejected: share is read-only (further rejections not logged)");
         }
         return;
     }
-    tracing::warn!(op, path = %path, error = %error, "write-back failed");
+    tracing::warn!(op, path = ?path, error = %error, "write-back failed");
 }
 
 /// 接続処理中の登録 ([`SessionState::connecting`]) を、connect_inner のどの return 経路でも外す。

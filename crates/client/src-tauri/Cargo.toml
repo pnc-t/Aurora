@@ -40,6 +40,8 @@ cpal = "0.15"
 opus = "0.3"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# 更新マニフェスト自体の署名検証で latest.json / .sig を取得する (update_manifest.rs)。host と同じ版。
+ureq = "2.10"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

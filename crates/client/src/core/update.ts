@@ -2,6 +2,7 @@
 
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 import { logger } from "./log";
 
 /** 更新チェック結果。available なら新版あり。 */
@@ -18,9 +19,29 @@ let pending: Update | null = null;
  * ネットワーク不通・dev 実行 (エンドポイント未到達) 等の失敗は none 扱いにする
  * (更新は必須機能ではないため、失敗で UI をブロックしない)。
  */
+type VerifiedUpdate = { version: string; url: string; signature: string };
+
+/**
+ * プラグインが取得した更新内容が、署名検証済み manifest (latest.json.sig) と一致するか。
+ * プラグインは setup.exe の署名しか見ないため、version を騙って旧正規版を指す manifest への
+ * 差し替え (ダウングレード) を防ぐ。検証できなければ fail-closed で適用しない。
+ */
+async function matchesVerifiedManifest(update: Update): Promise<boolean> {
+  try {
+    const v = await invoke<VerifiedUpdate>("verify_update_manifest");
+    const platforms = update.rawJson["platforms"] as Record<string, { url?: string; signature?: string }> | undefined;
+    const p = platforms?.["windows-x86_64"];
+    return update.version === v.version && p?.url === v.url && p?.signature === v.signature;
+  } catch (e) {
+    logger.warn(`update manifest verification failed: ${String(e)}`);
+    return false;
+  }
+}
+
 export async function checkForUpdate(): Promise<UpdateStatus> {
   try {
-    const update = await check();
+    const found = await check();
+    const update = found && (await matchesVerifiedManifest(found)) ? found : null;
     if (update) {
       pending = update;
       return { kind: "available", version: update.version, notes: update.body ?? "" };
@@ -40,7 +61,7 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
 export async function installPendingUpdate(): Promise<void> {
   if (!pending) {
     const u = await check();
-    if (!u) return;
+    if (!u || !(await matchesVerifiedManifest(u))) return;
     pending = u;
   }
   await pending.downloadAndInstall();

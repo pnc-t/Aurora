@@ -885,7 +885,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                     ControlMsg::FileOffer { id, name, size } => {
                         match open_upload(&name).await {
                             Ok((file, path)) => {
-                                tracing::info!(id, name = %name, size, path = %path, "file upload start");
+                                tracing::info!(id, name = ?name, size, path = %path, "file upload start");
                                 upload = Some(UploadState { id, file, written: 0, total: size, path });
                             }
                             Err(e) => {
@@ -958,7 +958,8 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                         }
                     }
                     ControlMsg::FileRequest { id, path } => {
-                        tracing::info!(id, path = %path, "file download requested");
+                        // クライアント由来の文字列は Debug 形式で出し、改行で偽のログ行を作らせない。
+                        tracing::info!(id, path = ?path, "file download requested");
                         let out_tx = out_tx.clone();
                         tokio::spawn(async move {
                             stream_file_to_client(id, &path, out_tx).await;

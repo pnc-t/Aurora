@@ -290,7 +290,10 @@ jobs:
       # (Get-Content での確認表示はファイルを変更しない)。
       - name: Sign host updater manifest
         shell: pwsh
-        run: cargo tauri signer sign dist-release/latest-host.json
+        run: |
+          cargo tauri signer sign dist-release/latest-host.json
+          # client の latest.json も同じ理由で署名する (client は update_manifest.rs で fail-closed 検証)。
+          cargo tauri signer sign dist-release/latest.json
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -310,6 +313,7 @@ jobs:
           files: |
             dist-release/*-setup.exe
             dist-release/latest.json
+            dist-release/latest.json.sig
             dist-release/latest-host.json
             dist-release/latest-host.json.sig
             dist-release/aurora-wol-*-aarch64

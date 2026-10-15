@@ -12,6 +12,7 @@ pub mod noise;
 pub mod paths;
 pub mod preauth;
 pub mod proto;
+pub mod update_sig;
 
 pub use framing::{AudioPacket, STREAM_AUDIO, STREAM_VIDEO, VideoPacket, VideoPacketFlags};
 pub use noise::{

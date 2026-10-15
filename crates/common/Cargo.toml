@@ -20,6 +20,9 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 bitflags = "2.6"
 argon2 = { workspace = true }
+# 自動アップデートの署名検証 (update_sig.rs、host / client 共有)。zero-dependency で監査しやすい実装。
+minisign-verify = "0.2"
+base64 = "0.22"
 
 # DPAPI (dpapi.rs) 用。秘密のローカル暗号化保存を host/client 双方でここに集約する。
 [target.'cfg(windows)'.dependencies.windows]

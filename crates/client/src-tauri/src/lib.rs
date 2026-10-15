@@ -21,6 +21,8 @@ mod mobile_clipboard;
 mod net;
 mod secret;
 mod stats;
+#[cfg(desktop)]
+mod update_manifest;
 
 use net::SessionState;
 use tauri::Manager;
@@ -216,6 +218,7 @@ pub fn run() {
         log::perf_enabled,
         log::open_logs_folder,
         log::export_logs_zip,
+        update_manifest::verify_update_manifest,
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
