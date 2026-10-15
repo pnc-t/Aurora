@@ -73,6 +73,8 @@ const JITTER_EMA_FALL = 0.3;
  * 余裕を足す。refresh 未満なので cushion 待ちを丸々 1 tick 早めることはない。
  */
 const VSYNC_TOLERANCE_FRAC = 0.25;
+/** デコーダ未構成中 (キーフレーム待ち) のキーフレーム要求の最小間隔。 */
+const UNCONFIGURED_KEY_REQ_INTERVAL_MS = 500;
 
 /** 値を [lo, hi] に収める。 */
 function clamp(x: number, lo: number, hi: number): number {
@@ -185,6 +187,8 @@ class VstatMeter {
 export class Decoder {
   private decoder: VideoDecoder | null = null;
   private configured = false;
+  /** 未構成中に最後にキーフレームを要求した時刻 (performance.now)。 */
+  private lastUnconfiguredKeyReqMs = -Infinity;
   private readonly ctx: CanvasRenderingContext2D | null;
   // 現在のコーデック。host からの video_codec_changed で更新される (既定は接続直後の h264 想定)。
   // 変更時は configure 済み状態を破棄し、次のキーフレームから当該コーデックで再構成する。
@@ -486,8 +490,13 @@ export class Decoder {
 
     if (!this.configured) {
       if (!keyframe) {
-        // 設定前のキーフレームを待つ。届かなければ要求。
-        this.opts.requestKeyframe();
+        // 設定前のキーフレームを待つ。届かなければ要求。delta は毎フレーム来るため、そのたびに
+        // 要求すると host が IDR を重ねて生成し帯域スパイクになる (net/video.rs の抑制と揃える)。
+        const now = performance.now();
+        if (now - this.lastUnconfiguredKeyReqMs >= UNCONFIGURED_KEY_REQ_INTERVAL_MS) {
+          this.lastUnconfiguredKeyReqMs = now;
+          this.opts.requestKeyframe();
+        }
         return;
       }
       // h264 は従来通り SPS 欠落時にキーフレーム再要求で待つ (回帰防止)。hevc/av1 はパース失敗
