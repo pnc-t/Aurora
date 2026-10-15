@@ -115,16 +115,21 @@ impl DeviceGuard {
         if let Err(e) = save_trusted(&trusted) {
             tracing::warn!(error = %e, "failed to persist device removal");
         }
+        // 許可リストの変更は接続可否を左右するため成功時も残す (残さないと「いつの間にか空になって
+        // 接続できない」を後から追えない)。ラベルは端末由来なので Debug 形式で出す。
+        tracing::info!(label = ?removed.label, remaining = trusted.len(), "trusted device removed");
         Some(removed.label)
     }
 
     /// 許可リストを全消去して永続化する (端末の総入れ替え用)。
     pub fn clear(&self) {
         if let Ok(mut t) = self.trusted.lock() {
+            let removed = t.len();
             t.clear();
             if let Err(e) = save_trusted(&t) {
                 tracing::warn!(error = %e, "failed to persist device allowlist clear");
             }
+            tracing::info!(removed, "trusted device allowlist cleared");
         }
     }
 
@@ -178,6 +183,7 @@ impl DeviceGuard {
             // 承認は成立したがディスクに残らなかった = 再起動で信頼が消える。要警告。
             tracing::warn!(error = %e, "failed to persist approved device");
         }
+        tracing::info!(label = ?label, total = trusted.len(), "trusted device approved");
         Some(label)
     }
 

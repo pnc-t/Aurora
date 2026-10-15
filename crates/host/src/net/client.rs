@@ -20,6 +20,12 @@ fn display_label(device_name: &str, ip: std::net::IpAddr) -> String {
     }
 }
 
+/// PSK を検証する前に終わった接続 (launcher の到達性プローブの即切断・無言タイムアウト等)。
+/// 認証失敗ではなく、正規の操作でも毎回起きるため、ログの重大度を下げる目印にする。
+#[derive(thiserror::Error, Debug)]
+#[error("connection ended before authentication: {0}")]
+pub(crate) struct EndedBeforeAuth(String);
+
 /// UDP 送信失敗の連続を数え、ログを「失敗し始めた 1 回」と「回復時の 1 行」に絞る
 /// (60fps で失敗し続けると毎パケット warn がログを埋めるため)。
 struct UdpSendFailStreak {
@@ -148,8 +154,8 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
             triple
         }
         Err(e) if !psk_evaluated => {
-            tracing::debug!(peer = %peer, error = %e, "connection ended before authentication; not counted as auth failure");
-            return Err(e);
+            // 総当たりの試行としては数えない。呼び出し側 (net/mod.rs) は型で見分けて WARN にしない。
+            return Err(EndedBeforeAuth(e.to_string()).into());
         }
         Err(e) => {
             // バックオフ待ちの前に認証前枠を返す。待つ間も握ると、1 ピアの失敗連投で枠が埋まる。
