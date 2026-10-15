@@ -193,6 +193,10 @@ export class Decoder {
   // 連発しうるため、最大 1 秒 1 回に間引き、その間に潰した件数を併記する。
   private lastErrLogMs = 0;
   private suppressedErrs = 0;
+  // 直近にデコーダを作り直した時刻。WebCodecs はエラーで VideoDecoder を closed にするため、
+  // 復帰には作り直しが要る (recoverDecoder 参照)。恒久的に復号できないストリームでは
+  // フレーム毎にエラーが出るので、作り直しは 1 秒 1 回までに抑える。
+  private lastRecoverMs = 0;
 
   // --- ジッタバッファ状態 ---
   // 提示待ちのデコード済みフレーム (到着順 = 提示順)。提示予定時刻と、遅延計測用の
@@ -263,6 +267,28 @@ export class Decoder {
     this.reset();
   }
 
+  /**
+   * デコードエラーからの復帰。
+   *
+   * WebCodecs は `error` を出した `VideoDecoder` を **closed** にする。仕様上 closed の
+   * コーデックは二度と使えないため、`configured = false` に戻して次のキーフレームを要求する
+   * だけでは復帰できない (次の `configure()` が InvalidStateError で落ち、以後は永久に
+   * 映像が出ないまま毎フレーム再要求を投げ続ける)。復帰にはインスタンスの作り直しが要る。
+   *
+   * 一方、コーデック非対応など恒久的に復号できないストリームではフレーム毎にエラーが出る。
+   * 作り直しを 1 秒 1 回に抑え、その間は静かに落とす (キーフレーム要求は従来どおり出す)。
+   */
+  private recoverDecoder(): void {
+    const now = performance.now();
+    if (now - this.lastRecoverMs < 1000) {
+      this.configured = false;
+      return;
+    }
+    this.lastRecoverMs = now;
+    this.reset();
+    this.opts.requestKeyframe();
+  }
+
   /** デコーダを作り直す (接続/再接続/タブ復帰時)。次のキーフレームから再構成する。 */
   reset(): void {
     this.flushQueue();
@@ -277,8 +303,8 @@ export class Decoder {
       output: (frame) => this.onFrame(frame),
       error: (e) => {
         this.throttledError("VideoDecoder error", e);
-        this.configured = false;
-        this.opts.requestKeyframe();
+        // この時点で decoder は closed。作り直さないと以後 configure できない。
+        this.recoverDecoder();
       },
     });
     this.configured = false;
@@ -484,6 +510,9 @@ export class Decoder {
         );
       } catch (e) {
         this.throttledError("configure failed", codec, e);
+        // closed なデコーダに configure すると InvalidStateError になる。作り直して次の
+        // キーフレームで再挑戦する (作り直さないとここを永久に繰り返す)。
+        this.recoverDecoder();
         return;
       }
     }
@@ -513,8 +542,8 @@ export class Decoder {
       decoder.decode(chunk);
     } catch (e) {
       this.throttledError("decode failed", e);
-      this.configured = false;
-      this.opts.requestKeyframe();
+      // decode が投げるのは closed / unconfigured のとき。ここも作り直しで復帰させる。
+      this.recoverDecoder();
     }
   }
 
