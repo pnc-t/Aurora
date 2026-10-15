@@ -50,28 +50,32 @@ mod imp {
             ENABLED.store(true, Ordering::Relaxed);
             tracing::info!("keyboard grab enabled");
         } else {
-            // OFF は自分が転送先のときだけ有効にする。窓 A の blur 由来の OFF (async invoke) が
-            // 窓 B の ON より後に届くと B の占有を勝手に切ってしまうため。
-            {
-                let target = TARGET.lock().expect("keyboard grab target mutex poisoned");
-                match target.as_ref() {
-                    Some(t) if t.label() == window.label() => {}
-                    _ => return,
-                }
-            }
-            ENABLED.store(false, Ordering::Relaxed);
-            // down だけ奪って up を転送し損ねるとリモート側にキー残留するため、
-            // swallow 中だった分は OFF 時にまとめて up を転送する。
-            let downs: Vec<u16> = std::mem::take(
-                &mut *SWALLOWED
-                    .lock()
-                    .expect("keyboard grab swallowed mutex poisoned"),
-            );
-            for vk in downs {
-                forward(vk, false);
-            }
-            tracing::info!("keyboard grab disabled");
+            release_for_window(window.label());
         }
+    }
+
+    /// `label` の窓が転送先のときだけ占有を解除する。窓 A の blur 由来の OFF (async invoke) が
+    /// 窓 B の ON より後に届くと B の占有を勝手に切ってしまうため、他窓からの OFF は無視する。
+    pub fn release_for_window(label: &str) {
+        {
+            let target = TARGET.lock().expect("keyboard grab target mutex poisoned");
+            match target.as_ref() {
+                Some(t) if t.label() == label => {}
+                _ => return,
+            }
+        }
+        ENABLED.store(false, Ordering::Relaxed);
+        // down だけ奪って up を転送し損ねるとリモート側にキー残留するため、
+        // swallow 中だった分は OFF 時にまとめて up を転送する。
+        let downs: Vec<u16> = std::mem::take(
+            &mut *SWALLOWED
+                .lock()
+                .expect("keyboard grab swallowed mutex poisoned"),
+        );
+        for vk in downs {
+            forward(vk, false);
+        }
+        tracing::info!("keyboard grab disabled");
     }
 
     fn ensure_hook_thread() {
@@ -194,4 +198,13 @@ pub async fn set_keyboard_grab(window: tauri::Window, on: bool) -> Result<(), St
         let _ = (window, on);
     }
     Ok(())
+}
+
+/// 窓破棄時の後始末。JS の後始末 (タブの teardown) を経ずに窓が閉じても、その窓が転送先なら
+/// 占有を解除する (残すとローカル PC の Win / Alt+Tab がシステム全体で握り潰されたままになる)。
+pub(crate) fn release_for_window(label: &str) {
+    #[cfg(target_os = "windows")]
+    imp::release_for_window(label);
+    #[cfg(not(target_os = "windows"))]
+    let _ = label;
 }
