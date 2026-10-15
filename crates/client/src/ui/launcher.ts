@@ -405,9 +405,16 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
               <div class="setting-row">
                 <div class="s-meta">
                   <div class="s-title">この PC をドライブとして共有</div>
-                  <div class="s-desc">接続中、<b>この PC の This PC 全体 (全ドライブ)</b> がホスト側に仮想ドライブとして現れ、ホストの Explorer から閲覧・コピー・書き込みできる。安全のため、ホストに<b>登録済みの端末</b>のときだけドライブが出る</div>
+                  <div class="s-desc">接続中、<b>この PC の This PC 全体 (全ドライブ)</b> がホスト側に仮想ドライブとして現れ、ホストの Explorer から閲覧・コピーできる。安全のため、ホストに<b>登録済みの端末</b>のときだけドライブが出る</div>
                 </div>
                 <label class="switch"><input type="checkbox" id="set-share-files" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row" id="row-share-writable">
+                <div class="s-meta">
+                  <div class="s-title">ホストからの書き込みを許可</div>
+                  <div class="s-desc">ホストの Explorer での作成・編集・削除をこの PC に反映する。OFF (読み取り専用) のときホスト側の変更は反映されない。<b>ホストが乗っ取られていると、この PC 上でプログラムを実行される</b>おそれがあるため、必要なときだけ ON にする</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-share-writable" /><span class="slider"></span></label>
               </div>
               </div>
               <div class="setting-group">ショートカット (接続中のローカル操作)</div>
@@ -497,6 +504,13 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   const mbpsInput = $<HTMLInputElement>("#set-mbps");
   const codecSelect = $<HTMLSelectElement>("#set-codec");
   const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
+  const shareWritableToggle = $<HTMLInputElement>("#set-share-writable");
+  const shareWritableRow = $("#row-share-writable");
+  // 書き込み許可は共有 ON のときだけ意味を持つため、OFF の間は操作できない見た目にする。
+  const syncShareWritable = (): void => {
+    if (shareWritableToggle) shareWritableToggle.disabled = !settings.share_files;
+    shareWritableRow?.classList.toggle("is-disabled", !settings.share_files);
+  };
   const audioMutedToggle = $<HTMLInputElement>("#set-audio-muted");
   const grabKeyboardToggle = $<HTMLInputElement>("#set-grab-keyboard");
   const clipboardSyncToggle = $<HTMLInputElement>("#set-clipboard-sync");
@@ -1464,6 +1478,11 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
   });
   shareFilesToggle?.addEventListener("change", () => {
     settings = { ...settings, share_files: shareFilesToggle.checked };
+    syncShareWritable();
+    persist();
+  });
+  shareWritableToggle?.addEventListener("change", () => {
+    settings = { ...settings, share_files_writable: shareWritableToggle.checked };
     persist();
   });
   audioMutedToggle?.addEventListener("change", () => {
@@ -1566,6 +1585,8 @@ export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallb
     if (fpsInput) fpsInput.value = String(settings.fps);
     if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
     if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
+    if (shareWritableToggle) shareWritableToggle.checked = settings.share_files_writable;
+    syncShareWritable();
     if (audioMutedToggle) audioMutedToggle.checked = settings.audio_muted;
     if (grabKeyboardToggle) grabKeyboardToggle.checked = settings.grab_keyboard;
     if (clipboardSyncToggle) clipboardSyncToggle.checked = settings.clipboard_sync;

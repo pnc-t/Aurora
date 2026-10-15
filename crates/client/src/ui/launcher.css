@@ -332,6 +332,8 @@ input[type="number"] { -moz-appearance: textfield; }
 }
 .switch input:checked + .slider { background: var(--accent); }
 .switch input:checked + .slider::before { transform: translateX(18px); }
+.setting-row.is-disabled { opacity: 0.5; }
+.setting-row.is-disabled .switch .slider { cursor: default; }
 
 /* ダイアログ (接続 / ホスト編集) */
 #dialog-backdrop {

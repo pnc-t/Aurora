@@ -364,8 +364,12 @@ export async function uploadFileFromPath(id: number, path: string): Promise<void
  * **このPC (client) の This PC 全体 (全ドライブ)** をホストの仮想ドライブへ公開する。
  * 設定は接続成立時に session が自分の id で適用する (登録端末のみホストにドライブが出る)。
  */
-export async function setFileSharing(sessionId: string, enabled: boolean): Promise<void> {
-  await invoke("set_file_sharing", { sessionId, enabled });
+export async function setFileSharing(
+  sessionId: string,
+  enabled: boolean,
+  writable: boolean,
+): Promise<void> {
+  await invoke("set_file_sharing", { sessionId, enabled, writable });
 }
 
 /** ホスト別のクライアント設定上書き。未指定フィールドはグローバル設定に従う (Rust 側 config::HostOverrides と対応)。 */
@@ -465,6 +469,8 @@ export type ClientSettings = {
   auto_reconnect: boolean;
   use_virtual_display: boolean;
   share_files: boolean;
+  /** 共有中にホストからの書き戻しを許可する (既定 false = 読み取り専用)。 */
+  share_files_writable: boolean;
   /** 映像コーデック ("auto" はプローブで対応する全コーデックを申告する)。 */
   codec: CodecChoice;
   /** 接続時に音声をミュートで開始する。 */
@@ -504,6 +510,7 @@ export const DEFAULT_SETTINGS: ClientSettings = {
   auto_reconnect: true,
   use_virtual_display: false,
   share_files: false,
+  share_files_writable: false,
   codec: "auto",
   audio_muted: false,
   audio_volume: 1.0,

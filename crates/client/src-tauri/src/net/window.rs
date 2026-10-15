@@ -335,11 +335,13 @@ pub async fn handoff_session_to_window(
 }
 
 /// このセッションのファイル共有を有効/無効にする。有効時は This PC 全体 (全ドライブ) を
-/// ホストの仮想ドライブへ公開する。設定 (launcher) のトグルに対応し、接続成立時に session が呼ぶ。
+/// ホストの仮想ドライブへ公開する。`writable` が false ならホストからの書き戻しを拒否する
+/// (読み取り専用)。設定 (launcher) のトグルに対応し、接続成立時に session が呼ぶ。
 #[tauri::command]
 pub async fn set_file_sharing(
     session_id: String,
     enabled: bool,
+    writable: bool,
     state: tauri::State<'_, SessionState>,
 ) -> Result<(), String> {
     let scope = {
@@ -348,11 +350,11 @@ pub async fn set_file_sharing(
         s.share_scope.clone()
     };
     *scope.lock().await = if enabled {
-        ShareScope::WholePc
+        ShareScope::WholePc { writable }
     } else {
         ShareScope::Disabled
     };
-    tracing::info!(session = %session_id, enabled, "file sharing set");
+    tracing::info!(session = %session_id, enabled, writable, "file sharing set");
     Ok(())
 }
 

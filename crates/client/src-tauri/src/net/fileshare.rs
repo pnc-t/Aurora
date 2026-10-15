@@ -29,8 +29,16 @@ pub enum ShareScope {
     Disabled,
     /// This PC 全体。先頭コンポーネントをドライブ文字とみなし、全ドライブを 1 つの合成ルートに
     /// 公開する。ホスト側は登録端末のときだけ実際にドライブを mount する (net.rs の client_trusted)。
-    WholePc,
+    WholePc {
+        /// ホストからの書き戻し (作成/書込/削除/改名) を受け付けるか。既定 false (読み取り専用)。
+        /// 書込可だと、侵害されたホストがスタートアップフォルダ等へ書き込むだけでこの PC 上の
+        /// コード実行に到達できるため、必要なときだけ明示的に開ける。
+        writable: bool,
+    },
 }
+
+/// 読み取り専用共有で書き戻しを拒否したときのエラー (ログを 1 セッション 1 回に絞る判定に使う)。
+pub(crate) const READ_ONLY_SHARE: &str = "share is read-only";
 
 /// 1 ページの一覧結果。
 pub(crate) struct ListPage {
@@ -68,7 +76,7 @@ const MAX_READ: u32 = 60 * 1024;
 fn resolve_read(scope: &ShareScope, rel: &str) -> Result<Option<PathBuf>, String> {
     match scope {
         ShareScope::Disabled => Err("sharing disabled".into()),
-        ShareScope::WholePc => whole_pc_resolve(rel),
+        ShareScope::WholePc { .. } => whole_pc_resolve(rel),
     }
 }
 
@@ -76,7 +84,8 @@ fn resolve_read(scope: &ShareScope, rel: &str) -> Result<Option<PathBuf>, String
 fn resolve_write(scope: &ShareScope, rel: &str) -> Result<PathBuf, String> {
     match scope {
         ShareScope::Disabled => Err("sharing disabled".into()),
-        ShareScope::WholePc => whole_pc_resolve_write(rel),
+        ShareScope::WholePc { writable: false } => Err(READ_ONLY_SHARE.into()),
+        ShareScope::WholePc { writable: true } => whole_pc_resolve_write(rel),
     }
 }
 
@@ -291,6 +300,19 @@ pub(crate) async fn fs_rename(scope: &ShareScope, from: &str, to: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 読み取り専用共有では書き戻し系の解決を全て拒否し、読み取り系は通す。
+    #[test]
+    fn read_only_share_rejects_writes() {
+        let ro = ShareScope::WholePc { writable: false };
+        assert_eq!(
+            resolve_write(&ro, "C/Users/x/a.txt"),
+            Err(READ_ONLY_SHARE.into())
+        );
+        assert!(resolve_read(&ro, "C/Users/x/a.txt").is_ok());
+        let rw = ShareScope::WholePc { writable: true };
+        assert!(resolve_write(&rw, "C/Users/x/a.txt").is_ok());
+    }
 
     /// 合成ルート (0 成分) とドライブのルート (1 成分) への破壊系操作は拒否する
     /// (ドライブごと remove_dir_all / rename される回帰を防ぐ)。

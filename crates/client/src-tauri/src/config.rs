@@ -157,6 +157,10 @@ pub struct ClientSettings {
     /// (host net.rs の client_trusted ゲート)。中身は接続中のみ要求時に読まれる。
     #[serde(default)]
     pub share_files: bool,
+    /// 共有中、ホストからの書き戻し (作成/書込/削除/改名) を許可する。既定 OFF (読み取り専用)。
+    /// 書込可だと侵害されたホストがこの PC 上でのコード実行に到達できるため、明示的に開ける。
+    #[serde(default)]
+    pub share_files_writable: bool,
     /// 接続時に音声をミュートで開始する。ツールバーからいつでも解除できる。
     #[serde(default)]
     pub audio_muted: bool,
@@ -233,6 +237,7 @@ impl Default for ClientSettings {
             auto_reconnect: true,
             use_virtual_display: false,
             share_files: false,
+            share_files_writable: false,
             audio_muted: false,
             audio_volume: 1.0,
             grab_keyboard: true,

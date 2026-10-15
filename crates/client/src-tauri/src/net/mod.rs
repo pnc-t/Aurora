@@ -59,8 +59,8 @@ pub use wol::*;
 // net モジュール内でサブモジュール間参照する型/関数 (`use super::*` で各ファイルへ供給)。
 pub(crate) use connect::send_ctrl;
 pub(crate) use fileshare::{
-    DownloadState, ShareScope, fs_create, fs_delete, fs_list, fs_read, fs_rename, fs_write,
-    open_download,
+    DownloadState, READ_ONLY_SHARE, ShareScope, fs_create, fs_delete, fs_list, fs_read, fs_rename,
+    fs_write, open_download,
 };
 pub(crate) use video::{make_udp_socket, udp_reader_loop};
 pub(crate) use window::emit_connections;
