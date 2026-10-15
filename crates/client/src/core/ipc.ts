@@ -280,12 +280,18 @@ export async function selectDisplay(sessionId: string, id: number): Promise<void
 }
 
 /** 映像パラメータ (fps 上限 / ビットレート上限 bps) を実行時にホストへ送る。 */
+/** ビットレート上限 (Mbps) の設定上限。Rust 側は bps を u32 で受けるため、これ以上だと
+ *  ×1_000_000 が u32 を超えて IPC ごと失敗する (設定値と実際の上限が黙って食い違う)。 */
+export const MAX_MBPS = 1000;
+
 export async function setVideoParams(
   sessionId: string,
   fps: number,
   maxBitrateBps: number,
 ): Promise<void> {
-  await invoke("set_video_params", { sessionId, fps, maxBitrateBps });
+  // UI 側でも制限するが、保存済み設定・ホスト別上書き等どの経路から来ても u32 に収める。
+  const bps = Math.min(maxBitrateBps, MAX_MBPS * 1_000_000);
+  await invoke("set_video_params", { sessionId, fps, maxBitrateBps: bps });
 }
 
 /** 音声ミュートの切替をホストへ送る (ミュート中はホストが音声を送らない)。 */

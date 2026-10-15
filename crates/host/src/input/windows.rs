@@ -117,8 +117,13 @@ impl InputInjector for WinInjector {
                 let mut pt = POINT::default();
                 // SAFETY: 出力先は自前のスタック変数。失敗時は Err が返るだけで副作用は無い。
                 unsafe { GetCursorPos(&mut pt) }?;
-                let abs_x = (pt.x + dx).clamp(self.vx, self.vx + self.vw - 1);
-                let abs_y = (pt.y + dy).clamp(self.vy, self.vy + self.vh - 1);
+                // dx/dy はクライアント任意の i32。加算のあふれは画面端へのクランプで吸収する。
+                let abs_x =
+                    pt.x.saturating_add(dx)
+                        .clamp(self.vx, self.vx + self.vw - 1);
+                let abs_y =
+                    pt.y.saturating_add(dy)
+                        .clamp(self.vy, self.vy + self.vh - 1);
                 let cx = ((abs_x - self.vx) as i64 * 65535 / (self.vw as i64 - 1).max(1)) as i32;
                 let cy = ((abs_y - self.vy) as i64 * 65535 / (self.vh as i64 - 1).max(1)) as i32;
                 let mi = MOUSEINPUT {

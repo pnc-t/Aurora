@@ -1557,9 +1557,15 @@ fn capture_loop(
     let mut cur_cursor_overlay = false;
     loop {
         // 実行時の fps 上限変更 (クライアント SetVideoParams) を反映する。
-        while let Ok(fps) = fps_rx.try_recv() {
+        while let Ok(requested) = fps_rx.try_recv() {
+            // クライアント要求は運用者の --fps を超えられない (0 = 無制限は「制約なし」として扱う)。
+            let fps = match (requested, fps_cap) {
+                (r, 0) => r,
+                (0, cap) => cap,
+                (r, cap) => r.min(cap),
+            };
             min_interval = fps_to_interval(fps);
-            tracing::info!(fps, "fps cap updated");
+            tracing::info!(requested, fps, "fps cap updated");
         }
         // 実行時の解像度変更 (クライアント SetResolution) を反映する。
         while let Ok(h) = scale_rx.try_recv() {

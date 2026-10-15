@@ -36,6 +36,9 @@ pub(crate) struct BitrateController {
     current_bps: u32,
     /// 適応制御の上限 (bps)。`--max-bitrate` 由来。エンコーダのピーク上限と揃える。
     max_bps: u32,
+    /// 運用者が `--max-bitrate` で決めた絶対上限。クライアントの SetVideoParams はこれを超えて
+    /// 上限を引き上げられない (帯域/負荷の上限はホスト運用者の権限)。
+    limit_bps: u32,
     /// 持続可能上限の推定 (直近の輻輳点)。増速を緩める閾値に使う。
     ceiling_bps: u32,
     /// 直前サンプルが輻輳だったか。輻輳の立ち上がりでのみ ceiling を記録するため。
@@ -50,6 +53,7 @@ impl BitrateController {
         Self {
             current_bps: DEFAULT_BITRATE_BPS.clamp(MIN_BITRATE_BPS, max_bps),
             max_bps,
+            limit_bps: max_bps,
             ceiling_bps: max_bps,
             in_congestion: false,
         }
@@ -60,7 +64,7 @@ impl BitrateController {
     /// 突き抜けてロス→急降下する初期の波の元だったため、下から `on_stats` で滑らかに上げる。
     /// 天井推定はリセットして新上限まで再探索させる。新しい現在値を返す。
     pub(crate) fn set_max(&mut self, max_bps: u32) -> u32 {
-        self.max_bps = max_bps.max(MIN_BITRATE_BPS);
+        self.max_bps = max_bps.min(self.limit_bps).max(MIN_BITRATE_BPS);
         self.current_bps = self.current_bps.clamp(MIN_BITRATE_BPS, self.max_bps);
         self.ceiling_bps = self.max_bps;
         self.in_congestion = false;
@@ -80,7 +84,11 @@ impl BitrateController {
 
         // 非輻輳時は ceiling をゆっくり上方回復させ、条件改善に追従する (低い値での固着防止)。
         if !congested {
-            self.ceiling_bps = (self.ceiling_bps + self.ceiling_bps / 128).min(self.max_bps);
+            // 無制限 (u32::MAX) だと加算があふれるため飽和させる。
+            self.ceiling_bps = self
+                .ceiling_bps
+                .saturating_add(self.ceiling_bps / 128)
+                .min(self.max_bps);
         }
 
         let next = if congested {
@@ -140,5 +148,26 @@ mod tests {
         // 持続: ceiling 据え置き、20M→16M。
         assert_eq!(bc.on_stats(200, 1000), Some(16_000_000));
         assert_eq!(bc.ceiling_bps, 25_000_000);
+    }
+
+    /// 無制限 (u32::MAX) でも ceiling の上方回復があふれない。
+    #[test]
+    fn unlimited_ceiling_recovery_does_not_overflow() {
+        let mut bc = BitrateController::new(u32::MAX);
+        bc.current_bps = 10_000_000;
+        let _ = bc.on_stats(0, 1000);
+        assert_eq!(bc.ceiling_bps, u32::MAX);
+    }
+
+    /// クライアントの set_max は運用者の上限を超えられない (下げるのは可)。
+    #[test]
+    fn client_cannot_raise_above_operator_limit() {
+        let mut bc = BitrateController::new(20_000_000);
+        bc.set_max(100_000_000);
+        assert_eq!(bc.max_bps, 20_000_000);
+        bc.set_max(8_000_000);
+        assert_eq!(bc.max_bps, 8_000_000);
+        bc.set_max(15_000_000);
+        assert_eq!(bc.max_bps, 15_000_000);
     }
 }

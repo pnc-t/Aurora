@@ -9,6 +9,7 @@
 // recent_hosts.json (config.rs) には引き続き { label, host, port } のみ保持する。
 
 import {
+  MAX_MBPS,
   connectedHosts,
   disconnectHost,
   deleteRecentHost,
@@ -126,10 +127,12 @@ function validateFps(raw: string): NumValidation {
   if (!Number.isInteger(n) || n < 0) return { ok: false, message: "0 以上の整数を入れてください" };
   return { ok: true, value: n };
 }
-/** ビットレート上限 (Mbps): 1 以上の整数。 */
+/** ビットレート上限 (Mbps): 1〜MAX_MBPS の整数。 */
 function validateMbps(raw: string): NumValidation {
   const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) return { ok: false, message: "1 以上の整数を入れてください" };
+  if (!Number.isInteger(n) || n < 1 || n > MAX_MBPS) {
+    return { ok: false, message: `1〜${MAX_MBPS} の整数を入れてください` };
+  }
   return { ok: true, value: n };
 }
 /** ポート番号: 1〜65535 の整数。 */
