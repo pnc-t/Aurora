@@ -255,15 +255,21 @@ export class Session {
     this.syncSharedUi();
   }
 
-  /** タブを非アクティブにする: 入力 detach・映像一時停止。 */
-  deactivate(): void {
-    this.active = false;
-    // input.detach() は pointerlockchange リスナーを外してから exitPointerLock するため
-    // onCaptureChange(false) (= キーボード占有 OFF) が発火しない。タブ切替でキャプチャ中の
-    // まま次のタブへ移るとキーボード占有が残留するため、ここで明示的に落とす。
+  /**
+   * 入力を外す。input.detach() は pointerlockchange リスナーを外してから exitPointerLock するため
+   * onCaptureChange(false) (= キーボード占有 OFF) が発火しない。キャプチャ中のままタブ切替・切断・
+   * 移譲・終了するとローカル PC の Win / Alt+Tab が握り潰されたまま残るため、ここで明示的に落とす。
+   */
+  private detachInput(): void {
     const wasCaptured = this.input.isCaptured();
     this.input.detach();
     if (wasCaptured) void setKeyboardGrab(false).catch((e) => logger.warn("setKeyboardGrab failed", e));
+  }
+
+  /** タブを非アクティブにする: 入力 detach・映像一時停止。 */
+  deactivate(): void {
+    this.active = false;
+    this.detachInput();
     if (this.connected) void setVideoPaused(this.id, true);
   }
 
@@ -323,7 +329,7 @@ export class Session {
       this.prepareTimer = null;
     }
     this.preparingVirtual = false;
-    this.input.detach();
+    this.detachInput();
     this.decoder.close();
     this.sessionGen++;
   }
@@ -858,7 +864,7 @@ export class Session {
     this.preparingVirtual = false;
     this.lastSentVw = 0;
     this.lastSentVh = 0;
-    this.input.detach();
+    this.detachInput();
     if (this.active) {
       this.host.toolbar.setConnected(false);
       this.host.toolbar.setCaptureToggled(false);
@@ -892,7 +898,7 @@ export class Session {
       this.prepareTimer = null;
     }
     this.preparingVirtual = false;
-    this.input.detach();
+    this.detachInput();
     this.decoder.close();
   }
 

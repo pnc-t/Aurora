@@ -108,6 +108,7 @@ pub fn run() {
                     if label == "main" {
                         window.app_handle().exit(0);
                     } else if label.starts_with("capture-") {
+                        keyboard_grab::release_for_window(&label);
                         // 死んだ窓へ以後ルーティングしないよう、追跡していたなら外す。
                         let state = window.app_handle().state::<SessionState>();
                         if let Ok(mut g) = state.last_focused_capture.lock()
