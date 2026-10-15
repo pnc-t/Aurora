@@ -21,6 +21,8 @@ const WINDOWS_RESERVED: &[&str] = &[
 ///   ため、残すと「表示名と実体が食い違う」ファイルができる
 /// - Windows の予約デバイス名 (`CON`, `aux.txt` 等) は `_` を前置して無害化する。
 ///   そのまま使うと `File::create` がデバイス名前空間に触れて失敗・誤動作する
+/// - 制御文字と双方向テキスト制御文字 (RLO 等) は `_` に置換する。RLO を挟むと
+///   `invoice_<RLO>fdp.exe` が Explorer 上で `invoice_exe.pdf` に見え、拡張子を偽装できる
 /// - 空・`.`・`..` など実体を持たない名前は `default` にフォールバックする
 pub fn sanitize_filename(name: &str, default: &str) -> String {
     let base = std::path::Path::new(name)
@@ -31,7 +33,7 @@ pub fn sanitize_filename(name: &str, default: &str) -> String {
     let cleaned: String = base
         .chars()
         .map(|c| {
-            if matches!(c, ':' | '/' | '\\') {
+            if matches!(c, ':' | '/' | '\\') || c.is_control() || is_bidi_control(c) {
                 '_'
             } else {
                 c
@@ -58,6 +60,14 @@ pub fn sanitize_filename(name: &str, default: &str) -> String {
     }
 }
 
+/// 表示順を入れ替える双方向テキスト制御文字 (LRM/RLM/ALM・埋め込み/上書き・分離)。
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// 受信ファイルの保存ルート (`%USERPROFILE%\Aurora\<subdir>`、非 Windows は `$HOME` 配下)。
 ///
 /// トレイ常駐・ログオン時自動起動・ショートカット起動では CWD が `System32` 等の不定な
@@ -82,9 +92,46 @@ pub async fn create_incoming_file(
     let dir = incoming_dir(subdir);
     tokio::fs::create_dir_all(&dir).await?;
     let safe = sanitize_filename(name, fallback);
-    let path = dir.join(&safe);
-    let file = tokio::fs::File::create(&path).await?;
-    Ok((file, path.display().to_string()))
+    // 既存ファイルは上書きしない (create は truncate するため、同名の受信で前回の受信物や
+    // ユーザーが置いたファイルが無言で失われる)。衝突したら `name (1).ext` のように番号を振る。
+    let (stem, ext) = match safe.rfind('.') {
+        Some(i) if i > 0 => (&safe[..i], &safe[i..]),
+        _ => (safe.as_str(), ""),
+    };
+    for n in 0..MAX_NAME_SUFFIX {
+        let candidate = if n == 0 {
+            safe.clone()
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = dir.join(&candidate);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => return Ok((file, path.display().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many files with the same name",
+    ))
+}
+
+/// 同名衝突時に試す連番の上限。
+const MAX_NAME_SUFFIX: u32 = 1000;
+
+/// 中断した受信の書きかけファイルを削除する。正常完了ファイルと同じ場所に不完全データが残り、
+/// 破損ファイルを正常品と誤認させないため (host のアップロード / client のダウンロード共通)。
+/// 削除失敗は元のエラーを潰さないようログのみに留める。
+pub async fn discard_incoming_file(path: &str) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        tracing::warn!(path = %path, error = %e, "failed to remove incomplete incoming file");
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +142,14 @@ mod tests {
     fn strips_path_separators() {
         assert_eq!(sanitize_filename("a/b/c.txt", "x.bin"), "c.txt");
         assert_eq!(sanitize_filename(r"a\b\c.txt", "x.bin"), "c.txt");
+    }
+
+    #[test]
+    fn neutralizes_bidi_and_control_chars() {
+        let s = sanitize_filename("invoice_\u{202E}fdp.exe", "x.bin");
+        assert!(!s.contains('\u{202E}'));
+        assert!(s.ends_with(".exe"));
+        assert!(!sanitize_filename("a\u{0007}b.txt", "x.bin").contains('\u{0007}'));
     }
 
     #[test]

@@ -20,15 +20,6 @@ fn display_label(device_name: &str, ip: std::net::IpAddr) -> String {
     }
 }
 
-/// アップロード異常終了時の書きかけファイルを削除する。正常完了ファイルと同名で
-/// 不完全データが残り、ユーザーが破損ファイルを正常品と誤認するのを防ぐため。
-/// 削除失敗は元のアップロードエラーを潰さないようログのみに留める。
-async fn cleanup_aborted_upload(path: &str) {
-    if let Err(e) = tokio::fs::remove_file(path).await {
-        tracing::warn!(path = %path, error = %e, "failed to remove aborted upload file");
-    }
-}
-
 /// UDP 送信失敗の連続を数え、ログを「失敗し始めた 1 回」と「回復時の 1 行」に絞る
 /// (60fps で失敗し続けると毎パケット warn がログを埋めるため)。
 struct UdpSendFailStreak {
@@ -877,6 +868,13 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                             tracing::warn!("clipboard apply channel closed");
                         }
                     }
+                    ControlMsg::FileOffer { id, name, size } if upload.is_some() => {
+                        // 進行中の受信を黙って差し替えると、先行分の書きかけが残り FileResult も
+                        // 返らない (client 側の進捗が永久に止まる)。client のダウンロード受信と対称に拒否する。
+                        tracing::warn!(id, name = %name, size, "FileOffer rejected: an upload is already in progress");
+                        let msg = ControlMsg::FileResult { id, ok: false, message: "an upload is already in progress".into() };
+                        send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
+                    }
                     ControlMsg::FileOffer { id, name, size } => {
                         match open_upload(&name).await {
                             Ok((file, path)) => {
@@ -898,7 +896,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // データ欠落/重複の可能性が高く、書き込むと破損ファイルを残すため中断する。
                                     let message = format!("chunk offset mismatch: expected {}, got {offset}", u.written);
                                     tracing::warn!(id, expected = u.written, got = offset, "chunk offset mismatch, aborting upload");
-                                    cleanup_aborted_upload(&u.path).await;
+                                    aurora_common::fsname::discard_incoming_file(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
@@ -908,14 +906,14 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                     // (total の検証が抜けており実質デッドだった)。
                                     let message = format!("upload exceeds declared size {}", u.total);
                                     tracing::warn!(id, total = u.total, written = u.written, got = data.len(), "upload exceeds declared size, aborting");
-                                    cleanup_aborted_upload(&u.path).await;
+                                    aurora_common::fsname::discard_incoming_file(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
                                 } else if let Err(e) = u.file.write_all(&data).await {
                                     let message = format!("write failed: {e}");
                                     tracing::warn!(id, error = %e, "file write failed");
-                                    cleanup_aborted_upload(&u.path).await;
+                                    aurora_common::fsname::discard_incoming_file(&u.path).await;
                                     upload = None;
                                     let msg = ControlMsg::FileResult { id, ok: false, message };
                                     send_ctrl_msg(&mut write_half, &session, &msg, &mut tcp_tx_nonce).await?;
@@ -926,13 +924,20 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
                                         let res = u.file.flush().await;
                                         upload = None;
                                         let msg = match res {
+                                            // 告知サイズに届かずに終わった = 欠損。完了扱いにすると
+                                            // 切り詰められたファイルを正常品として残してしまう。
+                                            Ok(()) if written < total => {
+                                                tracing::warn!(id, written, total, "upload ended short of declared size");
+                                                aurora_common::fsname::discard_incoming_file(&path).await;
+                                                ControlMsg::FileResult { id, ok: false, message: format!("incomplete upload: {written}/{total} bytes") }
+                                            }
                                             Ok(()) => {
                                                 tracing::info!(id, written, total, path = %path, "file upload complete");
                                                 ControlMsg::FileResult { id, ok: true, message: path }
                                             }
                                             Err(e) => {
                                                 tracing::warn!(id, error = %e, "file flush failed");
-                                                cleanup_aborted_upload(&path).await;
+                                                aurora_common::fsname::discard_incoming_file(&path).await;
                                                 ControlMsg::FileResult { id, ok: false, message: format!("flush failed: {e}") }
                                             }
                                         };
@@ -1034,6 +1039,17 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     .await;
 
     // --- セッション後始末 (正常終了・エラーのどちらでも実行) ---
+    // -1) 受信途中で切れたアップロードの書きかけを消す (不完全ファイルを残さない)。
+    if let Some(u) = upload.take() {
+        tracing::warn!(
+            id = u.id,
+            written = u.written,
+            total = u.total,
+            "connection ended during upload; discarding partial file"
+        );
+        drop(u.file);
+        aurora_common::fsname::discard_incoming_file(&u.path).await;
+    }
     // -0.5) この接続が SelectDisplay(仮想) で立てた takeover_pending=true を SetClientViewport
     // で戻せずに終了した場合 (異常切断・ping タイムアウト等) の保険。shared フラグなので、戻さずに
     // 抜けると他の全クライアントの映像送出が永久に止まる (このセッションだけの問題では済まない)。
