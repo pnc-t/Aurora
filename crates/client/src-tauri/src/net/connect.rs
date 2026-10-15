@@ -6,6 +6,9 @@ use super::*;
 /// 数秒でユーザーへ気付かせて自動再接続へ渡す。
 const PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// reader → ProjFS 作業タスクの要求キュー長 (fs_worker_loop)。
+const FS_QUEUE: usize = 64;
+
 /// ハンドシェイク I/O を `CONNECT_TIMEOUT` で包む。タイムアウト/失敗を String に正規化する。
 async fn hs_io(fut: impl std::future::Future<Output = std::io::Result<()>>) -> Result<(), String> {
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
@@ -472,7 +475,14 @@ async fn connect_inner(
     let fs_reply_tx = ctrl_tx.clone();
     // このセッションのファイル共有スコープ (既定 Disabled = 無効)。reader と SessionHandle で共有。
     let share_scope: Arc<Mutex<ShareScope>> = Arc::new(Mutex::new(ShareScope::Disabled));
-    let share_scope_for_reader = share_scope.clone();
+    // ProjFS 要求は reader から作業タスクへ回す (reader を FS I/O で塞がない)。bounded: 悪意ある
+    // ホストの要求殺到でメモリを膨らませない。満杯時は reader が待つが、host 側も RPC を bounded に
+    // 持つため通常は満たない。
+    let (fs_req_tx, fs_req_rx) = mpsc::channel::<ControlMsg>(FS_QUEUE);
+    let fs_worker_task = tokio::spawn(
+        fs_worker_loop(fs_req_rx, share_scope.clone(), fs_reply_tx)
+            .instrument(tracing::Span::current()),
+    );
     // ダウンロード要求済み id の集合。request_file が追加し、reader が未要求の FileOffer を弾く。
     let pending_downloads = Arc::new(std::sync::Mutex::new(HashSet::<u32>::new()));
     let pending_for_reader = pending_downloads.clone();
@@ -487,8 +497,7 @@ async fn connect_inner(
                 clip_apply_for_reader,
                 stats_for_reader,
                 session_start,
-                fs_reply_tx,
-                share_scope_for_reader,
+                fs_req_tx,
                 pending_for_reader,
                 last_pong_for_reader,
                 clipboard_sync_for_reader,
@@ -674,6 +683,7 @@ async fn connect_inner(
                 clip_forward_task,
                 pong_watchdog_task,
                 udp_watchdog_task,
+                fs_worker_task,
             ];
             #[cfg(target_os = "android")]
             tasks.push(mobile_clip_apply_task);
@@ -744,8 +754,7 @@ async fn tcp_reader_loop(
     clip_apply_tx: mpsc::UnboundedSender<String>,
     stats: Arc<StatsCollector>,
     session_start: Instant,
-    fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
-    share_scope: Arc<Mutex<ShareScope>>,
+    fs_req_tx: mpsc::Sender<ControlMsg>,
     pending_downloads: Arc<std::sync::Mutex<HashSet<u32>>>,
     last_pong_ms: Arc<AtomicU64>,
     clipboard_sync: Arc<AtomicBool>,
@@ -755,9 +764,6 @@ async fn tcp_reader_loop(
     let mut download: Option<DownloadState> = None;
     // HostInfo (nonce 0) は connect_to_host で消費済みなので 1 から続ける。
     let mut tcp_rx_nonce: u64 = 1;
-    // 読み取り専用共有で書き戻しを拒否した旨を記録済みか。ホストは保存のたびに FsWrite を
-    // チャンク単位で連投するため、毎回 warn するとログが埋まる。
-    let mut read_only_logged = false;
     loop {
         read_tcp_frame(&mut read_half, &mut buf).await?;
         let msg = decode_ctrl_msg(&session, &buf, &mut tcp_rx_nonce, &mut plain)?;
@@ -962,10 +968,36 @@ async fn tcp_reader_loop(
                 }
                 _ => tracing::warn!(id, "download chunk without matching offer, ignored"),
             },
-            // --- ProjFS ドライブリダイレクト: 自分のファイルをホストへ配信 ---
-            // 共有スコープが Disabled なら resolve が error を返し、read は error 応答・破壊系は
-            // ログのみで無視する (無断アクセス防止)。WholePc なら This PC 全体を投影する
-            // (書き戻しは writable のときだけ)。
+            // --- ProjFS ドライブリダイレクト: 作業タスクへ回す (fs_worker_loop 参照) ---
+            msg @ (ControlMsg::FsList { .. }
+            | ControlMsg::FsRead { .. }
+            | ControlMsg::FsCreate { .. }
+            | ControlMsg::FsWrite { .. }
+            | ControlMsg::FsDelete { .. }
+            | ControlMsg::FsRename { .. }) => {
+                // 作業タスクが居ない (セッション終了中) なら捨てるだけ。
+                let _ = fs_req_tx.send(msg).await;
+            }
+            other => tracing::debug!(?other, "ignored control msg"),
+        }
+    }
+}
+
+/// ProjFS 要求 (ホスト → クライアント) を受信順に 1 件ずつ処理する。列挙/読込はディスク次第で
+/// 秒単位かかるため、tcp_reader_loop で直接 await すると Pong が読めず PONG_TIMEOUT で偽の切断に
+/// なる。書き戻しは順序依存 (Create→Write→Rename) なので並列化せず、この 1 タスクで直列に流す。
+/// 共有スコープが Disabled なら resolve が error を返し、read は error 応答・破壊系はログのみで
+/// 無視する (無断アクセス防止)。WholePc なら This PC 全体を投影する (書き戻しは writable のときだけ)。
+async fn fs_worker_loop(
+    mut rx: mpsc::Receiver<ControlMsg>,
+    share_scope: Arc<Mutex<ShareScope>>,
+    fs_reply_tx: mpsc::UnboundedSender<ControlMsg>,
+) {
+    // 読み取り専用共有で書き戻しを拒否した旨を記録済みか。ホストは保存のたびに FsWrite を
+    // チャンク単位で連投するため、毎回 warn するとログが埋まる。
+    let mut read_only_logged = false;
+    while let Some(msg) = rx.recv().await {
+        match msg {
             ControlMsg::FsList {
                 req_id,
                 path,
@@ -1014,7 +1046,7 @@ async fn tcp_reader_loop(
                     log_write_back_failure(&mut read_only_logged, "FsRename", &from, &e);
                 }
             }
-            other => tracing::debug!(?other, "ignored control msg"),
+            _ => {}
         }
     }
 }
