@@ -15,6 +15,7 @@ export default defineConfig({
         main: entry("src/index.html"),
         capture: entry("src/capture.html"),
         mobile: entry("src/mobile.html"),
+        "tab-ghost": entry("src/tab-ghost.html"),
       },
     },
   },

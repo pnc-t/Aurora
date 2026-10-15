@@ -22,6 +22,8 @@ mod net;
 mod secret;
 mod stats;
 #[cfg(desktop)]
+mod tab_drag;
+#[cfg(desktop)]
 mod update_manifest;
 
 use net::SessionState;
@@ -219,6 +221,7 @@ pub fn run() {
         log::open_logs_folder,
         log::export_logs_zip,
         update_manifest::verify_update_manifest,
+        tab_drag::begin_tab_drag,
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![

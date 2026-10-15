@@ -12,6 +12,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import "./styles/base.css";
 import {
   DEFAULT_SETTINGS,
+  beginTabDrag,
   findCaptureWindowAt,
   handoffSessionToWindow,
   initPerfFlag,
@@ -247,6 +248,18 @@ const tabs: TabsHandle = mountTabs(tabbar, {
   onClose: (id) => sessions.get(id)?.closeByUser(),
   onAdd: () => openAddTab(),
   onDetach: (id, sx, sy) => void splitTab(id, sx, sy),
+  onDragStart: async (id) => {
+    const s = sessions.get(id);
+    // 接続確立済みのタブだけが分割/合流の対象 (splitTab と同じ条件)。それ以外は DOM のまま。
+    if (!s || !s.isConnected) return false;
+    try {
+      await beginTabDrag(id, s.tabLabel, sessions.size === 1);
+      return true;
+    } catch (e) {
+      logger.debug(`tab drag tracking unavailable: ${String(e)}`);
+      return false;
+    }
+  },
   onCloseOthers: (id) => {
     for (const s of [...sessions.values()]) if (s.id !== id) s.closeByUser();
   },
@@ -332,6 +345,20 @@ async function splitTab(id: string, screenX: number, screenY: number): Promise<v
   s.detachForHandoff();
   removeSession(s);
 }
+
+// --- Rust 側のタブドラッグ追跡 (begin_tab_drag) の結果。離した座標で合流/分割を確定する ---
+void getCurrentWebviewWindow().listen<{ session_id: string; x: number; y: number }>(
+  "aurora://tab-drag-drop",
+  (e) => {
+    void (async () => {
+      const { session_id: id, x, y } = e.payload;
+      await splitTab(id, x, y);
+      // まだこの窓に残っている = 分割/合流しなかった (失敗・未接続等)。タブ 1 枚の窓はドラッグ中に
+      // 隠しているため、ここで戻さないと見えない窓が残る。
+      if (sessions.has(id)) await getCurrentWindow().show();
+    })();
+  },
+);
 
 // --- 「+」: 同じ窓に新しいタブ (接続) を追加 ---
 function openAddTab(): void {
