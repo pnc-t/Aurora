@@ -15,6 +15,8 @@ pub async fn disconnect(
             // (connect_to_host のセッション置換経路と同じ後始末に統一)。
             s.shutdown();
         }
+        // 接続処理中ならまだ inner に居ないため、完了時に破棄させる印を付ける。
+        state.cancel_connecting(|id, _| id == session_id);
     }
     // セッションが恒久的に終了するため、staging に保持していた接続資格情報も破棄する
     // (connect_inner が再接続用に remove せず保持する方針にした分、ここで対称に消す)。
@@ -42,6 +44,7 @@ pub async fn disconnect_host(
             .filter(|(_, h)| h.host.trim().to_lowercase() == target)
             .map(|(id, _)| id.clone())
             .collect();
+        state.cancel_connecting(|_, c| c.host.trim().to_lowercase() == target);
         let mut stopped = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(h) = guard.remove(&id) {

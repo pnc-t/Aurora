@@ -345,10 +345,22 @@ impl SessionHandle {
     }
 }
 
+/// 接続処理中のセッション 1 件。[`SessionState::connecting`] の値。
+pub struct Connecting {
+    pub host: String,
+    /// 接続処理中に disconnect / disconnect_host が来た。完了時に登録せず停止する。
+    pub cancelled: bool,
+}
+
 #[derive(Default)]
 pub struct SessionState {
     /// session_id → 稼働中セッション。1 capture ウィンドウ = 1 セッション。
     pub inner: Mutex<HashMap<String, SessionHandle>>,
+    /// session_id → 接続処理中 (DNS/TCP/ハンドシェイク中で `inner` 未登録) のセッション。
+    /// この間の切断要求は `inner` では空振りするため、ここに印を付けて完了時に破棄させる
+    /// (付けないと UI から消えたタブのセッションが完了後に登録され、誰も止められない孤児になる)。
+    /// 印付けと完了時の確認は必ず `inner` のロックを握ってから行い、両者を直列化する。
+    pub connecting: std::sync::Mutex<HashMap<String, Connecting>>,
     /// `open_capture_window` が一時的に積む接続資格情報 (session_id → password)。
     /// `connect_to_host` が pop して使う。URL に平文パスワードを載せないための受け渡し。
     /// 値 `None` は「保存済みパスワード (DPAPI) を使う」を意味する。
@@ -364,6 +376,18 @@ pub struct SessionState {
     /// `adopt` と同じ理由でデスクトップ限定。
     #[cfg(desktop)]
     pub last_focused_capture: std::sync::Mutex<Option<String>>,
+}
+
+impl SessionState {
+    /// 条件に合う接続処理中セッションにキャンセル印を付ける。`inner` のロック保持中に呼ぶこと。
+    pub(crate) fn cancel_connecting(&self, pred: impl Fn(&str, &Connecting) -> bool) {
+        let mut map = self.connecting.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, c) in map.iter_mut() {
+            if pred(id, c) {
+                c.cancelled = true;
+            }
+        }
+    }
 }
 
 /// セッション id の発番。プロセス生存期間で一意ならよいので単調増加カウンタで足りる。
