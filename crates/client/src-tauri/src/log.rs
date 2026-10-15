@@ -11,6 +11,9 @@
 /// `error`/`warn`/`info`/`debug` のいずれか (未知は info 扱い)。
 #[tauri::command]
 pub fn frontend_log(level: String, message: String) {
+    // メッセージにはホスト由来の文字列 (端末名・エラー文等) が混ざりうる。改行をそのまま書くと
+    // 偽のログ行を作れるため、1 行に畳む。
+    let message = message.replace('\r', "\\r").replace('\n', "\\n");
     match level.as_str() {
         "error" => tracing::error!(target: "aurora::frontend", "{message}"),
         "warn" => tracing::warn!(target: "aurora::frontend", "{message}"),

@@ -7,7 +7,6 @@
 //! (差し替え + 再起動のトランザクション責任は NSIS 側に委ねる)。
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
@@ -219,25 +218,7 @@ fn fetch_capped(url: &str) -> Result<Vec<u8>> {
 /// ダウンロード済みデータを検証する。tauri updater と同じスキームに揃え、改竄/破損した setup.exe
 /// を適用しないため。
 fn verify_signature(data: &[u8], signature_b64: &str) -> Result<()> {
-    let pubkey_bytes = base64::engine::general_purpose::STANDARD
-        .decode(HOST_UPDATE_PUBKEY)
-        .context("failed to decode embedded update public key")?;
-    let pubkey_text =
-        String::from_utf8(pubkey_bytes).context("embedded update public key is not valid UTF-8")?;
-    let public_key = minisign_verify::PublicKey::decode(&pubkey_text)
-        .context("invalid embedded minisign public key")?;
-
-    let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(signature_b64)
-        .context("failed to decode update signature")?;
-    let sig_text = String::from_utf8(sig_bytes).context("update signature is not valid UTF-8")?;
-    let signature =
-        minisign_verify::Signature::decode(&sig_text).context("invalid update signature format")?;
-
-    // tauri updater は prehashed (非 legacy) 署名を生成するため allow_legacy=false で厳密照合する。
-    public_key
-        .verify(data, &signature, false)
-        .context("update signature verification failed")?;
+    aurora_common::update_sig::verify(data, HOST_UPDATE_PUBKEY, signature_b64)?;
     Ok(())
 }
 

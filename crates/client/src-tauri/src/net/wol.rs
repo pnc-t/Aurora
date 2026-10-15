@@ -55,8 +55,14 @@ pub async fn wake_host(
     let secret_key = wol_secret_key(&relay_host, relay_port);
     let password = match password {
         Some(p) => p,
-        None => crate::secret::get(&app, &secret_key)
-            .ok_or_else(|| "保存済みパスワードがありません".to_string())?,
+        // secret ストアは同期 I/O + OS 呼び出し (DPAPI / Keystore) のため tokio ワーカーを塞がない。
+        None => {
+            let (app2, key2) = (app.clone(), secret_key.clone());
+            tokio::task::spawn_blocking(move || crate::secret::get(&app2, &key2))
+                .await
+                .map_err(|e| format!("パスワードの読み出しに失敗: {e}"))?
+                .ok_or_else(|| "保存済みパスワードがありません".to_string())?
+        }
     };
 
     let target = format!("{relay_host}:{relay_port}");
@@ -92,11 +98,6 @@ pub async fn wake_host(
     let session = hs.into_transport().map_err(err)?;
     tracing::info!("wol: noise handshake complete");
 
-    // ハンドシェイク成功 = パスワード一致。保存はユーザーが明示的に選んだときだけ。
-    if save_password && let Err(e) = crate::secret::put(&app, &secret_key, &password) {
-        tracing::warn!(error = %e, "failed to save wol relay password");
-    }
-
     let mut tx_nonce: u64 = 0;
     send_wol_msg(
         &mut tcp,
@@ -111,6 +112,17 @@ pub async fn wake_host(
     let mut plain = Vec::new();
     let mut rx_nonce: u64 = 0;
     let msg = decode_wol_msg(&session, &buf, &mut rx_nonce, &mut plain).map_err(err)?;
+    // XXpsk3 の initiator はハンドシェイク完了だけでは相手が PSK を知っている保証が無い (PSK は
+    // こちらの第 3 メッセージで検証される側)。相手の暗号文を復号できた = PSK 一致が確定した
+    // ここで初めて保存する (誤ったパスワードを保存済みにしない)。保存はユーザーが選んだときだけ。
+    if save_password {
+        let (app2, key2, pw2) = (app.clone(), secret_key.clone(), password.clone());
+        match tokio::task::spawn_blocking(move || crate::secret::put(&app2, &key2, &pw2)).await {
+            Ok(Err(e)) => tracing::warn!(error = %e, "failed to save wol relay password"),
+            Err(e) => tracing::warn!(error = %e, "save wol relay password task failed"),
+            Ok(Ok(())) => {}
+        }
+    }
     match msg {
         WolMsg::Ack { ok: true, .. } => {
             tracing::info!("wol: wake acked");
