@@ -370,6 +370,14 @@ fn main() -> Result<()> {
         return dump_h264(n);
     }
 
+    // サーバ起動は 1 プロセスだけ。キャプチャ/エンコーダの初期化 (GPU) に入る前に判定する。
+    // ガードはプロセス終了まで保持する (run_server は通常戻らず、トレイ終了は exit する)。
+    let Some(_instance) = system::instance::acquire() else {
+        tracing::info!("another aurora-host server is already running; exiting");
+        system::instance::notify_already_running();
+        return Ok(());
+    };
+
     // 待受ポートの解決: `--port` 明示なら CLI を、無ければ保存値 (トレイ管理) を、それも
     // 無ければ既定を使う。
     let port = if args.port_explicit {
@@ -378,14 +386,19 @@ fn main() -> Result<()> {
         system::load_port().unwrap_or(args.port)
     };
     let bind = resolve_bind_spec(args.bind);
-    run_server(
+    let result = run_server(
         args.perf,
         args.fps_cap,
         args.max_bitrate_bps,
         port,
         bind,
         args.encode_gpu,
-    )
+    );
+    // GUI サブシステムでは main の Err は誰にも見えない (stderr が無い)。ログにだけは必ず残す。
+    if let Err(e) = &result {
+        tracing::error!(error = %e, "host server stopped with error");
+    }
+    result
 }
 
 /// 待受アドレスの解決方法 ([`BindSpec`]) を決める。
@@ -597,7 +610,12 @@ fn reexec_self(current_port: u16) {
         ?args,
         "capture stuck unrecoverably; re-exec host to recover"
     );
-    match std::process::Command::new(&exe).args(&args).spawn() {
+    match std::process::Command::new(&exe)
+        .args(&args)
+        // 子は単一インスタンスガードで親 (このプロセス) の終了を待ってから引き継ぐ。
+        .env(system::instance::REEXEC_CHILD_ENV, "1")
+        .spawn()
+    {
         Ok(mut child) => {
             // spawn 成功 = 回復成功ではない。子が引数不正や初期化失敗で即死しているのに
             // exit(0) すると誰も残らない (完全停止)。少しだけ待って生存確認し、即死して
@@ -661,6 +679,7 @@ fn maybe_reexec_for_igpu_capture(target_name: &str) {
     match std::process::Command::new(&exe)
         .args(&args)
         .env(IGPU_FALLBACK_ENV, "1")
+        .env(system::instance::REEXEC_CHILD_ENV, "1")
         .spawn()
     {
         Ok(mut child) => {
