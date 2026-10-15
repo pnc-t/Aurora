@@ -799,7 +799,9 @@ export class Session {
     // 設定でファイル共有が ON なら、この接続で This PC 全体を公開する (既定 OFF)。
     // 各セッションが自分の id で適用し、ホスト側は所有接続かつ登録端末のときだけドライブを mount する。
     if (settings.share_files) {
-      void setFileSharing(this.id, true).catch((e) => logger.warn("setFileSharing failed", e));
+      void setFileSharing(this.id, true, settings.share_files_writable).catch((e) =>
+        logger.warn("setFileSharing failed", e),
+      );
     }
     // 接続時に音声をミュートで始める設定なら、ホストへも初期状態として送る (ツールバー表示は
     // 下の setAudioAvailable(initialMuted) / syncSharedUi 側で揃える)。

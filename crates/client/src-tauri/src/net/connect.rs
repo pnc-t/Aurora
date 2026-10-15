@@ -755,6 +755,9 @@ async fn tcp_reader_loop(
     let mut download: Option<DownloadState> = None;
     // HostInfo (nonce 0) は connect_to_host で消費済みなので 1 から続ける。
     let mut tcp_rx_nonce: u64 = 1;
+    // 読み取り専用共有で書き戻しを拒否した旨を記録済みか。ホストは保存のたびに FsWrite を
+    // チャンク単位で連投するため、毎回 warn するとログが埋まる。
+    let mut read_only_logged = false;
     loop {
         read_tcp_frame(&mut read_half, &mut buf).await?;
         let msg = decode_ctrl_msg(&session, &buf, &mut tcp_rx_nonce, &mut plain)?;
@@ -961,7 +964,8 @@ async fn tcp_reader_loop(
             },
             // --- ProjFS ドライブリダイレクト: 自分のファイルをホストへ配信 ---
             // 共有スコープが Disabled なら resolve が error を返し、read は error 応答・破壊系は
-            // ログのみで無視する (無断アクセス防止)。WholePc なら This PC 全体を投影する。
+            // ログのみで無視する (無断アクセス防止)。WholePc なら This PC 全体を投影する
+            // (書き戻しは writable のときだけ)。
             ControlMsg::FsList {
                 req_id,
                 path,
@@ -989,28 +993,40 @@ async fn tcp_reader_loop(
             ControlMsg::FsCreate { path, is_dir } => {
                 let scope = share_scope.lock().await.clone();
                 if let Err(e) = fs_create(&scope, &path, is_dir).await {
-                    tracing::warn!(path = %path, error = %e, "FsCreate failed");
+                    log_write_back_failure(&mut read_only_logged, "FsCreate", &path, &e);
                 }
             }
             ControlMsg::FsWrite { path, offset, data } => {
                 let scope = share_scope.lock().await.clone();
                 if let Err(e) = fs_write(&scope, &path, offset, &data).await {
-                    tracing::warn!(path = %path, error = %e, "FsWrite failed");
+                    log_write_back_failure(&mut read_only_logged, "FsWrite", &path, &e);
                 }
             }
             ControlMsg::FsDelete { path } => {
                 let scope = share_scope.lock().await.clone();
                 if let Err(e) = fs_delete(&scope, &path).await {
-                    tracing::warn!(path = %path, error = %e, "FsDelete failed");
+                    log_write_back_failure(&mut read_only_logged, "FsDelete", &path, &e);
                 }
             }
             ControlMsg::FsRename { from, to } => {
                 let scope = share_scope.lock().await.clone();
                 if let Err(e) = fs_rename(&scope, &from, &to).await {
-                    tracing::warn!(from = %from, to = %to, error = %e, "FsRename failed");
+                    log_write_back_failure(&mut read_only_logged, "FsRename", &from, &e);
                 }
             }
             other => tracing::debug!(?other, "ignored control msg"),
         }
     }
+}
+
+/// 書き戻し失敗のログ。読み取り専用による拒否は想定内なので 1 セッション 1 回だけ記録する。
+fn log_write_back_failure(read_only_logged: &mut bool, op: &str, path: &str, error: &str) {
+    if error == READ_ONLY_SHARE {
+        if !*read_only_logged {
+            *read_only_logged = true;
+            tracing::info!(op, path = %path, "write-back rejected: share is read-only (further rejections not logged)");
+        }
+        return;
+    }
+    tracing::warn!(op, path = %path, error = %error, "write-back failed");
 }
