@@ -114,6 +114,11 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     // ハンドシェイク 3 メッセージ + transport 確立を 1 ブロックにまとめ、失敗時に遅延を挟む。
     // 相手 (クライアント) の静的公開鍵は transport 確立で hs が消費される前に控える
     // (デバイスピン留めの許可リスト照合に使う)。
+    // PSK は XXpsk3 の 3 通目の復号でしか検証されない。それより前の失敗 (到達性プローブの即切断・
+    // 無言タイムアウト・プロトコル不正) はパスワードを試していないので総当たりの試行として数えない
+    // (数えると launcher のプローブだけで tray に認証失敗が出てバックオフも伸びる)。無言で居座る
+    // 接続は HANDSHAKE_TIMEOUT と認証前枠の IP 別上限が抑える。
+    let mut psk_evaluated = false;
     let (session, remote_key, device_name) = match async {
         // <- e
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
@@ -130,6 +135,7 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
             .await
             .context("handshake timed out (s,se,psk)")??;
+        psk_evaluated = true;
         hs.read_msg(&buf, &mut tmp)?;
         let remote_key = hs.remote_static();
         // 最終メッセージの (暗号化済み) payload にクライアントが載せた端末名。デバイスピン留めの
@@ -149,6 +155,10 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
             // セッションは MAX_CLIENTS 側の管理で、認証前枠を握り続ける理由が無い。
             drop(preauth);
             triple
+        }
+        Err(e) if !psk_evaluated => {
+            tracing::debug!(peer = %peer, error = %e, "connection ended before authentication; not counted as auth failure");
+            return Err(e);
         }
         Err(e) => {
             // バックオフ待ちの前に認証前枠を返す。待つ間も握ると、1 ピアの失敗連投で枠が埋まる。

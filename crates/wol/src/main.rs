@@ -317,6 +317,9 @@ async fn handle_conn(
 
     // host (net/client.rs) と同じ 3 メッセージ Noise XX-PSK ハンドシェイク。失敗時 (主に PSK
     // 不一致による復号失敗) は送信元 IP 単位の指数バックオフを挟んでからエラーを返す (D-1)。
+    // PSK は 3 通目の復号でしか検証されないため、それより前の失敗は総当たりの試行として数えない
+    // (host net/client.rs と対称)。
+    let mut psk_evaluated = false;
     let session = match async {
         // <- e
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
@@ -333,6 +336,7 @@ async fn handle_conn(
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_tcp_frame(&mut stream, &mut buf))
             .await
             .context("handshake timed out (s,se,psk)")??;
+        psk_evaluated = true;
         hs.read_msg(&buf, &mut tmp)?;
         let session = hs.into_transport()?;
         Ok::<_, anyhow::Error>(session)
@@ -344,6 +348,10 @@ async fn handle_conn(
             drop(slot);
             throttle.record_success(peer.ip());
             s
+        }
+        Err(e) if !psk_evaluated => {
+            tracing::debug!(%peer, error = %e, "connection ended before authentication; not counted as auth failure");
+            return Err(e);
         }
         Err(e) => {
             // バックオフ待ちの前に枠を返す。待つ間も握ると、1 ピアの失敗連投で枠が埋まる。
