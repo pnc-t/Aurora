@@ -250,6 +250,26 @@ impl Default for ClientSettings {
     }
 }
 
+/// 履歴 / WoL 対象の読み込み→更新→書き込みを直列化するロック。マルチウィンドウや接続成功時の
+/// MAC・最終接続日時の保存が並行すると、後勝ちで片方の更新が消えるため。
+static HOSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock(m: &'static std::sync::Mutex<()>) -> std::sync::MutexGuard<'static, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 一時ファイルへ書いてから rename で置き換える。直接上書き中に落ちる (Android の kill 等) と
+/// JSON が途中で切れ、以後の読み込みが解析失敗で保存ごと詰まるため。
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)
+}
+
 fn config_path(app: &AppHandle, file: &str) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -308,6 +328,7 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
         last_connected: entry.last_connected,
     };
 
+    let _lock = lock(&HOSTS_LOCK);
     let mut hosts = load_recent_hosts(app.clone())?;
     match hosts
         .iter()
@@ -351,12 +372,14 @@ pub fn save_recent_host(app: AppHandle, entry: HostEntry) -> Result<(), String> 
 pub fn set_recent_hosts(app: AppHandle, hosts: Vec<HostEntry>) -> Result<(), String> {
     let mut hosts = hosts;
     hosts.truncate(MAX_RECENT);
+    let _lock = lock(&HOSTS_LOCK);
     write_hosts(&app, &hosts)
 }
 
 /// 指定 host の履歴を削除する。
 #[tauri::command]
 pub fn delete_recent_host(app: AppHandle, host: String) -> Result<(), String> {
+    let _lock = lock(&HOSTS_LOCK);
     let mut hosts = load_recent_hosts(app.clone())?;
     hosts.retain(|h| !h.host.eq_ignore_ascii_case(host.trim()));
     write_hosts(&app, &hosts)
@@ -364,12 +387,9 @@ pub fn delete_recent_host(app: AppHandle, host: String) -> Result<(), String> {
 
 fn write_hosts(app: &AppHandle, hosts: &[HostEntry]) -> Result<(), String> {
     let path = config_path(app, HOSTS_FILE)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("config dir 作成に失敗: {e}"))?;
-    }
     let json =
         serde_json::to_string_pretty(hosts).map_err(|e| format!("履歴の直列化に失敗: {e}"))?;
-    fs::write(&path, json).map_err(|e| format!("履歴の書き込みに失敗: {e}"))
+    write_atomic(&path, json.as_bytes()).map_err(|e| format!("履歴の書き込みに失敗: {e}"))
 }
 
 /// クライアント設定を読み込む。ファイルが無ければ既定値。
@@ -390,12 +410,9 @@ pub fn load_settings(app: AppHandle) -> Result<ClientSettings, String> {
 #[tauri::command]
 pub fn save_settings(app: AppHandle, settings: ClientSettings) -> Result<(), String> {
     let path = config_path(&app, SETTINGS_FILE)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("config dir 作成に失敗: {e}"))?;
-    }
     let json =
         serde_json::to_string_pretty(&settings).map_err(|e| format!("設定の直列化に失敗: {e}"))?;
-    fs::write(&path, json).map_err(|e| format!("設定の書き込みに失敗: {e}"))
+    write_atomic(&path, json.as_bytes()).map_err(|e| format!("設定の書き込みに失敗: {e}"))
 }
 
 /// WoL (Wake-on-LAN) 中継先の 1 件。`wake_host` (net/wol.rs) が `relay_host:relay_port`
@@ -448,6 +465,7 @@ pub fn list_wol_targets(app: AppHandle) -> Result<Vec<WolTarget>, String> {
 /// WoL 対象を保存する。`id` が一致する既存エントリは置換し、無ければ追加する。
 #[tauri::command]
 pub fn save_wol_target(app: AppHandle, target: WolTarget) -> Result<(), String> {
+    let _lock = lock(&WOL_LOCK);
     let mut targets = list_wol_targets(app.clone())?;
     match targets.iter().position(|t| t.id == target.id) {
         Some(i) => targets[i] = target,
@@ -459,12 +477,14 @@ pub fn save_wol_target(app: AppHandle, target: WolTarget) -> Result<(), String> 
 /// WoL 対象一覧を丸ごと差し替える (並べ替えの保存用)。
 #[tauri::command]
 pub fn set_wol_targets(app: AppHandle, targets: Vec<WolTarget>) -> Result<(), String> {
+    let _lock = lock(&WOL_LOCK);
     write_wol_targets(&app, &targets)
 }
 
 /// 指定 id の WoL 対象を削除する。
 #[tauri::command]
 pub fn delete_wol_target(app: AppHandle, id: String) -> Result<(), String> {
+    let _lock = lock(&WOL_LOCK);
     let mut targets = list_wol_targets(app.clone())?;
     targets.retain(|t| t.id != id);
     write_wol_targets(&app, &targets)
@@ -472,10 +492,24 @@ pub fn delete_wol_target(app: AppHandle, id: String) -> Result<(), String> {
 
 fn write_wol_targets(app: &AppHandle, targets: &[WolTarget]) -> Result<(), String> {
     let path = wol_targets_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("config dir 作成に失敗: {e}"))?;
-    }
     let json = serde_json::to_string_pretty(targets)
         .map_err(|e| format!("WoL 対象の直列化に失敗: {e}"))?;
-    fs::write(&path, json).map_err(|e| format!("WoL 対象の書き込みに失敗: {e}"))
+    write_atomic(&path, json.as_bytes()).map_err(|e| format!("WoL 対象の書き込みに失敗: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上書きで中身が置き換わり、一時ファイルが残らない (rename で消費される)。
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("aurora-cfg-test-{}", std::process::id()));
+        let path = dir.join("x.json");
+        write_atomic(&path, b"[1]").unwrap();
+        write_atomic(&path, b"[2]").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"[2]");
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

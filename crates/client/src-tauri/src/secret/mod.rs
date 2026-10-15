@@ -122,19 +122,33 @@ fn store_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join(FILE))
 }
 
-/// 暗号化マップを読み込む。ファイルが無ければ空。復号失敗時もエラーにせず空で返す
+/// put/delete の読み込み→書き戻しを直列化する。固定名の一時ファイルを共有するうえ、並行すると
+/// 片方の更新が失われるため (マルチウィンドウ・接続成功時の保存が同時に走りうる)。
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 暗号化マップを読み込む (読み取り専用の用途)。読めなければ空で返す
 /// (別ユーザーのファイルが残っていても接続フローを止めないため)。
 fn load_map(app: &AppHandle) -> BTreeMap<String, String> {
-    let Ok(path) = store_path(app) else {
-        return BTreeMap::new();
-    };
+    load_map_for_update(app).unwrap_or_default()
+}
+
+/// 書き戻し前提で暗号化マップを読み込む。ファイルが無い / 復号できない (別ユーザーの残骸等、
+/// 恒久的に使えない) なら空。読み込み自体の I/O エラーは `Err` で返す: ウイルス対策のロック等で
+/// 一瞬読めなかっただけで空とみなして書き戻すと、全ホストの保存パスワードを消してしまう。
+fn load_map_for_update(app: &AppHandle) -> Result<BTreeMap<String, String>, String> {
+    let path = store_path(app)?;
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(_) => return BTreeMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("保存済みパスワードの読み込みに失敗: {e}")),
     };
-    decrypt(&bytes)
-        .and_then(|plain| serde_json::from_slice(&plain).ok())
-        .unwrap_or_default()
+    match decrypt(&bytes).and_then(|plain| serde_json::from_slice(&plain).ok()) {
+        Some(map) => Ok(map),
+        None => {
+            tracing::warn!("saved password store is unreadable; starting from an empty store");
+            Ok(BTreeMap::new())
+        }
+    }
 }
 
 fn save_map(app: &AppHandle, map: &BTreeMap<String, String>) -> Result<(), String> {
@@ -161,7 +175,8 @@ pub fn get(app: &AppHandle, host: &str) -> Option<String> {
 
 /// 指定 host のパスワードを暗号化保存する (接続成功時に呼ぶ)。
 pub fn put(app: &AppHandle, host: &str, password: &str) -> Result<(), String> {
-    let mut map = load_map(app);
+    let _lock = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = load_map_for_update(app)?;
     map.insert(key(host), password.to_string());
     save_map(app, &map)
 }
@@ -175,7 +190,8 @@ pub fn saved_password_hosts(app: AppHandle) -> Result<Vec<String>, String> {
 /// 指定 host の保存済みパスワードを削除する (「忘れる」ボタン)。
 #[tauri::command]
 pub fn delete_host_password(app: AppHandle, host: String) -> Result<(), String> {
-    let mut map = load_map(&app);
+    let _lock = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = load_map_for_update(&app)?;
     if map.remove(&key(&host)).is_some() {
         save_map(&app, &map)?;
     }
