@@ -1,16 +1,16 @@
 ﻿; Aurora Host インストーラ (NSIS)
 ;
-; 操作される側 (aurora-host.exe) を配布する per-user インストーラ。
-; client (Tauri NSIS) と同じ「管理者プロンプトなしで入れて、Apps & features から
-; クリーンにアンインストールできる」体験に揃える。
+; 操作される側 (aurora-host.exe) を配布する per-machine インストーラ。
+; Apps & features からクリーンにアンインストールできる体験は client (Tauri NSIS) と揃える。
 ;
 ; ビルド: installer\host\build.ps1 (release ビルド → makensis)。
 ;
 ; 設計方針:
-;   - 本体は per-user (%LOCALAPPDATA%\Programs\Aurora Host) に置く。RequestExecutionLevel
-;     user なのでインストール自体は UAC 不要。
-;   - ただし「ログオン時自動起動 (/RL HIGHEST タスク)」と「ProjFS 有効化」はシステム操作で
-;     昇格が要る。これらを選んだときだけ ExecShellWait "runas" で 1 回 UAC を出して実行する。
+;   - 本体は per-machine (%ProgramFiles%\Aurora Host) に置き、インストーラ全体を昇格で動かす。
+;     自動起動タスクは /RL HIGHEST (昇格) でこの exe を毎ログオン実行するため、ユーザー権限で
+;     書き換えられる場所 (旧: %LOCALAPPDATA%\Programs) に置くと、同一ユーザーの非昇格コードが
+;     exe を差し替えるだけで UAC 無しに管理者権限を得られてしまう。昇格スクリプト (VDD 導入/削除)
+;     も同じ理由で管理者専用の $INSTDIR から実行し、$TEMP は経由しない。
 ;   - クリーンアンインストール最優先。痕跡 = exe / スケジュールタスク "Aurora Host" /
 ;     %LOCALAPPDATA%\Aurora (port / password.bin) / ショートカット / レジストリ。全部消す。
 ;   - 自動起動タスクの登録/解除は host 自身の --install / --uninstall に委譲 (二重実装しない)。
@@ -31,10 +31,10 @@ Unicode true
 
 Name "${APPNAME} ${APPVERSION}"
 OutFile "..\dist\aurora-host-setup-${APPVERSION}.exe"
-; 本体は per-user。インストール自体に管理者権限は要らない。
-RequestExecutionLevel user
-InstallDir "$LOCALAPPDATA\Programs\Aurora Host"
-InstallDirRegKey HKCU "${REGROOT}" "InstallDir"
+; 本体は per-machine (設計方針参照)。インストール/アンインストールとも昇格して動く。
+RequestExecutionLevel admin
+InstallDir "$PROGRAMFILES64\Aurora Host"
+InstallDirRegKey HKLM "${REGROOT}" "InstallDir"
 SetCompressor /SOLID lzma
 
 VIProductVersion "${APPVERSION}.0"
@@ -113,19 +113,23 @@ Section "Aurora Host 本体" SecCore
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Apps & features 登録 (per-user = HKCU)
-  WriteRegStr   HKCU "${REGROOT}"   "InstallDir"        "$INSTDIR"
-  WriteRegStr   HKCU "${UNINSTKEY}" "DisplayName"       "${APPNAME}"
-  WriteRegStr   HKCU "${UNINSTKEY}" "DisplayVersion"    "${APPVERSION}"
-  WriteRegStr   HKCU "${UNINSTKEY}" "Publisher"         "${PUBLISHER}"
-  WriteRegStr   HKCU "${UNINSTKEY}" "DisplayIcon"       "$INSTDIR\${EXENAME}"
-  WriteRegStr   HKCU "${UNINSTKEY}" "UninstallString"   '"$INSTDIR\uninstall.exe"'
-  WriteRegStr   HKCU "${UNINSTKEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
-  WriteRegStr   HKCU "${UNINSTKEY}" "InstallLocation"   "$INSTDIR"
-  WriteRegDWORD HKCU "${UNINSTKEY}" "NoModify"          1
-  WriteRegDWORD HKCU "${UNINSTKEY}" "NoRepair"          1
+  ; Apps & features 登録 (per-machine = HKLM)
+  WriteRegStr   HKLM "${REGROOT}"   "InstallDir"        "$INSTDIR"
+  WriteRegStr   HKLM "${UNINSTKEY}" "DisplayName"       "${APPNAME}"
+  WriteRegStr   HKLM "${UNINSTKEY}" "DisplayVersion"    "${APPVERSION}"
+  WriteRegStr   HKLM "${UNINSTKEY}" "Publisher"         "${PUBLISHER}"
+  WriteRegStr   HKLM "${UNINSTKEY}" "DisplayIcon"       "$INSTDIR\${EXENAME}"
+  WriteRegStr   HKLM "${UNINSTKEY}" "UninstallString"   '"$INSTDIR\uninstall.exe"'
+  WriteRegStr   HKLM "${UNINSTKEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
+  WriteRegStr   HKLM "${UNINSTKEY}" "InstallLocation"   "$INSTDIR"
+  WriteRegDWORD HKLM "${UNINSTKEY}" "NoModify"          1
+  WriteRegDWORD HKLM "${UNINSTKEY}" "NoRepair"          1
 
+  ; per-machine なのでスタートメニューは全ユーザー側に置く。$LOCALAPPDATA 等はインストールした
+  ; ユーザー側を指したままにする必要があるため、使い終わったら current へ戻す。
+  SetShellVarContext all
   CreateShortcut "$SMPROGRAMS\Aurora Host.lnk" "$INSTDIR\${EXENAME}"
+  SetShellVarContext current
 SectionEnd
 
 Section "ログオン時に自動起動 (推奨)" SecAutostart
@@ -134,11 +138,11 @@ Section "ログオン時に自動起動 (推奨)" SecAutostart
   ; 既存フラグもここで丸ごとスキップすることで書き換えず、ユーザー設定を保持する。
   IfSilent secautostart_skip secautostart_run
   secautostart_run:
-    ; ONLOGON /RL HIGHEST タスクの登録は昇格が要る。host 自身の --install に委譲し、
-    ; ここだけ runas で 1 回だけ昇格する。タスク名は "Aurora Host" (autostart.rs)。
-    ExecShellWait "runas" "$INSTDIR\${EXENAME}" "--install" SW_HIDE
+    ; ONLOGON /RL HIGHEST タスクの登録は host 自身の --install に委譲する (インストーラは
+    ; 昇格済みなので追加の UAC は出ない)。タスク名は "Aurora Host" (autostart.rs)。
+    ExecShellWait "" "$INSTDIR\${EXENAME}" "--install" SW_HIDE
     ; アンインストール時に --uninstall を呼ぶべきか判定するためのフラグ。
-    WriteRegDWORD HKCU "${REGROOT}" "Autostart" 1
+    WriteRegDWORD HKLM "${REGROOT}" "Autostart" 1
   secautostart_skip:
 SectionEnd
 
@@ -148,9 +152,9 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   IfSilent secvdd_skip secvdd_run
   secvdd_run:
   ; MttVDD (Virtual Display Driver) を C:\ProgramData\Aurora\vdd に展開し、デバイスノード作成 +
-  ; ドライバ束縛まで行う。ドライバのインストールは昇格が要るため runas で一回だけ UAC を出す。
-  ; アンインストールではドライバは削除しない (システム共有コンポーネント、手動削除を推奨)。
-  ; $TEMP はユーザー権限で書き込み可能。コピーと nefconw/pnputil は runas で昇格して実行。
+  ; ドライバ束縛まで行う (インストーラは昇格済み)。
+  ; 展開先は $TEMP ではなく管理者専用の $INSTDIR 配下にする。$TEMP はユーザー権限で書き込めるため、
+  ; 展開から昇格実行までの間に同一ユーザーの非昇格コードが ps1 / nefconw を差し替えられる。
   ;
   ; 重要: MttVDD は Root\MttVDD の root 列挙ソフトウェアデバイス。`pnputil /add-driver /install`
   ; はドライバをストアに入れるだけでデバイスノードを作らない (= 仮想ディスプレイが 0 個のまま)。
@@ -162,7 +166,7 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   ; そこで導入ロジックを専用 PowerShell スクリプト install_vdd.ps1 (ASCII・ログ出力・MTT1337 検証
   ; +再試行付き) に集約し、ここからは昇格して呼ぶだけにする。失敗時は C:\ProgramData\Aurora\vdd\
   ; install_log.txt に原因が残る。
-  SetOutPath "$TEMP\AuroraVDDSetup"
+  SetOutPath "$INSTDIR\vdd-setup"
   File "vdd\MttVDD.dll"
   File "vdd\MttVDD.inf"
   File "vdd\mttvdd.cat"
@@ -170,16 +174,17 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   File "vdd\nefconw.exe"
   File "install_vdd.ps1"
 
-  ; 配置 + ノード作成 + ドライバ束縛 + 検証を install_vdd.ps1 が行う (昇格が 1 回必要)。
+  ; 配置 + ノード作成 + ドライバ束縛 + 検証を install_vdd.ps1 が行う。
   ; -HostExe を渡し、VDD 登録直後に host --align-vdd で描画 GPU をキャプチャ GPU に合わせる
   ; (クロス GPU 固着の恒久回避。SecCore は先に実行済みなので exe は配置済み)。
-  ExecShellWait "runas" "powershell.exe" \
-    '-NoProfile -ExecutionPolicy Bypass -File "$TEMP\AuroraVDDSetup\install_vdd.ps1" -HostExe "$INSTDIR\${EXENAME}"' SW_HIDE
+  ExecShellWait "" "powershell.exe" \
+    '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\vdd-setup\install_vdd.ps1" -HostExe "$INSTDIR\${EXENAME}"' SW_HIDE
 
-  ; 一時ファイルを削除。
-  RMDir /r "$TEMP\AuroraVDDSetup"
+  ; 展開物を削除 (SetOutPath でカレントになっているため抜けてから消す)。
+  SetOutPath "$INSTDIR"
+  RMDir /r "$INSTDIR\vdd-setup"
 
-  WriteRegDWORD HKCU "${REGROOT}" "VDDInstalled" 1
+  WriteRegDWORD HKLM "${REGROOT}" "VDDInstalled" 1
   secvdd_skip:
 SectionEnd
 
@@ -187,18 +192,18 @@ Section /o "ファイル転送機能を有効化 (Client-ProjFS)" SecProjFS
   ; サイレント更新は UAC を出さない契約のため丸ごとスキップする (既定 /o の防御ガード)。
   IfSilent secprojfs_skip secprojfs_run
   secprojfs_run:
-  ; Windows オプション機能の有効化は昇格が要る。再起動が必要な場合あり。
+  ; Windows オプション機能の有効化 (インストーラは昇格済み)。再起動が必要な場合あり。
   ; 共有機能なのでアンインストールでは戻さない。
-  ExecShellWait "runas" "powershell.exe" \
+  ExecShellWait "" "powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -Command "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart"' SW_HIDE
   secprojfs_skip:
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      "aurora-host 本体を %LOCALAPPDATA%\Programs に配置します (必須)。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecAutostart} "ログオン時に自動起動する ONLOGON タスクを登録します (昇格が 1 回必要)。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecVDD}       "仮想ディスプレイドライバ (MttVDD) をインストールします。RDP 風の仮想画面で接続するのに必要です (昇格が 1 回必要)。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecProjFS}    "RDP 風ファイル転送に使う Windows 機能 Client-ProjFS を有効化します (昇格が 1 回必要)。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      "aurora-host 本体を %ProgramFiles% に配置します (必須)。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecAutostart} "ログオン時に自動起動する ONLOGON タスクを登録します。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecVDD}       "仮想ディスプレイドライバ (MttVDD) をインストールします。RDP 風の仮想画面で接続するのに必要です。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecProjFS}    "RDP 風ファイル転送に使う Windows 機能 Client-ProjFS を有効化します。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ---------------------------------------------------------------------------
@@ -207,17 +212,17 @@ Section "Uninstall"
   nsExec::Exec 'taskkill /IM ${EXENAME} /F'
   Pop $0
 
-  ; 2) 自動起動タスクを登録していたら解除 (昇格が要る)。未登録なら無駄な UAC を出さない。
-  ReadRegDWORD $0 HKCU "${REGROOT}" "Autostart"
+  ; 2) 自動起動タスクを登録していたら解除 (アンインストーラは昇格済み)。
+  ReadRegDWORD $0 HKLM "${REGROOT}" "Autostart"
   ${If} $0 == 1
-    ExecShellWait "runas" "$INSTDIR\${EXENAME}" "--uninstall" SW_HIDE
+    ExecShellWait "" "$INSTDIR\${EXENAME}" "--uninstall" SW_HIDE
   ${EndIf}
 
   ; 3) VDD ドライバを削除 (インストールした場合のみ)。
   ;    デバイス削除・ドライバストア削除・C:\ProgramData\Aurora\vdd 削除を一括で行う。
-  ReadRegDWORD $0 HKCU "${REGROOT}" "VDDInstalled"
+  ReadRegDWORD $0 HKLM "${REGROOT}" "VDDInstalled"
   ${If} $0 == 1
-    ExecShellWait "runas" "powershell.exe" \
+    ExecShellWait "" "powershell.exe" \
       '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\remove_vdd.ps1"' SW_HIDE
   ${EndIf}
 
@@ -226,12 +231,14 @@ Section "Uninstall"
   Delete "$INSTDIR\remove_vdd.ps1"
   Delete "$INSTDIR\uninstall.exe"
   RMDir  "$INSTDIR"
+  SetShellVarContext all
   Delete "$SMPROGRAMS\Aurora Host.lnk"
+  SetShellVarContext current
 
-  ; 5) 設定・暗号化パスワード・ログを完全削除 (per-user なので昇格不要)。
+  ; 5) 設定・暗号化パスワード・ログを完全削除 (インストール先と違いこれらは per-user)。
   RMDir /r "$LOCALAPPDATA\Aurora"
 
   ; 6) レジストリを掃除。
-  DeleteRegKey HKCU "${UNINSTKEY}"
-  DeleteRegKey HKCU "${REGROOT}"
+  DeleteRegKey HKLM "${UNINSTKEY}"
+  DeleteRegKey HKLM "${REGROOT}"
 SectionEnd

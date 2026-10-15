@@ -244,6 +244,16 @@ fn verify_signature(data: &[u8], signature_b64: &str) -> Result<()> {
 /// setup.exe をダウンロード・検証してサイレントインストールを起動する。差し替え + 再起動は
 /// NSIS 側のトランザクション責任 (別タスク)。成功すると戻らない (`exit(0)`)。
 fn apply(av: &AvailableUpdate) -> Result<()> {
+    // インストール先は管理者専用の %ProgramFiles% で、setup も requireAdministrator。非昇格
+    // (スタートメニューからの手動起動等) では setup を置けず、起動しても UAC が要りサイレント
+    // 更新の契約を守れないため、ダウンロード前に理由が分かる形で中止する。
+    // setup を一時ディレクトリへ逃がす回避はしない: ユーザー書込可の場所に置くと検証→実行の
+    // 間に差し替えられ、昇格実行される (インストール先を per-machine にした理由と同じ)。
+    if !crate::display::process_is_elevated() {
+        anyhow::bail!(
+            "host is not elevated; update requires the logon task (or run as administrator)"
+        );
+    }
     let exe = std::env::current_exe().context("current_exe failed")?;
     let dir = exe
         .parent()

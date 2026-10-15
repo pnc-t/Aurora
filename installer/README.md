@@ -5,7 +5,7 @@ Aurora は配布物が 4 つに分かれる。生成物はすべて **`installer
 | 配布物 | 中身 | インストーラ | 生成方法 |
 |--------|------|--------------|----------|
 | **client** | Tauri アプリ (`aurora-client`) | NSIS (per-user) | `cargo tauri build` |
-| **host** | 素のバイナリ (`aurora-host`) | NSIS (per-user) | `installer\host\build.ps1` |
+| **host** | 素のバイナリ (`aurora-host`) | NSIS (per-machine) | `installer\host\build.ps1` |
 | **wol** | raspi 向け静的バイナリ (`aurora-wol`) | 不要 (`install` サブコマンド内蔵) | `cargo zigbuild` (build-all 内) |
 | **android** | Tauri Android アプリ (APK) | 不要 (APK 直接インストール) | `cargo tauri android build` (build-all の `-Android`) |
 
@@ -67,8 +67,11 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 ## host (NSIS)
 
 `installer/host/aurora-host.nsi` がインストーラ定義。client と同じ NSIS で、
-**per-user インストール (管理者プロンプトなし)** + Apps & features 登録の
-クリーンアンインストーラを備える。自動起動タスクの登録/解除は host 自身の
+**per-machine インストール (起動時に UAC 1 回)** + Apps & features 登録の
+クリーンアンインストーラを備える。per-machine にしているのは、自動起動タスクが
+`/RL HIGHEST` (昇格) で exe を毎ログオン実行するため。ユーザー権限で書き換えられる
+場所に置くと、同一ユーザーの非昇格コードが exe を差し替えるだけで UAC 無しに管理者
+権限を得られてしまう。自動起動タスクの登録/解除は host 自身の
 `--install` / `--uninstall` に委譲する。
 
 前提ツール: makensis。**client を一度 `cargo tauri build` していれば** Tauri が
@@ -84,12 +87,14 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 出力: `installer\dist\aurora-host-setup-0.1.0.exe`
 
 インストーラの挙動:
-- `aurora-host.exe` を `%LOCALAPPDATA%\Programs\Aurora Host\` に配置 (per-user・UAC 不要)。
+- `aurora-host.exe` を `%ProgramFiles%\Aurora Host\` に配置 (per-machine・インストーラ起動時に UAC 1 回)。
 - コンポーネント「ログオン時に自動起動」(既定 ON) → `aurora-host --install` で
-  ONLOGON / RL HIGHEST のスケジュールタスク "Aurora Host" を登録。タスク登録は
-  昇格が要るため、**この項目を選んだときだけ UAC が 1 回出る**。
+  ONLOGON / RL HIGHEST のスケジュールタスク "Aurora Host" を、**インストーラを昇格させた
+  ユーザー**に登録する (標準ユーザーが別の管理者アカウントで昇格するとそちらに登録される)。
 - コンポーネント「ファイル転送機能を有効化」(既定 OFF) → `Client-ProjFS` を有効化
-  (これも選択時のみ UAC 1 回。再起動が必要な場合あり)。不要なら OFF のまま。
+  (再起動が必要な場合あり)。不要なら OFF のまま。
+- 自己更新は昇格して動く host (= 自動起動タスク経由) でのみ行える。スタートメニューから
+  非昇格で起動した host は更新要求をログに残して中止する。
 
 **接続パスワード**はインストーラでは設定しない。インストール後にトレイアイコン
 右クリック →「パスワード変更」、または端末から `aurora-host --set-password` を
@@ -100,10 +105,10 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 「アプリと機能」または同梱アンインストーラから削除。痕跡を残さない:
 1. 常駐プロセス (`aurora-host.exe`) を停止。
 2. 自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
-   を解除 (タスク削除に昇格が要るため UAC が 1 回出る。未登録なら出ない)。
+   を解除。
 3. exe / インストール先フォルダ / スタートメニューのショートカットを削除。
 4. `%LOCALAPPDATA%\Aurora\` (port / password.bin) を削除。
-5. HKCU のアンインストール登録を削除。
+5. HKLM のアンインストール登録を削除。
 
 ProjFS (`Client-ProjFS`) は他用途でも使う共有システム機能のため、
 アンインストールでは**無効化しない**。手動で戻す場合:
