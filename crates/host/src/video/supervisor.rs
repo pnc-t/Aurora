@@ -223,6 +223,7 @@ fn supervise(
                 if let Some(stdout) = stdout
                     && !relay(
                         BufReader::new(stdout),
+                        &mut child,
                         &nal_tx,
                         &codec_tx,
                         &tray_bus,
@@ -283,6 +284,7 @@ fn replay_messages(r: &Replay) -> Vec<ToWorker> {
 /// ワーカーの出力を net へ流す。ワーカーが終わったら `true`、net 側が終わったら `false`。
 fn relay(
     mut out: impl std::io::Read,
+    child: &mut Child,
     nal_tx: &mpsc::Sender<EncodedNal>,
     codec_tx: &mpsc::Sender<CodecStatus>,
     tray_bus: &SharedTrayBus,
@@ -306,11 +308,11 @@ fn relay(
                     let _ = tx.send((resolution, host_codecs));
                 }
             }
-            FromWorker::Nal(nal) => {
-                if nal_tx.blocking_send(nal).is_err() {
-                    return false;
-                }
-            }
+            FromWorker::Nal(nal) => match send_nal(nal_tx, nal, child) {
+                NalSend::Sent => {}
+                NalSend::WorkerGone => return true,
+                NalSend::NetGone => return false,
+            },
             FromWorker::Codec(status) => {
                 if codec_tx.blocking_send(status).is_err() {
                     return false;
@@ -324,6 +326,35 @@ fn relay(
                 if let Err(e) = crate::display::end_takeover() {
                     tracing::warn!(error = %e, "end_takeover requested by capture worker failed");
                 }
+            }
+        }
+    }
+}
+
+enum NalSend {
+    Sent,
+    WorkerGone,
+    NetGone,
+}
+
+/// NAL を net へ渡す。クライアントが居ない間、net は映像を受け取らない (背圧でエンコードを止めて
+/// 待機中の CPU/GPU を抑えるため、net/mod.rs のファンアウト参照)。ここで待つ間はパイプを読まない
+/// ので、背圧はワーカーまで届いてエンコードが止まる。ただ待ち続けるとワーカーの終了 (固着からの
+/// 作り直し) に気付けず、次にクライアントが来るまで作り直しが遅れる (VM で再現・2026-10-17)。
+/// 待つ間もワーカーの生死を見て、終わっていたら渡しかけの NAL は捨てる (古い映像なので不要)。
+fn send_nal(nal_tx: &mpsc::Sender<EncodedNal>, nal: EncodedNal, child: &mut Child) -> NalSend {
+    const RETRY: Duration = Duration::from_millis(50);
+    let mut nal = nal;
+    loop {
+        match nal_tx.try_send(nal) {
+            Ok(()) => return NalSend::Sent,
+            Err(mpsc::error::TrySendError::Closed(_)) => return NalSend::NetGone,
+            Err(mpsc::error::TrySendError::Full(back)) => {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return NalSend::WorkerGone;
+                }
+                nal = back;
+                std::thread::sleep(RETRY);
             }
         }
     }
