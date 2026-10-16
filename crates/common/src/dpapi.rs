@@ -30,7 +30,8 @@ pub enum DpapiError {
 mod imp {
     use super::DpapiError;
     use windows::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
+        CryptProtectData, CryptUnprotectData,
     };
     use windows::core::PCWSTR;
 
@@ -51,9 +52,23 @@ mod imp {
         }
     }
 
-    /// 平文を DPAPI で暗号化する。処理後は入力バッファ (ヒープ上の平文) をゼロ埋めする
-    /// (ベストエフォート)。
+    /// 平文を DPAPI (ユーザースコープ) で暗号化する。処理後は入力バッファ (ヒープ上の平文) を
+    /// ゼロ埋めする (ベストエフォート)。
     pub fn protect(plain: &[u8]) -> Result<Vec<u8>, DpapiError> {
+        protect_with(plain, CRYPTPROTECT_UI_FORBIDDEN)
+    }
+
+    /// 平文を DPAPI (マシンスコープ) で暗号化する。**同じ PC のどのアカウントでも復号できる**ので、
+    /// 機密性は保存先ファイルの ACL で担保すること (ここが守るのはディスク持ち出し等のオフライン
+    /// 読み取りだけ)。サインイン前でも SYSTEM が読める必要がある host の接続パスワード用。
+    pub fn protect_machine(plain: &[u8]) -> Result<Vec<u8>, DpapiError> {
+        protect_with(
+            plain,
+            CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE,
+        )
+    }
+
+    fn protect_with(plain: &[u8], flags: u32) -> Result<Vec<u8>, DpapiError> {
         let mut input = plain.to_vec();
         let in_blob = CRYPT_INTEGER_BLOB {
             cbData: input.len() as u32,
@@ -64,15 +79,7 @@ mod imp {
         // SAFETY: in_blob は input が指す cbData バイトの有効領域を指す。成功すると out は
         // DPAPI が LocalAlloc した領域を指すので、直後に OutBlob でラップして必ず解放する。
         let result = unsafe {
-            CryptProtectData(
-                &in_blob,
-                PCWSTR::null(),
-                None,
-                None,
-                None,
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut out,
-            )
+            CryptProtectData(&in_blob, PCWSTR::null(), None, None, None, flags, &mut out)
         };
         let out = OutBlob(out);
         result.map_err(|source| DpapiError::Api {
@@ -91,7 +98,7 @@ mod imp {
         Ok(encrypted)
     }
 
-    /// DPAPI で暗号化されたバイト列を復号する。
+    /// DPAPI で暗号化されたバイト列を復号する (ユーザー/マシンどちらのスコープの BLOB も可)。
     pub fn unprotect(enc: &[u8]) -> Result<Vec<u8>, DpapiError> {
         let mut input = enc.to_vec();
         let in_blob = CRYPT_INTEGER_BLOB {
@@ -125,11 +132,17 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{protect, unprotect};
+pub use imp::{protect, protect_machine, unprotect};
 
 /// 非 Windows では未対応。
 #[cfg(not(windows))]
 pub fn protect(_plain: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::Unsupported)
+}
+
+/// 非 Windows では未対応。
+#[cfg(not(windows))]
+pub fn protect_machine(_plain: &[u8]) -> Result<Vec<u8>, DpapiError> {
     Err(DpapiError::Unsupported)
 }
 

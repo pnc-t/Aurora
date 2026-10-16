@@ -3,7 +3,7 @@
 //! 接続パスワード (PSK) は「知識要素」だが、漏れると任意端末から接続できてしまう。これを
 //! 補う「所持要素」として、Noise XX が交換するクライアントの**永続静的公開鍵**を許可リストで
 //! 照合する (= 2 要素目)。許可リストは公開鍵のみで非機密のため平文保存
-//! (`%LOCALAPPDATA%\Aurora\trusted_devices.txt`、1 行 = `<hex公開鍵> <ラベル>`)。
+//! (`%ProgramData%\Aurora\host\trusted_devices.txt`、1 行 = `<hex公開鍵> <ラベル>`)。
 //!
 //! 既定は**無効** (opt-in)。有効時は許可リストに無い鍵を拒否し、登録は**ペアリング窓 + オーナー
 //! 承認**の 2 段階で行う: オーナーがトレイで窓を開くと、その間に PSK 認証を通った未知端末は
@@ -332,10 +332,10 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(all(target_os = "windows", not(test)))]
 fn store_path(file: &str) -> Option<std::path::PathBuf> {
-    Some(aurora_common::paths::data_dir()?.join(file))
+    Some(crate::system::state::state_dir().ok()?.join(file))
 }
 
-/// テストでは本物の `%LOCALAPPDATA%\Aurora` に書かない。承認/削除を通すテストが実データの
+/// テストでは本物の状態ディレクトリ (`%ProgramData%\Aurora\host`) に書かない。承認/削除を通すテストが実データの
 /// 許可リストを上書きし、`cargo test` のたびに開発機の登録端末が全消去されていた (2026-10-16)。
 #[cfg(all(target_os = "windows", test))]
 fn store_path(file: &str) -> Option<std::path::PathBuf> {

@@ -950,10 +950,10 @@ mod imp {
         }
     }
 
-    /// ログフォルダ (`%LOCALAPPDATA%\Aurora\logs`) をエクスプローラで開く。未作成なら作る
+    /// ログフォルダ (`%ProgramData%\Aurora\host\logs`) をエクスプローラで開く。未作成なら作る
     /// (起動直後でまだ書き込みが無い場合に空フォルダを開けるように)。
     fn open_logs_folder(hwnd: HWND) {
-        let Some(dir) = aurora_common::logging::default_log_dir() else {
+        let Ok(dir) = crate::system::state::log_dir() else {
             message_box(
                 hwnd,
                 "ログフォルダの場所を特定できませんでした。",
@@ -961,7 +961,6 @@ mod imp {
             );
             return;
         };
-        let _ = std::fs::create_dir_all(&dir);
         // explorer で開く。GUI サブシステムのため標準の関連付け起動でよい。
         if std::process::Command::new("explorer")
             .arg(&dir)

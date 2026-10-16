@@ -97,6 +97,8 @@ struct Args {
     install_service: bool,
     /// SYSTEM サービスを停止・削除して終了する (`--uninstall-service`)。
     uninstall_service: bool,
+    /// 旧版のユーザー側状態を状態ディレクトリへ移して終了する (`--migrate-user-state`)。
+    migrate_user_state: bool,
 }
 
 /// `--help` で出す使い方。フラグを増やしたらここも足す。
@@ -124,6 +126,7 @@ OPTIONS:
         --uninstall         自動起動を解除する
         --install-service   SYSTEM サービスとして登録・開始する (UAC/ロック画面対応、管理者)
         --uninstall-service SYSTEM サービスを停止・削除する (管理者)
+        --migrate-user-state 旧版の設定/パスワードを %ProgramData%\\Aurora\\host へ移す (管理者)
         --set-password      接続パスワードを対話入力して暗号化保存する
         --clear-password    保存済みパスワードを削除する
         --list-displays     ディスプレイ一覧を表示する
@@ -161,6 +164,7 @@ impl Default for Args {
             service: false,
             install_service: false,
             uninstall_service: false,
+            migrate_user_state: false,
         }
     }
 }
@@ -250,6 +254,7 @@ fn parse_args() -> Result<Args, String> {
             "--service" => args.service = true,
             "--install-service" => args.install_service = true,
             "--uninstall-service" => args.uninstall_service = true,
+            "--migrate-user-state" => args.migrate_user_state = true,
             // サービスが本体に付ける印。挙動は `system::service::is_service_child` が直接見る。
             system::service::SERVICE_CHILD_ARG => {}
             "--help" | "-h" => args.help = true,
@@ -313,6 +318,7 @@ fn main() -> Result<()> {
         || args.uninstall
         || args.install_service
         || args.uninstall_service
+        || args.migrate_user_state
         || args.set_password
         || args.clear_password
         || args.dump_bmp
@@ -357,6 +363,9 @@ fn main() -> Result<()> {
     }
     if args.uninstall_service {
         return system::service::uninstall_service();
+    }
+    if args.migrate_user_state {
+        return system::state::migrate_user_state();
     }
     if args.install {
         // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
@@ -474,7 +483,7 @@ fn build_log_filter(level: Option<&str>) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into())
 }
 
-/// `tracing` を初期化する。`to_file` が真なら `%LOCALAPPDATA%\Aurora\logs\host.<日付>.log`
+/// `tracing` を初期化する。`to_file` が真なら `%ProgramData%\Aurora\host\logs\<file_stem>.<日付>.log`
 /// へ日次ローテ (7 世代) + 非ブロッキングで書き、デバッグビルドや CLI 実行では加えて
 /// コンソール (stdout) にも出す。ファイル出力先が用意できない場合はコンソールへフォール
 /// バックする。フィルタの優先順位は `--log-level` 引数 > `RUST_LOG` 環境変数 > 既定
@@ -487,8 +496,12 @@ fn init_tracing(
     aurora_common::logging::init(aurora_common::logging::LogOptions {
         file_stem,
         filter: build_log_filter(level),
+        // 保護済みの %ProgramData%\Aurora\host\logs が用意できない (非管理者の開発実行・所有者不正) ときは
+        // 原因をログで追えるよう従来のユーザー側へ書く。
         dir: if to_file {
-            aurora_common::logging::default_log_dir()
+            system::state::log_dir()
+                .ok()
+                .or_else(aurora_common::logging::default_log_dir)
         } else {
             None
         },

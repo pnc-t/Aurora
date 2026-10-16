@@ -1,7 +1,8 @@
 //! host の非機密ローカル設定 (待受ポート・エンコード GPU 指定) の保存。
 //!
 //! パスワード ([`crate::security::secret`], DPAPI 暗号化) と異なりこれらは機密ではないので、
-//! 平文テキストで保存する。設定ごとに 1 ファイル (`%LOCALAPPDATA%\Aurora\<名前>`) に分ける。
+//! 平文テキストで保存する。設定ごとに 1 ファイル (`%ProgramData%\Aurora\host\<名前>`、ACL で
+//! SYSTEM/Administrators のみ = 一般ユーザーは改ざんできない) に分ける。
 //! - `port`: トレイの「ポートを変更」で書き込み、起動時に読む。`--port` 引数が明示された
 //!   場合はそちらが優先される (CLI > 保存値 > 既定、解決は `main` で行う)。
 //! - `encode-gpu`: `--encode-gpu` はトレイ UI が無く CLI が唯一の入口のため、`--port` と異なり
@@ -14,7 +15,7 @@ use anyhow::Result;
 #[cfg(target_os = "windows")]
 fn store_path(file_name: &str) -> Result<std::path::PathBuf> {
     use anyhow::Context;
-    let dir = aurora_common::paths::data_dir().context("LOCALAPPDATA is not set")?;
+    let dir = crate::system::state::state_dir().context("resolve host state dir")?;
     Ok(dir.join(file_name))
 }
 

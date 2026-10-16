@@ -31,3 +31,21 @@ pub fn data_dir() -> Option<PathBuf> {
         Some(p)
     }
 }
+
+/// PC 単位 (全ユーザー共通) の状態ディレクトリ (`%ProgramData%\Aurora`) を返す。環境変数が
+/// 無ければ `None`。非 Windows は [`data_dir`] と同じ。
+///
+/// host を SYSTEM サービスで動かすと `%LOCALAPPDATA%` が SYSTEM のプロファイルを指し、サインイン
+/// 前にも状態を読む必要があるため、host はこちらに置く (client は [`data_dir`] のまま)。
+/// **既定の ACL は一般ユーザーにも読み取り/作成を許す**ので、機密や改ざんされては困る状態を置く
+/// 呼び出し側が、作成・使用前にディレクトリの所有者と ACL を固めること。
+pub fn machine_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        Some(PathBuf::from(std::env::var_os("ProgramData")?).join("Aurora"))
+    }
+    #[cfg(not(windows))]
+    {
+        data_dir()
+    }
+}
