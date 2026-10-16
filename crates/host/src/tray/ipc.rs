@@ -15,8 +15,9 @@
 
 use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use super::control::{TrayContext, TrayReply, TrayRequest, handle};
 
@@ -173,60 +174,91 @@ fn own_session_id() -> anyhow::Result<u32> {
 
 // ---- トレイ (クライアント) 側 ----
 
-type Job = (TrayRequest, mpsc::Sender<TrayReply>);
+/// ワーカーへの 1 要求。`deadline` を過ぎた要求は UI 側が既に「応答なし」と表示済みなので、
+/// 本体へ送らずに捨てる (失敗と見せた操作が後から適用されるのを防ぐ)。
+struct Job {
+    req: TrayRequest,
+    reply: mpsc::Sender<TrayReply>,
+    deadline: Instant,
+}
 
 /// パイプ越しに本体を操作する [`super::TrayControl`]。I/O は専用スレッドで行い、UI スレッドは
 /// 応答を [`CALL_TIMEOUT`] までしか待たない。
 pub struct PipeControl {
     tx: mpsc::Sender<Job>,
+    /// ワーカーが本体と通信中か。本体が固まって前の要求が返らない間は、新しい要求を積まずに
+    /// 即「応答なし」を返す (1 秒周期のポーリングごとに UI を 5 秒止めない)。
+    busy: Arc<AtomicBool>,
 }
 
 impl PipeControl {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = busy.clone();
         let _ = std::thread::Builder::new()
             .name("tray-pipe".into())
-            .spawn(move || worker(rx));
-        Self { tx }
+            .spawn(move || worker(rx, worker_busy));
+        Self { tx, busy }
     }
 }
 
+const NO_RESPONSE: &str = "本体が応答しません。\n直前の操作が後から反映される場合があります。";
+
 impl super::TrayControl for PipeControl {
     fn call(&self, req: TrayRequest) -> TrayReply {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send((req, reply_tx)).is_err() {
+        if self.busy.load(Ordering::Acquire) {
+            return TrayReply::Failed(NO_RESPONSE.into());
+        }
+        let (reply, reply_rx) = mpsc::channel();
+        let job = Job {
+            req,
+            reply,
+            deadline: Instant::now() + CALL_TIMEOUT,
+        };
+        if self.tx.send(job).is_err() {
             return TrayReply::Failed("本体に接続できません。".into());
         }
         reply_rx
             .recv_timeout(CALL_TIMEOUT)
-            .unwrap_or_else(|_| TrayReply::Failed("本体が応答しません。".into()))
+            .unwrap_or_else(|_| TrayReply::Failed(NO_RESPONSE.into()))
     }
 }
 
-fn worker(rx: mpsc::Receiver<Job>) {
+fn worker(rx: mpsc::Receiver<Job>, busy: Arc<AtomicBool>) {
     let mut conn: Option<std::fs::File> = None;
-    for (req, reply_tx) in rx {
-        if conn.is_none() {
-            match connect() {
-                Ok(f) => conn = Some(f),
-                Err(e) => {
-                    tracing::debug!(error = %e, "tray pipe connect failed");
-                    let _ = reply_tx.send(TrayReply::Failed("本体に接続できません。".into()));
-                    continue;
-                }
+    for job in rx {
+        if Instant::now() >= job.deadline {
+            continue;
+        }
+        busy.store(true, Ordering::Release);
+        let reply = exchange(&mut conn, &job.req);
+        busy.store(false, Ordering::Release);
+        let _ = job.reply.send(reply);
+    }
+}
+
+/// 必要なら繋ぎ直して 1 往復する。失敗したら接続を捨て、次の要求で繋ぎ直す。
+fn exchange(conn: &mut Option<std::fs::File>, req: &TrayRequest) -> TrayReply {
+    if conn.is_none() {
+        match connect() {
+            Ok(f) => *conn = Some(f),
+            Err(e) => {
+                tracing::debug!(error = %e, "tray pipe connect failed");
+                return TrayReply::Failed("本体に接続できません。".into());
             }
         }
-        let Some(f) = conn.as_mut() else { continue };
-        match roundtrip(f, &req) {
-            Ok(reply) => {
-                let _ = reply_tx.send(reply);
-            }
-            Err(e) => {
-                // 本体の再起動などで切れた。次の要求で繋ぎ直す。
-                tracing::debug!(error = %e, "tray pipe request failed; reconnecting next time");
-                conn = None;
-                let _ = reply_tx.send(TrayReply::Failed("本体に接続できません。".into()));
-            }
+    }
+    let Some(f) = conn.as_mut() else {
+        return TrayReply::Failed("本体に接続できません。".into());
+    };
+    match roundtrip(f, req) {
+        Ok(reply) => reply,
+        Err(e) => {
+            // 本体の再起動などで切れた。次の要求で繋ぎ直す。
+            tracing::debug!(error = %e, "tray pipe request failed; reconnecting next time");
+            *conn = None;
+            TrayReply::Failed("本体に接続できません。".into())
         }
     }
 }
