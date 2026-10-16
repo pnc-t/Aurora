@@ -53,10 +53,8 @@ pub struct DxgiCapturer {
 /// capture_loop の re-exec 判定に使う: ロック/UAC 中の ACCESS_LOST はデスクトップが
 /// 戻れば復帰する正常動作であり、「プロセス再起動が必要な固着」として数えてはならない。
 pub fn input_desktop_is_default() -> bool {
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetUserObjectInformationW,
-        OpenInputDesktop, UOI_NAME,
+        CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, OpenInputDesktop,
     };
 
     // SAFETY: 入力デスクトップを読み取り最小権限で開くだけ。失敗 = セキュアデスクトップ等で
@@ -66,26 +64,12 @@ pub fn input_desktop_is_default() -> bool {
             Ok(d) => d,
             Err(_) => return false,
         };
-    let mut name = [0u16; 64];
-    let mut needed = 0u32;
-    // SAFETY: desk は直前に取得した有効ハンドル。バッファ長 (バイト) を渡し UTF-16 名を受ける。
-    let got = unsafe {
-        GetUserObjectInformationW(
-            HANDLE(desk.0),
-            UOI_NAME,
-            Some(name.as_mut_ptr().cast()),
-            (name.len() * 2) as u32,
-            Some(&mut needed),
-        )
-    };
+    let name = crate::system::desktop::desktop_name(desk);
     // SAFETY: 上で開いたデスクトップハンドルを閉じる (リーク防止)。
     let _ = unsafe { CloseDesktop(desk) };
-    match got {
-        Ok(()) => {
-            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-            String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("default")
-        }
-        Err(_) => true,
+    match name {
+        Some(n) => n.eq_ignore_ascii_case("default"),
+        None => true,
     }
 }
 
@@ -165,6 +149,9 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
 /// dGPU からデスクトップを複製できない徴候で、呼び出し側 (main) が iGPU フォールバックの判断に使う。
 pub fn select_capture_adapter(target: &str) -> CaptureAdapter {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+    // サービス配下でサインイン画面中に起動した場合、プローブの DuplicateOutput も入力デスクトップ
+    // (Winlogon) 上で叩かないと E_ACCESSDENIED になり、アダプタ選択を誤る。
+    crate::system::desktop::follow_input_desktop();
     // SAFETY: CreateDXGIFactory1 は OUT パラメータを初期化する。
     let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
         Ok(f) => f,
@@ -520,6 +507,9 @@ impl DxgiCapturer {
     }
 
     fn from_output(device: SharedDevice, output: IDXGIOutput) -> Result<Self> {
+        // 複製はスレッドのデスクトップに対して作られる。UAC/ロック画面 (Winlogon) へ切り替わった
+        // 後の再構築で乗り換えないと、ACCESS_LOST の再構築ループから抜けられない (SYSTEM 時のみ効く)。
+        crate::system::desktop::follow_input_desktop();
         let d3d = &device.device;
         // SAFETY: output live。GetDesc は値返し。GDI デバイス名 (\\.\DISPLAYn) を得る。
         let out_desc = unsafe { output.GetDesc() }.context("IDXGIOutput::GetDesc")?;
