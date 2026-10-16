@@ -15,18 +15,16 @@
 //! - 親の `%ProgramData%\Aurora` には ACL を付けない。VDD ドライバ (インストーラが `vdd\` に配置) は
 //!   親からの継承 ACL で設定ファイルを読むため、親を保護すると仮想ディスプレイが壊れる。
 //!   親は所有者だけ検査する (一般ユーザー所有の親なら子の `host\` をすり替えられるため)。
-//! - ログ (`logs\`) だけはユーザーが「ログフォルダを開く」で読めるよう Users に読み取りを足す。
-//!   ログに機密は出さない方針 (CLAUDE.md) なので、読めても実害は接続元 IP 程度。
+//! - ログ (`logs\`) も同じく SYSTEM / Administrators のみ。接続元 IP・端末の指紋・転送した
+//!   ファイルのパスが残るので、PC の他のユーザーには読ませない (トレイは管理者として動くので開ける)。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 
-/// 状態ディレクトリ: SYSTEM と Administrators のみフルコントロール、継承を切る (P)。
+/// 状態ディレクトリとログ: SYSTEM と Administrators のみフルコントロール、継承を切る (P)。
 const STATE_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-/// ログ: 上に加えて Users へ読み取り。
-const LOGS_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
 
 /// 保護済みの状態ディレクトリを返す。成功するまでは呼ばれるたびに作成・検査・ACL 適用を試み、
 /// 成功した結果だけをプロセス内で使い回す (起動直後の一過性の失敗をプロセス終了まで引きずらない)。
@@ -41,7 +39,7 @@ pub fn log_dir() -> Result<PathBuf> {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     cached_or(&DIR, || {
         let dir = state_dir()?.join("logs");
-        prepare(&dir, LOGS_SDDL)?;
+        prepare(&dir, STATE_SDDL)?;
         Ok(dir)
     })
 }
