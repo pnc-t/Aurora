@@ -30,6 +30,8 @@ const MAX_MESSAGE: usize = 256 * 1024;
 const CLIENT_ACCESS: u32 = 0x0012_0083;
 /// パイプの DACL (継承なし)。昇格した管理者と SYSTEM のみ。
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+/// 同時に受け付けるトレイ接続の上限 (サービスが起こすトレイ + 手動で出したもの程度)。
+const MAX_CLIENTS: usize = 4;
 /// トレイが本体の応答を待つ上限。本体が固まってもトレイ UI まで固めない。
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -111,16 +113,42 @@ async fn serve_inner(ctx: TrayContext) -> anyhow::Result<()> {
         anyhow::anyhow!("create tray pipe (already created by another process?): {e}")
     })?;
     tracing::info!("tray pipe listening");
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     loop {
-        server.connect().await?;
+        // 1 回の失敗でループごと終えると、以後トレイから一切操作できなくなる。作り直して続ける。
+        if let Err(e) = server.connect().await {
+            tracing::warn!(error = %e, "tray pipe connect failed; recreating instance");
+            server = next_instance(&security).await;
+            continue;
+        }
         let client = server;
-        server = security.create(false)?;
+        server = next_instance(&security).await;
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("too many tray pipe clients; dropping new connection");
+            continue;
+        };
         let ctx = ctx.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle_client(client, ctx, own_session).await {
                 tracing::debug!(error = %e, "tray pipe client ended");
             }
         });
+    }
+}
+
+/// 次の待受インスタンスを作る。作れるまで間を空けて繰り返す (一過性の失敗で待受を失わない)。
+async fn next_instance(
+    security: &PipeSecurity,
+) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    loop {
+        match security.create(false) {
+            Ok(s) => return s,
+            Err(e) => {
+                tracing::warn!(error = %e, "create tray pipe instance failed; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
