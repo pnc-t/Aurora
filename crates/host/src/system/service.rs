@@ -54,11 +54,16 @@ mod imp {
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, TokenSessionId,
     };
     use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-        GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
-        WaitForSingleObject,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+        GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
+        STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
     use windows::core::{PCWSTR, PWSTR};
     use windows_service::service::{
@@ -97,6 +102,33 @@ mod imp {
 
     // SAFETY: 保持するのはカーネルハンドル値だけで、どのスレッドから閉じても安全。
     unsafe impl Send for OwnedHandle {}
+
+    /// 本体とトレイを入れるジョブ。サービスプロセスが異常終了してハンドルが閉じると、OS が中の
+    /// プロセスをまとめて終了する (KILL_ON_JOB_CLOSE)。入れないと孤児の本体がポートと単一
+    /// インスタンスを握り続け、再起動したサービスの本体が即終了するバックオフに陥る。
+    /// 本体が起こす孫 (自己更新の setup 等) はジョブに入れない (SILENT_BREAKAWAY_OK)。
+    /// 入れると、更新中にサービスを止めた時点で setup ごと殺されてしまう。
+    struct Job(OwnedHandle);
+
+    impl Job {
+        fn new() -> Result<Self> {
+            // SAFETY: 無名ジョブを既定のセキュリティで作るだけ。ハンドルは OwnedHandle が閉じる。
+            let job = OwnedHandle(unsafe { CreateJobObjectW(None, PCWSTR::null()) }?);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            // SAFETY: job は有効なジョブハンドル。info は呼び出し中有効で、長さはその実サイズ。
+            unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }?;
+            Ok(Self(job))
+        }
+    }
 
     /// サービスが起動して見張っている本体。
     struct Child {
@@ -179,6 +211,10 @@ mod imp {
             .into_iter()
             .filter(|a| a != "--service")
             .collect::<Vec<_>>();
+        // ジョブを作れなくても起動は続ける (サービスが落ちたときの後始末が効かなくなるだけ)。
+        let job = Job::new()
+            .inspect_err(|e| tracing::warn!(error = %e, "failed to create job object; children may outlive the service"))
+            .ok();
         let mut child: Option<Child> = None;
         let mut backoff = BACKOFF_MIN;
         let mut next_spawn = Instant::now();
@@ -228,7 +264,7 @@ mod imp {
             }
 
             if child.is_none() && target != NO_CONSOLE_SESSION && Instant::now() >= next_spawn {
-                match spawn_in_session(target, &forward) {
+                match spawn_in_session(target, &forward, job.as_ref()) {
                     Ok(c) => {
                         tracing::info!(pid = c.pid, session = c.session, "host process started");
                         child = Some(c);
@@ -266,7 +302,7 @@ mod imp {
                 && tray_closed_in != Some(target)
                 && Instant::now() >= next_tray
             {
-                match spawn_tray(target) {
+                match spawn_tray(target, job.as_ref()) {
                     Ok(Some(t)) => {
                         tracing::info!(pid = t.pid, session = t.session, "tray started");
                         tray = Some(t);
@@ -310,7 +346,7 @@ mod imp {
     }
 
     /// 自分 (LocalSystem) のトークンを複製し、セッションだけを `session` に差し替えて本体を起動する。
-    fn spawn_in_session(session: u32, forward: &[String]) -> Result<Child> {
+    fn spawn_in_session(session: u32, forward: &[String], job: Option<&Job>) -> Result<Child> {
         let mut own = HANDLE::default();
         // SAFETY: 自プロセスのトークンを複製用の権限で開く。own は出力先。
         unsafe {
@@ -352,11 +388,11 @@ mod imp {
         let mut args = vec![SERVICE_CHILD_ARG.to_string()];
         args.extend(forward.iter().cloned());
         // 環境は親 (SYSTEM) を継承する。
-        create_process(&primary, &args, None, session)
+        create_process(&primary, &args, None, session, job)
     }
 
     /// ログオンユーザーのトークンでトレイ (`--tray`) を起動する。ユーザーが居なければ `Ok(None)`。
-    fn spawn_tray(session: u32) -> Result<Option<Child>> {
+    fn spawn_tray(session: u32, job: Option<&Job>) -> Result<Option<Child>> {
         let mut user = HANDLE::default();
         // SAFETY: session のログオンユーザーのトークンを出力先へ受ける (SeTcb 権限 = LocalSystem で可)。
         // 失敗はサインイン画面などユーザー未ログオンの状態。
@@ -365,7 +401,7 @@ mod imp {
         }
         let user = OwnedHandle(user);
         let env = EnvBlock::for_user(&user)?;
-        create_process(&user, &["--tray".to_string()], Some(&env), session).map(Some)
+        create_process(&user, &["--tray".to_string()], Some(&env), session, job).map(Some)
     }
 
     /// `CreateEnvironmentBlock` が作るユーザーの環境変数ブロック (Drop で解放)。トレイに利用者の
@@ -389,12 +425,14 @@ mod imp {
         }
     }
 
-    /// 自分の exe を `token` で `session` の対話デスクトップに起動する。
+    /// 自分の exe を `token` で `session` の対話デスクトップに起動する。`job` があれば、走り出す前
+    /// (停止状態で作って割り当ててから再開) にジョブへ入れる。
     fn create_process(
         token: &OwnedHandle,
         args: &[String],
         env: Option<&EnvBlock>,
         session: u32,
+        job: Option<&Job>,
     ) -> Result<Child> {
         let exe = std::env::current_exe().context("get current exe path")?;
         let mut cmdline = quote_arg(&exe.to_string_lossy());
@@ -430,7 +468,7 @@ mod imp {
                 None,
                 None,
                 false,
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
                 env.map(|e| e.0 as *const std::ffi::c_void),
                 PCWSTR::null(),
                 &si,
@@ -438,10 +476,19 @@ mod imp {
             )
         }
         .context("CreateProcessAsUserW")?;
-        // スレッドハンドルは使わないので即閉じる。
-        drop(OwnedHandle(pi.hThread));
+        let thread = OwnedHandle(pi.hThread);
+        let process = OwnedHandle(pi.hProcess);
+        if let Some(job) = job {
+            // SAFETY: どちらも直前に作った有効なハンドル。プロセスはまだ停止状態。
+            if let Err(e) = unsafe { AssignProcessToJobObject(job.0.0, process.0) } {
+                tracing::warn!(error = %e, "failed to assign process to job object");
+            }
+        }
+        // SAFETY: CREATE_SUSPENDED で作った主スレッドを再開する。
+        unsafe { ResumeThread(thread.0) };
+        drop(thread);
         Ok(Child {
-            process: OwnedHandle(pi.hProcess),
+            process,
             pid: pi.dwProcessId,
             session,
             started: Instant::now(),
