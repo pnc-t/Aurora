@@ -1741,7 +1741,13 @@ fn capture_loop(
                 // も ACCESS_LOST が続くので、この条件でも確実に検出できる。
                 // SYSTEM (サービス配下) では下の再構築が Winlogon へ乗り換えて取り込みを続ける
                 // (system::desktop)。非 SYSTEM は乗り換えられず、Default 復帰まで待つだけ。
-                if !capture::input_desktop_is_default() {
+                //
+                // ただしサービス配下ではロック中も数える。ロック画面をまたぐと DWM へのプロセス単位の
+                // 接続が壊れ (ACM 有効機で実機確認・2026-10-17)、Winlogon へ乗り換えて作り直しても
+                // ACCESS_LOST が続く。数えないとロック中は映像が止まったままになり (入力は届くので
+                // 遠隔からロック解除できない)、再起動 (= 新しい接続) まで回復しない。サービス配下の
+                // re-exec はサービスに作り直させるだけで、クライアントは自動再接続する。
+                if !capture::input_desktop_is_default() && !system::service::is_service_child() {
                     first_fail = None;
                     tracing::debug!(error = %e, name = %cur_name, "capture failed on lock/secure desktop; not counted as stuck");
                 } else {
