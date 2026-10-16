@@ -330,9 +330,11 @@ mod imp {
     }
 
     fn topology_file() -> Option<std::path::PathBuf> {
-        let p = aurora_common::paths::data_dir()?;
-        let _ = std::fs::create_dir_all(&p);
-        Some(p.join("takeover_topology.txt"))
+        Some(
+            crate::system::state::state_dir()
+                .ok()?
+                .join("takeover_topology.txt"),
+        )
     }
 
     fn serialize_topology(states: &[DisplayState]) -> String {
@@ -380,9 +382,11 @@ mod imp {
 
     /// CCD のバイナリ保存先 (raw bytes)。テキスト版 (`topology_file`) はフォールバック用に併存。
     fn ccd_topology_file() -> Option<std::path::PathBuf> {
-        let p = aurora_common::paths::data_dir()?;
-        let _ = std::fs::create_dir_all(&p);
-        Some(p.join("takeover_ccd.bin"))
+        Some(
+            crate::system::state::state_dir()
+                .ok()?
+                .join("takeover_ccd.bin"),
+        )
     }
 
     /// 現在アクティブなトポロジ (paths/modes) を CCD で取得する。
