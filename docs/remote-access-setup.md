@@ -6,9 +6,9 @@ host が起動していて、パスワードが事前に分かっている** 必
 
 前提: ネットワークは **Tailscale (Tailnet)**。NAT 越え・中継は使わない。
 
-> 配布インストーラ (`aurora-host-setup-<ver>.exe`) で導入した場合、自動起動タスクの登録は
-> インストーラの Autostart セクションが行うため、以降の `--install` 手順は不要。以下の
-> `cargo build` / 生成された exe を直接叩く手順は、ソースからビルドする開発者向け。
+> 配布インストーラ (`aurora-host-setup-<ver>.exe`) で導入した場合、サービス登録は
+> インストーラの「サービスとして常駐」セクションが行うため、以降の `--install-service` 手順は
+> 不要。以下の `cargo build` / 生成された exe を直接叩く手順は、ソースからビルドする開発者向け。
 
 ---
 
@@ -22,21 +22,23 @@ host が起動していて、パスワードが事前に分かっている** 必
    保存しておき、両端であらかじめ共有する（接続時に「取得」するのではなく、自分で
    決めた値を両方が知っている状態にする）。
 
-   > **保存方法**: 入力したパスワードは **DPAPI**（Windows のデータ保護 API）で
-   > 暗号化して `%LOCALAPPDATA%\Aurora\password.bin` に保存される。平文の環境変数や
-   > レジストリには残らない。復号できるのは**保存したのと同じ Windows ユーザー
-   > アカウントだけ**で、他ユーザーや他 PC では復号できない。したがって
-   > `--set-password` は**ログオン時タスクを走らせるのと同じユーザー**で実行すること
-   > （昇格は不要）。
+   > **保存方法**: 入力したパスワードは **DPAPI**（Windows のデータ保護 API、マシン
+   > スコープ）で暗号化して `%ProgramData%\Aurora\host\password.bin` に保存される。平文の
+   > 環境変数やレジストリには残らない。サインイン前の SYSTEM サービスからも読めるよう
+   > PC 単位で保存し、読み書きはフォルダの ACL で **SYSTEM と Administrators だけ**に
+   > 限っている。したがって `--set-password` は**管理者の PowerShell** で実行する
+   > （トレイの「パスワードを変更」なら昇格不要）。
 
-2. **host をログオン時に自動起動する**
+2. **host を SYSTEM サービスとして常駐させる**
    誰も操作しなくても host プロセスが立ち上がっている必要がある。
-   `aurora-host --install` がタスクスケジューラに「ログオン時」タスクを登録する。
+   `aurora-host --install-service` が Windows サービス "AuroraHost" を登録する。
 
-   > **なぜ Windows サービスではないのか**: 画面キャプチャに使う DXGI Desktop
-   > Duplication は対話ユーザセッションでしか動作しない。Windows サービスは
-   > Session 0 で隔離実行されるためデスクトップをキャプチャできない。よって
-   > 「ログオン時タスク（= ユーザセッションで実行）」を使う。
+   > **仕組み**: 画面キャプチャに使う DXGI Desktop Duplication は対話ユーザセッション
+   > でしか動作せず、Windows サービスが動く Session 0 からはキャプチャできない。そこで
+   > サービスは本体を**対話セッションへ SYSTEM 権限で**起動し直す (RustDesk / Chrome
+   > Remote Desktop と同じ構成)。SYSTEM で動くので、UAC の確認画面・ロック画面・
+   > サインイン画面 (再起動直後を含む) も映して操作できる。トレイはログオンユーザーの
+   > 権限で別に起動される。
 
 3. **自宅 PC を起こし、Tailscale が起動している**
    - 電源: Wake-on-LAN で起こすか、スリープ運用 + WoL で復帰させる。
@@ -47,13 +49,13 @@ host が起動していて、パスワードが事前に分かっている** 必
 [事前準備・自宅で一度]
   aurora-host --set-password でパスワードを DPAPI 暗号保存
         +
-  aurora-host --install で自動起動を登録
+  aurora-host --install-service でサービスを登録
         +
   Tailscale を自動接続に、PC を WoL 対応に
         ↓
 [出先]
   client の WoL タブで自宅 PC を起こす（aurora-wol 中継、任意）
-        → Tailscale 接続 → ログオン時タスクで host 起動
+        → Tailscale 接続 → サービスが host を起動 (サインイン画面のままでも接続可)
         ↓
   client 起動 → 100.x.x.x:<port> + 既知のパスワードを入力 → 接続
 ```
@@ -72,43 +74,49 @@ cargo build -p aurora-host --release
 
 ### 2. パスワードを設定する（DPAPI 暗号保存）
 
-ログオン時タスクを走らせるのと**同じ Windows ユーザー**で、**昇格しない**通常の
-PowerShell で実行する（昇格すると別アカウント＝管理者の鍵で暗号化され、ユーザー
-セッションのタスクから復号できなくなる）:
+**管理者の PowerShell** で実行する（保存先 `%ProgramData%\Aurora\host` は SYSTEM と
+Administrators しか書けない）:
 
 ```powershell
 .\target\release\aurora-host.exe --set-password
 ```
 
 - パスワードを 2 回（確認入力）求められる。入力はエコーされない。
-- 入力値は DPAPI で暗号化され `%LOCALAPPDATA%\Aurora\password.bin` に保存される
-  （平文の環境変数・レジストリには残らない）。
+- 入力値は DPAPI で暗号化され `%ProgramData%\Aurora\host\password.bin` に保存される
+  （平文の環境変数・レジストリには残らない）。稼働中の host には届かないので、
+  サービス運用中に CLI で変えたら `Restart-Service AuroraHost` で反映する
+  （トレイからの変更は即反映）。
 - このパスワードは出先の client で入力する値そのもの。秘密として扱い、リポジトリや
   ログに残さないこと。
 - 変更は再実行で上書き、削除は `--clear-password`。
 - 未設定のまま host を起動すると、従来どおり起動ごとにランダムなパスワードを生成して
   表示する（手動接続・動作確認用）。無人起動にはこの手順での固定保存が必要。
 
-### 3. 自動起動を登録する
+### 3. サービスとして登録する
 
-実行ファイルのある場所から、登録したい起動オプションを付けて実行する。
-`--install` 以外の引数（`--port` など）はそのままタスクのコマンド行へ転送される。
-`/RL HIGHEST`（昇格実行）で登録されるため、**管理者の PowerShell** で実行する:
+実行ファイルのある場所から、登録したい起動オプションを付けて**管理者の PowerShell** で
+実行する。`--install-service` 以外の引数（`--port` など）はそのままサービスの起動引数へ
+転送される。旧方式の「ログオン時」タスクが登録済みなら削除される。
 
 ```powershell
-# 例: ポート 8000 / ビットレート上限 10Mbps で自動起動させる
-.\target\release\aurora-host.exe --install --port 8000 --max-bitrate 10
+# 例: ポート 8000 / ビットレート上限 10Mbps で常駐させる
+.\target\release\aurora-host.exe --install-service --port 8000 --max-bitrate 10
 ```
+
+> サービスは登録した exe のパスを実行し続ける。`target\release` の exe を登録したまま
+> 再ビルドすると exe がロックされて上書きできないので、先に `--uninstall-service` する。
 
 登録内容を確認・解除するには:
 
 ```powershell
-schtasks /Query /TN "Aurora Host"          # 確認
-.\target\release\aurora-host.exe --uninstall   # 解除
+Get-Service AuroraHost                                  # 確認
+.\target\release\aurora-host.exe --uninstall-service    # 解除
 ```
 
-> パスワードはタスク定義へ埋め込まれない（手順 2 で保存した DPAPI ファイルを、同じ
-> ユーザーで走るタスクが復号して読む）。
+> パスワードはサービス定義へ埋め込まれない（手順 2 で保存した DPAPI ファイルを
+> サービス配下の host が復号して読む）。旧版で `%LOCALAPPDATA%\Aurora` に保存した
+> 設定/パスワードは、保存したユーザーの管理者 PowerShell で
+> `aurora-host --migrate-user-state` を一度実行すると移行できる（インストーラは自動で行う）。
 
 ### 4. Tailscale を自動接続にする
 
@@ -207,9 +215,9 @@ WoL タブのカードにある操作:
 | 症状 | 確認点 |
 |------|--------|
 | 接続できない | `tailscale status` で双方がオンラインか。`<port>` が host の `--port` と一致しているか |
-| パスワードが通らない | `--set-password` をタスクと同じユーザーで（昇格せず）実行したか。`%LOCALAPPDATA%\Aurora\password.bin` があるか。client 側の入力値と一致しているか |
-| タスクは動くが映像が来ない | ログオンセッションがアクティブか（ロック画面のみでは DXGI が止まる構成あり）。GPU ドライバ |
-| `--install` が失敗する | 管理者権限で実行しているか（`/RL HIGHEST` 登録のため） |
+| パスワードが通らない | `%ProgramData%\Aurora\host\password.bin` があるか。CLI で変えたならサービスを再起動したか。client 側の入力値と一致しているか |
+| サービスは動くが映像が来ない | `Get-Service AuroraHost` が Running か。host ログ (`%ProgramData%\Aurora\host\logs\`) の `service.<日付>.log` / `host.<日付>.log`。GPU ドライバ |
+| `--install-service` が失敗する | 管理者権限で実行しているか |
 | WoL で起きない | Pi（aurora-wol）と自宅 PC が同一サブネットか。MAC が正しいか。高速スタートアップ無効化したか。S5 不可なら S3/S4（スリープ/休止）で運用 |
 | WoL タブで「保存済みパスワードがありません」と出る | 中継先（raspi）のパスワード未保存。表示されるダイアログでパスワードを入力（`deploy-aurora-wol.ps1` 実行時に控えた値）|
-| 自動ログオンしたい | 無人運用で「ログオン時」を満たすには自動ログオン設定が要る（セキュリティと要相談） |
+| 自動ログオンしたい | サービス運用では不要（サインイン画面のまま接続し、遠隔でサインインできる） |
