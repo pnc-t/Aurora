@@ -80,6 +80,7 @@ mod imp {
         ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
         ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
         ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        SessionChangeReason,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -99,6 +100,8 @@ mod imp {
     const BACKOFF_MAX: Duration = Duration::from_secs(60);
     /// トレイが異常終了したときの再起動待ち (explorer 起動前のログオン直後などを空振りしないよう緩め)。
     const TRAY_RETRY: Duration = Duration::from_secs(5);
+    /// 同じセッションに既にトレイが居たときに確かめ直す間隔。
+    const TRAY_ALREADY_RUNNING_RETRY: Duration = Duration::from_secs(60);
     /// 停止要求から本体の自主終了を待つ上限。過ぎたら強制終了する。
     const GRACEFUL_STOP: Duration = Duration::from_secs(5);
     /// 停止処理にかかりうる上限として SCM へ伝える目安 (本体の自主終了待ち + 強制終了の待ち)。
@@ -186,8 +189,11 @@ mod imp {
 
     enum Event {
         Stop,
-        /// WTS セッション変化。中身は見ず、ループ側でアクティブセッションを引き直す。
-        SessionChanged,
+        /// WTS セッション変化。対象はループ側でアクティブセッションを引き直して決める。
+        /// `logon_changed` はサインイン/サインアウトか (閉じたトレイの記憶を捨てる契機)。
+        SessionChanged {
+            logon_changed: bool,
+        },
     }
 
     /// `--service`: SCM のディスパッチャへ制御を渡す (サービス停止まで戻らない)。
@@ -214,8 +220,12 @@ mod imp {
                     let _ = tx.send(Event::Stop);
                     ServiceControlHandlerResult::NoError
                 }
-                ServiceControl::SessionChange(_) => {
-                    let _ = tx.send(Event::SessionChanged);
+                ServiceControl::SessionChange(param) => {
+                    let logon_changed = matches!(
+                        param.reason,
+                        SessionChangeReason::SessionLogon | SessionChangeReason::SessionLogoff
+                    );
+                    let _ = tx.send(Event::SessionChanged { logon_changed });
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -294,7 +304,14 @@ mod imp {
                     }
                     return;
                 }
-                Ok(Event::SessionChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // サインイン/サインアウトをまたいだら、閉じたトレイの記憶は捨てる (同じセッション
+                // ID が別のログオンで再利用されうるため、ID だけで覚えていると出し直されない)。
+                Ok(Event::SessionChanged { logon_changed }) => {
+                    if logon_changed {
+                        tray_closed_in = None;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
 
             // SAFETY: 引数なしで現在のコンソールセッション ID を返すだけ。
@@ -348,12 +365,16 @@ mod imp {
             if let Some(t) = &tray {
                 if let Some(code) = exit_code(t) {
                     if code == 0 {
-                        // 「トレイを閉じる」(または同セッションに既にトレイがある)。
+                        // 利用者が「トレイを閉じる」を選んだ。
                         tracing::info!(
                             session = t.session,
                             "tray closed; not restarting in this session"
                         );
                         tray_closed_in = Some(t.session);
+                    } else if code == crate::tray::TRAY_ALREADY_RUNNING_EXIT as u32 {
+                        // 手動で出したトレイが既に居る。閉じたと見なさず、そちらが閉じられたら
+                        // 出し直せるよう間を空けて確かめ直す。
+                        next_tray = Instant::now() + TRAY_ALREADY_RUNNING_RETRY;
                     } else {
                         tracing::warn!(exit_code = code, "tray exited abnormally; restarting");
                         next_tray = Instant::now() + TRAY_RETRY;

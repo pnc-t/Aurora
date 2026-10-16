@@ -174,6 +174,10 @@ pub fn spawn(ctx: TrayContext) {
 #[cfg(not(target_os = "windows"))]
 pub fn spawn(_ctx: TrayContext) {}
 
+/// 同じセッションに既にトレイが居て起動をやめたときの終了コード。サービスは 0 (利用者が閉じた)
+/// と区別し、閉じたとは記憶しない。
+pub const TRAY_ALREADY_RUNNING_EXIT: i32 = 3;
+
 /// `--tray`: 単独トレイを動かす (サービスがログオンユーザーの昇格トークンで起動する)。
 /// 同じセッションで二重に出さないよう名前付き Mutex で 1 つに絞る。
 #[cfg(target_os = "windows")]
@@ -188,7 +192,8 @@ pub fn run_standalone() -> anyhow::Result<()> {
     // SAFETY: 直前の CreateMutexW のエラー状態を読むだけ。
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         tracing::info!("tray already running in this session; exiting");
-        return Ok(());
+        // 「利用者が閉じた」(終了コード 0) と区別してサービスへ伝える。
+        std::process::exit(TRAY_ALREADY_RUNNING_EXIT);
     }
     ui::run(Box::new(ipc::PipeControl::new()), ui::TrayMode::Standalone)?;
     Ok(())
