@@ -1,12 +1,12 @@
-//! SYSTEM サービス運用で、本体 (SYSTEM) とユーザー権限のトレイ (`--tray`) をつなぐ名前付きパイプ。
+//! SYSTEM サービス運用で、本体 (SYSTEM) と単独トレイ (`--tray`、管理者の昇格権限) をつなぐ名前付きパイプ。
 //!
 //! 形式: 1 要求 = `u32 LE 長さ + JSON` ([`TrayRequest`])、応答も同じ形式 ([`TrayReply`])。
 //!
 //! Windows 固有の落とし穴 (パイプは同じ PC の任意プロセスから名前で開けるため):
-//! - **接続できる相手を絞る**: DACL は SYSTEM / Administrators と対話ログオンユーザー (IU) のみ。
-//!   IU には読み書きに要る最小権限だけを与え、`FILE_CREATE_PIPE_INSTANCE` (= `FILE_APPEND_DATA`、
-//!   `GENERIC_WRITE` に含まれる) を渡さない。渡すと一般ユーザーが同名の別インスタンスを作って
-//!   トレイの接続を横取りできる。さらに本体と同じセッションのクライアントだけ受け付ける
+//! - **接続できる相手を絞る**: DACL は SYSTEM / Administrators のみ。トレイはサービスが昇格
+//!   (管理者) トークンで起動するので開ける。UAC の制限付きトークンでは Administrators が拒否専用
+//!   になるため、同じユーザーでも通常権限のプロセスは開けない (開けると、パスワードの総当たりや
+//!   未設定時の先回り設定をされうる)。さらに本体と同じセッションのクライアントだけ受け付ける
 //!   (別セッションの RDP ユーザー・切替中ユーザーを弾く)。ネットワーク越し (SMB) は拒否。
 //! - **相手が本物の本体か確かめる**: 本体より先に一般ユーザーが同名パイプを作っておけば、トレイが
 //!   入力したパスワードを盗める。トレイはパイプの所有者が SYSTEM / Administrators であることを
@@ -25,11 +25,11 @@ use super::control::{TrayContext, TrayReply, TrayRequest, handle};
 const PIPE_NAME: &str = r"\\.\pipe\AuroraHostTray";
 /// 1 メッセージの上限 (状態スナップショットでも数 KB。巨大長さでのメモリ確保を防ぐ)。
 const MAX_MESSAGE: usize = 256 * 1024;
-/// IU (対話ユーザー) に与える権限: FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
-/// READ_CONTROL | SYNCHRONIZE。`GENERIC_WRITE` 相当にしない理由はモジュール doc 参照。
+/// トレイがパイプを開く権限: FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+/// READ_CONTROL | SYNCHRONIZE (読み書きと所有者確認に要る最小限)。
 const CLIENT_ACCESS: u32 = 0x0012_0083;
-/// パイプの DACL (継承なし)。
-const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120083;;;IU)";
+/// パイプの DACL (継承なし)。昇格した管理者と SYSTEM のみ。
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 /// トレイが本体の応答を待つ上限。本体が固まってもトレイ UI まで固めない。
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 

@@ -3,7 +3,7 @@
 //! 同じ UI が 2 つの形で動く:
 //! - **同一プロセス** (開発実行・旧 ONLOGON 運用): host 本体のスレッドとして動き、
 //!   [`super::LocalControl`] で直接操作する。「終了」は host ごと終了する。
-//! - **単独プロセス** (`--tray`、SYSTEM サービス運用): ログオンユーザー権限で動き、名前付きパイプで
+//! - **単独プロセス** (`--tray`、SYSTEM サービス運用): ログオンユーザーの昇格 (管理者) 権限で動き、名前付きパイプで
 //!   本体に要求を送る。「トレイを閉じる」はトレイだけを閉じる (本体はサービスが維持する)。
 //!   SYSTEM の本体が対話デスクトップへ UI を出さないための分離 (SYSTEM 所有のダイアログは
 //!   ローカル利用者への権限昇格穴になる)。
@@ -806,7 +806,7 @@ fn open_logs_folder(hwnd: HWND) {
     let Some(state) = (unsafe { wnd_state(hwnd) }) else {
         return;
     };
-    // 単独トレイ (一般ユーザー権限) は保護済みフォルダを作成・ACL 設定できないので、
+    // 単独トレイはフォルダの作成・ACL 設定を本体に任せ (二重に触らない)、
     // 本体が用意した場所を開くだけにする。
     let dir = match state.mode {
         TrayMode::InProcess => crate::system::state::log_dir().ok(),

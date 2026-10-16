@@ -15,9 +15,12 @@
 //!   ログオン/ロックでは張り替えない (本体がデスクトップ切替に追従する)。
 //! - 本体の自己 re-exec (DXGI ACCESS_LOST 回復) は、サービス配下では子を産まずに終了して
 //!   サービスに再起動させる ([`is_service_child`])。孫プロセスはサービスから監視できない。
-//! - トレイ (`--tray`) は SYSTEM ではなく**ログオンユーザーのトークン** (`WTSQueryUserToken`、
-//!   管理者でも UAC の制限付きトークン) で起動する。SYSTEM の UI を対話デスクトップに出すと
-//!   ローカル利用者への権限昇格穴になるため。サインイン前はユーザーが居ないので起動しない。
+//! - トレイ (`--tray`) は SYSTEM ではなく**ログオンユーザーの昇格 (管理者) トークン** で起動する
+//!   (`WTSQueryUserToken` が返すのは UAC の制限付きトークンなので、`TokenLinkedToken` で昇格側を
+//!   得る。旧版の ONLOGON `/RL HIGHEST` と同じく同意画面は出ない)。SYSTEM の UI を対話デスクトップ
+//!   に出すとローカル利用者への権限昇格穴になり、逆に通常権限で動かすと同じユーザーの通常権限
+//!   プロセスが UIPI に阻まれずトレイを自動操作できてしまう (パイプも管理者限定にしてある)。
+//!   管理者でないユーザーのセッションと、サインイン前はトレイを起動しない。
 
 /// SCM に登録するサービス名 (`sc query AuroraHost` で引ける)。
 #[cfg(target_os = "windows")]
@@ -54,8 +57,10 @@ mod imp {
     use anyhow::{Context, Result, bail};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityIdentification, SetTokenInformation, TOKEN_ALL_ACCESS,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, TokenSessionId,
+        DuplicateTokenEx, GetTokenInformation, SecurityIdentification, SetTokenInformation,
+        TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+        TOKEN_LINKED_TOKEN, TOKEN_QUERY, TokenElevation, TokenLinkedToken, TokenPrimary,
+        TokenSessionId,
     };
     use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
     use windows::Win32::System::JobObjects::{
@@ -351,12 +356,20 @@ mod imp {
                 && Instant::now() >= next_tray
             {
                 match spawn_tray(target, job.as_ref()) {
-                    Ok(Some(t)) => {
+                    Ok(TraySpawn::Started(t)) => {
                         tracing::info!(pid = t.pid, session = t.session, "tray started");
                         tray = Some(t);
                     }
                     // サインイン画面 (ユーザー未ログオン)。ログオンしたら次の周期で起動する。
-                    Ok(None) => {}
+                    Ok(TraySpawn::NoUser) => {}
+                    // 管理者でないユーザー: このセッションでは出さない (毎周期試さない)。
+                    Ok(TraySpawn::NotAdmin) => {
+                        tracing::info!(
+                            session = target,
+                            "signed-in user is not an administrator; tray is not started"
+                        );
+                        tray_closed_in = Some(target);
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, session = target, "failed to start tray");
                         next_tray = Instant::now() + TRAY_RETRY;
@@ -461,17 +474,71 @@ mod imp {
         create_process(&primary, &args, None, session, job)
     }
 
-    /// ログオンユーザーのトークンでトレイ (`--tray`) を起動する。ユーザーが居なければ `Ok(None)`。
-    fn spawn_tray(session: u32, job: Option<&Job>) -> Result<Option<Child>> {
+    enum TraySpawn {
+        Started(Child),
+        NoUser,
+        NotAdmin,
+    }
+
+    /// ログオンユーザーの昇格 (管理者) トークンでトレイ (`--tray`) を起動する。
+    fn spawn_tray(session: u32, job: Option<&Job>) -> Result<TraySpawn> {
         let mut user = HANDLE::default();
         // SAFETY: session のログオンユーザーのトークンを出力先へ受ける (SeTcb 権限 = LocalSystem で可)。
         // 失敗はサインイン画面などユーザー未ログオンの状態。
         if unsafe { WTSQueryUserToken(session, &mut user) }.is_err() {
-            return Ok(None);
+            return Ok(TraySpawn::NoUser);
         }
         let user = OwnedHandle(user);
-        let env = EnvBlock::for_user(&user)?;
-        create_process(&user, &["--tray".to_string()], Some(&env), session, job).map(Some)
+        let Some(admin) = elevated_token(user)? else {
+            return Ok(TraySpawn::NotAdmin);
+        };
+        let env = EnvBlock::for_user(&admin)?;
+        create_process(&admin, &["--tray".to_string()], Some(&env), session, job)
+            .map(TraySpawn::Started)
+    }
+
+    /// ユーザートークンの昇格版を返す。UAC の制限付きトークンなら対の昇格トークン (SeTcb 権限
+    /// = LocalSystem からは一次トークンとして得られる)、既に昇格済みならそのまま。昇格できない
+    /// (管理者でない) ユーザーは `None`。
+    fn elevated_token(user: OwnedHandle) -> Result<Option<OwnedHandle>> {
+        if is_elevated(&user)? {
+            return Ok(Some(user));
+        }
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut len = 0u32;
+        // SAFETY: user は有効なトークン。linked は出力先で、長さはその実サイズ。分割トークンで
+        // ないユーザーでは失敗する (= 昇格側が無い)。
+        let got = unsafe {
+            GetTokenInformation(
+                user.0,
+                TokenLinkedToken,
+                Some((&mut linked as *mut TOKEN_LINKED_TOKEN).cast()),
+                std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut len,
+            )
+        };
+        if got.is_err() {
+            return Ok(None);
+        }
+        let linked = OwnedHandle(linked.LinkedToken);
+        Ok(is_elevated(&linked)?.then_some(linked))
+    }
+
+    fn is_elevated(token: &OwnedHandle) -> Result<bool> {
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        // SAFETY: token は有効なトークン。elevation は出力先で、長さはその実サイズ。
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenElevation,
+                Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+        }
+        .context("GetTokenInformation(TokenElevation)")?;
+        Ok(elevation.TokenIsElevated != 0)
     }
 
     /// `CreateEnvironmentBlock` が作るユーザーの環境変数ブロック (Drop で解放)。トレイに利用者の

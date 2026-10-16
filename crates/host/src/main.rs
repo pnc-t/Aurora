@@ -99,7 +99,7 @@ struct Args {
     uninstall_service: bool,
     /// 旧版のユーザー側状態を状態ディレクトリへ移して終了する (`--migrate-user-state`)。
     migrate_user_state: bool,
-    /// ユーザー権限の単独トレイとして動く (`--tray`、サービスがログオンユーザーとして起動する)。
+    /// 単独トレイとして動く (`--tray`、サービスがログオンユーザーの昇格トークンで起動する)。
     tray: bool,
 }
 
@@ -346,7 +346,7 @@ fn main() -> Result<()> {
     // ワーカーを生かすため main 終了まで保持する (drop すると以降のログが失われる)。
     // サービス (Session 0) とトレイは本体と別ファイルに書く (同じ日次ファイルへの複数プロセス同時
     // 書込を避ける)。どちらもデバッグビルドでもコンソールが無いので常にファイルへ。トレイは一般
-    // ユーザー権限で保護済みの host ログへ書けないので、ユーザー側 (%LOCALAPPDATA%) へ書く。
+    // 本体のログと混ざらないよう、ユーザー側 (%LOCALAPPDATA%) へ書く。
     let _log_guard = if args.tray {
         init_tracing(
             "tray",
@@ -436,7 +436,11 @@ fn main() -> Result<()> {
         // サービス運用中の手動起動 (スタートメニュー等) は、閉じたトレイを出し直したい意図とみなす。
         #[cfg(target_os = "windows")]
         if !system::service::is_service_child() && tray::ipc::host_pipe_exists() {
-            return tray::run_standalone();
+            // パイプは昇格した管理者しか開けない。非昇格の起動なら UAC を経て昇格し直す。
+            if display::process_is_elevated() {
+                return tray::run_standalone();
+            }
+            return tray::relaunch_elevated();
         }
         tracing::info!("another aurora-host server is already running; exiting");
         // サービス配下は SYSTEM なので対話デスクトップへ UI を出さない (サービスが待って再試行する)。
@@ -1301,7 +1305,7 @@ fn run_server(
         bus: tray_bus.clone(),
         update: update_state.clone(),
     };
-    // サービス配下 (SYSTEM) は対話デスクトップへ UI を出さず、ユーザー権限のトレイ (`--tray`) から
+    // サービス配下 (SYSTEM) は対話デスクトップへ UI を出さず、単独トレイ (`--tray`) から
     // パイプで操作を受ける。それ以外は従来どおり同一プロセスでトレイを出す。
     let pipe_tray_ctx = if system::service::is_service_child() {
         // サービスの停止 (アンインストール・更新・net stop) では、トレイ終了と同じ後始末をしてから

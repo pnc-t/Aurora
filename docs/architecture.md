@@ -31,7 +31,7 @@ crates/
 │   │              autostart=旧方式のログオン時自動起動タスクの登録・解除)
 │   ├── perf.rs    エンコード遅延・ソースビットレートの計測 (--perf)
 │   ├── tray/      トレイ (mod=状態バス / control=操作と特権ガード / ui=Win32 /
-│   │              ipc=サービス運用時のユーザー権限トレイとの名前付きパイプ)
+│   │              ipc=サービス運用時の単独トレイ (管理者の昇格権限) との名前付きパイプ)
 │   └── main.rs    エントリ・CLI・スレッド配線
 ├── wol/        WoL 中継デーモン (aurora-wol、素のバイナリ)。自宅 LAN の Raspberry Pi 等で
 │               常駐し、Tailnet 経由の client からの `WolMsg::Wake` を Noise ハンドシェイク後に

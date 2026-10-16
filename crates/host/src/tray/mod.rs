@@ -3,7 +3,7 @@
 //! - [`TrayBus`]: net/encode/update → トレイへの状態・通知の受け渡し (全 OS)。
 //! - [`control`]: トレイ操作のロジックと特権ガード (UI から独立)。
 //! - `ui` (Windows): Win32 のトレイアイコン・メニュー・ダイアログ。
-//! - [`ipc`] (Windows): SYSTEM サービス運用で、ユーザー権限のトレイ (`--tray`) と本体を
+//! - [`ipc`] (Windows): SYSTEM サービス運用で、単独トレイ (`--tray`、管理者の昇格権限) と本体を
 //!   名前付きパイプでつなぐ。
 //!
 //! CLI (`--set-password` / `--clear-password`) からの変更は**別プロセス**のため、本体の
@@ -159,7 +159,7 @@ mod ui;
 pub use control::{LocalControl, TrayContext, TrayControl, TrayReply, TrayRequest, TrayStatus};
 
 /// 同一プロセスのトレイ UI を別スレッドで起動する (開発実行・旧 ONLOGON 運用)。SYSTEM サービス
-/// 配下の本体はこれを呼ばず、[`ipc::serve`] でユーザー権限のトレイからの要求を受ける。
+/// 配下の本体はこれを呼ばず、[`ipc::serve`] で単独トレイからの要求を受ける。
 #[cfg(target_os = "windows")]
 pub fn spawn(ctx: TrayContext) {
     let _ = std::thread::Builder::new()
@@ -174,7 +174,7 @@ pub fn spawn(ctx: TrayContext) {
 #[cfg(not(target_os = "windows"))]
 pub fn spawn(_ctx: TrayContext) {}
 
-/// `--tray`: ユーザー権限の単独トレイを動かす (サービスがログオンユーザーとして起動する)。
+/// `--tray`: 単独トレイを動かす (サービスがログオンユーザーの昇格トークンで起動する)。
 /// 同じセッションで二重に出さないよう名前付き Mutex で 1 つに絞る。
 #[cfg(target_os = "windows")]
 pub fn run_standalone() -> anyhow::Result<()> {
@@ -191,6 +191,32 @@ pub fn run_standalone() -> anyhow::Result<()> {
         return Ok(());
     }
     ui::run(Box::new(ipc::PipeControl::new()), ui::TrayMode::Standalone)?;
+    Ok(())
+}
+
+/// 非昇格で起動されたときに、UAC を経て `--tray` を昇格起動し直す (パイプは昇格した管理者しか
+/// 開けないため)。スタートメニューから閉じたトレイを出し直す経路。利用者が UAC を拒否したら何もしない。
+#[cfg(target_os = "windows")]
+pub fn relaunch_elevated() -> anyhow::Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+
+    let exe = HSTRING::from(std::env::current_exe()?.as_os_str());
+    // SAFETY: 動詞・パス・引数は NUL 終端の文字列で、呼び出し中は生存している。
+    let r = unsafe { ShellExecuteW(None, w!("runas"), &exe, w!("--tray"), None, SW_SHOWNORMAL) };
+    // 32 以下はエラー (UAC の拒否を含む)。
+    if r.0 as usize <= 32 {
+        tracing::info!(
+            code = r.0 as usize,
+            "elevated tray relaunch was not started"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn relaunch_elevated() -> anyhow::Result<()> {
     Ok(())
 }
 
