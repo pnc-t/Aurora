@@ -1670,6 +1670,8 @@ fn capture_loop(
     // 一度でもフレームを取得できたか (= このプロセスでキャプチャが成立する環境か)。re-exec は
     // 「動いていたのに固着した」場合に限定し、起動時から取得できない環境での再起動ループを防ぐ。
     let mut captured_ok = false;
+    // このプロセスが最初にフレームを取得できた入力デスクトップ (サービス配下のみ記録)。
+    let mut captured_on: Option<String> = None;
     // 連続失敗が始まった時刻。Ok で None に戻す。
     let mut first_fail: Option<Instant> = None;
     // 現在の送出最大高さ (0 = キャプチャ解像度)。capturer 再構築をまたいで保持し再適用する。
@@ -1734,6 +1736,19 @@ fn capture_loop(
                 f
             }
             Err(e) => {
+                // サービス配下: 取り込みを始めたのと別のデスクトップ (Default ⇔ Winlogon) へ切り替わって
+                // 失敗したら、待たずに作り直させる。通常の画面で複製を始めたプロセスは、Winlogon へ
+                // 乗り換えて複製を作り直しても ACCESS_LOST が続く一方、最初から Winlogon で始めた
+                // 新しいプロセスなら取り込める (ロック画面のパスワード入力・ユーザー切替で実機確認、
+                // 2026-10-17)。8 秒の固着判定を待つと、その間パスワード入力画面が映らない。
+                if let Some(prev) = &captured_on
+                    && let Some(now) = system::desktop::input_desktop_name()
+                    && &now != prev
+                    && !crate::display::is_takeover_active()
+                {
+                    tracing::info!(from = %prev, to = %now, error = %e, "input desktop changed; restarting host to capture it");
+                    reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
+                }
                 // ロック画面・UAC セキュアデスクトップ中の ACCESS_LOST は、デスクトップが
                 // 戻れば復帰する正常動作。固着時間に数えると 8 秒を超える通常のロックや
                 // UAC 放置のたびに re-exec (= セッション切断) してしまうため、入力デスク
@@ -1842,6 +1857,9 @@ fn capture_loop(
         }
         if let Some(f) = acquired {
             captured_ok = true;
+            if captured_on.is_none() && system::service::is_service_child() {
+                captured_on = system::desktop::input_desktop_name();
+            }
             // (再)構築直後の最初のフレーム寸法を実解像度として通知する。
             if !reported {
                 let _ = res_tx.try_send((f.width, f.height));

@@ -43,6 +43,19 @@ mod imp {
         static LAST_FAILED: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
+    /// 現在の入力デスクトップの名前。開けない (非 SYSTEM で Winlogon 等) ときは `None`。
+    pub fn input_desktop_name() -> Option<String> {
+        use windows::Win32::System::StationsAndDesktops::DESKTOP_READOBJECTS;
+        // SAFETY: 入力デスクトップを読み取り最小権限で開くだけ。下で必ず閉じる。
+        let desk =
+            unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) }
+                .ok()?;
+        let name = desktop_name(desk);
+        // SAFETY: 直前に開いたハンドルを 1 度だけ閉じる (どのスレッドにも割り当てていない)。
+        let _ = unsafe { CloseDesktop(desk) };
+        name
+    }
+
     /// デスクトップの名前 (`Default` / `Winlogon` 等)。取得できなければ `None`。
     pub fn desktop_name(desk: HDESK) -> Option<String> {
         let mut name = [0u16; 64];
@@ -148,10 +161,16 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{desktop_name, follow_input_desktop, with_input_desktop};
+pub use imp::{desktop_name, follow_input_desktop, input_desktop_name, with_input_desktop};
 
 /// 非 Windows は入力デスクトップの概念が無い (常に乗り換えない)。
 #[cfg(not(target_os = "windows"))]
 pub fn follow_input_desktop() -> bool {
     false
+}
+
+/// 非 Windows は入力デスクトップの概念が無い。
+#[cfg(not(target_os = "windows"))]
+pub fn input_desktop_name() -> Option<String> {
+    None
 }
