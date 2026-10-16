@@ -3,6 +3,7 @@ use super::*;
 use crate::encode::{DEFAULT_BITRATE_BPS, MIN_BITRATE_BPS};
 
 /// 制御ループ → encode スレッドへの通知。
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum EncoderCommand {
     RequestKeyframe,
     /// 適応制御による平均ビットレート変更 (bps)。

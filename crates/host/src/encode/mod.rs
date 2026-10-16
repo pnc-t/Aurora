@@ -6,7 +6,7 @@ use crate::capture::Frame;
 #[cfg(target_os = "windows")]
 use crate::capture::SharedDevice;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncodedNal {
     /// 選択中コーデックのビットストリーム (H.264/HEVC は Annex-B `00 00 00 01` start code 付き、
     /// AV1 は OBU (Open Bitstream Unit) 列)。

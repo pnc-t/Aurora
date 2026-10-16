@@ -35,7 +35,7 @@ pub(crate) fn negotiate_codec(
 /// std::thread (encode_loop) 側で行われるため、その結果 (要求どおりだったか/フォールバック
 /// したか) を非同期側 (net セッション) へ伝え、`VideoCodecChanged` の配信とネゴシエーション
 /// 状態の是正 (host_codecs から使えないコーデックを外す) を行わせる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CodecStatus {
     /// (再) 作成が完了し、この実効コーデックで送出中 (要求どおり)。
     Active(VideoCodec),
