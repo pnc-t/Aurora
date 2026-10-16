@@ -70,7 +70,9 @@ impl Drop for WinVirtualization {
         // 仮想化停止より先にドライブを外す (セッション終了で This PC から消える = 一時表示)。
         // 非昇格シェル側にも作っているので両方の名前空間から外す。
         if let Some(letter) = self.drive {
-            unmount_drive(letter);
+            if own_namespace_usable() {
+                unmount_drive(letter);
+            }
             let _ = in_shell_session(|| unmount_drive(letter));
         }
         // SAFETY: ctx は start() で得た有効な仮想化コンテキスト。停止は drop で 1 回のみ。
@@ -104,6 +106,19 @@ fn mount_first_free_drive(root: &Path) -> Option<char> {
         if current & (1 << i) != 0 {
             tracing::warn!(drive = %format!("{letter}:"), "drive letter taken by another process just before mount; trying next");
             continue;
+        }
+        if !own_namespace_usable() {
+            match in_shell_session(|| mount_drive(letter, root)) {
+                Ok(Ok(())) => return Some(letter),
+                Ok(Err(e)) => {
+                    tracing::warn!(drive = %format!("{letter}:"), error = %e, "failed to mount ProjFS drive letter; trying next");
+                    continue;
+                }
+                Err(reason) => {
+                    tracing::info!(reason, "ProjFS drive not mounted (no shell session)");
+                    return None;
+                }
+            }
         }
         match mount_drive(letter, root) {
             Ok(()) => {
@@ -160,7 +175,9 @@ fn mount_drive(letter: char, root: &Path) -> windows::core::Result<()> {
 /// 残る (subst はログオンセッション存続)。起動時・セッション開始時・トレイ終了時にこれを呼び、
 /// 自分のルートを指す残骸ドライブを掃除して This PC に古いドライブが残らないようにする。
 pub(super) fn unmount_drives_for_root(root: &Path) {
-    unmount_drives_for_root_here(root);
+    if own_namespace_usable() {
+        unmount_drives_for_root_here(root);
+    }
     // 昇格 host は非昇格シェル側にも作るので、そちらの残骸も掃除する。
     let _ = in_shell_session(|| unmount_drives_for_root_here(root));
 }
@@ -226,6 +243,13 @@ fn query_dos_device(letter: char) -> Option<String> {
     (n != 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
+/// 自プロセスの DOS デバイス名前空間にドライブを作ってよいか。SYSTEM (サービス配下) の
+/// 名前空間は全セッション共通の Global なので、そこに作ると他ユーザーにも見え、外すときに
+/// 他者の定義を消しかねない。サービス配下では利用者 (シェル) の名前空間にだけ作る。
+fn own_namespace_usable() -> bool {
+    !crate::system::service::is_service_child()
+}
+
 /// 昇格プロセスのとき、非昇格シェル (explorer) のトークンを偽装した状態で `f` を実行する。
 /// 実行したら `Ok`。昇格していない (= 既にシェルと同じセッション) / シェルが見つからない /
 /// トークンを得られないときは実行せず、理由を `Err` で返す (ログでの切り分け用)。
@@ -234,7 +258,7 @@ fn query_dos_device(letter: char) -> Option<String> {
 /// 昇格側と非昇格側が別セッションになる。自動起動タスク (/RL HIGHEST) の host が作った Z: は
 /// 非昇格の Explorer から見えないため、シェルのトークンでも同じ定義を作る。`TokenLinkedToken`
 /// は SeTcb 権限が無いと識別レベルしか返らず偽装に使えないので、シェルのトークンを複製する。
-fn in_shell_session(f: impl FnOnce()) -> Result<(), &'static str> {
+fn in_shell_session<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
     if !crate::display::process_is_elevated() {
         return Err("not elevated");
     }
@@ -317,29 +341,7 @@ pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
         anyhow::bail!("projectedfslib.dll をロードできません (Windows 機能 Client-ProjFS が無効)");
     }
 
-    std::fs::create_dir_all(root).with_context(|| format!("create projfs root {root:?}"))?;
-
-    // 仮想化インスタンス GUID をルート直下に永続化し、再起動でも再利用する。
-    let id_path = root.join(".aurora-instance");
-    let instance_id = match std::fs::read(&id_path) {
-        Ok(bytes) if bytes.len() == 16 => {
-            GUID::from_u128(u128::from_le_bytes(bytes.try_into().unwrap()))
-        }
-        _ => {
-            let g = GUID::from_u128(rand::random::<u128>());
-            let _ = std::fs::write(&id_path, g.to_u128().to_le_bytes());
-            g
-        }
-    };
-
     let root_w = wide(&root.to_string_lossy());
-    // プレースホルダ化。既にマーク済みなら失敗するが投影は続行できるためログのみ。
-    // SAFETY: root_w は null 終端の有効な PCWSTR、instance_id は有効な GUID。
-    if let Err(e) = unsafe {
-        PrjMarkDirectoryAsPlaceholder(PCWSTR(root_w.as_ptr()), PCWSTR::null(), None, &instance_id)
-    } {
-        tracing::debug!(error = %e, "PrjMarkDirectoryAsPlaceholder (likely already a placeholder)");
-    }
 
     let provider = Box::new(Provider {
         bridge,
@@ -374,18 +376,52 @@ pub fn start(bridge: Arc<FsBridge>, root: &Path) -> Result<WinVirtualization> {
 
     let provider_ptr = provider.as_ref() as *const Provider as *const c_void;
 
-    // SAFETY: root_w/notify_root は有効な PCWSTR、callbacks/options/mappings は本関数で
-    // 構築し呼び出し完了まで生存する、provider_ptr は WinVirtualization が provider を
-    // 保持する限り有効。
-    let ctx = unsafe {
-        PrjStartVirtualizing(
-            PCWSTR(root_w.as_ptr()),
-            &callbacks,
-            Some(provider_ptr),
-            Some(&options),
-        )
-    }
-    .context("PrjStartVirtualizing (Client-ProjFS feature が無効の可能性)")?;
+    // ルートは利用者の %LOCALAPPDATA% 配下 = 利用者が自由に差し替えられる (ジャンクション・
+    // シェルフォルダのリダイレクト)。SYSTEM サービス配下で SYSTEM のまま作成・書き込み・
+    // 仮想化すると、任意の場所を SYSTEM 権限で書き換えさせられるため、利用者として行う。
+    let ctx = crate::system::user::run_as_session_user(|| -> Result<_> {
+        std::fs::create_dir_all(root).with_context(|| format!("create projfs root {root:?}"))?;
+
+        // 仮想化インスタンス GUID をルート直下に永続化し、再起動でも再利用する。
+        let id_path = root.join(".aurora-instance");
+        let instance_id = match std::fs::read(&id_path) {
+            Ok(bytes) if bytes.len() == 16 => {
+                GUID::from_u128(u128::from_le_bytes(bytes.try_into().unwrap()))
+            }
+            _ => {
+                let g = GUID::from_u128(rand::random::<u128>());
+                let _ = std::fs::write(&id_path, g.to_u128().to_le_bytes());
+                g
+            }
+        };
+
+        // プレースホルダ化。既にマーク済みなら失敗するが投影は続行できるためログのみ。
+        // SAFETY: root_w は null 終端の有効な PCWSTR、instance_id は有効な GUID。
+        if let Err(e) = unsafe {
+            PrjMarkDirectoryAsPlaceholder(
+                PCWSTR(root_w.as_ptr()),
+                PCWSTR::null(),
+                None,
+                &instance_id,
+            )
+        } {
+            tracing::debug!(error = %e, "PrjMarkDirectoryAsPlaceholder (likely already a placeholder)");
+        }
+
+        // SAFETY: root_w/notify_root は有効な PCWSTR、callbacks/options/mappings は本関数で
+        // 構築し呼び出し完了まで生存する、provider_ptr は WinVirtualization が provider を
+        // 保持する限り有効。
+        unsafe {
+            PrjStartVirtualizing(
+                PCWSTR(root_w.as_ptr()),
+                &callbacks,
+                Some(provider_ptr),
+                Some(&options),
+            )
+        }
+        .context("PrjStartVirtualizing (Client-ProjFS feature が無効の可能性)")
+    })
+    .map_err(|why| anyhow::anyhow!("ProjFS needs a signed-in user ({why})"))??;
 
     tracing::info!(root = %root.display(), "ProjFS virtualization started");
 
@@ -673,7 +709,11 @@ unsafe extern "system" fn notification_cb(
 /// materialize 済みのバッキングファイルを読み、FsCreate + FsWrite でクライアントへ送る。
 fn push_file_content(provider: &Provider, rel: &str) {
     let full = provider.root.join(rel);
-    let mut f = match std::fs::File::open(&full) {
+    // 開く (= アクセス判定) だけを利用者として行う。SYSTEM のまま開くと、ルート内のファイルを
+    // リンクにすり替えて利用者が読めないファイルをクライアントへ流させられる。
+    let opened = crate::system::user::run_as_session_user(|| std::fs::File::open(&full))
+        .unwrap_or_else(|why| Err(std::io::Error::other(why)));
+    let mut f = match opened {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(path = %rel, error = %e, "writeback open failed");

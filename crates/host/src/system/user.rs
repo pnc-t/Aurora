@@ -121,6 +121,16 @@ fn known_folder(token: &UserToken, id: &windows::core::GUID) -> Option<PathBuf> 
     }
 }
 
+/// SYSTEM サービス配下ではログオンユーザーを偽装して `f` を実行する。それ以外 (開発実行・旧
+/// ONLOGON 運用) は自プロセスのまま実行する。サービス配下でユーザーが居なければ実行せず `Err`。
+pub fn run_as_session_user<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
+    if !crate::system::service::is_service_child() {
+        return Ok(f());
+    }
+    let token = shell_impersonation_token()?;
+    impersonating(&token, f)
+}
+
 /// ファイル入出力をどのユーザーとして行うか。SYSTEM サービス配下ではログオンユーザーを偽装し、
 /// それ以外 (開発実行・旧 ONLOGON 運用) は従来どおり自プロセスのまま (プロファイルは環境変数)。
 ///
