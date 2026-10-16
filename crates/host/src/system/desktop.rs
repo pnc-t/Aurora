@@ -38,6 +38,9 @@ mod imp {
 
     thread_local! {
         static ATTACHED: RefCell<Option<Attached>> = const { RefCell::new(None) };
+        /// 直近に乗り換えに失敗したデスクトップ名。入力スレッドは毎イベント呼ぶので、同じ失敗を
+        /// 何度も警告しない (別のデスクトップで失敗したら改めて出す)。
+        static LAST_FAILED: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     /// デスクトップの名前 (`Default` / `Winlogon` 等)。取得できなければ `None`。
@@ -85,9 +88,22 @@ mod imp {
             }
             // SAFETY: new.handle は直前に開いた有効なデスクトップ。このスレッドはウィンドウを持たない前提。
             if let Err(e) = unsafe { SetThreadDesktop(new.handle) } {
-                tracing::debug!(error = %e, desktop = %new.name, "SetThreadDesktop failed; staying on current desktop");
+                // UAC/ロック画面が操作できない原因を本番ログ (info 以上) から追えるよう warn にする。
+                LAST_FAILED.with(|last| {
+                    let mut last = last.borrow_mut();
+                    if last.as_deref() != Some(new.name.as_str()) {
+                        tracing::warn!(
+                            error = %e,
+                            desktop = %new.name,
+                            thread = std::thread::current().name().unwrap_or("?"),
+                            "SetThreadDesktop failed; staying on current desktop"
+                        );
+                        *last = Some(new.name.clone());
+                    }
+                });
                 return false;
             }
+            LAST_FAILED.with(|last| *last.borrow_mut() = None);
             tracing::info!(
                 desktop = %new.name,
                 thread = std::thread::current().name().unwrap_or("?"),
