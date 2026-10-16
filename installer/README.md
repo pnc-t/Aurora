@@ -87,7 +87,7 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 インストーラの挙動:
 - `aurora-host.exe` を `%ProgramFiles%\Aurora Host\` に配置 (per-machine・インストーラ起動時に UAC 1 回)。
-- コンポーネント「サービスとして常駐」(必須。サイレント更新でも毎回) → `aurora-host --migrate-user-state`
+- コンポーネント「サービスとして常駐」(必須。サイレント更新でも毎回) → (旧版からの更新時のみ) `aurora-host --migrate-user-state`
   (旧版の設定/パスワードを **インストーラを昇格させたユーザー** の `%LOCALAPPDATA%\Aurora`
   から `%ProgramData%\Aurora\host` へ移す) → `aurora-host --install-service` で SYSTEM
   サービス "AuroraHost" を登録・開始 (旧 ONLOGON タスクは削除)。exe を上書きする前に
@@ -112,8 +112,9 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 3. 旧版で自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
    を解除。
 4. exe / インストール先フォルダ / スタートメニューのショートカットを削除。
-5. `%ProgramData%\Aurora\host\` (設定・password.bin・ログ) と `%LOCALAPPDATA%\Aurora\`
-   (旧版の設定・トレイのログ) を削除 (`%ProgramData%\Aurora` は VDD と共用なので空のときだけ消す)。
+5. `%ProgramData%\Aurora\host\` (設定・password.bin・ログ) を削除 (`%ProgramData%\Aurora` は VDD と
+   共用なので空のときだけ消す)。`%LOCALAPPDATA%\Aurora\` は client と共用なので、host のファイル
+   (旧版の設定・トレイのログ) だけを消し、フォルダは空のときだけ消す。
 6. HKLM のアンインストール登録を削除。
 
 ProjFS (`Client-ProjFS`) は他用途でも使う共有システム機能のため、

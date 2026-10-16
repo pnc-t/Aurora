@@ -19,7 +19,8 @@
 ;     (旧パスワードはその利用者でしか復号できない)、--install-service がタスクを削除する。
 ;   - クリーンアンインストール最優先。痕跡 = exe / サービス "AuroraHost" / 旧スケジュールタスク
 ;     "Aurora Host" / %ProgramData%\Aurora\host (設定・パスワード・ログ) / %LOCALAPPDATA%\Aurora
-;     (旧版の設定・トレイのログ) / ショートカット / レジストリ。全部消す。
+;     配下の host のファイル (旧版の設定・トレイのログ。フォルダ自体は client と共用) /
+;     ショートカット / レジストリ。全部消す。
 ;   - サービス/タスクの登録・解除は host 自身の --install-service 等に委譲 (二重実装しない)。
 ;   - ProjFS は共有システム機能なのでアンインストールでは無効化しない。
 
@@ -74,6 +75,12 @@ VIAddVersionKey "FileDescription" "${APPNAME} Installer"
 ; サイレント自己更新 (host の自己更新機構が "aurora-host-setup-<ver>.exe /S" を実行する)
 ; の待機リトライ回数カウンタ。対話インストールでは使わない。
 Var RetryCount
+; 旧版が入っていた (= 更新インストール) か。.onInit で、このインストールが登録を書き換える前に読む。
+Var IsUpgrade
+
+Function .onInit
+  ReadRegStr $IsUpgrade HKLM "${REGROOT}" "InstallDir"
+FunctionEnd
 
 ; ---------------------------------------------------------------------------
 ; exe を上書きする前に呼ぶ。サービスを先に止める (止めないとサービスが本体を起動し直して
@@ -163,11 +170,15 @@ Section "サービスとして常駐 (必須・UAC / ロック画面も操作可
   ; 旧版の設定/パスワードを移す。旧パスワードはインストールした利用者でしか復号できないので、
   ; この (利用者として昇格した) インストーラから呼ぶ。移行先に既にあれば何もしない。失敗しても
   ; サービス登録は続ける (パスワードはトレイから設定し直せる) が、黙って失わないよう知らせる。
-  ExecWait '"$INSTDIR\${EXENAME}" --migrate-user-state' $0
-  ${If} $0 != 0
-    DetailPrint "旧版の設定・パスワードの移行に失敗しました (終了コード $0)"
-    ${IfNot} ${Silent}
-      MessageBox MB_ICONEXCLAMATION|MB_OK "旧版の設定・パスワードを移行できませんでした。$\nインストール後、トレイアイコンからパスワードを設定し直してください。"
+  ; 新規インストールでは呼ばない: 移行元 (%LOCALAPPDATA%\Aurora) は利用者が自由に書ける場所で、
+  ; 同じユーザーで動くマルウェアが事前に置いたパスワード・許可端末を取り込ませないため。
+  ${If} $IsUpgrade != ""
+    ExecWait '"$INSTDIR\${EXENAME}" --migrate-user-state' $0
+    ${If} $0 != 0
+      DetailPrint "旧版の設定・パスワードの移行に失敗しました (終了コード $0)"
+      ${IfNot} ${Silent}
+        MessageBox MB_ICONEXCLAMATION|MB_OK "旧版の設定・パスワードを移行できませんでした。$\nインストール後、トレイアイコンからパスワードを設定し直してください。"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 
@@ -279,12 +290,26 @@ Section "Uninstall"
   SetShellVarContext current
 
   ; 6) 設定・暗号化パスワード・ログを完全削除。host の状態は PC 単位 (%ProgramData%\Aurora\host)。
-  ;    親の Aurora は VDD (vdd\) と共用なので空のときだけ消す。旧版の状態とトレイのログは per-user。
+  ;    親の Aurora は VDD (vdd\) と共用なので空のときだけ消す。
   SetShellVarContext all
   RMDir /r "$APPDATA\Aurora\host"
   RMDir "$APPDATA\Aurora"
   SetShellVarContext current
-  RMDir /r "$LOCALAPPDATA\Aurora"
+  ;    per-user 側 (%LOCALAPPDATA%\Aurora) は client と共用で、利用者が自由に書ける (中身を
+  ;    ジャンクションにされうる) 場所なので、フォルダごと再帰削除せず host のファイルだけを消す
+  ;    (旧版の状態・トレイのログ・ProjFS 投影ルート)。
+  Delete "$LOCALAPPDATA\Aurora\password.bin"
+  Delete "$LOCALAPPDATA\Aurora\port"
+  Delete "$LOCALAPPDATA\Aurora\encode-gpu"
+  Delete "$LOCALAPPDATA\Aurora\pinning"
+  Delete "$LOCALAPPDATA\Aurora\trusted_devices.txt"
+  Delete "$LOCALAPPDATA\Aurora\takeover_topology.txt"
+  Delete "$LOCALAPPDATA\Aurora\takeover_ccd.bin"
+  Delete "$LOCALAPPDATA\Aurora\logs\host.*"
+  Delete "$LOCALAPPDATA\Aurora\logs\tray.*"
+  RMDir "$LOCALAPPDATA\Aurora\remote"
+  RMDir "$LOCALAPPDATA\Aurora\logs"
+  RMDir "$LOCALAPPDATA\Aurora"
 
   ; 7) レジストリを掃除。
   DeleteRegKey HKLM "${UNINSTKEY}"
