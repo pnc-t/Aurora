@@ -28,24 +28,33 @@ const STATE_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 /// ログ: 上に加えて Users へ読み取り。
 const LOGS_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
 
-/// 保護済みの状態ディレクトリを返す。初回だけ作成・検査・ACL 適用し、結果をプロセス内で使い回す。
+/// 保護済みの状態ディレクトリを返す。成功するまでは呼ばれるたびに作成・検査・ACL 適用を試み、
+/// 成功した結果だけをプロセス内で使い回す (起動直後の一過性の失敗をプロセス終了まで引きずらない)。
+/// 管理者権限の無いプロセスでは ACL を適用できないので失敗し続ける (状態は SYSTEM/管理者専用)。
 pub fn state_dir() -> Result<PathBuf> {
-    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DIR.get_or_init(|| prepare_state_dir().map_err(|e| format!("{e:#}")))
-        .clone()
-        .map_err(|e| anyhow!(e))
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    cached_or(&DIR, prepare_state_dir)
 }
 
-/// 保護済みのログディレクトリ (`<state_dir>\logs`) を返す。
+/// 保護済みのログディレクトリ (`<state_dir>\logs`) を返す。キャッシュの方針は [`state_dir`] と同じ。
 pub fn log_dir() -> Result<PathBuf> {
-    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = state_dir().map_err(|e| format!("{e:#}"))?.join("logs");
-        prepare(&dir, LOGS_SDDL).map_err(|e| format!("{e:#}"))?;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    cached_or(&DIR, || {
+        let dir = state_dir()?.join("logs");
+        prepare(&dir, LOGS_SDDL)?;
         Ok(dir)
     })
-    .clone()
-    .map_err(|e| anyhow!(e))
+}
+
+fn cached_or(
+    cell: &OnceLock<PathBuf>,
+    prepare: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(dir) = cell.get() {
+        return Ok(dir.clone());
+    }
+    let dir = prepare()?;
+    Ok(cell.get_or_init(|| dir).clone())
 }
 
 /// ログディレクトリのパスだけを返す (作成・ACL 設定はしない)。保護済みフォルダを準備できない
