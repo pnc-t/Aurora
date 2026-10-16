@@ -87,6 +87,9 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 インストーラの挙動:
 - `aurora-host.exe` を `%ProgramFiles%\Aurora Host\` に配置 (per-machine・インストーラ起動時に UAC 1 回)。
+  インストール先は変更できるが、中身のある既存フォルダは選べない (前回のインストール先を除く)。
+  配置先の所有者を Administrators に、ACL を SYSTEM / Administrators は変更可・Users は読み取り
+  のみに固める (SYSTEM サービスが実行する exe とその DLL を一般ユーザーに差し替えさせないため)。
 - コンポーネント「サービスとして常駐」(必須。サイレント更新でも毎回) → (旧版からの更新時のみ) `aurora-host --migrate-user-state`
   (旧版の設定/パスワードを **インストーラを昇格させたユーザー** の `%LOCALAPPDATA%\Aurora`
   から `%ProgramData%\Aurora\host` へ移す) → `aurora-host --install-service` で SYSTEM

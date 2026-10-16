@@ -82,6 +82,27 @@ Function .onInit
   ReadRegStr $IsUpgrade HKLM "${REGROOT}" "InstallDir"
 FunctionEnd
 
+; インストール先の検証。SYSTEM サービスがこのフォルダの exe を実行し、exe は同じフォルダの DLL も
+; 読むため、一般ユーザーが前もって中身を置けたフォルダ (既存の別アプリのフォルダや自分で作った
+; フォルダ) は使わせない。空 or 存在しない新しいフォルダ、または前回のインストール先だけを許す。
+Function .onVerifyInstDir
+  StrCmp $INSTDIR $IsUpgrade verify_ok
+  IfFileExists "$INSTDIR\*.*" 0 verify_ok
+  FindFirst $0 $1 "$INSTDIR\*.*"
+  verify_loop:
+    StrCmp $1 "" verify_empty
+    StrCmp $1 "." verify_next
+    StrCmp $1 ".." verify_next
+    FindClose $0
+    Abort
+  verify_next:
+    FindNext $0 $1
+    Goto verify_loop
+  verify_empty:
+    FindClose $0
+  verify_ok:
+FunctionEnd
+
 ; ---------------------------------------------------------------------------
 ; exe を上書きする前に呼ぶ。サービスを先に止める (止めないとサービスが本体を起動し直して
 ; exe をロックし続ける。net stop はサービスが本体とトレイを止め終えるまで待つ)。その後で
@@ -90,7 +111,7 @@ FunctionEnd
 Function StopRunningHost
   nsExec::Exec '"$SYSDIR\net.exe" stop AuroraHost'
   Pop $0
-  nsExec::Exec 'taskkill /IM ${EXENAME} /F'
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM ${EXENAME} /F'
   Pop $0
 
   IfFileExists "$INSTDIR\${EXENAME}" 0 stoprunninghost_done
@@ -135,6 +156,13 @@ Section "Aurora Host 本体" SecCore
   Call StopRunningHost
 
   SetOutPath "$INSTDIR"
+  ; 所有者と ACL を固める (SYSTEM / Administrators は変更可、Users は読み取り・実行のみ、親からの
+  ; 継承を切る)。既定の %ProgramFiles% では元々この形だが、別の場所を選ばれたときに一般ユーザーが
+  ; exe を差し替えて SYSTEM 権限を得るのを防ぐ。
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  Pop $0
   File "..\..\target\release\${EXENAME}"
   ; VDD 削除スクリプトを同梱しておく (アンインストール時に使用)。
   File "remove_vdd.ps1"
@@ -228,7 +256,7 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   ; 配置 + ノード作成 + ドライバ束縛 + 検証を install_vdd.ps1 が行う。
   ; -HostExe を渡し、VDD 登録直後に host --align-vdd で描画 GPU をキャプチャ GPU に合わせる
   ; (クロス GPU 固着の恒久回避。SecCore は先に実行済みなので exe は配置済み)。
-  ExecShellWait "" "powershell.exe" \
+  ExecShellWait "" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\vdd-setup\install_vdd.ps1" -HostExe "$INSTDIR\${EXENAME}"' SW_HIDE
 
   ; 展開物を削除 (SetOutPath でカレントになっているため抜けてから消す)。
@@ -245,7 +273,7 @@ Section /o "ファイル転送機能を有効化 (Client-ProjFS)" SecProjFS
   secprojfs_run:
   ; Windows オプション機能の有効化 (インストーラは昇格済み)。再起動が必要な場合あり。
   ; 共有機能なのでアンインストールでは戻さない。
-  ExecShellWait "" "powershell.exe" \
+  ExecShellWait "" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -Command "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart"' SW_HIDE
   secprojfs_skip:
 SectionEnd
@@ -263,7 +291,7 @@ Section "Uninstall"
   ExecShellWait "" "$INSTDIR\${EXENAME}" "--uninstall-service" SW_HIDE
 
   ; 2) 残った常駐プロセスを停止 (起動中だと exe を消せない)。
-  nsExec::Exec 'taskkill /IM ${EXENAME} /F'
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM ${EXENAME} /F'
   Pop $0
 
   ; 3) 旧版の自動起動タスクを登録していたら解除 (アンインストーラは昇格済み)。
@@ -276,7 +304,7 @@ Section "Uninstall"
   ;    デバイス削除・ドライバストア削除・C:\ProgramData\Aurora\vdd 削除を一括で行う。
   ReadRegDWORD $0 HKLM "${REGROOT}" "VDDInstalled"
   ${If} $0 == 1
-    ExecShellWait "" "powershell.exe" \
+    ExecShellWait "" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
       '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\remove_vdd.ps1"' SW_HIDE
   ${EndIf}
 
