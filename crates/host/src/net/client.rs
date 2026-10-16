@@ -375,11 +375,16 @@ pub(crate) async fn handle_client(mut stream: TcpStream, args: ClientArgs) -> Re
     let _virt = if is_projfs_owner {
         // 投影ルートは CWD 相対ではなく固定の絶対パス (`%LOCALAPPDATA%\Aurora\remote`)。
         // セッション中だけ This PC にドライブとして現れ、切断 (Drop) で消える。
-        let remote_root = projfs::remote_root();
-        match projfs::start(fs_bridge.clone(), &remote_root) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(error = %e, "ProjFS drive redirection disabled");
+        match projfs::remote_root() {
+            Some(remote_root) => match projfs::start(fs_bridge.clone(), &remote_root) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ProjFS drive redirection disabled");
+                    None
+                }
+            },
+            None => {
+                tracing::info!("ProjFS drive redirection skipped (no signed-in user)");
                 None
             }
         }

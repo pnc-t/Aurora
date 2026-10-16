@@ -11,12 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{
-    BOOLEAN, CloseHandle, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary,
-    HANDLE, S_OK,
-};
-use windows::Win32::Security::{
-    DuplicateTokenEx, SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
-    TokenImpersonation,
+    BOOLEAN, E_OUTOFMEMORY, ERROR_FILE_NOT_FOUND, ERROR_IO_DEVICE, FreeLibrary, S_OK,
 };
 use windows::Win32::Storage::FileSystem::{
     DDD_NO_BROADCAST_SYSTEM, DDD_REMOVE_DEFINITION, DefineDosDeviceW, FILE_ATTRIBUTE_DIRECTORY,
@@ -35,10 +30,6 @@ use windows::Win32::Storage::ProjectedFileSystem::{
     PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData, PrjWritePlaceholderInfo,
 };
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
-use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadToken,
-};
-use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 use windows::core::{GUID, HRESULT, PCWSTR};
 
 use super::FsBridge;
@@ -235,16 +226,6 @@ fn query_dos_device(letter: char) -> Option<String> {
     (n != 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
-/// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: 取得に成功した有効なハンドルだけを保持し、1 度だけ閉じる。
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
 /// 昇格プロセスのとき、非昇格シェル (explorer) のトークンを偽装した状態で `f` を実行する。
 /// 実行したら `Ok`。昇格していない (= 既にシェルと同じセッション) / シェルが見つからない /
 /// トークンを得られないときは実行せず、理由を `Err` で返す (ログでの切り分け用)。
@@ -257,53 +238,8 @@ fn in_shell_session(f: impl FnOnce()) -> Result<(), &'static str> {
     if !crate::display::process_is_elevated() {
         return Err("not elevated");
     }
-    let token = shell_impersonation_token()?;
-    // SAFETY: 複製した偽装トークンを現在のスレッドに設定する。f の後で必ず解除する
-    // (このスレッドは tokio / ProjFS と共有されうるため、偽装を残さない)。
-    unsafe { SetThreadToken(None, token.0) }.map_err(|_| "SetThreadToken failed")?;
-    f();
-    // SAFETY: スレッドの偽装を解除するだけ。
-    let _ = unsafe { SetThreadToken(None, HANDLE::default()) };
-    Ok(())
-}
-
-/// 非昇格シェル (デスクトップの explorer) のトークンを偽装用に複製する。
-fn shell_impersonation_token() -> Result<OwnedHandle, &'static str> {
-    // SAFETY: 引数なしでシェルのデスクトップウィンドウを得るだけ (無ければ null)。
-    let hwnd = unsafe { GetShellWindow() };
-    if hwnd.0.is_null() {
-        return Err("no shell window");
-    }
-    let mut pid = 0u32;
-    // SAFETY: hwnd は直前に得たウィンドウ。pid は出力先のスタック変数。
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if pid == 0 {
-        return Err("no shell process");
-    }
-    // SAFETY: 同一ユーザーの explorer を問い合わせ権限だけで開く。
-    let process = OwnedHandle(
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-            .map_err(|_| "OpenProcess(shell) failed")?,
-    );
-    let mut primary = HANDLE::default();
-    // SAFETY: process は有効なプロセスハンドル。primary は出力先。
-    unsafe { OpenProcessToken(process.0, TOKEN_DUPLICATE | TOKEN_QUERY, &mut primary) }
-        .map_err(|_| "OpenProcessToken(shell) failed")?;
-    let primary = OwnedHandle(primary);
-    let mut imp = HANDLE::default();
-    // SAFETY: primary は有効なトークン。スレッド偽装に使える偽装レベルのトークンを複製する。
-    unsafe {
-        DuplicateTokenEx(
-            primary.0,
-            TOKEN_IMPERSONATE | TOKEN_QUERY,
-            None,
-            SecurityImpersonation,
-            TokenImpersonation,
-            &mut imp,
-        )
-    }
-    .map_err(|_| "DuplicateTokenEx failed")?;
-    Ok(OwnedHandle(imp))
+    let token = crate::system::user::shell_impersonation_token()?;
+    crate::system::user::impersonating(&token, f)
 }
 
 // SAFETY: ctx はスレッド間で移動しても安全 (ProjFS が内部同期する)。
