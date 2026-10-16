@@ -99,6 +99,8 @@ struct Args {
     uninstall_service: bool,
     /// 旧版のユーザー側状態を状態ディレクトリへ移して終了する (`--migrate-user-state`)。
     migrate_user_state: bool,
+    /// ユーザー権限の単独トレイとして動く (`--tray`、サービスがログオンユーザーとして起動する)。
+    tray: bool,
 }
 
 /// `--help` で出す使い方。フラグを増やしたらここも足す。
@@ -165,6 +167,7 @@ impl Default for Args {
             install_service: false,
             uninstall_service: false,
             migrate_user_state: false,
+            tray: false,
         }
     }
 }
@@ -255,6 +258,7 @@ fn parse_args() -> Result<Args, String> {
             "--install-service" => args.install_service = true,
             "--uninstall-service" => args.uninstall_service = true,
             "--migrate-user-state" => args.migrate_user_state = true,
+            "--tray" => args.tray = true,
             // サービスが本体に付ける印。挙動は `system::service::is_service_child` が直接見る。
             system::service::SERVICE_CHILD_ARG => {}
             "--help" | "-h" => args.help = true,
@@ -340,13 +344,27 @@ fn main() -> Result<()> {
     // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
     // (CLI / デバッグ) は従来どおりコンソールへ出す。_log_guard は非ブロッキング writer の
     // ワーカーを生かすため main 終了まで保持する (drop すると以降のログが失われる)。
-    // サービス (Session 0) は本体と別ファイルに書く (同じ日次ファイルへの 2 プロセス同時書込を避ける)。
-    // デバッグビルドでもコンソールが無いので常にファイルへ。
-    let _log_guard = init_tracing(
-        if args.service { "service" } else { "host" },
-        args.service || (!needs_console && !cfg!(debug_assertions)),
-        args.log_level.as_deref(),
-    );
+    // サービス (Session 0) とトレイは本体と別ファイルに書く (同じ日次ファイルへの複数プロセス同時
+    // 書込を避ける)。どちらもデバッグビルドでもコンソールが無いので常にファイルへ。トレイは一般
+    // ユーザー権限で保護済みの host ログへ書けないので、ユーザー側 (%LOCALAPPDATA%) へ書く。
+    let _log_guard = if args.tray {
+        init_tracing(
+            "tray",
+            aurora_common::logging::default_log_dir(),
+            args.log_level.as_deref(),
+        )
+    } else {
+        let stem = if args.service { "service" } else { "host" };
+        let to_file = args.service || (!needs_console && !cfg!(debug_assertions));
+        // 保護済みの %ProgramData%\Aurora\host\logs が用意できない (非管理者の開発実行・所有者不正)
+        // ときは原因をログで追えるよう従来のユーザー側へ書く。
+        let dir = to_file.then(|| {
+            system::state::log_dir()
+                .ok()
+                .or_else(aurora_common::logging::default_log_dir)
+        });
+        init_tracing(stem, dir.flatten(), args.log_level.as_deref())
+    };
 
     // ログ冒頭にバージョン/ビルド種別を残す (どのビルドで起きた事象かを後から特定するため)。
     tracing::info!(
@@ -357,6 +375,9 @@ fn main() -> Result<()> {
 
     if args.service {
         return system::service::run_dispatcher();
+    }
+    if args.tray {
+        return tray::run_standalone();
     }
     if args.install_service {
         return system::service::install_service(&system::service::current_service_forward_args());
@@ -412,6 +433,11 @@ fn main() -> Result<()> {
     // サーバ起動は 1 プロセスだけ。キャプチャ/エンコーダの初期化 (GPU) に入る前に判定する。
     // ガードはプロセス終了まで保持する (run_server は通常戻らず、トレイ終了は exit する)。
     let Some(_instance) = system::instance::acquire() else {
+        // サービス運用中の手動起動 (スタートメニュー等) は、閉じたトレイを出し直したい意図とみなす。
+        #[cfg(target_os = "windows")]
+        if !system::service::is_service_child() && tray::ipc::host_pipe_exists() {
+            return tray::run_standalone();
+        }
         tracing::info!("another aurora-host server is already running; exiting");
         // サービス配下は SYSTEM なので対話デスクトップへ UI を出さない (サービスが待って再試行する)。
         if !system::service::is_service_child() {
@@ -483,30 +509,22 @@ fn build_log_filter(level: Option<&str>) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| "aurora=info".into())
 }
 
-/// `tracing` を初期化する。`to_file` が真なら `%ProgramData%\Aurora\host\logs\<file_stem>.<日付>.log`
+/// `tracing` を初期化する。`dir` があれば `<dir>\<file_stem>.<日付>.log`
 /// へ日次ローテ (7 世代) + 非ブロッキングで書き、デバッグビルドや CLI 実行では加えて
 /// コンソール (stdout) にも出す。ファイル出力先が用意できない場合はコンソールへフォール
 /// バックする。フィルタの優先順位は `--log-level` 引数 > `RUST_LOG` 環境変数 > 既定
 /// (`aurora=info`)。戻り値のガードは main 終了まで保持すること。
 fn init_tracing(
     file_stem: &'static str,
-    to_file: bool,
+    dir: Option<std::path::PathBuf>,
     level: Option<&str>,
 ) -> aurora_common::logging::LogGuard {
     aurora_common::logging::init(aurora_common::logging::LogOptions {
         file_stem,
         filter: build_log_filter(level),
-        // 保護済みの %ProgramData%\Aurora\host\logs が用意できない (非管理者の開発実行・所有者不正) ときは
-        // 原因をログで追えるよう従来のユーザー側へ書く。
-        dir: if to_file {
-            system::state::log_dir()
-                .ok()
-                .or_else(aurora_common::logging::default_log_dir)
-        } else {
-            None
-        },
+        dir,
         // ファイル出力する常駐サーバでは stdout は不要 (コンソール無し)。CLI / デバッグは
-        // ファイル出力しない (= to_file=false) のでフォールバックで console に出る。
+        // ファイル出力しない (= dir=None) のでフォールバックで console に出る。
         console: false,
     })
 }
@@ -1272,19 +1290,25 @@ fn run_server(
     // GitHub Releases 経由の自己更新の実行時状態。update スレッド (検知/適用) と tray
     // (メニュー表示/要求) で共有する。
     let update_state = update::UpdateState::new();
-    // システムトレイ常駐 UI を起動 (Windows のみ実体)。保存パスワードが無い初回は
-    // 設定ダイアログを自動表示する。
-    tray::spawn(
-        psk.clone(),
+    // トレイ操作が触る共有状態。保存パスワードが無い初回はトレイが設定ダイアログを自動表示する。
+    let tray_ctx = tray::TrayContext {
+        psk: psk.clone(),
         has_password,
-        port_cell.clone(),
-        reload.clone(),
-        auth_failures.clone(),
-        devices.clone(),
-        tray_bus.clone(),
-        update_state.clone(),
-        !have_stored,
-    );
+        port: port_cell.clone(),
+        reload: reload.clone(),
+        auth_failures: auth_failures.clone(),
+        devices: devices.clone(),
+        bus: tray_bus.clone(),
+        update: update_state.clone(),
+    };
+    // サービス配下 (SYSTEM) は対話デスクトップへ UI を出さず、ユーザー権限のトレイ (`--tray`) から
+    // パイプで操作を受ける。それ以外は従来どおり同一プロセスでトレイを出す。
+    let pipe_tray_ctx = if system::service::is_service_child() {
+        Some(tray_ctx)
+    } else {
+        tray::spawn(tray_ctx);
+        None
+    };
     // 更新の検知/適用スレッド。ブロッキング HTTP/sleep を使うため tokio タスクではなく
     // 他サブシステム (capture/encode/input) と同じ流儀の std::thread にする。
     {
@@ -1524,6 +1548,12 @@ fn run_server(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        #[cfg(target_os = "windows")]
+        if let Some(ctx) = pipe_tray_ctx {
+            tokio::spawn(tray::ipc::serve(ctx));
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = pipe_tray_ctx;
         let cfg = ServerConfig {
             bind,
             port: port_cell,
