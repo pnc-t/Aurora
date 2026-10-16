@@ -15,6 +15,9 @@
 //!   ログオン/ロックでは張り替えない (本体がデスクトップ切替に追従する)。
 //! - 本体の自己 re-exec (DXGI ACCESS_LOST 回復) は、サービス配下では子を産まずに終了して
 //!   サービスに再起動させる ([`is_service_child`])。孫プロセスはサービスから監視できない。
+//! - トレイ (`--tray`) は SYSTEM ではなく**ログオンユーザーのトークン** (`WTSQueryUserToken`、
+//!   管理者でも UAC の制限付きトークン) で起動する。SYSTEM の UI を対話デスクトップに出すと
+//!   ローカル利用者への権限昇格穴になるため。サインイン前はユーザーが居ないので起動しない。
 
 /// SCM に登録するサービス名 (`sc query AuroraHost` で引ける)。
 #[cfg(target_os = "windows")]
@@ -50,7 +53,8 @@ mod imp {
         DuplicateTokenEx, SecurityIdentification, SetTokenInformation, TOKEN_ALL_ACCESS,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, TokenSessionId,
     };
-    use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
         CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
         GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
@@ -78,6 +82,8 @@ mod imp {
     const HEALTHY_RUNTIME: Duration = Duration::from_secs(30);
     const BACKOFF_MIN: Duration = Duration::from_secs(1);
     const BACKOFF_MAX: Duration = Duration::from_secs(60);
+    /// トレイが異常終了したときの再起動待ち (explorer 起動前のログオン直後などを空振りしないよう緩め)。
+    const TRAY_RETRY: Duration = Duration::from_secs(5);
 
     /// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
     struct OwnedHandle(HANDLE);
@@ -167,7 +173,7 @@ mod imp {
         Ok(())
     }
 
-    /// 本体をアクティブなコンソールセッションに 1 つだけ生かし続ける。Stop で本体を止めて戻る。
+    /// 本体とトレイをアクティブなコンソールセッションに 1 つずつ生かし続ける。Stop で両方止めて戻る。
     fn supervise(rx: &mpsc::Receiver<Event>) {
         let forward = super::current_service_forward_args()
             .into_iter()
@@ -176,10 +182,14 @@ mod imp {
         let mut child: Option<Child> = None;
         let mut backoff = BACKOFF_MIN;
         let mut next_spawn = Instant::now();
+        let mut tray: Option<Child> = None;
+        let mut next_tray = Instant::now();
+        // 利用者が「トレイを閉じる」を選んだセッション。そのセッションの間は出し直さない。
+        let mut tray_closed_in: Option<u32> = None;
         loop {
             match rx.recv_timeout(POLL) {
                 Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if let Some(c) = child.take() {
+                    for c in [child.take(), tray.take()].into_iter().flatten() {
                         terminate(&c, "service stopping");
                     }
                     return;
@@ -228,6 +238,45 @@ mod imp {
                     }
                 }
             }
+
+            if let Some(t) = &tray {
+                if let Some(code) = exit_code(t) {
+                    if code == 0 {
+                        // 「トレイを閉じる」(または同セッションに既にトレイがある)。
+                        tracing::info!(
+                            session = t.session,
+                            "tray closed; not restarting in this session"
+                        );
+                        tray_closed_in = Some(t.session);
+                    } else {
+                        tracing::warn!(exit_code = code, "tray exited abnormally; restarting");
+                        next_tray = Instant::now() + TRAY_RETRY;
+                    }
+                    tray = None;
+                } else if t.session != target {
+                    terminate(t, "console session changed");
+                    tray = None;
+                }
+            }
+
+            if tray.is_none()
+                && target != NO_CONSOLE_SESSION
+                && tray_closed_in != Some(target)
+                && Instant::now() >= next_tray
+            {
+                match spawn_tray(target) {
+                    Ok(Some(t)) => {
+                        tracing::info!(pid = t.pid, session = t.session, "tray started");
+                        tray = Some(t);
+                    }
+                    // サインイン画面 (ユーザー未ログオン)。ログオンしたら次の周期で起動する。
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, session = target, "failed to start tray");
+                        next_tray = Instant::now() + TRAY_RETRY;
+                    }
+                }
+            }
         }
     }
 
@@ -243,14 +292,14 @@ mod imp {
         Some(code)
     }
 
-    /// 本体を強制終了する。本体は終了処理を持たないが、ProjFS の subst 残骸と VDD テイクオーバーは
-    /// 次回起動時に掃除/復元されるので、ここで後始末を待たなくてよい。
+    /// 本体/トレイを強制終了する。本体は終了処理を持たないが、ProjFS の subst 残骸と VDD
+    /// テイクオーバーは次回起動時に掃除/復元されるので、ここで後始末を待たなくてよい。
     fn terminate(c: &Child, reason: &str) {
         tracing::info!(
             pid = c.pid,
             session = c.session,
             reason,
-            "terminating host process"
+            "terminating process"
         );
         // SAFETY: c.process は有効なプロセスハンドル (PROCESS_TERMINATE を含む全権限で作成済み)。
         let _ = unsafe { TerminateProcess(c.process.0, 1) };
@@ -260,8 +309,6 @@ mod imp {
 
     /// 自分 (LocalSystem) のトークンを複製し、セッションだけを `session` に差し替えて本体を起動する。
     fn spawn_in_session(session: u32, forward: &[String]) -> Result<Child> {
-        let exe = std::env::current_exe().context("get current exe path")?;
-
         let mut own = HANDLE::default();
         // SAFETY: 自プロセスのトークンを複製用の権限で開く。own は出力先。
         unsafe {
@@ -300,10 +347,56 @@ mod imp {
         }
         .context("SetTokenInformation(TokenSessionId) (needs LocalSystem)")?;
 
+        let mut args = vec![SERVICE_CHILD_ARG.to_string()];
+        args.extend(forward.iter().cloned());
+        // 環境は親 (SYSTEM) を継承する。
+        create_process(&primary, &args, None, session)
+    }
+
+    /// ログオンユーザーのトークンでトレイ (`--tray`) を起動する。ユーザーが居なければ `Ok(None)`。
+    fn spawn_tray(session: u32) -> Result<Option<Child>> {
+        let mut user = HANDLE::default();
+        // SAFETY: session のログオンユーザーのトークンを出力先へ受ける (SeTcb 権限 = LocalSystem で可)。
+        // 失敗はサインイン画面などユーザー未ログオンの状態。
+        if unsafe { WTSQueryUserToken(session, &mut user) }.is_err() {
+            return Ok(None);
+        }
+        let user = OwnedHandle(user);
+        let env = EnvBlock::for_user(&user)?;
+        create_process(&user, &["--tray".to_string()], Some(&env), session).map(Some)
+    }
+
+    /// `CreateEnvironmentBlock` が作るユーザーの環境変数ブロック (Drop で解放)。トレイに利用者の
+    /// `%LOCALAPPDATA%` 等を持たせる (SYSTEM の環境を継承させない)。
+    struct EnvBlock(*mut std::ffi::c_void);
+
+    impl EnvBlock {
+        fn for_user(token: &OwnedHandle) -> Result<Self> {
+            let mut env: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: token は有効なユーザートークン。env は成功時に確保されたブロックを指し、Drop で解放する。
+            unsafe { CreateEnvironmentBlock(&mut env, token.0, false) }
+                .context("CreateEnvironmentBlock")?;
+            Ok(Self(env))
+        }
+    }
+
+    impl Drop for EnvBlock {
+        fn drop(&mut self) {
+            // SAFETY: CreateEnvironmentBlock が確保したブロックを 1 度だけ解放する。
+            let _ = unsafe { DestroyEnvironmentBlock(self.0) };
+        }
+    }
+
+    /// 自分の exe を `token` で `session` の対話デスクトップに起動する。
+    fn create_process(
+        token: &OwnedHandle,
+        args: &[String],
+        env: Option<&EnvBlock>,
+        session: u32,
+    ) -> Result<Child> {
+        let exe = std::env::current_exe().context("get current exe path")?;
         let mut cmdline = quote_arg(&exe.to_string_lossy());
-        cmdline.push(' ');
-        cmdline.push_str(SERVICE_CHILD_ARG);
-        for a in forward {
+        for a in args {
             cmdline.push(' ');
             cmdline.push_str(&quote_arg(a));
         }
@@ -325,18 +418,18 @@ mod imp {
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
-        // SAFETY: 全ポインタは本関数のスタック/Vec を指し呼び出し中は生存する。cmdline_w は
-        // CreateProcessW 系の要件どおり書き込み可能な NUL 終端バッファ。環境は親 (SYSTEM) を継承。
+        // SAFETY: 全ポインタは本関数のスタック/Vec/env を指し呼び出し中は生存する。cmdline_w は
+        // CreateProcessW 系の要件どおり書き込み可能な NUL 終端バッファ。env は UNICODE 形式のブロック。
         unsafe {
             CreateProcessAsUserW(
-                primary.0,
+                token.0,
                 PCWSTR(exe_w.as_ptr()),
                 PWSTR(cmdline_w.as_mut_ptr()),
                 None,
                 None,
                 false,
                 CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                None,
+                env.map(|e| e.0 as *const std::ffi::c_void),
                 PCWSTR::null(),
                 &si,
                 &mut pi,

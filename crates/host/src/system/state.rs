@@ -48,6 +48,16 @@ pub fn log_dir() -> Result<PathBuf> {
     .map_err(|e| anyhow!(e))
 }
 
+/// ログディレクトリのパスだけを返す (作成・ACL 設定はしない)。保護済みフォルダを準備できない
+/// 一般ユーザー権限のトレイが「ログフォルダを開く」で使う。
+pub fn log_dir_path() -> Option<PathBuf> {
+    Some(
+        aurora_common::paths::machine_data_dir()?
+            .join("host")
+            .join("logs"),
+    )
+}
+
 fn prepare_state_dir() -> Result<PathBuf> {
     let root = aurora_common::paths::machine_data_dir()
         .ok_or_else(|| anyhow!("ProgramData is not set"))?;
