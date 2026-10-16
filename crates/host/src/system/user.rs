@@ -89,13 +89,21 @@ pub fn shell_impersonation_token() -> Result<UserToken, &'static str> {
 
 /// 現スレッドで `token` を偽装して `f` を実行し、必ず偽装を解除して戻る。
 pub fn impersonating<T>(token: &UserToken, f: impl FnOnce() -> T) -> Result<T, &'static str> {
-    // SAFETY: 複製した偽装トークンを現在のスレッドに設定する。f の後で必ず解除する
-    // (このスレッドは tokio / ProjFS と共有されうるため、偽装を残さない)。
+    // SAFETY: 複製した偽装トークンを現在のスレッドに設定する。解除は下のガードが Drop で行う。
     unsafe { SetThreadToken(None, token.0) }.map_err(|_| "SetThreadToken failed")?;
-    let out = f();
-    // SAFETY: スレッドの偽装を解除するだけ。
-    let _ = unsafe { SetThreadToken(None, HANDLE::default()) };
-    Ok(out)
+    let _revert = RevertOnDrop;
+    Ok(f())
+}
+
+/// スレッドの偽装を Drop で解除する。`f` が panic して巻き戻るときも解除し、偽装したままの
+/// スレッドを tokio / ProjFS のスレッドプールへ返さない (以後の別タスクがユーザー権限で動いてしまう)。
+struct RevertOnDrop;
+
+impl Drop for RevertOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: 現在のスレッドの偽装を解除するだけ。
+        let _ = unsafe { SetThreadToken(None, HANDLE::default()) };
+    }
 }
 
 /// トークンの持ち主のプロファイルディレクトリ (`C:\Users\<名前>`)。
