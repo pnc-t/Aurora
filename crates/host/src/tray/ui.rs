@@ -24,7 +24,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use super::{TrayControl, TrayEvent, TrayReply, TrayRequest, TrayStatus};
+use super::{TrayControl, TrayEvent, TrayReply, TrayRequest, TrayStatus, control::BUSY};
 
 /// トレイアイコンからの通知を受けるカスタムメッセージ。
 const WM_TRAY: u32 = WM_APP + 1;
@@ -760,15 +760,27 @@ fn change_password(hwnd: HWND) {
         return;
     };
     let _ = state.refresh();
-    let Some(require_current) = state.status.borrow().as_ref().map(|s| s.has_password) else {
+    let Some((require_current, busy)) = state
+        .status
+        .borrow()
+        .as_ref()
+        .map(|s| (s.has_password, s.busy))
+    else {
         message_box(hwnd, "本体に接続できません。", "Aurora Host");
         return;
     };
-    while let Some((current, new)) = prompt_password(hwnd, require_current) {
-        match state
-            .control
-            .call(TrayRequest::ChangePassword { current, new })
-        {
+    // 接続中は本体が拒否する。入力させてから断らないよう先に知らせる。
+    if busy {
+        message_box(hwnd, BUSY, "Aurora Host");
+        return;
+    }
+    // 現在パスワードを間違えて開き直すときは、入力済みの新しいパスワードを残す。
+    let mut keep_new: Option<String> = None;
+    while let Some((current, new)) = prompt_password(hwnd, require_current, keep_new.as_deref()) {
+        match state.control.call(TrayRequest::ChangePassword {
+            current,
+            new: new.clone(),
+        }) {
             TrayReply::Done(msg) => {
                 message_box(hwnd, &msg, "Aurora Host");
                 return;
@@ -779,6 +791,7 @@ fn change_password(hwnd: HWND) {
                 if !msg.contains("パスワード") {
                     return;
                 }
+                keep_new = msg.contains("現在のパスワード").then_some(new);
             }
             TrayReply::Status(_) => return,
         }
@@ -792,10 +805,14 @@ fn change_port(hwnd: HWND) {
         return;
     };
     let _ = state.refresh();
-    let Some(current) = state.status.borrow().as_ref().map(|s| s.port) else {
+    let Some((current, busy)) = state.status.borrow().as_ref().map(|s| (s.port, s.busy)) else {
         message_box(hwnd, "本体に接続できません。", "Aurora Host");
         return;
     };
+    if busy {
+        message_box(hwnd, BUSY, "Aurora Host");
+        return;
+    }
     if let Some(new_port) = prompt_port(hwnd, current)
         && new_port != current
     {
@@ -1029,7 +1046,11 @@ struct DlgResult {
 
 /// パスワード設定/変更ダイアログを表示する。`require_current` のときは「現在のパスワード」欄を
 /// 追加する。照合は本体側 (`control::handle`) で行う (トレイに PSK を持たせないため)。
-fn prompt_password(owner: HWND, require_current: bool) -> Option<(Option<String>, String)> {
+fn prompt_password(
+    owner: HWND,
+    require_current: bool,
+    keep_new: Option<&str>,
+) -> Option<(Option<String>, String)> {
     // SAFETY: パスワードダイアログ生成一式。各 Win32 呼び出しの結果は ? で確認する。
     unsafe {
         let hmod = GetModuleHandleW(None).ok()?;
@@ -1131,9 +1152,16 @@ fn prompt_password(owner: HWND, require_current: bool) -> Option<(Option<String>
             y += 58;
         }
         mk_label(y, w!("新しいパスワード"));
-        let _ = mk_edit(y + 20, ID_EDIT);
+        let new_edit = mk_edit(y + 20, ID_EDIT);
         mk_label(y + 58, w!("新しいパスワード (確認)"));
-        let _ = mk_edit(y + 78, ID_EDIT2);
+        let confirm_edit = mk_edit(y + 78, ID_EDIT2);
+        // 開き直し (現在パスワード違い) では新しいパスワードを入力済みの状態に戻す。
+        if let Some(text) = keep_new {
+            let text = to_wide(text);
+            for edit in [new_edit, confirm_edit].into_iter().flatten() {
+                let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
+            }
+        }
         let button_y = y + 120;
 
         // OK / キャンセルボタン。

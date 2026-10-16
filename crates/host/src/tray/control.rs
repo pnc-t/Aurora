@@ -59,6 +59,9 @@ pub struct TrayStatus {
     pub pairing_armed: bool,
     pub pending: Vec<PendingInfo>,
     pub device_labels: Vec<String>,
+    /// クライアント接続中か。接続中に拒否される操作 (パスワード/ポート変更) で、入力させる前に
+    /// 知らせるための表示用 (拒否そのものは [`handle`] が行う)。
+    pub busy: bool,
     /// 前回の取得以降に溜まった通知イベント (取得で消費される)。
     pub events: Vec<TrayEvent>,
 }
@@ -110,7 +113,8 @@ impl TrayControl for LocalControl {
     }
 }
 
-const BUSY: &str = "クライアント接続中は変更できません。\n切断してから操作してください。";
+/// 接続中に変更を拒否したときの文言 (トレイが入力前の事前案内にも使う)。
+pub const BUSY: &str = "クライアント接続中は変更できません。\n切断してから操作してください。";
 
 /// 現在パスワード照合の失敗に応じた待ち (総当たり対策)。遠隔の認証には IP 単位のスロットルが
 /// あるが、トレイ経由の照合はそれを通らないため、ここで同じ趣旨の制限をかける。照合 (Argon2、
@@ -297,6 +301,7 @@ fn status(ctx: &TrayContext) -> TrayStatus {
             })
             .collect(),
         device_labels: ctx.devices.labels(),
+        busy: crate::net::is_active(),
         events: ctx.bus.drain_events(),
     }
 }
