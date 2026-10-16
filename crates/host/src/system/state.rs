@@ -94,6 +94,14 @@ fn ensure_trusted_dir(dir: &std::path::Path) -> Result<()> {
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create {} (run as administrator)", dir.display()))?;
+    // 先回りで作られたジャンクション/シンボリックリンクは、所有者検査がリンク先 (SYSTEM 所有の
+    // 別ディレクトリ等) を見て通ってしまい、ACL 適用がリンク先を書き換える。リンクは使わない。
+    if is_reparse_point(dir)? {
+        bail!(
+            "{} is a junction or symbolic link (possibly planted by a non-admin user);              refusing to use it. Delete it as administrator and restart",
+            dir.display()
+        );
+    }
     if !owner_is_trusted(dir)? {
         bail!(
             "{} is owned by an untrusted account (possibly pre-created by a non-admin user); \
@@ -112,6 +120,16 @@ fn prepare(dir: &std::path::Path, sddl: &str) -> Result<()> {
     ensure_trusted_dir(dir)?;
     apply_dacl(dir, sddl)
         .with_context(|| format!("protect {} (run as administrator)", dir.display()))
+}
+
+/// リパースポイント (ジャンクション・シンボリックリンク等) か。リンク自体の属性を見る (辿らない)。
+#[cfg(target_os = "windows")]
+fn is_reparse_point(path: &std::path::Path) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| anyhow!("inspect {}: {e}", path.display()))?;
+    Ok(meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 /// 所有者が SYSTEM か Administrators か。
@@ -236,8 +254,9 @@ pub fn migrate_user_state() -> Result<()> {
     let mut migrated = Vec::new();
 
     let old_secret = src.join(crate::security::secret::FILE_NAME);
-    if old_secret.exists() && !dst.join(crate::security::secret::FILE_NAME).exists() {
-        let blob = std::fs::read(&old_secret).context("read old password store")?;
+    if !dst.join(crate::security::secret::FILE_NAME).exists()
+        && let Some(blob) = read_migration_source(&old_secret)?
+    {
         let plain = aurora_common::dpapi::unprotect(&blob)
             .context("decrypt old password store (run as the user who set it)")?;
         let password = String::from_utf8(plain).context("old password is not valid UTF-8")?;
@@ -247,10 +266,10 @@ pub fn migrate_user_state() -> Result<()> {
     // 平文設定は読み書きし直す (コピーだと元ファイルの ACL を持ち込みうる。新規作成なら
     // 保護済みディレクトリの継承 ACL になる)。
     for name in ["port", "encode-gpu", "pinning", "trusted_devices.txt"] {
-        let from = src.join(name);
         let to = dst.join(name);
-        if from.exists() && !to.exists() {
-            let data = std::fs::read(&from).with_context(|| format!("read old {name}"))?;
+        if !to.exists()
+            && let Some(data) = read_migration_source(&src.join(name))?
+        {
             std::fs::write(&to, data).with_context(|| format!("write {name}"))?;
             migrated.push(name);
         }
@@ -261,4 +280,31 @@ pub fn migrate_user_state() -> Result<()> {
         println!("migrated to {}: {}", dst.display(), migrated.join(", "));
     }
     Ok(())
+}
+
+/// 移行元のファイルを読む。無ければ `None`。移行元は利用者が自由に書ける場所で、移行は昇格した
+/// インストーラから走るため、リンク (別の場所のファイルを読ませる) や通常ファイル以外、上限を
+/// 超える大きさのものは取り込まない (いずれも旧版が書いた形ではない)。
+fn read_migration_source(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    /// 旧版の状態ファイルはいずれも数 KB 以下 (許可リストでも 1 端末 1 行)。
+    const MAX_MIGRATION_FILE: u64 = 1024 * 1024;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("inspect {}: {e}", path.display())),
+    };
+    #[cfg(target_os = "windows")]
+    let linked = is_reparse_point(path)?;
+    #[cfg(not(target_os = "windows"))]
+    let linked = meta.file_type().is_symlink();
+    if linked || !meta.is_file() || meta.len() > MAX_MIGRATION_FILE {
+        println!(
+            "skipping {} (not a plain file written by an older version)",
+            path.display()
+        );
+        return Ok(None);
+    }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|e| anyhow!("read {}: {e}", path.display()))
 }
