@@ -101,6 +101,9 @@ mod imp {
     const TRAY_RETRY: Duration = Duration::from_secs(5);
     /// 停止要求から本体の自主終了を待つ上限。過ぎたら強制終了する。
     const GRACEFUL_STOP: Duration = Duration::from_secs(5);
+    /// 停止処理にかかりうる上限として SCM へ伝える目安 (本体の自主終了待ち + 強制終了の待ち)。
+    /// 伝えないと、シャットダウン猶予の短い環境で SCM が停止中のサービスを強制終了しうる。
+    const STOP_WAIT_HINT: Duration = Duration::from_secs(15);
 
     /// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
     struct OwnedHandle(HANDLE);
@@ -240,7 +243,17 @@ mod imp {
         .context("report service running")?;
         tracing::info!("service running");
 
-        supervise(&rx);
+        supervise(&rx, || {
+            let _ = status.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::StopPending,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 1,
+                wait_hint: STOP_WAIT_HINT,
+                process_id: None,
+            });
+        });
 
         set_state(ServiceState::Stopped, ServiceControlAccept::empty())
             .context("report service stopped")?;
@@ -248,8 +261,9 @@ mod imp {
         Ok(())
     }
 
-    /// 本体とトレイをアクティブなコンソールセッションに 1 つずつ生かし続ける。Stop で両方止めて戻る。
-    fn supervise(rx: &mpsc::Receiver<Event>) {
+    /// 本体とトレイをアクティブなコンソールセッションに 1 つずつ生かし続ける。Stop で両方止めて戻る
+    /// (止め始める前に `on_stopping` で SCM へ停止処理中を伝える)。
+    fn supervise(rx: &mpsc::Receiver<Event>, on_stopping: impl Fn()) {
         let forward = super::current_service_forward_args()
             .into_iter()
             .filter(|a| a != "--service")
@@ -271,6 +285,7 @@ mod imp {
         loop {
             match rx.recv_timeout(POLL) {
                 Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    on_stopping();
                     if let Some(c) = child.take() {
                         stop_host(&c, stop_event.as_ref(), "service stopping");
                     }
