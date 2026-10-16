@@ -159,9 +159,14 @@ Section "Aurora Host 本体" SecCore
   ; 所有者と ACL を固める (SYSTEM / Administrators は変更可、Users は読み取り・実行のみ、親からの
   ; 継承を切る)。既定の %ProgramFiles% では元々この形だが、別の場所を選ばれたときに一般ユーザーが
   ; exe を差し替えて SYSTEM 権限を得るのを防ぐ。
+  ; 継承付きの ACE はフォルダにだけ付け (/T を付けない)、中身は「親から継承」へ戻す。/T で
+  ; 子ファイルにも付けようとすると、(OI)(CI) はファイルに付けられず、/inheritance:r で継承分だけ
+  ; 剥がれて DACL が空になり、管理者でも exe を上書きできなくなる (2026-10-17 実機で発生)。
   nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
   Pop $0
-  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR\*" /reset /T /C /Q'
   Pop $0
   File "..\..\target\release\${EXENAME}"
   ; VDD 削除スクリプトを同梱しておく (アンインストール時に使用)。
