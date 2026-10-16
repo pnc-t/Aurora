@@ -217,8 +217,10 @@ mod imp {
                         "host process exited; respawning"
                     );
                     child = None;
-                } else if c.session != target {
+                } else if target != NO_CONSOLE_SESSION && c.session != target {
                     // ログオフ・ユーザー切替: 旧セッションの本体は新しいコンソールを映せない。
+                    // 切替の過渡で一瞬「コンソール無し」が返るだけのときは付け替えない
+                    // (接続中のクライアントを無用に切ってしまう)。
                     terminate(c, "console session changed");
                     child = None;
                     next_spawn = Instant::now();
@@ -253,7 +255,7 @@ mod imp {
                         next_tray = Instant::now() + TRAY_RETRY;
                     }
                     tray = None;
-                } else if t.session != target {
+                } else if target != NO_CONSOLE_SESSION && t.session != target {
                     terminate(t, "console session changed");
                     tray = None;
                 }
