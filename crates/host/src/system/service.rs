@@ -24,6 +24,10 @@
 const SERVICE_NAME: &str = "AuroraHost";
 /// サービス配下で起動された本体である印 (CLI 引数)。サービスだけが付ける。
 pub const SERVICE_CHILD_ARG: &str = "--service-child";
+/// サービスが本体へ「後始末して終了せよ」を伝える名前付きイベント。Global 名前空間に作れるのは
+/// SeCreateGlobalPrivilege を持つサービス/管理者だけなので、一般ユーザーは先回りで作れない。
+#[cfg(target_os = "windows")]
+const STOP_EVENT_NAME: &str = "Global\\AuroraHostStop";
 
 /// 現プロセスがサービスから起動された本体かを返す。引数を見るだけなので誰でも付けられるが、
 /// 変わるのは「自己 re-exec の代わりに終了する」「二重起動ダイアログを出さない」挙動だけで、
@@ -61,9 +65,10 @@ mod imp {
     };
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-        GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
-        STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
+        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+        PROCESS_INFORMATION, ResetEvent, ResumeThread, STARTUPINFOW, SetEvent, TerminateProcess,
+        WaitForSingleObject,
     };
     use windows::core::{PCWSTR, PWSTR};
     use windows_service::service::{
@@ -75,7 +80,7 @@ mod imp {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{define_windows_service, service_dispatcher};
 
-    use super::{SERVICE_CHILD_ARG, SERVICE_NAME};
+    use super::{SERVICE_CHILD_ARG, SERVICE_NAME, STOP_EVENT_NAME};
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
     /// `WTSGetActiveConsoleSessionId` の「コンソールに接続中のセッションが無い」(切替の過渡)。
@@ -89,6 +94,8 @@ mod imp {
     const BACKOFF_MAX: Duration = Duration::from_secs(60);
     /// トレイが異常終了したときの再起動待ち (explorer 起動前のログオン直後などを空振りしないよう緩め)。
     const TRAY_RETRY: Duration = Duration::from_secs(5);
+    /// 停止要求から本体の自主終了を待つ上限。過ぎたら強制終了する。
+    const GRACEFUL_STOP: Duration = Duration::from_secs(5);
 
     /// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
     struct OwnedHandle(HANDLE);
@@ -102,6 +109,37 @@ mod imp {
 
     // SAFETY: 保持するのはカーネルハンドル値だけで、どのスレッドから閉じても安全。
     unsafe impl Send for OwnedHandle {}
+
+    /// 本体への停止要求イベント ([`STOP_EVENT_NAME`]、手動リセット)。強制終了 (`TerminateProcess`)
+    /// では本体の後始末 (仮想ディスプレイのテイクオーバー復元・ProjFS ドライブ解除) が走らず、
+    /// アンインストールや更新でそのまま次の起動が無いと物理画面が暗転したまま残る。
+    struct StopEvent(OwnedHandle);
+
+    impl StopEvent {
+        fn create() -> Result<Self> {
+            // SAFETY: 名前付きの手動リセットイベントを既定のセキュリティ (SYSTEM の既定 DACL) で
+            // 作るだけ。ハンドルは OwnedHandle が閉じる。
+            let h = unsafe {
+                CreateEventW(
+                    None,
+                    true,
+                    false,
+                    &windows::core::HSTRING::from(STOP_EVENT_NAME),
+                )
+            }?;
+            Ok(Self(OwnedHandle(h)))
+        }
+
+        fn set(&self) {
+            // SAFETY: 有効なイベントハンドルをシグナル状態にするだけ。
+            let _ = unsafe { SetEvent(self.0.0) };
+        }
+
+        fn reset(&self) {
+            // SAFETY: 有効なイベントハンドルを非シグナル状態に戻すだけ。
+            let _ = unsafe { ResetEvent(self.0.0) };
+        }
+    }
 
     /// 本体とトレイを入れるジョブ。サービスプロセスが異常終了してハンドルが閉じると、OS が中の
     /// プロセスをまとめて終了する (KILL_ON_JOB_CLOSE)。入れないと孤児の本体がポートと単一
@@ -215,6 +253,9 @@ mod imp {
         let job = Job::new()
             .inspect_err(|e| tracing::warn!(error = %e, "failed to create job object; children may outlive the service"))
             .ok();
+        let stop_event = StopEvent::create()
+            .inspect_err(|e| tracing::warn!(error = %e, "failed to create host stop event; stopping will skip cleanup"))
+            .ok();
         let mut child: Option<Child> = None;
         let mut backoff = BACKOFF_MIN;
         let mut next_spawn = Instant::now();
@@ -225,8 +266,11 @@ mod imp {
         loop {
             match rx.recv_timeout(POLL) {
                 Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    for c in [child.take(), tray.take()].into_iter().flatten() {
-                        terminate(&c, "service stopping");
+                    if let Some(c) = child.take() {
+                        stop_host(&c, stop_event.as_ref(), "service stopping");
+                    }
+                    if let Some(t) = tray.take() {
+                        terminate(&t, "service stopping");
                     }
                     return;
                 }
@@ -257,13 +301,17 @@ mod imp {
                     // ログオフ・ユーザー切替: 旧セッションの本体は新しいコンソールを映せない。
                     // 切替の過渡で一瞬「コンソール無し」が返るだけのときは付け替えない
                     // (接続中のクライアントを無用に切ってしまう)。
-                    terminate(c, "console session changed");
+                    stop_host(c, stop_event.as_ref(), "console session changed");
                     child = None;
                     next_spawn = Instant::now();
                 }
             }
 
             if child.is_none() && target != NO_CONSOLE_SESSION && Instant::now() >= next_spawn {
+                // 前回の停止要求が残っていると新しい本体が即終了してしまう。
+                if let Some(ev) = &stop_event {
+                    ev.reset();
+                }
                 match spawn_in_session(target, &forward, job.as_ref()) {
                     Ok(c) => {
                         tracing::info!(pid = c.pid, session = c.session, "host process started");
@@ -330,8 +378,30 @@ mod imp {
         Some(code)
     }
 
-    /// 本体/トレイを強制終了する。本体は終了処理を持たないが、ProjFS の subst 残骸と VDD
-    /// テイクオーバーは次回起動時に掃除/復元されるので、ここで後始末を待たなくてよい。
+    /// 本体に後始末をさせてから終了させる。停止要求イベントで自主終了を促し、[`GRACEFUL_STOP`]
+    /// 以内に終わらなければ強制終了する。
+    fn stop_host(c: &Child, event: Option<&StopEvent>, reason: &str) {
+        if let Some(ev) = event {
+            tracing::info!(
+                pid = c.pid,
+                session = c.session,
+                reason,
+                "asking host to stop"
+            );
+            ev.set();
+            // SAFETY: c.process は有効なプロセスハンドル。終了を上限付きで待つだけ。
+            let waited =
+                unsafe { WaitForSingleObject(c.process.0, GRACEFUL_STOP.as_millis() as u32) };
+            if waited == WAIT_OBJECT_0 {
+                return;
+            }
+            tracing::warn!(pid = c.pid, "host did not stop in time; terminating");
+        }
+        terminate(c, reason);
+    }
+
+    /// 本体/トレイを強制終了する。本体の後始末 (テイクオーバー復元等) は走らないので、本体には
+    /// 先に [`stop_host`] を使う。
     fn terminate(c: &Child, reason: &str) {
         tracing::info!(
             pid = c.pid,
@@ -504,6 +574,40 @@ mod imp {
         }
     }
 
+    /// サービス配下の本体側: サービスからの停止要求を待つスレッドを起こし、届いたら `on_stop` を
+    /// 呼ぶ (`on_stop` は後始末をしてプロセスを終了する想定)。イベントが開けなければ何もしない
+    /// (サービスはその場合 [`GRACEFUL_STOP`] 後に強制終了する)。
+    pub fn watch_stop_request(on_stop: impl FnOnce() + Send + 'static) {
+        use windows::Win32::System::Threading::{
+            INFINITE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE,
+        };
+        // SAFETY: 名前付きイベントを待機権限だけで開く。
+        let event = match unsafe {
+            OpenEventW(
+                SYNCHRONIZATION_SYNCHRONIZE,
+                false,
+                &windows::core::HSTRING::from(STOP_EVENT_NAME),
+            )
+        } {
+            Ok(h) => OwnedHandle(h),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot open service stop event; stop will be forced");
+                return;
+            }
+        };
+        let _ = std::thread::Builder::new()
+            .name("stop-watch".into())
+            .spawn(move || {
+                // フィールド (HANDLE) 単位でなく Send なラッパーごとスレッドへ移す。
+                let event = event;
+                // SAFETY: event は有効なイベントハンドル。シグナルされるまで待つだけ。
+                if unsafe { WaitForSingleObject(event.0, INFINITE) } == WAIT_OBJECT_0 {
+                    tracing::info!("stop requested by service");
+                    on_stop();
+                }
+            });
+    }
+
     /// `--install-service`: サービスを登録 (既存なら設定更新) して開始する。管理者権限が要る。
     /// 旧方式のログオン時タスクは、同じセッションで二重起動になる (先に起きた方だけが残り、
     /// どちらが SYSTEM か不定になる) ため削除する。
@@ -616,7 +720,13 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{install as install_service, run_dispatcher, uninstall as uninstall_service};
+pub use imp::{
+    install as install_service, run_dispatcher, uninstall as uninstall_service, watch_stop_request,
+};
+
+/// 非 Windows はサービス運用が無い (停止要求も来ない)。
+#[cfg(not(target_os = "windows"))]
+pub fn watch_stop_request(_on_stop: impl FnOnce() + Send + 'static) {}
 
 #[cfg(not(target_os = "windows"))]
 pub fn run_dispatcher() -> anyhow::Result<()> {

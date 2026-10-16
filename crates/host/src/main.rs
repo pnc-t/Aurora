@@ -1304,6 +1304,13 @@ fn run_server(
     // サービス配下 (SYSTEM) は対話デスクトップへ UI を出さず、ユーザー権限のトレイ (`--tray`) から
     // パイプで操作を受ける。それ以外は従来どおり同一プロセスでトレイを出す。
     let pipe_tray_ctx = if system::service::is_service_child() {
+        // サービスの停止 (アンインストール・更新・net stop) では、トレイ終了と同じ後始末をしてから
+        // 終わる。強制終了だと仮想ディスプレイのテイクオーバー中に物理画面が暗転したまま残る。
+        system::service::watch_stop_request(|| {
+            projfs::cleanup_drives();
+            display::recover_takeover_if_any();
+            std::process::exit(0);
+        });
         Some(tray_ctx)
     } else {
         tray::spawn(tray_ctx);
