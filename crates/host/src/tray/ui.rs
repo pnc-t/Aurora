@@ -472,6 +472,9 @@ fn on_timer(hwnd: HWND) {
         state.auth_cooldown.set(cd - 1);
     }
     let Some(f) = status.as_ref().map(|s| s.auth_failures) else {
+        // 本体に届かない (再起動中など)。再起動で累計が 0 に戻るので、古い基準を捨てて次に
+        // 取得できた値を新しい基準にする (古い大きい値と比べて増分を見逃さない)。
+        state.last_auth.set(None);
         return;
     };
     let prev = state.last_auth.replace(Some(f));
