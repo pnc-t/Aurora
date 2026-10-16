@@ -100,9 +100,26 @@ struct WndState {
     last_auth: Cell<Option<u32>>,
     /// 認証失敗バルーンのクールダウン残 tick。
     auth_cooldown: Cell<u32>,
+    /// 本体の状態を一度でも取得できたか。単独トレイはサービスが本体とほぼ同時に起動するため、
+    /// 本体がパイプを開く (キャプチャ/エンコーダ初期化の後) まで数秒つながらない。初回パスワード
+    /// ダイアログの要否は、起動時ではなく最初に取得できた時点で判定する。
+    first_status_seen: Cell<bool>,
 }
 
 impl WndState {
+    /// 状態を初めて取得できた時点で一度だけ評価し、パスワード未設定なら `true` (初回ダイアログを
+    /// 出す)。まだ取得できていない・評価済み・設定済みはすべて `false`。
+    fn take_first_status_prompt(&self) -> bool {
+        if self.first_status_seen.get() {
+            return false;
+        }
+        let Some(has_password) = self.status.borrow().as_ref().map(|s| s.has_password) else {
+            return false;
+        };
+        self.first_status_seen.set(true);
+        !has_password
+    }
+
     /// 本体へ状態を問い合わせてキャッシュを更新し、溜まっていた通知イベントを返す。
     fn refresh(&self) -> Vec<TrayEvent> {
         match self.control.call(TrayRequest::Status) {
@@ -180,14 +197,11 @@ pub fn run(control: Box<dyn TrayControl>, mode: TrayMode) -> windows::core::Resu
             last_connected: Cell::new(usize::MAX),
             last_auth: Cell::new(None),
             auth_cooldown: Cell::new(0),
+            first_status_seen: Cell::new(false),
         };
         // 起動前に溜まっていた通知 (再起動前の接続など) はバルーンにしない。
         let _ = state.refresh();
-        let prompt_now = state
-            .status
-            .borrow()
-            .as_ref()
-            .is_some_and(|s| !s.has_password);
+        let prompt_now = state.take_first_status_prompt();
         // 共有状態をウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
         let boxed: *mut WndState = Box::into_raw(Box::new(state));
 
@@ -223,7 +237,8 @@ pub fn run(control: Box<dyn TrayControl>, mode: TrayMode) -> windows::core::Resu
         // バルーン通知へ反映する。
         let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
 
-        // 初回 (保存パスワード無し) は起動直後に変更ダイアログを出す。
+        // 初回 (保存パスワード無し) は起動直後に変更ダイアログを出す (本体にまだ届かなければ
+        // on_timer が最初に届いた時点で出す)。
         if prompt_now {
             let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_CHANGE), LPARAM(0));
         }
@@ -390,8 +405,21 @@ fn on_timer(hwnd: HWND) {
         return;
     };
 
+    let first_seen_before = state.first_status_seen.get();
+    let mut events = state.refresh();
+    if !first_seen_before {
+        // 初めて本体に届いた: それまでに溜まった通知は (起動時と同じく) バルーンにしない。
+        if state.take_first_status_prompt() {
+            // SAFETY: hwnd は生存中のトレイ窓。メッセージを積むだけ (ダイアログはループ側で開く)。
+            let _ = unsafe { PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_CHANGE), LPARAM(0)) };
+        }
+        if state.first_status_seen.get() {
+            events.clear();
+        }
+    }
+
     // 1) 通知イベント → バルーン。接続/切断/登録をオーナーへ能動通知する (無人ホストの気付き)。
-    for ev in state.refresh() {
+    for ev in events {
         match ev {
             TrayEvent::Connected(label) => balloon(
                 hwnd,
