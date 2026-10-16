@@ -1685,6 +1685,8 @@ fn capture_loop(
                 // UAC 放置のたびに re-exec (= セッション切断) してしまうため、入力デスク
                 // トップが Default のときだけ数える。HDR 固着はアンロック後 (Default 復帰後)
                 // も ACCESS_LOST が続くので、この条件でも確実に検出できる。
+                // SYSTEM (サービス配下) では下の再構築が Winlogon へ乗り換えて取り込みを続ける
+                // (system::desktop)。非 SYSTEM は乗り換えられず、Default 復帰まで待つだけ。
                 if !capture::input_desktop_is_default() {
                     first_fail = None;
                     tracing::debug!(error = %e, name = %cur_name, "capture failed on lock/secure desktop; not counted as stuck");
