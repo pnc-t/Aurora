@@ -148,10 +148,14 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>> {
 /// 戻り値の意味は [`CaptureAdapter`] を参照。`AllUnsupported` はハイブリッド GPU (muxless) で
 /// dGPU からデスクトップを複製できない徴候で、呼び出し側 (main) が iGPU フォールバックの判断に使う。
 pub fn select_capture_adapter(target: &str) -> CaptureAdapter {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
     // サービス配下でサインイン画面中に起動した場合、プローブの DuplicateOutput も入力デスクトップ
-    // (Winlogon) 上で叩かないと E_ACCESSDENIED になり、アダプタ選択を誤る。
-    crate::system::desktop::follow_input_desktop();
+    // (Winlogon) 上で叩かないと E_ACCESSDENIED になり、アダプタ選択を誤る。呼び出し元 (main
+    // スレッド) を Winlogon に置きっぱなしにしないよう、プローブの間だけ移す。
+    crate::system::desktop::with_input_desktop(|| select_capture_adapter_here(target))
+}
+
+fn select_capture_adapter_here(target: &str) -> CaptureAdapter {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
     // SAFETY: CreateDXGIFactory1 は OUT パラメータを初期化する。
     let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
         Ok(f) => f,

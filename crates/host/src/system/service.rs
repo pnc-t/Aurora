@@ -15,15 +15,22 @@
 //!   ログオン/ロックでは張り替えない (本体がデスクトップ切替に追従する)。
 //! - 本体の自己 re-exec (DXGI ACCESS_LOST 回復) は、サービス配下では子を産まずに終了して
 //!   サービスに再起動させる ([`is_service_child`])。孫プロセスはサービスから監視できない。
-//! - トレイ (`--tray`) は SYSTEM ではなく**ログオンユーザーのトークン** (`WTSQueryUserToken`、
-//!   管理者でも UAC の制限付きトークン) で起動する。SYSTEM の UI を対話デスクトップに出すと
-//!   ローカル利用者への権限昇格穴になるため。サインイン前はユーザーが居ないので起動しない。
+//! - トレイ (`--tray`) は SYSTEM ではなく**ログオンユーザーの昇格 (管理者) トークン** で起動する
+//!   (`WTSQueryUserToken` が返すのは UAC の制限付きトークンなので、`TokenLinkedToken` で昇格側を
+//!   得る。旧版の ONLOGON `/RL HIGHEST` と同じく同意画面は出ない)。SYSTEM の UI を対話デスクトップ
+//!   に出すとローカル利用者への権限昇格穴になり、逆に通常権限で動かすと同じユーザーの通常権限
+//!   プロセスが UIPI に阻まれずトレイを自動操作できてしまう (パイプも管理者限定にしてある)。
+//!   管理者でないユーザーのセッションと、サインイン前はトレイを起動しない。
 
 /// SCM に登録するサービス名 (`sc query AuroraHost` で引ける)。
 #[cfg(target_os = "windows")]
 const SERVICE_NAME: &str = "AuroraHost";
 /// サービス配下で起動された本体である印 (CLI 引数)。サービスだけが付ける。
 pub const SERVICE_CHILD_ARG: &str = "--service-child";
+/// サービスが本体へ「後始末して終了せよ」を伝える名前付きイベント。Global 名前空間に作れるのは
+/// SeCreateGlobalPrivilege を持つサービス/管理者だけなので、一般ユーザーは先回りで作れない。
+#[cfg(target_os = "windows")]
+const STOP_EVENT_NAME: &str = "Global\\AuroraHostStop";
 
 /// 現プロセスがサービスから起動された本体かを返す。引数を見るだけなので誰でも付けられるが、
 /// 変わるのは「自己 re-exec の代わりに終了する」「二重起動ダイアログを出さない」挙動だけで、
@@ -50,14 +57,22 @@ mod imp {
     use anyhow::{Context, Result, bail};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityIdentification, SetTokenInformation, TOKEN_ALL_ACCESS,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, TokenSessionId,
+        DuplicateTokenEx, GetTokenInformation, SecurityIdentification, SetTokenInformation,
+        TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+        TOKEN_LINKED_TOKEN, TOKEN_QUERY, TokenElevation, TokenLinkedToken, TokenPrimary,
+        TokenSessionId,
     };
     use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-        GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
+        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+        PROCESS_INFORMATION, ResetEvent, ResumeThread, STARTUPINFOW, SetEvent, TerminateProcess,
         WaitForSingleObject,
     };
     use windows::core::{PCWSTR, PWSTR};
@@ -65,12 +80,13 @@ mod imp {
         ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
         ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
         ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        SessionChangeReason,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{define_windows_service, service_dispatcher};
 
-    use super::{SERVICE_CHILD_ARG, SERVICE_NAME};
+    use super::{SERVICE_CHILD_ARG, SERVICE_NAME, STOP_EVENT_NAME};
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
     /// `WTSGetActiveConsoleSessionId` の「コンソールに接続中のセッションが無い」(切替の過渡)。
@@ -84,6 +100,13 @@ mod imp {
     const BACKOFF_MAX: Duration = Duration::from_secs(60);
     /// トレイが異常終了したときの再起動待ち (explorer 起動前のログオン直後などを空振りしないよう緩め)。
     const TRAY_RETRY: Duration = Duration::from_secs(5);
+    /// 同じセッションに既にトレイが居たときに確かめ直す間隔。
+    const TRAY_ALREADY_RUNNING_RETRY: Duration = Duration::from_secs(60);
+    /// 停止要求から本体の自主終了を待つ上限。過ぎたら強制終了する。
+    const GRACEFUL_STOP: Duration = Duration::from_secs(5);
+    /// 停止処理にかかりうる上限として SCM へ伝える目安 (本体の自主終了待ち + 強制終了の待ち)。
+    /// 伝えないと、シャットダウン猶予の短い環境で SCM が停止中のサービスを強制終了しうる。
+    const STOP_WAIT_HINT: Duration = Duration::from_secs(15);
 
     /// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
     struct OwnedHandle(HANDLE);
@@ -98,6 +121,64 @@ mod imp {
     // SAFETY: 保持するのはカーネルハンドル値だけで、どのスレッドから閉じても安全。
     unsafe impl Send for OwnedHandle {}
 
+    /// 本体への停止要求イベント ([`STOP_EVENT_NAME`]、手動リセット)。強制終了 (`TerminateProcess`)
+    /// では本体の後始末 (仮想ディスプレイのテイクオーバー復元・ProjFS ドライブ解除) が走らず、
+    /// アンインストールや更新でそのまま次の起動が無いと物理画面が暗転したまま残る。
+    struct StopEvent(OwnedHandle);
+
+    impl StopEvent {
+        fn create() -> Result<Self> {
+            // SAFETY: 名前付きの手動リセットイベントを既定のセキュリティ (SYSTEM の既定 DACL) で
+            // 作るだけ。ハンドルは OwnedHandle が閉じる。
+            let h = unsafe {
+                CreateEventW(
+                    None,
+                    true,
+                    false,
+                    &windows::core::HSTRING::from(STOP_EVENT_NAME),
+                )
+            }?;
+            Ok(Self(OwnedHandle(h)))
+        }
+
+        fn set(&self) {
+            // SAFETY: 有効なイベントハンドルをシグナル状態にするだけ。
+            let _ = unsafe { SetEvent(self.0.0) };
+        }
+
+        fn reset(&self) {
+            // SAFETY: 有効なイベントハンドルを非シグナル状態に戻すだけ。
+            let _ = unsafe { ResetEvent(self.0.0) };
+        }
+    }
+
+    /// 本体とトレイを入れるジョブ。サービスプロセスが異常終了してハンドルが閉じると、OS が中の
+    /// プロセスをまとめて終了する (KILL_ON_JOB_CLOSE)。入れないと孤児の本体がポートと単一
+    /// インスタンスを握り続け、再起動したサービスの本体が即終了するバックオフに陥る。
+    /// 本体が起こす孫 (自己更新の setup 等) はジョブに入れない (SILENT_BREAKAWAY_OK)。
+    /// 入れると、更新中にサービスを止めた時点で setup ごと殺されてしまう。
+    struct Job(OwnedHandle);
+
+    impl Job {
+        fn new() -> Result<Self> {
+            // SAFETY: 無名ジョブを既定のセキュリティで作るだけ。ハンドルは OwnedHandle が閉じる。
+            let job = OwnedHandle(unsafe { CreateJobObjectW(None, PCWSTR::null()) }?);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            // SAFETY: job は有効なジョブハンドル。info は呼び出し中有効で、長さはその実サイズ。
+            unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }?;
+            Ok(Self(job))
+        }
+    }
+
     /// サービスが起動して見張っている本体。
     struct Child {
         process: OwnedHandle,
@@ -108,8 +189,11 @@ mod imp {
 
     enum Event {
         Stop,
-        /// WTS セッション変化。中身は見ず、ループ側でアクティブセッションを引き直す。
-        SessionChanged,
+        /// WTS セッション変化。対象はループ側でアクティブセッションを引き直して決める。
+        /// `logon_changed` はサインイン/サインアウトか (閉じたトレイの記憶を捨てる契機)。
+        SessionChanged {
+            logon_changed: bool,
+        },
     }
 
     /// `--service`: SCM のディスパッチャへ制御を渡す (サービス停止まで戻らない)。
@@ -136,8 +220,12 @@ mod imp {
                     let _ = tx.send(Event::Stop);
                     ServiceControlHandlerResult::NoError
                 }
-                ServiceControl::SessionChange(_) => {
-                    let _ = tx.send(Event::SessionChanged);
+                ServiceControl::SessionChange(param) => {
+                    let logon_changed = matches!(
+                        param.reason,
+                        SessionChangeReason::SessionLogon | SessionChangeReason::SessionLogoff
+                    );
+                    let _ = tx.send(Event::SessionChanged { logon_changed });
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -165,7 +253,17 @@ mod imp {
         .context("report service running")?;
         tracing::info!("service running");
 
-        supervise(&rx);
+        supervise(&rx, || {
+            let _ = status.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::StopPending,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 1,
+                wait_hint: STOP_WAIT_HINT,
+                process_id: None,
+            });
+        });
 
         set_state(ServiceState::Stopped, ServiceControlAccept::empty())
             .context("report service stopped")?;
@@ -173,12 +271,20 @@ mod imp {
         Ok(())
     }
 
-    /// 本体とトレイをアクティブなコンソールセッションに 1 つずつ生かし続ける。Stop で両方止めて戻る。
-    fn supervise(rx: &mpsc::Receiver<Event>) {
+    /// 本体とトレイをアクティブなコンソールセッションに 1 つずつ生かし続ける。Stop で両方止めて戻る
+    /// (止め始める前に `on_stopping` で SCM へ停止処理中を伝える)。
+    fn supervise(rx: &mpsc::Receiver<Event>, on_stopping: impl Fn()) {
         let forward = super::current_service_forward_args()
             .into_iter()
             .filter(|a| a != "--service")
             .collect::<Vec<_>>();
+        // ジョブを作れなくても起動は続ける (サービスが落ちたときの後始末が効かなくなるだけ)。
+        let job = Job::new()
+            .inspect_err(|e| tracing::warn!(error = %e, "failed to create job object; children may outlive the service"))
+            .ok();
+        let stop_event = StopEvent::create()
+            .inspect_err(|e| tracing::warn!(error = %e, "failed to create host stop event; stopping will skip cleanup"))
+            .ok();
         let mut child: Option<Child> = None;
         let mut backoff = BACKOFF_MIN;
         let mut next_spawn = Instant::now();
@@ -189,12 +295,23 @@ mod imp {
         loop {
             match rx.recv_timeout(POLL) {
                 Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    for c in [child.take(), tray.take()].into_iter().flatten() {
-                        terminate(&c, "service stopping");
+                    on_stopping();
+                    if let Some(c) = child.take() {
+                        stop_host(&c, stop_event.as_ref(), "service stopping");
+                    }
+                    if let Some(t) = tray.take() {
+                        terminate(&t, "service stopping");
                     }
                     return;
                 }
-                Ok(Event::SessionChanged) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // サインイン/サインアウトをまたいだら、閉じたトレイの記憶は捨てる (同じセッション
+                // ID が別のログオンで再利用されうるため、ID だけで覚えていると出し直されない)。
+                Ok(Event::SessionChanged { logon_changed }) => {
+                    if logon_changed {
+                        tray_closed_in = None;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
 
             // SAFETY: 引数なしで現在のコンソールセッション ID を返すだけ。
@@ -217,16 +334,22 @@ mod imp {
                         "host process exited; respawning"
                     );
                     child = None;
-                } else if c.session != target {
+                } else if target != NO_CONSOLE_SESSION && c.session != target {
                     // ログオフ・ユーザー切替: 旧セッションの本体は新しいコンソールを映せない。
-                    terminate(c, "console session changed");
+                    // 切替の過渡で一瞬「コンソール無し」が返るだけのときは付け替えない
+                    // (接続中のクライアントを無用に切ってしまう)。
+                    stop_host(c, stop_event.as_ref(), "console session changed");
                     child = None;
                     next_spawn = Instant::now();
                 }
             }
 
             if child.is_none() && target != NO_CONSOLE_SESSION && Instant::now() >= next_spawn {
-                match spawn_in_session(target, &forward) {
+                // 前回の停止要求が残っていると新しい本体が即終了してしまう。
+                if let Some(ev) = &stop_event {
+                    ev.reset();
+                }
+                match spawn_in_session(target, &forward, job.as_ref()) {
                     Ok(c) => {
                         tracing::info!(pid = c.pid, session = c.session, "host process started");
                         child = Some(c);
@@ -242,18 +365,22 @@ mod imp {
             if let Some(t) = &tray {
                 if let Some(code) = exit_code(t) {
                     if code == 0 {
-                        // 「トレイを閉じる」(または同セッションに既にトレイがある)。
+                        // 利用者が「トレイを閉じる」を選んだ。
                         tracing::info!(
                             session = t.session,
                             "tray closed; not restarting in this session"
                         );
                         tray_closed_in = Some(t.session);
+                    } else if code == crate::tray::TRAY_ALREADY_RUNNING_EXIT as u32 {
+                        // 手動で出したトレイが既に居る。閉じたと見なさず、そちらが閉じられたら
+                        // 出し直せるよう間を空けて確かめ直す。
+                        next_tray = Instant::now() + TRAY_ALREADY_RUNNING_RETRY;
                     } else {
                         tracing::warn!(exit_code = code, "tray exited abnormally; restarting");
                         next_tray = Instant::now() + TRAY_RETRY;
                     }
                     tray = None;
-                } else if t.session != target {
+                } else if target != NO_CONSOLE_SESSION && t.session != target {
                     terminate(t, "console session changed");
                     tray = None;
                 }
@@ -264,13 +391,21 @@ mod imp {
                 && tray_closed_in != Some(target)
                 && Instant::now() >= next_tray
             {
-                match spawn_tray(target) {
-                    Ok(Some(t)) => {
+                match spawn_tray(target, job.as_ref()) {
+                    Ok(TraySpawn::Started(t)) => {
                         tracing::info!(pid = t.pid, session = t.session, "tray started");
                         tray = Some(t);
                     }
                     // サインイン画面 (ユーザー未ログオン)。ログオンしたら次の周期で起動する。
-                    Ok(None) => {}
+                    Ok(TraySpawn::NoUser) => {}
+                    // 管理者でないユーザー: このセッションでは出さない (毎周期試さない)。
+                    Ok(TraySpawn::NotAdmin) => {
+                        tracing::info!(
+                            session = target,
+                            "signed-in user is not an administrator; tray is not started"
+                        );
+                        tray_closed_in = Some(target);
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, session = target, "failed to start tray");
                         next_tray = Instant::now() + TRAY_RETRY;
@@ -292,8 +427,30 @@ mod imp {
         Some(code)
     }
 
-    /// 本体/トレイを強制終了する。本体は終了処理を持たないが、ProjFS の subst 残骸と VDD
-    /// テイクオーバーは次回起動時に掃除/復元されるので、ここで後始末を待たなくてよい。
+    /// 本体に後始末をさせてから終了させる。停止要求イベントで自主終了を促し、[`GRACEFUL_STOP`]
+    /// 以内に終わらなければ強制終了する。
+    fn stop_host(c: &Child, event: Option<&StopEvent>, reason: &str) {
+        if let Some(ev) = event {
+            tracing::info!(
+                pid = c.pid,
+                session = c.session,
+                reason,
+                "asking host to stop"
+            );
+            ev.set();
+            // SAFETY: c.process は有効なプロセスハンドル。終了を上限付きで待つだけ。
+            let waited =
+                unsafe { WaitForSingleObject(c.process.0, GRACEFUL_STOP.as_millis() as u32) };
+            if waited == WAIT_OBJECT_0 {
+                return;
+            }
+            tracing::warn!(pid = c.pid, "host did not stop in time; terminating");
+        }
+        terminate(c, reason);
+    }
+
+    /// 本体/トレイを強制終了する。本体の後始末 (テイクオーバー復元等) は走らないので、本体には
+    /// 先に [`stop_host`] を使う。
     fn terminate(c: &Child, reason: &str) {
         tracing::info!(
             pid = c.pid,
@@ -308,7 +465,7 @@ mod imp {
     }
 
     /// 自分 (LocalSystem) のトークンを複製し、セッションだけを `session` に差し替えて本体を起動する。
-    fn spawn_in_session(session: u32, forward: &[String]) -> Result<Child> {
+    fn spawn_in_session(session: u32, forward: &[String], job: Option<&Job>) -> Result<Child> {
         let mut own = HANDLE::default();
         // SAFETY: 自プロセスのトークンを複製用の権限で開く。own は出力先。
         unsafe {
@@ -350,20 +507,74 @@ mod imp {
         let mut args = vec![SERVICE_CHILD_ARG.to_string()];
         args.extend(forward.iter().cloned());
         // 環境は親 (SYSTEM) を継承する。
-        create_process(&primary, &args, None, session)
+        create_process(&primary, &args, None, session, job)
     }
 
-    /// ログオンユーザーのトークンでトレイ (`--tray`) を起動する。ユーザーが居なければ `Ok(None)`。
-    fn spawn_tray(session: u32) -> Result<Option<Child>> {
+    enum TraySpawn {
+        Started(Child),
+        NoUser,
+        NotAdmin,
+    }
+
+    /// ログオンユーザーの昇格 (管理者) トークンでトレイ (`--tray`) を起動する。
+    fn spawn_tray(session: u32, job: Option<&Job>) -> Result<TraySpawn> {
         let mut user = HANDLE::default();
         // SAFETY: session のログオンユーザーのトークンを出力先へ受ける (SeTcb 権限 = LocalSystem で可)。
         // 失敗はサインイン画面などユーザー未ログオンの状態。
         if unsafe { WTSQueryUserToken(session, &mut user) }.is_err() {
-            return Ok(None);
+            return Ok(TraySpawn::NoUser);
         }
         let user = OwnedHandle(user);
-        let env = EnvBlock::for_user(&user)?;
-        create_process(&user, &["--tray".to_string()], Some(&env), session).map(Some)
+        let Some(admin) = elevated_token(user)? else {
+            return Ok(TraySpawn::NotAdmin);
+        };
+        let env = EnvBlock::for_user(&admin)?;
+        create_process(&admin, &["--tray".to_string()], Some(&env), session, job)
+            .map(TraySpawn::Started)
+    }
+
+    /// ユーザートークンの昇格版を返す。UAC の制限付きトークンなら対の昇格トークン (SeTcb 権限
+    /// = LocalSystem からは一次トークンとして得られる)、既に昇格済みならそのまま。昇格できない
+    /// (管理者でない) ユーザーは `None`。
+    fn elevated_token(user: OwnedHandle) -> Result<Option<OwnedHandle>> {
+        if is_elevated(&user)? {
+            return Ok(Some(user));
+        }
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut len = 0u32;
+        // SAFETY: user は有効なトークン。linked は出力先で、長さはその実サイズ。分割トークンで
+        // ないユーザーでは失敗する (= 昇格側が無い)。
+        let got = unsafe {
+            GetTokenInformation(
+                user.0,
+                TokenLinkedToken,
+                Some((&mut linked as *mut TOKEN_LINKED_TOKEN).cast()),
+                std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut len,
+            )
+        };
+        if got.is_err() {
+            return Ok(None);
+        }
+        let linked = OwnedHandle(linked.LinkedToken);
+        Ok(is_elevated(&linked)?.then_some(linked))
+    }
+
+    fn is_elevated(token: &OwnedHandle) -> Result<bool> {
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        // SAFETY: token は有効なトークン。elevation は出力先で、長さはその実サイズ。
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenElevation,
+                Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+        }
+        .context("GetTokenInformation(TokenElevation)")?;
+        Ok(elevation.TokenIsElevated != 0)
     }
 
     /// `CreateEnvironmentBlock` が作るユーザーの環境変数ブロック (Drop で解放)。トレイに利用者の
@@ -387,12 +598,14 @@ mod imp {
         }
     }
 
-    /// 自分の exe を `token` で `session` の対話デスクトップに起動する。
+    /// 自分の exe を `token` で `session` の対話デスクトップに起動する。`job` があれば、走り出す前
+    /// (停止状態で作って割り当ててから再開) にジョブへ入れる。
     fn create_process(
         token: &OwnedHandle,
         args: &[String],
         env: Option<&EnvBlock>,
         session: u32,
+        job: Option<&Job>,
     ) -> Result<Child> {
         let exe = std::env::current_exe().context("get current exe path")?;
         let mut cmdline = quote_arg(&exe.to_string_lossy());
@@ -428,7 +641,7 @@ mod imp {
                 None,
                 None,
                 false,
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
                 env.map(|e| e.0 as *const std::ffi::c_void),
                 PCWSTR::null(),
                 &si,
@@ -436,10 +649,19 @@ mod imp {
             )
         }
         .context("CreateProcessAsUserW")?;
-        // スレッドハンドルは使わないので即閉じる。
-        drop(OwnedHandle(pi.hThread));
+        let thread = OwnedHandle(pi.hThread);
+        let process = OwnedHandle(pi.hProcess);
+        if let Some(job) = job {
+            // SAFETY: どちらも直前に作った有効なハンドル。プロセスはまだ停止状態。
+            if let Err(e) = unsafe { AssignProcessToJobObject(job.0.0, process.0) } {
+                tracing::warn!(error = %e, "failed to assign process to job object");
+            }
+        }
+        // SAFETY: CREATE_SUSPENDED で作った主スレッドを再開する。
+        unsafe { ResumeThread(thread.0) };
+        drop(thread);
         Ok(Child {
-            process: OwnedHandle(pi.hProcess),
+            process,
             pid: pi.dwProcessId,
             session,
             started: Instant::now(),
@@ -453,6 +675,40 @@ mod imp {
         } else {
             a.to_string()
         }
+    }
+
+    /// サービス配下の本体側: サービスからの停止要求を待つスレッドを起こし、届いたら `on_stop` を
+    /// 呼ぶ (`on_stop` は後始末をしてプロセスを終了する想定)。イベントが開けなければ何もしない
+    /// (サービスはその場合 [`GRACEFUL_STOP`] 後に強制終了する)。
+    pub fn watch_stop_request(on_stop: impl FnOnce() + Send + 'static) {
+        use windows::Win32::System::Threading::{
+            INFINITE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE,
+        };
+        // SAFETY: 名前付きイベントを待機権限だけで開く。
+        let event = match unsafe {
+            OpenEventW(
+                SYNCHRONIZATION_SYNCHRONIZE,
+                false,
+                &windows::core::HSTRING::from(STOP_EVENT_NAME),
+            )
+        } {
+            Ok(h) => OwnedHandle(h),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot open service stop event; stop will be forced");
+                return;
+            }
+        };
+        let _ = std::thread::Builder::new()
+            .name("stop-watch".into())
+            .spawn(move || {
+                // フィールド (HANDLE) 単位でなく Send なラッパーごとスレッドへ移す。
+                let event = event;
+                // SAFETY: event は有効なイベントハンドル。シグナルされるまで待つだけ。
+                if unsafe { WaitForSingleObject(event.0, INFINITE) } == WAIT_OBJECT_0 {
+                    tracing::info!("stop requested by service");
+                    on_stop();
+                }
+            });
     }
 
     /// `--install-service`: サービスを登録 (既存なら設定更新) して開始する。管理者権限が要る。
@@ -567,7 +823,13 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{install as install_service, run_dispatcher, uninstall as uninstall_service};
+pub use imp::{
+    install as install_service, run_dispatcher, uninstall as uninstall_service, watch_stop_request,
+};
+
+/// 非 Windows はサービス運用が無い (停止要求も来ない)。
+#[cfg(not(target_os = "windows"))]
+pub fn watch_stop_request(_on_stop: impl FnOnce() + Send + 'static) {}
 
 #[cfg(not(target_os = "windows"))]
 pub fn run_dispatcher() -> anyhow::Result<()> {

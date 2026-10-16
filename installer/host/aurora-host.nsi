@@ -12,14 +12,15 @@
 ;     exe を差し替えるだけで SYSTEM 権限を得られてしまう。昇格スクリプト (VDD 導入/削除)
 ;     も同じ理由で管理者専用の $INSTDIR から実行し、$TEMP は経由しない。
 ;   - SYSTEM サービス化 (UAC / ロック画面 / サインイン画面の遠隔操作のため)。サービスが本体を
-;     対話セッションへ SYSTEM で、トレイをログオンユーザー権限で起動する。exe を上書きする前に
+;     対話セッションへ SYSTEM で、トレイをログオンユーザーの昇格 (管理者) 権限で起動する。exe を上書きする前に
 ;     必ずサービスを止める (止めないとサービスが本体を即座に起動し直し、exe がロックされ続ける)。
 ;   - 旧版 (ONLOGON タスク + %LOCALAPPDATA%\Aurora) からの移行: --migrate-user-state を
 ;     **インストールした利用者として** 実行して設定/パスワードを %ProgramData%\Aurora\host へ移し
 ;     (旧パスワードはその利用者でしか復号できない)、--install-service がタスクを削除する。
 ;   - クリーンアンインストール最優先。痕跡 = exe / サービス "AuroraHost" / 旧スケジュールタスク
 ;     "Aurora Host" / %ProgramData%\Aurora\host (設定・パスワード・ログ) / %LOCALAPPDATA%\Aurora
-;     (旧版の設定・トレイのログ) / ショートカット / レジストリ。全部消す。
+;     配下の host のファイル (旧版の設定・トレイのログ。フォルダ自体は client と共用) /
+;     ショートカット / レジストリ。全部消す。
 ;   - サービス/タスクの登録・解除は host 自身の --install-service 等に委譲 (二重実装しない)。
 ;   - ProjFS は共有システム機能なのでアンインストールでは無効化しない。
 
@@ -74,6 +75,33 @@ VIAddVersionKey "FileDescription" "${APPNAME} Installer"
 ; サイレント自己更新 (host の自己更新機構が "aurora-host-setup-<ver>.exe /S" を実行する)
 ; の待機リトライ回数カウンタ。対話インストールでは使わない。
 Var RetryCount
+; 旧版が入っていた (= 更新インストール) か。.onInit で、このインストールが登録を書き換える前に読む。
+Var IsUpgrade
+
+Function .onInit
+  ReadRegStr $IsUpgrade HKLM "${REGROOT}" "InstallDir"
+FunctionEnd
+
+; インストール先の検証。SYSTEM サービスがこのフォルダの exe を実行し、exe は同じフォルダの DLL も
+; 読むため、一般ユーザーが前もって中身を置けたフォルダ (既存の別アプリのフォルダや自分で作った
+; フォルダ) は使わせない。空 or 存在しない新しいフォルダ、または前回のインストール先だけを許す。
+Function .onVerifyInstDir
+  StrCmp $INSTDIR $IsUpgrade verify_ok
+  IfFileExists "$INSTDIR\*.*" 0 verify_ok
+  FindFirst $0 $1 "$INSTDIR\*.*"
+  verify_loop:
+    StrCmp $1 "" verify_empty
+    StrCmp $1 "." verify_next
+    StrCmp $1 ".." verify_next
+    FindClose $0
+    Abort
+  verify_next:
+    FindNext $0 $1
+    Goto verify_loop
+  verify_empty:
+    FindClose $0
+  verify_ok:
+FunctionEnd
 
 ; ---------------------------------------------------------------------------
 ; exe を上書きする前に呼ぶ。サービスを先に止める (止めないとサービスが本体を起動し直して
@@ -83,7 +111,7 @@ Var RetryCount
 Function StopRunningHost
   nsExec::Exec '"$SYSDIR\net.exe" stop AuroraHost'
   Pop $0
-  nsExec::Exec 'taskkill /IM ${EXENAME} /F'
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM ${EXENAME} /F'
   Pop $0
 
   IfFileExists "$INSTDIR\${EXENAME}" 0 stoprunninghost_done
@@ -128,6 +156,18 @@ Section "Aurora Host 本体" SecCore
   Call StopRunningHost
 
   SetOutPath "$INSTDIR"
+  ; 所有者と ACL を固める (SYSTEM / Administrators は変更可、Users は読み取り・実行のみ、親からの
+  ; 継承を切る)。既定の %ProgramFiles% では元々この形だが、別の場所を選ばれたときに一般ユーザーが
+  ; exe を差し替えて SYSTEM 権限を得るのを防ぐ。
+  ; 継承付きの ACE はフォルダにだけ付け (/T を付けない)、中身は「親から継承」へ戻す。/T で
+  ; 子ファイルにも付けようとすると、(OI)(CI) はファイルに付けられず、/inheritance:r で継承分だけ
+  ; 剥がれて DACL が空になり、管理者でも exe を上書きできなくなる (2026-10-17 実機で発生)。
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\icacls.exe" "$INSTDIR\*" /reset /T /C /Q'
+  Pop $0
   File "..\..\target\release\${EXENAME}"
   ; VDD 削除スクリプトを同梱しておく (アンインストール時に使用)。
   File "remove_vdd.ps1"
@@ -153,28 +193,41 @@ Section "Aurora Host 本体" SecCore
   SetShellVarContext current
 SectionEnd
 
-Section "サービスとして常駐 (推奨・UAC / ロック画面も操作可)" SecService
-  ; サイレント更新契約: 自己更新は無人実行前提で UAC を出さない (setup は昇格済みの host から
-  ; 起動される)。既にサービス運用なら登録し直して開始するだけ。旧版の ONLOGON 運用
-  ; (Autostart=1) からの更新はここでサービスへ移行する。どちらでもないサイレント実行
-  ; (手動起動のみの運用) は利用者の選択を保持して何もしない。
-  IfSilent 0 secservice_run
-    ReadRegDWORD $0 HKLM "${REGROOT}" "Service"
-    ReadRegDWORD $1 HKLM "${REGROOT}" "Autostart"
-    ${If} $0 != 1
-    ${AndIf} $1 != 1
-      Goto secservice_skip
+Section "サービスとして常駐 (必須・UAC / ロック画面も操作可)" SecService
+  ; 必須: host の設定・パスワードは %ProgramData%\Aurora\host (SYSTEM / 管理者専用) に置くため、
+  ; 非昇格で手動起動した host は状態を読み書きできない。常にサービスで動かす。サイレント更新
+  ; (setup は昇格済みの host から起動され UAC を出さない) でも毎回登録し直し、旧版の ONLOGON
+  ; 運用や手動起動のみの運用もここでサービスへ移行する。
+  SectionIn RO
+
+  ; 旧版の設定/パスワードを移す。旧パスワードはインストールした利用者でしか復号できないので、
+  ; この (利用者として昇格した) インストーラから呼ぶ。移行先に既にあれば何もしない。失敗しても
+  ; サービス登録は続ける (パスワードはトレイから設定し直せる) が、黙って失わないよう知らせる。
+  ; 新規インストールでは呼ばない: 移行元 (%LOCALAPPDATA%\Aurora) は利用者が自由に書ける場所で、
+  ; 同じユーザーで動くマルウェアが事前に置いたパスワード・許可端末を取り込ませないため。
+  ${If} $IsUpgrade != ""
+    ExecWait '"$INSTDIR\${EXENAME}" --migrate-user-state' $0
+    ${If} $0 != 0
+      DetailPrint "旧版の設定・パスワードの移行に失敗しました (終了コード $0)"
+      ${IfNot} ${Silent}
+        MessageBox MB_ICONEXCLAMATION|MB_OK "旧版の設定・パスワードを移行できませんでした。$\nインストール後、トレイアイコンからパスワードを設定し直してください。"
+      ${EndIf}
     ${EndIf}
-  secservice_run:
-    ; 旧版の設定/パスワードを移す。旧パスワードはインストールした利用者でしか復号できないので、
-    ; この (利用者として昇格した) インストーラから呼ぶ。移行先に既にあれば何もしない。
-    ExecShellWait "" "$INSTDIR\${EXENAME}" "--migrate-user-state" SW_HIDE
-    ; サービス登録 (既存なら設定更新) + 旧 ONLOGON タスク削除 + 開始は host に委譲する。
-    ExecShellWait "" "$INSTDIR\${EXENAME}" "--install-service" SW_HIDE
-    ; アンインストール時に --uninstall-service を呼ぶべきか判定するためのフラグ。
+  ${EndIf}
+
+  ; サービス登録 (既存なら設定更新) + 旧 ONLOGON タスク削除 + 開始は host に委譲する。
+  ; Service=1 は成功したときだけ書く (失敗時はフィニッシュ/サイレント後に従来どおり本体を直接起動する)。
+  ExecWait '"$INSTDIR\${EXENAME}" --install-service' $0
+  ${If} $0 == 0
     WriteRegDWORD HKLM "${REGROOT}" "Service" 1
     DeleteRegValue HKLM "${REGROOT}" "Autostart"
-  secservice_skip:
+  ${Else}
+    DetailPrint "サービスの登録に失敗しました (終了コード $0)"
+    DeleteRegValue HKLM "${REGROOT}" "Service"
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONSTOP|MB_OK "Aurora Host をサービスとして登録できませんでした (終了コード $0)。$\nUAC の確認画面・ロック画面は遠隔操作できません。%ProgramData%\Aurora\host\logs を確認してください。"
+    ${EndIf}
+  ${EndIf}
 SectionEnd
 
 Section /o "仮想ディスプレイドライバ (VDD) をインストール" SecVDD
@@ -208,7 +261,7 @@ Section /o "仮想ディスプレイドライバ (VDD) をインストール" Se
   ; 配置 + ノード作成 + ドライバ束縛 + 検証を install_vdd.ps1 が行う。
   ; -HostExe を渡し、VDD 登録直後に host --align-vdd で描画 GPU をキャプチャ GPU に合わせる
   ; (クロス GPU 固着の恒久回避。SecCore は先に実行済みなので exe は配置済み)。
-  ExecShellWait "" "powershell.exe" \
+  ExecShellWait "" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\vdd-setup\install_vdd.ps1" -HostExe "$INSTDIR\${EXENAME}"' SW_HIDE
 
   ; 展開物を削除 (SetOutPath でカレントになっているため抜けてから消す)。
@@ -225,14 +278,14 @@ Section /o "ファイル転送機能を有効化 (Client-ProjFS)" SecProjFS
   secprojfs_run:
   ; Windows オプション機能の有効化 (インストーラは昇格済み)。再起動が必要な場合あり。
   ; 共有機能なのでアンインストールでは戻さない。
-  ExecShellWait "" "powershell.exe" \
+  ExecShellWait "" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -Command "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart"' SW_HIDE
   secprojfs_skip:
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      "aurora-host 本体を %ProgramFiles% に配置します (必須)。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecService}   "SYSTEM サービスとして登録し、PC 起動時から常駐します。UAC の確認画面・ロック画面・サインイン画面も遠隔で操作できます。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecService}   "SYSTEM サービスとして登録し、PC 起動時から常駐します (必須)。UAC の確認画面・ロック画面・サインイン画面も遠隔で操作できます。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecVDD}       "仮想ディスプレイドライバ (MttVDD) をインストールします。RDP 風の仮想画面で接続するのに必要です。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecProjFS}    "RDP 風ファイル転送に使う Windows 機能 Client-ProjFS を有効化します。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
@@ -243,7 +296,7 @@ Section "Uninstall"
   ExecShellWait "" "$INSTDIR\${EXENAME}" "--uninstall-service" SW_HIDE
 
   ; 2) 残った常駐プロセスを停止 (起動中だと exe を消せない)。
-  nsExec::Exec 'taskkill /IM ${EXENAME} /F'
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM ${EXENAME} /F'
   Pop $0
 
   ; 3) 旧版の自動起動タスクを登録していたら解除 (アンインストーラは昇格済み)。
@@ -256,7 +309,7 @@ Section "Uninstall"
   ;    デバイス削除・ドライバストア削除・C:\ProgramData\Aurora\vdd 削除を一括で行う。
   ReadRegDWORD $0 HKLM "${REGROOT}" "VDDInstalled"
   ${If} $0 == 1
-    ExecShellWait "" "powershell.exe" \
+    ExecShellWait "" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
       '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\remove_vdd.ps1"' SW_HIDE
   ${EndIf}
 
@@ -270,12 +323,26 @@ Section "Uninstall"
   SetShellVarContext current
 
   ; 6) 設定・暗号化パスワード・ログを完全削除。host の状態は PC 単位 (%ProgramData%\Aurora\host)。
-  ;    親の Aurora は VDD (vdd\) と共用なので空のときだけ消す。旧版の状態とトレイのログは per-user。
+  ;    親の Aurora は VDD (vdd\) と共用なので空のときだけ消す。
   SetShellVarContext all
   RMDir /r "$APPDATA\Aurora\host"
   RMDir "$APPDATA\Aurora"
   SetShellVarContext current
-  RMDir /r "$LOCALAPPDATA\Aurora"
+  ;    per-user 側 (%LOCALAPPDATA%\Aurora) は client と共用で、利用者が自由に書ける (中身を
+  ;    ジャンクションにされうる) 場所なので、フォルダごと再帰削除せず host のファイルだけを消す
+  ;    (旧版の状態・トレイのログ・ProjFS 投影ルート)。
+  Delete "$LOCALAPPDATA\Aurora\password.bin"
+  Delete "$LOCALAPPDATA\Aurora\port"
+  Delete "$LOCALAPPDATA\Aurora\encode-gpu"
+  Delete "$LOCALAPPDATA\Aurora\pinning"
+  Delete "$LOCALAPPDATA\Aurora\trusted_devices.txt"
+  Delete "$LOCALAPPDATA\Aurora\takeover_topology.txt"
+  Delete "$LOCALAPPDATA\Aurora\takeover_ccd.bin"
+  Delete "$LOCALAPPDATA\Aurora\logs\host.*"
+  Delete "$LOCALAPPDATA\Aurora\logs\tray.*"
+  RMDir "$LOCALAPPDATA\Aurora\remote"
+  RMDir "$LOCALAPPDATA\Aurora\logs"
+  RMDir "$LOCALAPPDATA\Aurora"
 
   ; 7) レジストリを掃除。
   DeleteRegKey HKLM "${UNINSTKEY}"

@@ -69,6 +69,7 @@ features = [
     "Win32_System_Console",
     "Win32_System_Environment",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Registry",

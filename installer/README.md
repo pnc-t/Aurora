@@ -87,11 +87,17 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 インストーラの挙動:
 - `aurora-host.exe` を `%ProgramFiles%\Aurora Host\` に配置 (per-machine・インストーラ起動時に UAC 1 回)。
-- コンポーネント「サービスとして常駐」(既定 ON) → `aurora-host --migrate-user-state`
+  インストール先は変更できるが、中身のある既存フォルダは選べない (前回のインストール先を除く)。
+  配置先の所有者を Administrators に、ACL を SYSTEM / Administrators は変更可・Users は読み取り
+  のみに固める (SYSTEM サービスが実行する exe とその DLL を一般ユーザーに差し替えさせないため)。
+- コンポーネント「サービスとして常駐」(必須。サイレント更新でも毎回) → (旧版からの更新時のみ) `aurora-host --migrate-user-state`
   (旧版の設定/パスワードを **インストーラを昇格させたユーザー** の `%LOCALAPPDATA%\Aurora`
   から `%ProgramData%\Aurora\host` へ移す) → `aurora-host --install-service` で SYSTEM
   サービス "AuroraHost" を登録・開始 (旧 ONLOGON タスクは削除)。exe を上書きする前に
-  サービスを止める (`net stop AuroraHost`)。
+  サービスを止める (`net stop AuroraHost`)。必須にしているのは、状態 (`%ProgramData%\Aurora\host`)
+  が SYSTEM / 管理者専用で、非昇格で手動起動した host からは読み書きできないため。移行・登録の
+  失敗は終了コードで検知し、対話インストールではメッセージで知らせる (登録に失敗したら
+  `Service` フラグを書かず、従来どおり本体を直接起動する)。
 - コンポーネント「ファイル転送機能を有効化」(既定 OFF) → `Client-ProjFS` を有効化
   (再起動が必要な場合あり)。不要なら OFF のまま。
 - 自己更新は昇格して動く host (= サービス経由、または旧 ONLOGON タスク経由) でのみ行える。
@@ -109,8 +115,9 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 3. 旧版で自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
    を解除。
 4. exe / インストール先フォルダ / スタートメニューのショートカットを削除。
-5. `%ProgramData%\Aurora\host\` (設定・password.bin・ログ) と `%LOCALAPPDATA%\Aurora\`
-   (旧版の設定・トレイのログ) を削除 (`%ProgramData%\Aurora` は VDD と共用なので空のときだけ消す)。
+5. `%ProgramData%\Aurora\host\` (設定・password.bin・ログ) を削除 (`%ProgramData%\Aurora` は VDD と
+   共用なので空のときだけ消す)。`%LOCALAPPDATA%\Aurora\` は client と共用なので、host のファイル
+   (旧版の設定・トレイのログ) だけを消し、フォルダは空のときだけ消す。
 6. HKLM のアンインストール登録を削除。
 
 ProjFS (`Client-ProjFS`) は他用途でも使う共有システム機能のため、

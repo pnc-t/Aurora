@@ -52,9 +52,6 @@ impl WinInjector {
     }
 
     fn send_one(&self, input: INPUT) -> Result<()> {
-        // SendInput は呼び出しスレッドのデスクトップへ届く。UAC/ロック画面 (Winlogon) へ切り替わって
-        // いたら先に乗り換える (SYSTEM 時のみ効く。毎回の確認は OpenInputDesktop 1 回で安価)。
-        crate::system::desktop::follow_input_desktop();
         let arr = [input];
         // SAFETY: arr は 1 要素の有効な INPUT 配列。サイズ引数は INPUT の実サイズ。
         let n = unsafe { SendInput(&arr, std::mem::size_of::<INPUT>() as i32) };
@@ -86,6 +83,10 @@ impl InputInjector for WinInjector {
     }
 
     fn inject(&mut self, ev: &InputEvent) -> Result<()> {
+        // SendInput も GetCursorPos (相対移動) も呼び出しスレッドのデスクトップに対して働く。
+        // UAC/ロック画面 (Winlogon) へ切り替わっていたら、どちらより先に乗り換える (SYSTEM 時のみ
+        // 効く。毎回の確認は OpenInputDesktop 1 回で安価)。
+        crate::system::desktop::follow_input_desktop();
         match *ev {
             InputEvent::MouseMove { x, y } => {
                 // クライアントは選択ディスプレイ内の座標 (0..width, 0..height) を送る。

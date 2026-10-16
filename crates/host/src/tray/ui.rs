@@ -3,7 +3,7 @@
 //! 同じ UI が 2 つの形で動く:
 //! - **同一プロセス** (開発実行・旧 ONLOGON 運用): host 本体のスレッドとして動き、
 //!   [`super::LocalControl`] で直接操作する。「終了」は host ごと終了する。
-//! - **単独プロセス** (`--tray`、SYSTEM サービス運用): ログオンユーザー権限で動き、名前付きパイプで
+//! - **単独プロセス** (`--tray`、SYSTEM サービス運用): ログオンユーザーの昇格 (管理者) 権限で動き、名前付きパイプで
 //!   本体に要求を送る。「トレイを閉じる」はトレイだけを閉じる (本体はサービスが維持する)。
 //!   SYSTEM の本体が対話デスクトップへ UI を出さないための分離 (SYSTEM 所有のダイアログは
 //!   ローカル利用者への権限昇格穴になる)。
@@ -24,7 +24,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use super::{TrayControl, TrayEvent, TrayReply, TrayRequest, TrayStatus};
+use super::{TrayControl, TrayEvent, TrayReply, TrayRequest, TrayStatus, control::BUSY};
 
 /// トレイアイコンからの通知を受けるカスタムメッセージ。
 const WM_TRAY: u32 = WM_APP + 1;
@@ -100,9 +100,26 @@ struct WndState {
     last_auth: Cell<Option<u32>>,
     /// 認証失敗バルーンのクールダウン残 tick。
     auth_cooldown: Cell<u32>,
+    /// 本体の状態を一度でも取得できたか。単独トレイはサービスが本体とほぼ同時に起動するため、
+    /// 本体がパイプを開く (キャプチャ/エンコーダ初期化の後) まで数秒つながらない。初回パスワード
+    /// ダイアログの要否は、起動時ではなく最初に取得できた時点で判定する。
+    first_status_seen: Cell<bool>,
 }
 
 impl WndState {
+    /// 状態を初めて取得できた時点で一度だけ評価し、パスワード未設定なら `true` (初回ダイアログを
+    /// 出す)。まだ取得できていない・評価済み・設定済みはすべて `false`。
+    fn take_first_status_prompt(&self) -> bool {
+        if self.first_status_seen.get() {
+            return false;
+        }
+        let Some(has_password) = self.status.borrow().as_ref().map(|s| s.has_password) else {
+            return false;
+        };
+        self.first_status_seen.set(true);
+        !has_password
+    }
+
     /// 本体へ状態を問い合わせてキャッシュを更新し、溜まっていた通知イベントを返す。
     fn refresh(&self) -> Vec<TrayEvent> {
         match self.control.call(TrayRequest::Status) {
@@ -180,14 +197,11 @@ pub fn run(control: Box<dyn TrayControl>, mode: TrayMode) -> windows::core::Resu
             last_connected: Cell::new(usize::MAX),
             last_auth: Cell::new(None),
             auth_cooldown: Cell::new(0),
+            first_status_seen: Cell::new(false),
         };
         // 起動前に溜まっていた通知 (再起動前の接続など) はバルーンにしない。
         let _ = state.refresh();
-        let prompt_now = state
-            .status
-            .borrow()
-            .as_ref()
-            .is_some_and(|s| !s.has_password);
+        let prompt_now = state.take_first_status_prompt();
         // 共有状態をウィンドウに紐づける (WM_CREATE で GWLP_USERDATA へ格納)。
         let boxed: *mut WndState = Box::into_raw(Box::new(state));
 
@@ -223,7 +237,8 @@ pub fn run(control: Box<dyn TrayControl>, mode: TrayMode) -> windows::core::Resu
         // バルーン通知へ反映する。
         let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
 
-        // 初回 (保存パスワード無し) は起動直後に変更ダイアログを出す。
+        // 初回 (保存パスワード無し) は起動直後に変更ダイアログを出す (本体にまだ届かなければ
+        // on_timer が最初に届いた時点で出す)。
         if prompt_now {
             let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_CHANGE), LPARAM(0));
         }
@@ -390,8 +405,21 @@ fn on_timer(hwnd: HWND) {
         return;
     };
 
+    let first_seen_before = state.first_status_seen.get();
+    let mut events = state.refresh();
+    if !first_seen_before {
+        // 初めて本体に届いた: それまでに溜まった通知は (起動時と同じく) バルーンにしない。
+        if state.take_first_status_prompt() {
+            // SAFETY: hwnd は生存中のトレイ窓。メッセージを積むだけ (ダイアログはループ側で開く)。
+            let _ = unsafe { PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_CHANGE), LPARAM(0)) };
+        }
+        if state.first_status_seen.get() {
+            events.clear();
+        }
+    }
+
     // 1) 通知イベント → バルーン。接続/切断/登録をオーナーへ能動通知する (無人ホストの気付き)。
-    for ev in state.refresh() {
+    for ev in events {
         match ev {
             TrayEvent::Connected(label) => balloon(
                 hwnd,
@@ -444,6 +472,9 @@ fn on_timer(hwnd: HWND) {
         state.auth_cooldown.set(cd - 1);
     }
     let Some(f) = status.as_ref().map(|s| s.auth_failures) else {
+        // 本体に届かない (再起動中など)。再起動で累計が 0 に戻るので、古い基準を捨てて次に
+        // 取得できた値を新しい基準にする (古い大きい値と比べて増分を見逃さない)。
+        state.last_auth.set(None);
         return;
     };
     let prev = state.last_auth.replace(Some(f));
@@ -729,15 +760,27 @@ fn change_password(hwnd: HWND) {
         return;
     };
     let _ = state.refresh();
-    let Some(require_current) = state.status.borrow().as_ref().map(|s| s.has_password) else {
+    let Some((require_current, busy)) = state
+        .status
+        .borrow()
+        .as_ref()
+        .map(|s| (s.has_password, s.busy))
+    else {
         message_box(hwnd, "本体に接続できません。", "Aurora Host");
         return;
     };
-    while let Some((current, new)) = prompt_password(hwnd, require_current) {
-        match state
-            .control
-            .call(TrayRequest::ChangePassword { current, new })
-        {
+    // 接続中は本体が拒否する。入力させてから断らないよう先に知らせる。
+    if busy {
+        message_box(hwnd, BUSY, "Aurora Host");
+        return;
+    }
+    // 現在パスワードを間違えて開き直すときは、入力済みの新しいパスワードを残す。
+    let mut keep_new: Option<String> = None;
+    while let Some((current, new)) = prompt_password(hwnd, require_current, keep_new.as_deref()) {
+        match state.control.call(TrayRequest::ChangePassword {
+            current,
+            new: new.clone(),
+        }) {
             TrayReply::Done(msg) => {
                 message_box(hwnd, &msg, "Aurora Host");
                 return;
@@ -748,6 +791,7 @@ fn change_password(hwnd: HWND) {
                 if !msg.contains("パスワード") {
                     return;
                 }
+                keep_new = msg.contains("現在のパスワード").then_some(new);
             }
             TrayReply::Status(_) => return,
         }
@@ -761,10 +805,14 @@ fn change_port(hwnd: HWND) {
         return;
     };
     let _ = state.refresh();
-    let Some(current) = state.status.borrow().as_ref().map(|s| s.port) else {
+    let Some((current, busy)) = state.status.borrow().as_ref().map(|s| (s.port, s.busy)) else {
         message_box(hwnd, "本体に接続できません。", "Aurora Host");
         return;
     };
+    if busy {
+        message_box(hwnd, BUSY, "Aurora Host");
+        return;
+    }
     if let Some(new_port) = prompt_port(hwnd, current)
         && new_port != current
     {
@@ -778,7 +826,7 @@ fn open_logs_folder(hwnd: HWND) {
     let Some(state) = (unsafe { wnd_state(hwnd) }) else {
         return;
     };
-    // 単独トレイ (一般ユーザー権限) は保護済みフォルダを作成・ACL 設定できないので、
+    // 単独トレイはフォルダの作成・ACL 設定を本体に任せ (二重に触らない)、
     // 本体が用意した場所を開くだけにする。
     let dir = match state.mode {
         TrayMode::InProcess => crate::system::state::log_dir().ok(),
@@ -998,7 +1046,11 @@ struct DlgResult {
 
 /// パスワード設定/変更ダイアログを表示する。`require_current` のときは「現在のパスワード」欄を
 /// 追加する。照合は本体側 (`control::handle`) で行う (トレイに PSK を持たせないため)。
-fn prompt_password(owner: HWND, require_current: bool) -> Option<(Option<String>, String)> {
+fn prompt_password(
+    owner: HWND,
+    require_current: bool,
+    keep_new: Option<&str>,
+) -> Option<(Option<String>, String)> {
     // SAFETY: パスワードダイアログ生成一式。各 Win32 呼び出しの結果は ? で確認する。
     unsafe {
         let hmod = GetModuleHandleW(None).ok()?;
@@ -1100,9 +1152,16 @@ fn prompt_password(owner: HWND, require_current: bool) -> Option<(Option<String>
             y += 58;
         }
         mk_label(y, w!("新しいパスワード"));
-        let _ = mk_edit(y + 20, ID_EDIT);
+        let new_edit = mk_edit(y + 20, ID_EDIT);
         mk_label(y + 58, w!("新しいパスワード (確認)"));
-        let _ = mk_edit(y + 78, ID_EDIT2);
+        let confirm_edit = mk_edit(y + 78, ID_EDIT2);
+        // 開き直し (現在パスワード違い) では新しいパスワードを入力済みの状態に戻す。
+        if let Some(text) = keep_new {
+            let text = to_wide(text);
+            for edit in [new_edit, confirm_edit].into_iter().flatten() {
+                let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
+            }
+        }
         let button_y = y + 120;
 
         // OK / キャンセルボタン。

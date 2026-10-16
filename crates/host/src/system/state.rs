@@ -15,41 +15,48 @@
 //! - 親の `%ProgramData%\Aurora` には ACL を付けない。VDD ドライバ (インストーラが `vdd\` に配置) は
 //!   親からの継承 ACL で設定ファイルを読むため、親を保護すると仮想ディスプレイが壊れる。
 //!   親は所有者だけ検査する (一般ユーザー所有の親なら子の `host\` をすり替えられるため)。
-//! - ログ (`logs\`) だけはユーザーが「ログフォルダを開く」で読めるよう Users に読み取りを足す。
-//!   ログに機密は出さない方針 (CLAUDE.md) なので、読めても実害は接続元 IP 程度。
+//! - ログ (`logs\`) も同じく SYSTEM / Administrators のみ。接続元 IP・端末の指紋・転送した
+//!   ファイルのパスが残るので、PC の他のユーザーには読ませない (トレイは管理者として動くので開ける)。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 
-/// 状態ディレクトリ: SYSTEM と Administrators のみフルコントロール、継承を切る (P)。
+/// 状態ディレクトリとログ: SYSTEM と Administrators のみフルコントロール、継承を切る (P)。
 const STATE_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-/// ログ: 上に加えて Users へ読み取り。
-const LOGS_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
 
-/// 保護済みの状態ディレクトリを返す。初回だけ作成・検査・ACL 適用し、結果をプロセス内で使い回す。
+/// 保護済みの状態ディレクトリを返す。成功するまでは呼ばれるたびに作成・検査・ACL 適用を試み、
+/// 成功した結果だけをプロセス内で使い回す (起動直後の一過性の失敗をプロセス終了まで引きずらない)。
+/// 管理者権限の無いプロセスでは ACL を適用できないので失敗し続ける (状態は SYSTEM/管理者専用)。
 pub fn state_dir() -> Result<PathBuf> {
-    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DIR.get_or_init(|| prepare_state_dir().map_err(|e| format!("{e:#}")))
-        .clone()
-        .map_err(|e| anyhow!(e))
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    cached_or(&DIR, prepare_state_dir)
 }
 
-/// 保護済みのログディレクトリ (`<state_dir>\logs`) を返す。
+/// 保護済みのログディレクトリ (`<state_dir>\logs`) を返す。キャッシュの方針は [`state_dir`] と同じ。
 pub fn log_dir() -> Result<PathBuf> {
-    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = state_dir().map_err(|e| format!("{e:#}"))?.join("logs");
-        prepare(&dir, LOGS_SDDL).map_err(|e| format!("{e:#}"))?;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    cached_or(&DIR, || {
+        let dir = state_dir()?.join("logs");
+        prepare(&dir, STATE_SDDL)?;
         Ok(dir)
     })
-    .clone()
-    .map_err(|e| anyhow!(e))
+}
+
+fn cached_or(
+    cell: &OnceLock<PathBuf>,
+    prepare: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(dir) = cell.get() {
+        return Ok(dir.clone());
+    }
+    let dir = prepare()?;
+    Ok(cell.get_or_init(|| dir).clone())
 }
 
 /// ログディレクトリのパスだけを返す (作成・ACL 設定はしない)。保護済みフォルダを準備できない
-/// 一般ユーザー権限のトレイが「ログフォルダを開く」で使う。
+/// 単独トレイが「ログフォルダを開く」で使う (準備は本体の役目)。
 pub fn log_dir_path() -> Option<PathBuf> {
     Some(
         aurora_common::paths::machine_data_dir()?
@@ -85,6 +92,14 @@ fn ensure_trusted_dir(dir: &std::path::Path) -> Result<()> {
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create {} (run as administrator)", dir.display()))?;
+    // 先回りで作られたジャンクション/シンボリックリンクは、所有者検査がリンク先 (SYSTEM 所有の
+    // 別ディレクトリ等) を見て通ってしまい、ACL 適用がリンク先を書き換える。リンクは使わない。
+    if is_reparse_point(dir)? {
+        bail!(
+            "{} is a junction or symbolic link (possibly planted by a non-admin user);              refusing to use it. Delete it as administrator and restart",
+            dir.display()
+        );
+    }
     if !owner_is_trusted(dir)? {
         bail!(
             "{} is owned by an untrusted account (possibly pre-created by a non-admin user); \
@@ -103,6 +118,16 @@ fn prepare(dir: &std::path::Path, sddl: &str) -> Result<()> {
     ensure_trusted_dir(dir)?;
     apply_dacl(dir, sddl)
         .with_context(|| format!("protect {} (run as administrator)", dir.display()))
+}
+
+/// リパースポイント (ジャンクション・シンボリックリンク等) か。リンク自体の属性を見る (辿らない)。
+#[cfg(target_os = "windows")]
+fn is_reparse_point(path: &std::path::Path) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| anyhow!("inspect {}: {e}", path.display()))?;
+    Ok(meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 /// 所有者が SYSTEM か Administrators か。
@@ -227,8 +252,9 @@ pub fn migrate_user_state() -> Result<()> {
     let mut migrated = Vec::new();
 
     let old_secret = src.join(crate::security::secret::FILE_NAME);
-    if old_secret.exists() && !dst.join(crate::security::secret::FILE_NAME).exists() {
-        let blob = std::fs::read(&old_secret).context("read old password store")?;
+    if !dst.join(crate::security::secret::FILE_NAME).exists()
+        && let Some(blob) = read_migration_source(&old_secret)?
+    {
         let plain = aurora_common::dpapi::unprotect(&blob)
             .context("decrypt old password store (run as the user who set it)")?;
         let password = String::from_utf8(plain).context("old password is not valid UTF-8")?;
@@ -238,10 +264,10 @@ pub fn migrate_user_state() -> Result<()> {
     // 平文設定は読み書きし直す (コピーだと元ファイルの ACL を持ち込みうる。新規作成なら
     // 保護済みディレクトリの継承 ACL になる)。
     for name in ["port", "encode-gpu", "pinning", "trusted_devices.txt"] {
-        let from = src.join(name);
         let to = dst.join(name);
-        if from.exists() && !to.exists() {
-            let data = std::fs::read(&from).with_context(|| format!("read old {name}"))?;
+        if !to.exists()
+            && let Some(data) = read_migration_source(&src.join(name))?
+        {
             std::fs::write(&to, data).with_context(|| format!("write {name}"))?;
             migrated.push(name);
         }
@@ -252,4 +278,31 @@ pub fn migrate_user_state() -> Result<()> {
         println!("migrated to {}: {}", dst.display(), migrated.join(", "));
     }
     Ok(())
+}
+
+/// 移行元のファイルを読む。無ければ `None`。移行元は利用者が自由に書ける場所で、移行は昇格した
+/// インストーラから走るため、リンク (別の場所のファイルを読ませる) や通常ファイル以外、上限を
+/// 超える大きさのものは取り込まない (いずれも旧版が書いた形ではない)。
+fn read_migration_source(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    /// 旧版の状態ファイルはいずれも数 KB 以下 (許可リストでも 1 端末 1 行)。
+    const MAX_MIGRATION_FILE: u64 = 1024 * 1024;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("inspect {}: {e}", path.display())),
+    };
+    #[cfg(target_os = "windows")]
+    let linked = is_reparse_point(path)?;
+    #[cfg(not(target_os = "windows"))]
+    let linked = meta.file_type().is_symlink();
+    if linked || !meta.is_file() || meta.len() > MAX_MIGRATION_FILE {
+        println!(
+            "skipping {} (not a plain file written by an older version)",
+            path.display()
+        );
+        return Ok(None);
+    }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|e| anyhow!("read {}: {e}", path.display()))
 }

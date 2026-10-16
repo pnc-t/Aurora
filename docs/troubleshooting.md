@@ -32,7 +32,7 @@
 |------|------|
 | `--install-service` が失敗する | 管理者権限で実行しているか |
 | サービスは動くが映像が来ない | `Get-Service AuroraHost` が Running か。`%ProgramData%\Aurora\host\logs\service.<日付>.log` に本体の起動失敗が無いか |
-| トレイアイコンが出ない | スタートメニューの Aurora Host を起動するとトレイだけ出し直す (サービス稼働中は本体を二重起動しない)。トレイのログは `%LOCALAPPDATA%\Aurora\logs\tray.<日付>.log` |
+| トレイアイコンが出ない | サインインしているのが管理者か (管理者でないユーザーではトレイを出さない)。閉じた場合はスタートメニューの Aurora Host を起動すると UAC 確認のあとトレイだけ出し直す (サービス稼働中は本体を二重起動しない)。トレイのログは `%LOCALAPPDATA%\Aurora\logs\tray.<日付>.log` |
 | WoL で起きない | 中継役 (`aurora-wol`) と自宅 PC が同一サブネットか。BIOS/UEFI と NIC ドライバで Wake-on-LAN が有効か。MAC が正しいか。高速スタートアップを無効化したか (`powercfg /h off`)。S5 不可なら S3/S4 (スリープ/休止) で運用。詳細は [`crates/wol/README.md`](../crates/wol/README.md) を参照 |
 | 自動ログオンしたい | サービス運用では不要 (サインイン画面のまま接続し、遠隔でサインインできる) |
 

@@ -89,13 +89,21 @@ pub fn shell_impersonation_token() -> Result<UserToken, &'static str> {
 
 /// 現スレッドで `token` を偽装して `f` を実行し、必ず偽装を解除して戻る。
 pub fn impersonating<T>(token: &UserToken, f: impl FnOnce() -> T) -> Result<T, &'static str> {
-    // SAFETY: 複製した偽装トークンを現在のスレッドに設定する。f の後で必ず解除する
-    // (このスレッドは tokio / ProjFS と共有されうるため、偽装を残さない)。
+    // SAFETY: 複製した偽装トークンを現在のスレッドに設定する。解除は下のガードが Drop で行う。
     unsafe { SetThreadToken(None, token.0) }.map_err(|_| "SetThreadToken failed")?;
-    let out = f();
-    // SAFETY: スレッドの偽装を解除するだけ。
-    let _ = unsafe { SetThreadToken(None, HANDLE::default()) };
-    Ok(out)
+    let _revert = RevertOnDrop;
+    Ok(f())
+}
+
+/// スレッドの偽装を Drop で解除する。`f` が panic して巻き戻るときも解除し、偽装したままの
+/// スレッドを tokio / ProjFS のスレッドプールへ返さない (以後の別タスクがユーザー権限で動いてしまう)。
+struct RevertOnDrop;
+
+impl Drop for RevertOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: 現在のスレッドの偽装を解除するだけ。
+        let _ = unsafe { SetThreadToken(None, HANDLE::default()) };
+    }
 }
 
 /// トークンの持ち主のプロファイルディレクトリ (`C:\Users\<名前>`)。
@@ -119,6 +127,16 @@ fn known_folder(token: &UserToken, id: &windows::core::GUID) -> Option<PathBuf> 
         CoTaskMemFree(Some(p.0 as *const std::ffi::c_void));
         s.map(PathBuf::from)
     }
+}
+
+/// SYSTEM サービス配下ではログオンユーザーを偽装して `f` を実行する。それ以外 (開発実行・旧
+/// ONLOGON 運用) は自プロセスのまま実行する。サービス配下でユーザーが居なければ実行せず `Err`。
+pub fn run_as_session_user<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
+    if !crate::system::service::is_service_child() {
+        return Ok(f());
+    }
+    let token = shell_impersonation_token()?;
+    impersonating(&token, f)
 }
 
 /// ファイル入出力をどのユーザーとして行うか。SYSTEM サービス配下ではログオンユーザーを偽装し、

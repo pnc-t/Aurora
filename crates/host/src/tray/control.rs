@@ -3,14 +3,16 @@
 //! トレイ UI は「要求 ([`TrayRequest`]) を投げて応答 ([`TrayReply`]) を表示する」だけにし、
 //! 状態の読み書きと特権ガード (接続中拒否・現在パスワード照合) は全てここ ([`handle`]) で行う。
 //! 開発実行・旧 ONLOGON 運用では同一プロセス内の [`LocalControl`] がそのまま呼び、SYSTEM
-//! サービス運用ではユーザー権限のトレイプロセスが名前付きパイプ越しに本体へ送る
+//! サービス運用では単独のトレイプロセス (管理者の昇格権限) が名前付きパイプ越しに本体へ送る
 //! ([`super::ipc`])。どちらの経路でもガードはこの 1 箇所を通るので、経路ごとに防御が
 //! 食い違わない (memory: host-privileged-paths-symmetry)。
 //!
-//! **PSK はトレイへ渡さない**: 現在パスワードの照合も本体側で行う。ユーザー権限のトレイに
+//! **PSK はトレイへ渡さない**: 現在パスワードの照合も本体側で行う。別プロセスのトレイに
 //! PSK を渡すと、同じ PC の他プロセスがパイプ経由で取り出して遠隔認証に使えてしまう。
 
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use aurora_common::noise::psk_from_password;
 use serde::{Deserialize, Serialize};
@@ -57,6 +59,9 @@ pub struct TrayStatus {
     pub pairing_armed: bool,
     pub pending: Vec<PendingInfo>,
     pub device_labels: Vec<String>,
+    /// クライアント接続中か。接続中に拒否される操作 (パスワード/ポート変更) で、入力させる前に
+    /// 知らせるための表示用 (拒否そのものは [`handle`] が行う)。
+    pub busy: bool,
     /// 前回の取得以降に溜まった通知イベント (取得で消費される)。
     pub events: Vec<TrayEvent>,
 }
@@ -108,7 +113,26 @@ impl TrayControl for LocalControl {
     }
 }
 
-const BUSY: &str = "クライアント接続中は変更できません。\n切断してから操作してください。";
+/// 接続中に変更を拒否したときの文言 (トレイが入力前の事前案内にも使う)。
+pub const BUSY: &str = "クライアント接続中は変更できません。\n切断してから操作してください。";
+
+/// 現在パスワード照合の失敗に応じた待ち (総当たり対策)。遠隔の認証には IP 単位のスロットルが
+/// あるが、トレイ経由の照合はそれを通らないため、ここで同じ趣旨の制限をかける。照合 (Argon2、
+/// 64MiB) はこのロックを握ったまま行うので、同時に走るのは 1 件だけになる (メモリ/CPU の枯渇防止)。
+struct PasswordThrottle {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+static PASSWORD_THROTTLE: Mutex<PasswordThrottle> = Mutex::new(PasswordThrottle {
+    failures: 0,
+    retry_at: None,
+});
+
+/// 失敗 n 回目のあとの待ち: 1, 2, 4, ... 秒、上限 5 分。
+fn password_backoff(failures: u32) -> Duration {
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(8)).min(Duration::from_secs(300))
+}
 
 /// 要求を処理する。ファイル書き込み (パスワード・設定・許可リスト) を伴うので、tokio タスクから
 /// 呼ぶときは `spawn_blocking` 経由にすること。
@@ -122,11 +146,27 @@ pub fn handle(ctx: &TrayContext, req: TrayRequest) -> TrayReply {
                 return Failed(BUSY.into());
             }
             if ctx.has_password.load(Ordering::Relaxed) {
+                let Ok(mut throttle) = PASSWORD_THROTTLE.lock() else {
+                    return Failed("現在のパスワードを確認できませんでした。".into());
+                };
+                if let Some(at) = throttle.retry_at {
+                    let now = Instant::now();
+                    if now < at {
+                        let secs = (at - now).as_secs() + 1;
+                        return Failed(format!(
+                            "現在のパスワードの入力誤りが続いたため、{secs} 秒後に再試行してください。"
+                        ));
+                    }
+                }
                 let expected = ctx.psk.lock().ok().map(|g| *g);
                 let given = current.as_deref().map(psk_from_password);
                 if expected.is_none() || given != expected {
+                    throttle.failures = throttle.failures.saturating_add(1);
+                    throttle.retry_at = Some(Instant::now() + password_backoff(throttle.failures));
                     return Failed("現在のパスワードが違います。".into());
                 }
+                throttle.failures = 0;
+                throttle.retry_at = None;
             }
             if new.chars().count() < aurora_common::noise::MIN_PASSWORD_LEN {
                 return Failed(format!(
@@ -261,6 +301,7 @@ fn status(ctx: &TrayContext) -> TrayStatus {
             })
             .collect(),
         device_labels: ctx.devices.labels(),
+        busy: crate::net::is_active(),
         events: ctx.bus.drain_events(),
     }
 }

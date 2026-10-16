@@ -1,12 +1,12 @@
-//! SYSTEM サービス運用で、本体 (SYSTEM) とユーザー権限のトレイ (`--tray`) をつなぐ名前付きパイプ。
+//! SYSTEM サービス運用で、本体 (SYSTEM) と単独トレイ (`--tray`、管理者の昇格権限) をつなぐ名前付きパイプ。
 //!
 //! 形式: 1 要求 = `u32 LE 長さ + JSON` ([`TrayRequest`])、応答も同じ形式 ([`TrayReply`])。
 //!
 //! Windows 固有の落とし穴 (パイプは同じ PC の任意プロセスから名前で開けるため):
-//! - **接続できる相手を絞る**: DACL は SYSTEM / Administrators と対話ログオンユーザー (IU) のみ。
-//!   IU には読み書きに要る最小権限だけを与え、`FILE_CREATE_PIPE_INSTANCE` (= `FILE_APPEND_DATA`、
-//!   `GENERIC_WRITE` に含まれる) を渡さない。渡すと一般ユーザーが同名の別インスタンスを作って
-//!   トレイの接続を横取りできる。さらに本体と同じセッションのクライアントだけ受け付ける
+//! - **接続できる相手を絞る**: DACL は SYSTEM / Administrators のみ。トレイはサービスが昇格
+//!   (管理者) トークンで起動するので開ける。UAC の制限付きトークンでは Administrators が拒否専用
+//!   になるため、同じユーザーでも通常権限のプロセスは開けない (開けると、パスワードの総当たりや
+//!   未設定時の先回り設定をされうる)。さらに本体と同じセッションのクライアントだけ受け付ける
 //!   (別セッションの RDP ユーザー・切替中ユーザーを弾く)。ネットワーク越し (SMB) は拒否。
 //! - **相手が本物の本体か確かめる**: 本体より先に一般ユーザーが同名パイプを作っておけば、トレイが
 //!   入力したパスワードを盗める。トレイはパイプの所有者が SYSTEM / Administrators であることを
@@ -15,8 +15,9 @@
 
 use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use super::control::{TrayContext, TrayReply, TrayRequest, handle};
 
@@ -24,11 +25,13 @@ use super::control::{TrayContext, TrayReply, TrayRequest, handle};
 const PIPE_NAME: &str = r"\\.\pipe\AuroraHostTray";
 /// 1 メッセージの上限 (状態スナップショットでも数 KB。巨大長さでのメモリ確保を防ぐ)。
 const MAX_MESSAGE: usize = 256 * 1024;
-/// IU (対話ユーザー) に与える権限: FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
-/// READ_CONTROL | SYNCHRONIZE。`GENERIC_WRITE` 相当にしない理由はモジュール doc 参照。
+/// トレイがパイプを開く権限: FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+/// READ_CONTROL | SYNCHRONIZE (読み書きと所有者確認に要る最小限)。
 const CLIENT_ACCESS: u32 = 0x0012_0083;
-/// パイプの DACL (継承なし)。
-const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120083;;;IU)";
+/// パイプの DACL (継承なし)。昇格した管理者と SYSTEM のみ。
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+/// 同時に受け付けるトレイ接続の上限 (サービスが起こすトレイ + 手動で出したもの程度)。
+const MAX_CLIENTS: usize = 4;
 /// トレイが本体の応答を待つ上限。本体が固まってもトレイ UI まで固めない。
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -110,16 +113,42 @@ async fn serve_inner(ctx: TrayContext) -> anyhow::Result<()> {
         anyhow::anyhow!("create tray pipe (already created by another process?): {e}")
     })?;
     tracing::info!("tray pipe listening");
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     loop {
-        server.connect().await?;
+        // 1 回の失敗でループごと終えると、以後トレイから一切操作できなくなる。作り直して続ける。
+        if let Err(e) = server.connect().await {
+            tracing::warn!(error = %e, "tray pipe connect failed; recreating instance");
+            server = next_instance(&security).await;
+            continue;
+        }
         let client = server;
-        server = security.create(false)?;
+        server = next_instance(&security).await;
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("too many tray pipe clients; dropping new connection");
+            continue;
+        };
         let ctx = ctx.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle_client(client, ctx, own_session).await {
                 tracing::debug!(error = %e, "tray pipe client ended");
             }
         });
+    }
+}
+
+/// 次の待受インスタンスを作る。作れるまで間を空けて繰り返す (一過性の失敗で待受を失わない)。
+async fn next_instance(
+    security: &PipeSecurity,
+) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    loop {
+        match security.create(false) {
+            Ok(s) => return s,
+            Err(e) => {
+                tracing::warn!(error = %e, "create tray pipe instance failed; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -173,60 +202,91 @@ fn own_session_id() -> anyhow::Result<u32> {
 
 // ---- トレイ (クライアント) 側 ----
 
-type Job = (TrayRequest, mpsc::Sender<TrayReply>);
+/// ワーカーへの 1 要求。`deadline` を過ぎた要求は UI 側が既に「応答なし」と表示済みなので、
+/// 本体へ送らずに捨てる (失敗と見せた操作が後から適用されるのを防ぐ)。
+struct Job {
+    req: TrayRequest,
+    reply: mpsc::Sender<TrayReply>,
+    deadline: Instant,
+}
 
 /// パイプ越しに本体を操作する [`super::TrayControl`]。I/O は専用スレッドで行い、UI スレッドは
 /// 応答を [`CALL_TIMEOUT`] までしか待たない。
 pub struct PipeControl {
     tx: mpsc::Sender<Job>,
+    /// ワーカーが本体と通信中か。本体が固まって前の要求が返らない間は、新しい要求を積まずに
+    /// 即「応答なし」を返す (1 秒周期のポーリングごとに UI を 5 秒止めない)。
+    busy: Arc<AtomicBool>,
 }
 
 impl PipeControl {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = busy.clone();
         let _ = std::thread::Builder::new()
             .name("tray-pipe".into())
-            .spawn(move || worker(rx));
-        Self { tx }
+            .spawn(move || worker(rx, worker_busy));
+        Self { tx, busy }
     }
 }
 
+const NO_RESPONSE: &str = "本体が応答しません。\n直前の操作が後から反映される場合があります。";
+
 impl super::TrayControl for PipeControl {
     fn call(&self, req: TrayRequest) -> TrayReply {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send((req, reply_tx)).is_err() {
+        if self.busy.load(Ordering::Acquire) {
+            return TrayReply::Failed(NO_RESPONSE.into());
+        }
+        let (reply, reply_rx) = mpsc::channel();
+        let job = Job {
+            req,
+            reply,
+            deadline: Instant::now() + CALL_TIMEOUT,
+        };
+        if self.tx.send(job).is_err() {
             return TrayReply::Failed("本体に接続できません。".into());
         }
         reply_rx
             .recv_timeout(CALL_TIMEOUT)
-            .unwrap_or_else(|_| TrayReply::Failed("本体が応答しません。".into()))
+            .unwrap_or_else(|_| TrayReply::Failed(NO_RESPONSE.into()))
     }
 }
 
-fn worker(rx: mpsc::Receiver<Job>) {
+fn worker(rx: mpsc::Receiver<Job>, busy: Arc<AtomicBool>) {
     let mut conn: Option<std::fs::File> = None;
-    for (req, reply_tx) in rx {
-        if conn.is_none() {
-            match connect() {
-                Ok(f) => conn = Some(f),
-                Err(e) => {
-                    tracing::debug!(error = %e, "tray pipe connect failed");
-                    let _ = reply_tx.send(TrayReply::Failed("本体に接続できません。".into()));
-                    continue;
-                }
+    for job in rx {
+        if Instant::now() >= job.deadline {
+            continue;
+        }
+        busy.store(true, Ordering::Release);
+        let reply = exchange(&mut conn, &job.req);
+        busy.store(false, Ordering::Release);
+        let _ = job.reply.send(reply);
+    }
+}
+
+/// 必要なら繋ぎ直して 1 往復する。失敗したら接続を捨て、次の要求で繋ぎ直す。
+fn exchange(conn: &mut Option<std::fs::File>, req: &TrayRequest) -> TrayReply {
+    if conn.is_none() {
+        match connect() {
+            Ok(f) => *conn = Some(f),
+            Err(e) => {
+                tracing::debug!(error = %e, "tray pipe connect failed");
+                return TrayReply::Failed("本体に接続できません。".into());
             }
         }
-        let Some(f) = conn.as_mut() else { continue };
-        match roundtrip(f, &req) {
-            Ok(reply) => {
-                let _ = reply_tx.send(reply);
-            }
-            Err(e) => {
-                // 本体の再起動などで切れた。次の要求で繋ぎ直す。
-                tracing::debug!(error = %e, "tray pipe request failed; reconnecting next time");
-                conn = None;
-                let _ = reply_tx.send(TrayReply::Failed("本体に接続できません。".into()));
-            }
+    }
+    let Some(f) = conn.as_mut() else {
+        return TrayReply::Failed("本体に接続できません。".into());
+    };
+    match roundtrip(f, req) {
+        Ok(reply) => reply,
+        Err(e) => {
+            // 本体の再起動などで切れた。次の要求で繋ぎ直す。
+            tracing::debug!(error = %e, "tray pipe request failed; reconnecting next time");
+            *conn = None;
+            TrayReply::Failed("本体に接続できません。".into())
         }
     }
 }

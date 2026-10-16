@@ -18,8 +18,8 @@ mod imp {
 
     use windows::Win32::Foundation::{GENERIC_ALL, HANDLE};
     use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, GetUserObjectInformationW,
-        HDESK, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
+        CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, GetThreadDesktop,
+        GetUserObjectInformationW, HDESK, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
     };
 
     /// このスレッドを割り当てたデスクトップ。Drop で (割り当て解除後の) ハンドルを閉じる。
@@ -38,6 +38,22 @@ mod imp {
 
     thread_local! {
         static ATTACHED: RefCell<Option<Attached>> = const { RefCell::new(None) };
+        /// 直近に乗り換えに失敗したデスクトップ名。入力スレッドは毎イベント呼ぶので、同じ失敗を
+        /// 何度も警告しない (別のデスクトップで失敗したら改めて出す)。
+        static LAST_FAILED: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// 現在の入力デスクトップの名前。開けない (非 SYSTEM で Winlogon 等) ときは `None`。
+    pub fn input_desktop_name() -> Option<String> {
+        use windows::Win32::System::StationsAndDesktops::DESKTOP_READOBJECTS;
+        // SAFETY: 入力デスクトップを読み取り最小権限で開くだけ。下で必ず閉じる。
+        let desk =
+            unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) }
+                .ok()?;
+        let name = desktop_name(desk);
+        // SAFETY: 直前に開いたハンドルを 1 度だけ閉じる (どのスレッドにも割り当てていない)。
+        let _ = unsafe { CloseDesktop(desk) };
+        name
     }
 
     /// デスクトップの名前 (`Default` / `Winlogon` 等)。取得できなければ `None`。
@@ -85,9 +101,22 @@ mod imp {
             }
             // SAFETY: new.handle は直前に開いた有効なデスクトップ。このスレッドはウィンドウを持たない前提。
             if let Err(e) = unsafe { SetThreadDesktop(new.handle) } {
-                tracing::debug!(error = %e, desktop = %new.name, "SetThreadDesktop failed; staying on current desktop");
+                // UAC/ロック画面が操作できない原因を本番ログ (info 以上) から追えるよう warn にする。
+                LAST_FAILED.with(|last| {
+                    let mut last = last.borrow_mut();
+                    if last.as_deref() != Some(new.name.as_str()) {
+                        tracing::warn!(
+                            error = %e,
+                            desktop = %new.name,
+                            thread = std::thread::current().name().unwrap_or("?"),
+                            "SetThreadDesktop failed; staying on current desktop"
+                        );
+                        *last = Some(new.name.clone());
+                    }
+                });
                 return false;
             }
+            LAST_FAILED.with(|last| *last.borrow_mut() = None);
             tracing::info!(
                 desktop = %new.name,
                 thread = std::thread::current().name().unwrap_or("?"),
@@ -98,13 +127,50 @@ mod imp {
             true
         })
     }
+
+    /// `f` の間だけ呼び出しスレッドを入力デスクトップへ移し、終わったら元のデスクトップへ戻す。
+    /// [`follow_input_desktop`] と違って乗り換えを残さないので、追従し続けない (以後の状態変化を
+    /// 見ない) スレッド (起動時のアダプタ確認を行う main スレッド等) に使う。移せなければそのまま実行する。
+    pub fn with_input_desktop<T>(f: impl FnOnce() -> T) -> T {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        // SAFETY: 自スレッドに割り当て中のデスクトップを得るだけ (このハンドルは閉じてはならない)。
+        let Ok(original) = (unsafe { GetThreadDesktop(GetCurrentThreadId()) }) else {
+            return f();
+        };
+        // SAFETY: 入力デスクトップを開くだけ。失敗 (権限不足等) はそのまま実行する。
+        let Ok(input) = (unsafe {
+            OpenInputDesktop(
+                DESKTOP_CONTROL_FLAGS(0),
+                false,
+                DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0),
+            )
+        }) else {
+            return f();
+        };
+        // SAFETY: input は直前に開いた有効なデスクトップ。このスレッドはウィンドウを持たない前提。
+        let switched = unsafe { SetThreadDesktop(input) }.is_ok();
+        let out = f();
+        if switched {
+            // SAFETY: original は自スレッドが元々割り当てられていた有効なデスクトップ。
+            let _ = unsafe { SetThreadDesktop(original) };
+        }
+        // SAFETY: 割り当てを外した (または割り当てなかった) input を 1 度だけ閉じる。
+        let _ = unsafe { CloseDesktop(input) };
+        out
+    }
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{desktop_name, follow_input_desktop};
+pub use imp::{desktop_name, follow_input_desktop, input_desktop_name, with_input_desktop};
 
 /// 非 Windows は入力デスクトップの概念が無い (常に乗り換えない)。
 #[cfg(not(target_os = "windows"))]
 pub fn follow_input_desktop() -> bool {
     false
+}
+
+/// 非 Windows は入力デスクトップの概念が無い。
+#[cfg(not(target_os = "windows"))]
+pub fn input_desktop_name() -> Option<String> {
+    None
 }

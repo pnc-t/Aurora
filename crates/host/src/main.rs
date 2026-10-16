@@ -99,7 +99,7 @@ struct Args {
     uninstall_service: bool,
     /// 旧版のユーザー側状態を状態ディレクトリへ移して終了する (`--migrate-user-state`)。
     migrate_user_state: bool,
-    /// ユーザー権限の単独トレイとして動く (`--tray`、サービスがログオンユーザーとして起動する)。
+    /// 単独トレイとして動く (`--tray`、サービスがログオンユーザーの昇格トークンで起動する)。
     tray: bool,
 }
 
@@ -346,7 +346,7 @@ fn main() -> Result<()> {
     // ワーカーを生かすため main 終了まで保持する (drop すると以降のログが失われる)。
     // サービス (Session 0) とトレイは本体と別ファイルに書く (同じ日次ファイルへの複数プロセス同時
     // 書込を避ける)。どちらもデバッグビルドでもコンソールが無いので常にファイルへ。トレイは一般
-    // ユーザー権限で保護済みの host ログへ書けないので、ユーザー側 (%LOCALAPPDATA%) へ書く。
+    // 本体のログと混ざらないよう、ユーザー側 (%LOCALAPPDATA%) へ書く。
     let _log_guard = if args.tray {
         init_tracing(
             "tray",
@@ -436,7 +436,11 @@ fn main() -> Result<()> {
         // サービス運用中の手動起動 (スタートメニュー等) は、閉じたトレイを出し直したい意図とみなす。
         #[cfg(target_os = "windows")]
         if !system::service::is_service_child() && tray::ipc::host_pipe_exists() {
-            return tray::run_standalone();
+            // パイプは昇格した管理者しか開けない。非昇格の起動なら UAC を経て昇格し直す。
+            if display::process_is_elevated() {
+                return tray::run_standalone();
+            }
+            return tray::relaunch_elevated();
         }
         tracing::info!("another aurora-host server is already running; exiting");
         // サービス配下は SYSTEM なので対話デスクトップへ UI を出さない (サービスが待って再試行する)。
@@ -1301,9 +1305,16 @@ fn run_server(
         bus: tray_bus.clone(),
         update: update_state.clone(),
     };
-    // サービス配下 (SYSTEM) は対話デスクトップへ UI を出さず、ユーザー権限のトレイ (`--tray`) から
+    // サービス配下 (SYSTEM) は対話デスクトップへ UI を出さず、単独トレイ (`--tray`) から
     // パイプで操作を受ける。それ以外は従来どおり同一プロセスでトレイを出す。
     let pipe_tray_ctx = if system::service::is_service_child() {
+        // サービスの停止 (アンインストール・更新・net stop) では、トレイ終了と同じ後始末をしてから
+        // 終わる。強制終了だと仮想ディスプレイのテイクオーバー中に物理画面が暗転したまま残る。
+        system::service::watch_stop_request(|| {
+            projfs::cleanup_drives();
+            display::recover_takeover_if_any();
+            std::process::exit(0);
+        });
         Some(tray_ctx)
     } else {
         tray::spawn(tray_ctx);
@@ -1659,6 +1670,8 @@ fn capture_loop(
     // 一度でもフレームを取得できたか (= このプロセスでキャプチャが成立する環境か)。re-exec は
     // 「動いていたのに固着した」場合に限定し、起動時から取得できない環境での再起動ループを防ぐ。
     let mut captured_ok = false;
+    // このプロセスが最初にフレームを取得できた入力デスクトップ (サービス配下のみ記録)。
+    let mut captured_on: Option<String> = None;
     // 連続失敗が始まった時刻。Ok で None に戻す。
     let mut first_fail: Option<Instant> = None;
     // 現在の送出最大高さ (0 = キャプチャ解像度)。capturer 再構築をまたいで保持し再適用する。
@@ -1723,6 +1736,19 @@ fn capture_loop(
                 f
             }
             Err(e) => {
+                // サービス配下: 取り込みを始めたのと別のデスクトップ (Default ⇔ Winlogon) へ切り替わって
+                // 失敗したら、待たずに作り直させる。通常の画面で複製を始めたプロセスは、Winlogon へ
+                // 乗り換えて複製を作り直しても ACCESS_LOST が続く一方、最初から Winlogon で始めた
+                // 新しいプロセスなら取り込める (ロック画面のパスワード入力・ユーザー切替で実機確認、
+                // 2026-10-17)。8 秒の固着判定を待つと、その間パスワード入力画面が映らない。
+                if let Some(prev) = &captured_on
+                    && let Some(now) = system::desktop::input_desktop_name()
+                    && &now != prev
+                    && !crate::display::is_takeover_active()
+                {
+                    tracing::info!(from = %prev, to = %now, error = %e, "input desktop changed; restarting host to capture it");
+                    reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
+                }
                 // ロック画面・UAC セキュアデスクトップ中の ACCESS_LOST は、デスクトップが
                 // 戻れば復帰する正常動作。固着時間に数えると 8 秒を超える通常のロックや
                 // UAC 放置のたびに re-exec (= セッション切断) してしまうため、入力デスク
@@ -1730,7 +1756,13 @@ fn capture_loop(
                 // も ACCESS_LOST が続くので、この条件でも確実に検出できる。
                 // SYSTEM (サービス配下) では下の再構築が Winlogon へ乗り換えて取り込みを続ける
                 // (system::desktop)。非 SYSTEM は乗り換えられず、Default 復帰まで待つだけ。
-                if !capture::input_desktop_is_default() {
+                //
+                // ただしサービス配下ではロック中も数える。ロック画面をまたぐと DWM へのプロセス単位の
+                // 接続が壊れ (ACM 有効機で実機確認・2026-10-17)、Winlogon へ乗り換えて作り直しても
+                // ACCESS_LOST が続く。数えないとロック中は映像が止まったままになり (入力は届くので
+                // 遠隔からロック解除できない)、再起動 (= 新しい接続) まで回復しない。サービス配下の
+                // re-exec はサービスに作り直させるだけで、クライアントは自動再接続する。
+                if !capture::input_desktop_is_default() && !system::service::is_service_child() {
                     first_fail = None;
                     tracing::debug!(error = %e, name = %cur_name, "capture failed on lock/secure desktop; not counted as stuck");
                 } else {
@@ -1825,6 +1857,9 @@ fn capture_loop(
         }
         if let Some(f) = acquired {
             captured_ok = true;
+            if captured_on.is_none() && system::service::is_service_child() {
+                captured_on = system::desktop::input_desktop_name();
+            }
             // (再)構築直後の最初のフレーム寸法を実解像度として通知する。
             if !reported {
                 let _ = res_tx.try_send((f.width, f.height));
