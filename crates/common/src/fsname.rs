@@ -68,29 +68,48 @@ fn is_bidi_control(c: char) -> bool {
     )
 }
 
-/// 受信ファイルの保存ルート (`%USERPROFILE%\Aurora\<subdir>`、非 Windows は `$HOME` 配下)。
+/// 自プロセスのユーザープロファイル (`%USERPROFILE%`、非 Windows は `$HOME`)。
 ///
 /// トレイ常駐・ログオン時自動起動・ショートカット起動では CWD が `System32` 等の不定な
 /// (書き込み不可もありうる) 場所になるため、CWD 相対ではなくユーザープロファイル配下の
 /// 固定パスへ絶対化して discoverable にする。`USERPROFILE`/`HOME` が無ければ最後の手段
 /// としてカレントディレクトリ。
-fn incoming_dir(subdir: &str) -> std::path::PathBuf {
-    let base = std::env::var_os("USERPROFILE")
+fn own_profile_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("Aurora").join(subdir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-/// [`incoming_dir`] 配下に受信ファイルを作成する。ファイル名は [`sanitize_filename`] で
-/// 単一ファイル名へ正規化する。戻り値は (作成した `File`, 表示用フルパス)。
+/// 自プロセスのプロファイル配下 (`<profile>\Aurora\<subdir>`) に受信ファイルを作成する。
+/// 中身は [`create_incoming_file_at`] と同じ (同期 I/O は blocking スレッドで行う)。
 pub async fn create_incoming_file(
     subdir: &str,
     name: &str,
     fallback: &str,
 ) -> std::io::Result<(tokio::fs::File, String)> {
-    let dir = incoming_dir(subdir);
-    tokio::fs::create_dir_all(&dir).await?;
+    let (subdir, name, fallback) = (subdir.to_string(), name.to_string(), fallback.to_string());
+    let (file, path) = tokio::task::spawn_blocking(move || {
+        create_incoming_file_at(&own_profile_dir(), &subdir, &name, &fallback)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok((tokio::fs::File::from_std(file), path))
+}
+
+/// `<profile>\Aurora\<subdir>` 配下に受信ファイルを作成する (同期)。ファイル名は
+/// [`sanitize_filename`] で単一ファイル名へ正規化する。戻り値は (作成した `File`, 表示用フルパス)。
+///
+/// プロファイルを引数で受けるのは、SYSTEM サービスの host がログオンユーザーを偽装した
+/// スレッドから、そのユーザーのプロファイル配下へ作るため (所有者・ACL をユーザーに揃える)。
+pub fn create_incoming_file_at(
+    profile: &std::path::Path,
+    subdir: &str,
+    name: &str,
+    fallback: &str,
+) -> std::io::Result<(std::fs::File, String)> {
+    let dir = profile.join("Aurora").join(subdir);
+    std::fs::create_dir_all(&dir)?;
     let safe = sanitize_filename(name, fallback);
     // 既存ファイルは上書きしない (create は truncate するため、同名の受信で前回の受信物や
     // ユーザーが置いたファイルが無言で失われる)。衝突したら `name (1).ext` のように番号を振る。
@@ -105,11 +124,10 @@ pub async fn create_incoming_file(
             format!("{stem} ({n}){ext}")
         };
         let path = dir.join(&candidate);
-        match tokio::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .await
         {
             Ok(file) => return Ok((file, path.display().to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

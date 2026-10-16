@@ -237,14 +237,24 @@ impl FsBridge {
 /// ProjFS 投影ルート (= This PC に出すドライブの実体) の絶対パス。
 ///
 /// トレイ常駐 / 自動起動だと CWD が `System32` 等になり得るため、CWD 相対だと投影先が
-/// 予測不能になる (権限の無い場所に作ろうとして失敗もする)。`%LOCALAPPDATA%\Aurora\remote`
-/// に固定して discoverable にする。Windows 以外は ProjFS 自体が no-op なので値は使われない。
-pub fn remote_root() -> std::path::PathBuf {
+/// 予測不能になる (権限の無い場所に作ろうとして失敗もする)。利用者の
+/// `%LOCALAPPDATA%\Aurora\remote` に固定して discoverable にする。SYSTEM サービス配下では
+/// SYSTEM ではなくログオンユーザーの `%LOCALAPPDATA%` (利用者の Explorer から辿れる場所) を
+/// 使い、ユーザーが居ない (サインイン画面) ときは `None` (投影しない)。Windows 以外は ProjFS
+/// 自体が no-op なので値は使われない。
+pub fn remote_root() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
-    if let Some(base) = aurora_common::paths::data_dir() {
-        return base.join("remote");
+    {
+        Some(
+            crate::system::user::session_user_local_appdata()?
+                .join("Aurora")
+                .join("remote"),
+        )
     }
-    std::path::PathBuf::from("aurora-remote")
+    #[cfg(not(windows))]
+    {
+        Some(std::path::PathBuf::from("aurora-remote"))
+    }
 }
 
 /// 投影ルートを指す残骸ドライブ (異常終了で残った subst) を掃除する。
@@ -254,7 +264,9 @@ pub fn remote_root() -> std::path::PathBuf {
 /// This PC に古い投影ドライブが残らないようにする。Windows 以外は no-op。
 pub fn cleanup_drives() {
     #[cfg(windows)]
-    windows::unmount_drives_for_root(&remote_root());
+    if let Some(root) = remote_root() {
+        windows::unmount_drives_for_root(&root);
+    }
 }
 
 /// 投影セッション。Drop で仮想化を停止し、割り当てたドライブも解除する
