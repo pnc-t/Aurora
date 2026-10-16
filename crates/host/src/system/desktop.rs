@@ -18,8 +18,8 @@ mod imp {
 
     use windows::Win32::Foundation::{GENERIC_ALL, HANDLE};
     use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, GetUserObjectInformationW,
-        HDESK, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
+        CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, GetThreadDesktop,
+        GetUserObjectInformationW, HDESK, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
     };
 
     /// このスレッドを割り当てたデスクトップ。Drop で (割り当て解除後の) ハンドルを閉じる。
@@ -114,10 +114,41 @@ mod imp {
             true
         })
     }
+
+    /// `f` の間だけ呼び出しスレッドを入力デスクトップへ移し、終わったら元のデスクトップへ戻す。
+    /// [`follow_input_desktop`] と違って乗り換えを残さないので、追従し続けない (以後の状態変化を
+    /// 見ない) スレッド (起動時のアダプタ確認を行う main スレッド等) に使う。移せなければそのまま実行する。
+    pub fn with_input_desktop<T>(f: impl FnOnce() -> T) -> T {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        // SAFETY: 自スレッドに割り当て中のデスクトップを得るだけ (このハンドルは閉じてはならない)。
+        let Ok(original) = (unsafe { GetThreadDesktop(GetCurrentThreadId()) }) else {
+            return f();
+        };
+        // SAFETY: 入力デスクトップを開くだけ。失敗 (権限不足等) はそのまま実行する。
+        let Ok(input) = (unsafe {
+            OpenInputDesktop(
+                DESKTOP_CONTROL_FLAGS(0),
+                false,
+                DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0),
+            )
+        }) else {
+            return f();
+        };
+        // SAFETY: input は直前に開いた有効なデスクトップ。このスレッドはウィンドウを持たない前提。
+        let switched = unsafe { SetThreadDesktop(input) }.is_ok();
+        let out = f();
+        if switched {
+            // SAFETY: original は自スレッドが元々割り当てられていた有効なデスクトップ。
+            let _ = unsafe { SetThreadDesktop(original) };
+        }
+        // SAFETY: 割り当てを外した (または割り当てなかった) input を 1 度だけ閉じる。
+        let _ = unsafe { CloseDesktop(input) };
+        out
+    }
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{desktop_name, follow_input_desktop};
+pub use imp::{desktop_name, follow_input_desktop, with_input_desktop};
 
 /// 非 Windows は入力デスクトップの概念が無い (常に乗り換えない)。
 #[cfg(not(target_os = "windows"))]
