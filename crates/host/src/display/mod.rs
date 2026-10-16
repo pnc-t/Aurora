@@ -43,6 +43,12 @@ pub fn is_takeover_active() -> bool {
     TAKEOVER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 取り込みワーカー用: テイクオーバーを行う本体から伝えられた状態を写す。ワーカーは自分では
+/// テイクオーバーしないが、capture_loop の固着判定はこの状態を見る。
+pub fn mirror_takeover_active(active: bool) {
+    TAKEOVER_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// テイクオーバー開始: 現在の全トポロジを保存 (+ディスク) し、仮想 (`\\.\DISPLAYn`) を主 (0,0) +
 /// 表示領域 `(w,h)` に最も近い解像度にして物理を全てデタッチする。適用後の仮想解像度を返す。
 #[cfg(target_os = "windows")]

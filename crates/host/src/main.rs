@@ -30,6 +30,7 @@ mod security;
 mod system;
 mod tray;
 mod update;
+mod video;
 
 use audio::EncodedAudio;
 use capture::{DisplayInfo, Frame, PlatformCapturer, ScreenCapturer};
@@ -101,6 +102,8 @@ struct Args {
     migrate_user_state: bool,
     /// 単独トレイとして動く (`--tray`、サービスがログオンユーザーの昇格トークンで起動する)。
     tray: bool,
+    /// 取り込みワーカーとして動く (`--capture-worker`、本体が子プロセスとして起動する)。
+    capture_worker: bool,
 }
 
 /// `--help` で出す使い方。フラグを増やしたらここも足す。
@@ -168,6 +171,7 @@ impl Default for Args {
             uninstall_service: false,
             migrate_user_state: false,
             tray: false,
+            capture_worker: false,
         }
     }
 }
@@ -259,6 +263,8 @@ fn parse_args() -> Result<Args, String> {
             "--uninstall-service" => args.uninstall_service = true,
             "--migrate-user-state" => args.migrate_user_state = true,
             "--tray" => args.tray = true,
+            // 本体が付ける内部用の引数 (利用者向けの使い方には載せない)。
+            video::WORKER_ARG => args.capture_worker = true,
             // サービスが本体に付ける印。挙動は `system::service::is_service_child` が直接見る。
             system::service::SERVICE_CHILD_ARG => {}
             "--help" | "-h" => args.help = true,
@@ -354,8 +360,16 @@ fn main() -> Result<()> {
             args.log_level.as_deref(),
         )
     } else {
-        let stem = if args.service { "service" } else { "host" };
-        let to_file = args.service || (!needs_console && !cfg!(debug_assertions));
+        let stem = if args.service {
+            "service"
+        } else if args.capture_worker {
+            "capture"
+        } else {
+            "host"
+        };
+        // サービスとワーカーはコンソールを持たないので、デバッグビルドでも常にファイルへ。
+        let to_file =
+            args.service || args.capture_worker || (!needs_console && !cfg!(debug_assertions));
         // 保護済みの %ProgramData%\Aurora\host\logs が用意できない (非管理者の開発実行・所有者不正)
         // ときは原因をログで追えるよう従来のユーザー側へ書く。
         let dir = to_file.then(|| {
@@ -378,6 +392,9 @@ fn main() -> Result<()> {
     }
     if args.tray {
         return tray::run_standalone();
+    }
+    if args.capture_worker {
+        return video::run_worker();
     }
     if args.install_service {
         return system::service::install_service(&system::service::current_service_forward_args());
@@ -646,139 +663,115 @@ fn reopen_std_to_console() {
     }
 }
 
-/// 持続的なキャプチャ固着からの最終手段: 同じ実行ファイルを同じ引数で起動し直し、現プロセスを
-/// 終了する。HDR ディスプレイのロック→アンロック遷移後などに DXGI Desktop Duplication が
-/// ACCESS_LOST を返し続け、共有デバイスの作り直しもスレッドの入力デスクトップ貼り直しも効かず、
-/// プロセスを生かしたままでは二度と復帰しないケースがある (実機確認済)。固着は DXGI/DWM への
-/// プロセス単位の接続が壊れることに起因し、プロセス内のどの再生成 API でもリセットできない。
-/// 新プロセスはこの接続を張り直せるためキャプチャが復帰する。client は自動再接続する。
-///
-/// 起動に成功したら現プロセスを `exit(0)` で終える (戻らない)。spawn 自体に失敗した場合のみ戻り、
-/// 呼び出し側はキャプチャのリトライを続ける (動いている可能性を残すため自殺はしない)。
-fn reexec_self(current_port: u16) {
-    // サービス配下では子を産まずに終了し、サービスに作り直させる (孫はサービスから監視できず、
-    // 単一インスタンスガードで次の起動とも食い合う)。保存ポートは再起動後に読み直される。
-    if system::service::is_service_child() {
-        tracing::warn!("capture stuck unrecoverably; exiting so the service restarts the host");
-        std::process::exit(3);
-    }
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "re-exec: current_exe failed; continuing retries");
-            return;
-        }
-    };
-    // 自身の起動引数 (--bind / --log-level 等) を引き継ぐ。ただし --port は元の CLI 値を
-    // そのまま再生すると、起動後にトレイで変更したポートへ巻き戻ってしまう (明示 --port は
-    // 保存値より優先のため)。元の --port を除去し、現在の実効ポートに置き換えて渡す。
-    let mut args: Vec<String> = Vec::new();
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        if a == "--port" {
-            let _ = it.next(); // 値も読み飛ばす
-            continue;
-        }
-        args.push(a);
-    }
-    args.push("--port".into());
-    args.push(current_port.to_string());
-    tracing::warn!(
-        ?exe,
-        ?args,
-        "capture stuck unrecoverably; re-exec host to recover"
-    );
-    match std::process::Command::new(&exe)
-        .args(&args)
-        // 子は単一インスタンスガードで親 (このプロセス) の終了を待ってから引き継ぐ。
-        .env(system::instance::REEXEC_CHILD_ENV, "1")
-        .spawn()
-    {
-        Ok(mut child) => {
-            // spawn 成功 = 回復成功ではない。子が引数不正や初期化失敗で即死しているのに
-            // exit(0) すると誰も残らない (完全停止)。少しだけ待って生存確認し、即死して
-            // いたら旧プロセスを生かしてリトライを続ける。子は bind の AddrInUse を 5 秒
-            // リトライして待つため、この待ちが子の bind を失敗させることはない。
-            std::thread::sleep(std::time::Duration::from_millis(750));
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::error!(%status, "re-exec: child died immediately; keeping old process");
-                }
-                // 生存中 (None) / 確認失敗: 子に委ね、旧プロセスは速やかに終了してソケットを
-                // 解放する (新プロセス側は bind をリトライして待つ)。
-                _ => std::process::exit(0),
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "re-exec: spawn failed; continuing retries");
-        }
-    }
+/// 持続的なキャプチャ固着からの最終手段: 取り込みワーカーを終了し、本体に作り直させる (戻らない)。
+/// HDR/ACM 機のロック遷移後や、UAC・ロック画面 (Winlogon) とのデスクトップ切替のあとは、DXGI
+/// Desktop Duplication が ACCESS_LOST を返し続け、共有デバイスの作り直しもスレッドの入力デスクトップ
+/// 貼り直しも効かない (実機確認済)。固着は DXGI/DWM へのプロセス単位の接続が壊れることに起因し、
+/// 新しいプロセスなら張り直せる。ワーカーだけを作り直すので、クライアントとの接続は切れない。
+fn restart_capture_worker() -> ! {
+    tracing::warn!("capture stuck unrecoverably; exiting so the host restarts the capture worker");
+    std::process::exit(video::WORKER_RESTART_EXIT);
 }
-
-/// iGPU フォールバック適用後の子プロセスである印 (多重 re-exec 防止)。
-#[cfg(windows)]
-const IGPU_FALLBACK_ENV: &str = "AURORA_IGPU_FALLBACK";
 
 /// ハイブリッド GPU (muxless Optimus) のノートでは内蔵パネルのデスクトップ合成を iGPU が担うため、
 /// dGPU プロセスからは `DuplicateOutput` が全アダプタで UNSUPPORTED になり画面が出ない。Windows の
-/// per-app GPU プリファレンス (`UserGpuPreferences` レジストリ) を **iGPU(省電力)** にして re-exec すると、
+/// per-app GPU プリファレンス (`UserGpuPreferences` レジストリ) を **iGPU(省電力)** にして作り直すと、
 /// DXGI の出力列挙が iGPU 側へ反転し複製できる (実機確認済)。レジストリは永続化するので次回起動からは
 /// 直接 iGPU で立ち上がり本フォールバックは発火しない。dGPU がデスクトップを所有する通常機 (デスクトップ
-/// 等) はプローブが成功しここは何もしないため dGPU/NVENC のまま。env で 1 回限りに制限し、それでも
-/// 直らなければ通常のリトライ経路に委ねる (無限 re-exec 防止)。
+/// 等) はプローブが成功しここは何もしないため dGPU/NVENC のまま。既に省電力側に設定済みなのに複製
+/// できないときは作り直さず通常のリトライ経路に委ねる (作り直しの無限ループ防止)。
+///
+/// 今プリファレンスを省電力側に設定したら `true` を返す。プリファレンスはプロセス起動時にしか
+/// 効かないので、呼び出し側はプロセスを作り直すこと (取り込みワーカーは終了して本体に作り直させ、
+/// `--align-vdd` は自分を起動し直す)。
 #[cfg(windows)]
-fn maybe_reexec_for_igpu_capture(target_name: &str) {
-    // 既にフォールバック適用後の子なら、再度の re-exec はしない。
-    if std::env::var_os(IGPU_FALLBACK_ENV).is_some() {
-        return;
-    }
+fn switch_to_igpu_if_needed(target_name: &str) -> bool {
     // dGPU で複製可能 (通常機) / 対象出力なし → フォールバック不要。
     if !capture::capture_all_adapters_unsupported(target_name) {
-        return;
+        return false;
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "igpu fallback: current_exe failed; continuing on default GPU");
-            return;
+            return false;
         }
     };
     let exe_str = exe.to_string_lossy().to_string();
+    if powersaving_gpu_preference_set(&exe_str) {
+        tracing::warn!(
+            "igpu fallback: power-saving GPU preference already set but still not duplicable; continuing on default GPU"
+        );
+        return false;
+    }
     if let Err(e) = set_powersaving_gpu_preference(&exe_str) {
         tracing::error!(error = %e, "igpu fallback: failed to set GPU preference; continuing on default GPU");
-        return;
+        return false;
     }
     tracing::warn!(
         exe = %exe_str,
-        "hybrid GPU: desktop not duplicable on current GPU; set iGPU (power-saving) preference and re-exec"
+        "hybrid GPU: desktop not duplicable on current GPU; set iGPU (power-saving) preference (restart required)"
     );
-    // サービス配下は reexec_self と同じくサービスに作り直させる。プリファレンスは永続化済みなので
-    // 次の起動はプローブが通る。通らなくてもサービス側の短命終了バックオフで暴走しない。
-    if system::service::is_service_child() {
-        std::process::exit(3);
+    true
+}
+
+/// VDD の描画 GPU をキャプチャ GPU に一致させる (クロス GPU keyed mutex 固着の恒久対策)。
+/// 別 GPU が VDD を描画すると Windows がクロスアダプタ共有サーフェス (keyed mutex) で橋渡しし、
+/// キャプチャ側 Desktop Duplication が ACCESS_LOST 恒常化で固まる (Optimus ノートで実機確認)。
+/// friendlyname 変更の反映には**デバイス再起動が要る** (RELOAD_DRIVER pipe は loadSettings を
+/// 再実行しないため無効)。デバイス再起動は昇格が要るので、非昇格時は試みず次回 reboot 反映に委ねる
+/// (非昇格では WMI/pnputil とも 0x80041001 等で失敗し、怖い WARN を出すだけになる)。
+#[cfg(target_os = "windows")]
+fn align_vdd_render_gpu(gpu: &str) {
+    if gpu.is_empty() {
+        tracing::warn!("capture GPU name unavailable; leaving VDD friendlyname unchanged");
+        return;
     }
-    // 起動引数はそのまま引き継ぐ (startup 時点なので tray のポート変更は未発生=書換え不要)。
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(&exe)
-        .args(&args)
-        .env(IGPU_FALLBACK_ENV, "1")
-        .env(system::instance::REEXEC_CHILD_ENV, "1")
-        .spawn()
-    {
-        Ok(mut child) => {
-            // spawn 成功 = 回復成功ではない。子が即死したら旧プロセスを残す (reexec_self と同じ流儀)。
-            std::thread::sleep(std::time::Duration::from_millis(750));
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::error!(%status, "igpu fallback: child died immediately; keeping old process");
+    match display::ensure_vdd_render_gpu(gpu) {
+        Ok(true) if display::process_is_elevated() => {
+            tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; restarting VDD device to apply");
+            match display::restart_vdd_device() {
+                Ok(()) => tracing::info!("VDD device restarted"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "VDD device restart failed; change applies on next reboot or manual device restart")
                 }
-                _ => std::process::exit(0),
             }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "igpu fallback: spawn failed; continuing on default GPU");
+        Ok(true) => {
+            tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; device restart needs elevation, change applies on next reboot");
         }
+        Ok(false) => {
+            tracing::debug!(gpu = %gpu, "VDD render GPU already matches capture GPU (or VDD not installed)")
+        }
+        Err(e) => tracing::warn!(error = %e, "could not align VDD render GPU"),
     }
+}
+
+/// 自プロセス実行ファイルの GPU プリファレンスが既に iGPU(省電力) か。読めなければ `false`。
+#[cfg(windows)]
+fn powersaving_gpu_preference_set(exe_path: &str) -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    use windows::core::HSTRING;
+
+    let mut buf = [0u16; 64];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: キー名・値名は NUL 終端の HSTRING、buf は size バイトの出力先 (呼び出し中有効)。
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from("Software\\Microsoft\\DirectX\\UserGpuPreferences"),
+            &HSTRING::from(exe_path),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if r.is_err() {
+        return false;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len]).contains("GpuPreference=1;")
 }
 
 /// 自プロセス実行ファイルの GPU プリファレンスを iGPU(省電力) に設定する。
@@ -932,39 +925,26 @@ fn vdd_test_restore_cmd() -> Result<()> {
 /// 再起動して即反映するワンショット。インストーラ (install_vdd.ps1、昇格) が VDD 登録直後に
 /// 呼び、初回からクロス GPU keyed mutex 固着を避ける (WMI の VRAM 最大推測では dGPU を誤選択
 /// するため host の実測に一元化)。run_server 起動時の整合ステップと同じ処理を、常駐せず 1 回
-/// だけ行う。muxless Optimus では dGPU プロセスから複製できず GPU 名を誤るため、run_server と
-/// 同様に iGPU へ寄せる re-exec を通してから判定する (昇格プロセスで呼ばれる前提なのでデバイス
-/// 再起動も通る)。
+/// だけ行う。muxless Optimus では dGPU プロセスから複製できず GPU 名を誤るため、取り込みワーカーと
+/// 同様に iGPU へ寄せてから (寄せたら自分を起動し直して) 判定する (昇格プロセスで呼ばれる前提なので
+/// デバイス再起動も通る)。
 #[cfg(target_os = "windows")]
 fn align_vdd_cmd() -> Result<()> {
     let primary = capture::enumerate_displays()
         .ok()
         .and_then(|d| d.into_iter().next().map(|d| d.name))
         .unwrap_or_else(|| "\\\\.\\DISPLAY1".to_string());
-    maybe_reexec_for_igpu_capture(&primary);
-    let device = capture::create_shared_device(&primary)?;
-    let gpu = device.adapter_name.clone();
-    if gpu.is_empty() {
-        tracing::warn!(
-            "align-vdd: capture GPU name unavailable; leaving VDD friendlyname unchanged"
-        );
+    if switch_to_igpu_if_needed(&primary) {
+        // プリファレンスは起動時にしか効かない。新しいプロセスでやり直し、その結果を返す。
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .arg("--align-vdd")
+            .status()
+            .context("re-run --align-vdd after switching to the power-saving GPU")?;
+        anyhow::ensure!(status.success(), "--align-vdd re-run failed ({status})");
         return Ok(());
     }
-    match display::ensure_vdd_render_gpu(&gpu) {
-        Ok(true) => {
-            tracing::info!(gpu = %gpu, "align-vdd: VDD render GPU aligned to capture GPU; restarting VDD device");
-            match display::restart_vdd_device() {
-                Ok(()) => tracing::info!("align-vdd: VDD device restarted"),
-                Err(e) => {
-                    tracing::warn!(error = %e, "align-vdd: VDD device restart failed; applies on next reboot")
-                }
-            }
-        }
-        Ok(false) => {
-            tracing::info!(gpu = %gpu, "align-vdd: VDD render GPU already matches capture GPU")
-        }
-        Err(e) => tracing::warn!(error = %e, "align-vdd: could not align VDD render GPU"),
-    }
+    let device = capture::create_shared_device(&primary)?;
+    align_vdd_render_gpu(&device.adapter_name);
     Ok(())
 }
 
@@ -1359,17 +1339,6 @@ fn run_server(
     // 初期キャプチャ対象 (先頭 = primary)。
     let initial_name = displays[0].name.clone();
 
-    // ハイブリッド GPU (muxless Optimus) のノートで dGPU プロセスからは内蔵パネルを複製できない
-    // (DuplicateOutput が全アダプタで UNSUPPORTED) 環境は、自プロセスの GPU プリファレンスを
-    // iGPU(省電力) にして re-exec する。フォールバック発火時はここから戻らず子へ置き換わる。
-    // dGPU がデスクトップを所有する通常機 (デスクトップ等) では何もしない (dGPU/NVENC のまま)。
-    #[cfg(windows)]
-    maybe_reexec_for_igpu_capture(&initial_name);
-
-    // capture・convert・encode で共有する D3D11 デバイスを 1 つだけ生成する
-    // (Windows のみ。他 OS は `()`)。ディスプレイ切替や MFT 共有のため持続させる。
-    let device = capture::create_shared_device(&initial_name)?;
-
     // --encode-gpu の解決: CLI 明示 > 保存値 > 既定 (キャプチャ GPU)。"auto" は保存を消して既定へ。
     // 保存失敗は映像機能に影響しないため warn で続行する。
     let encode_gpu: Option<String> = match encode_gpu_arg.as_deref() {
@@ -1388,50 +1357,8 @@ fn run_server(
         None => system::load_encode_gpu(),
     };
 
-    // VDD の描画 GPU をキャプチャ GPU に一致させる (クロス GPU keyed mutex 固着の恒久対策)。
-    // 別 GPU が VDD を描画すると Windows がクロスアダプタ共有サーフェス (keyed mutex) で橋渡しし、
-    // キャプチャ側 Desktop Duplication が ACCESS_LOST 恒常化で固まる (Optimus ノートで実機確認)。
-    // friendlyname 変更の反映には**デバイス再起動が要る** (RELOAD_DRIVER pipe は loadSettings を
-    // 再実行しないため無効)。startup 時点なら接続なし=安全。デバイス再起動は昇格が要るので
-    // (autostart /RL HIGHEST なら成功)、非昇格時は再起動を試みず次回 reboot 反映に委ねる。
-    #[cfg(target_os = "windows")]
-    {
-        let gpu = device.adapter_name.clone();
-        if !gpu.is_empty() {
-            match display::ensure_vdd_render_gpu(&gpu) {
-                Ok(true) => {
-                    // デバイス再起動は昇格が要る (非昇格では WMI/pnputil とも 0x80041001 等で失敗)。
-                    // 非昇格の手動起動 (インストーラ完了時の起動など) では無駄に試して怖い WARN を
-                    // 出さず、リブート反映に委ねる。autostart (/RL HIGHEST) は昇格するので即反映される。
-                    if display::process_is_elevated() {
-                        tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; restarting VDD device to apply");
-                        match display::restart_vdd_device() {
-                            Ok(()) => tracing::info!("VDD device restarted"),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "VDD device restart failed; change applies on next reboot or manual device restart")
-                            }
-                        }
-                    } else {
-                        tracing::info!(gpu = %gpu, "VDD render GPU aligned to capture GPU; device restart needs elevation (run via autostart), change applies on next reboot");
-                    }
-                }
-                Ok(false) => {
-                    tracing::debug!(gpu = %gpu, "VDD render GPU already matches capture GPU (or VDD not installed)")
-                }
-                Err(e) => tracing::warn!(error = %e, "could not align VDD render GPU"),
-            }
-        }
-    }
-
-    // フレームと一緒に capture 時刻 (Instant) を運び、encode 側で capture→encode 待ちを測る
-    // (--perf 時のみ集計)。Instant は Copy で安価。
-    let (frame_tx, frame_rx) = mpsc::channel::<(Instant, Frame)>(2);
-    let (nal_tx, nal_rx) = mpsc::channel::<EncodedNal>(16);
-    let (enc_cmd_tx, enc_cmd_rx) = mpsc::channel::<EncoderCommand>(8);
     let (input_tx, input_rx) = mpsc::channel::<InputCmd>(256);
     let (audio_tx, audio_rx) = mpsc::channel::<EncodedAudio>(64);
-    // 制御スレッド → capture スレッドへ「キャプチャ対象ディスプレイ id」を渡す。
-    let (cap_select_tx, cap_select_rx) = std::sync::mpsc::channel::<String>();
     let (clip_handle, clip_change_rx) = aurora_common::clipboard::spawn();
     let clip_apply_tx = clip_handle.apply_tx.clone();
 
@@ -1457,8 +1384,6 @@ fn run_server(
         }
     };
 
-    // capture スレッド: 選択ディスプレイをキャプチャし、(再)構築直後の実解像度を res_tx で通知。
-    let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
     if fps_cap == 0 {
         tracing::info!("frame rate cap: uncapped");
     } else {
@@ -1472,81 +1397,34 @@ fn run_server(
             "bitrate cap (PeakConstrainedVBR peak)"
         );
     }
-    // 実行時 fps 変更 (クライアントの SetVideoParams) を capture スレッドへ届けるチャネル。
-    let (fps_tx, fps_rx) = std::sync::mpsc::channel::<u32>();
-    // 実行時の解像度変更 (クライアントの SetResolution) を capture スレッドへ届けるチャネル
-    // (送出する映像の最大高さ。0 = キャプチャ解像度のまま)。
-    let (scale_tx, scale_rx) = std::sync::mpsc::channel::<u32>();
-    // 映像へのカーソル合成 ON/OFF (クライアントのマウスキャプチャ中だけ) を capture スレッドへ。
-    let (cursor_tx, cursor_rx) = std::sync::mpsc::channel::<bool>();
-    let cap_device = device.clone();
-    // re-exec 時に現在の実効ポート (トレイ変更反映済み) を引き継ぐため共有して渡す。
-    let cap_port = port_cell.clone();
-    // 接続/キーフレーム要求時に capture スレッドへ「現在の画面を 1 枚送れ」と促す共有フラグ。
-    let force_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cap_force_frame = force_frame.clone();
-    std::thread::Builder::new()
-        .name("capture".into())
-        .spawn(move || {
-            if let Err(e) = capture_loop(
-                cap_device,
-                frame_tx,
-                res_tx,
-                cap_select_rx,
-                initial_name,
-                fps_cap,
-                fps_rx,
-                scale_rx,
-                cursor_rx,
-                cap_port,
-                cap_force_frame,
-            ) {
-                tracing::error!(error = %e, "capture loop ended");
-            }
-        })?;
 
-    // 初期ディスプレイの実解像度を待ち、列挙値 (mac/linux はフォールバック) を上書きする。
-    if let Ok((width, height)) = res_rx.recv_timeout(Duration::from_secs(10)) {
+    // 画面取り込み・エンコードは別プロセス (取り込みワーカー) で動かす (video モジュール doc)。
+    // 最初のワーカーの準備 (実解像度・エンコード可能なコーデック) を待ってから待受を始める。
+    let video = video::start(
+        video::VideoConfig {
+            display: initial_name,
+            fps_cap,
+            max_bitrate_bps,
+            encode_gpu,
+            perf,
+        },
+        tray_bus.clone(),
+    )?;
+    // 初期ディスプレイの実解像度で列挙値 (mac/linux はフォールバック) を上書きする。
+    if let Some((width, height)) = video.resolution {
         tracing::info!(width, height, "active display resolution");
         displays[0].width = width;
         displays[0].height = height;
     } else {
         tracing::warn!("active display resolution unknown, using enumerated value");
     }
-
     let initial_geom = DisplayGeom {
         x: displays[0].x,
         y: displays[0].y,
         width: displays[0].width,
         height: displays[0].height,
     };
-
-    // host が実際にエンコードできる映像コーデックを起動時に 1 度だけ探索する (ネゴシエーションの
-    // host 側能力)。実フレームは投入せず MFT の activate + MediaType 設定まで試すのみ。
-    let host_codecs = encode::probe_encoders(&device, encode_gpu.as_deref());
-    tracing::info!(?host_codecs, "probed host video codec capability");
-    // encode スレッド → net (非同期側) への実効コーデック報告チャネル。
-    let (codec_status_tx, codec_status_rx) = mpsc::channel::<net::CodecStatus>(4);
-
-    // encode スレッド
-    let encode_tray_bus = tray_bus.clone();
-    std::thread::Builder::new()
-        .name("encode".into())
-        .spawn(move || {
-            if let Err(e) = encode_loop(
-                device,
-                frame_rx,
-                nal_tx,
-                enc_cmd_rx,
-                perf,
-                max_bitrate_bps,
-                encode_gpu,
-                codec_status_tx,
-                encode_tray_bus,
-            ) {
-                tracing::error!(error = %e, "encode loop ended");
-            }
-        })?;
+    tracing::info!(host_codecs = ?video.host_codecs, "probed host video codec capability");
 
     // input 注入スレッド (SendInput は同期APIなので tokio の外で実行)
     std::thread::Builder::new()
@@ -1576,21 +1454,21 @@ fn run_server(
             max_bitrate_bps,
             auth_failures,
             devices,
-            force_frame,
+            force_frame: video.force_frame,
             tray_bus,
-            host_codecs,
-            codec_status_rx,
+            host_codecs: video.host_codecs,
+            codec_status_rx: video.codec_status_rx,
         };
         net::run_server(
             cfg,
-            nal_rx,
+            video.nal_rx,
             audio_rx,
-            enc_cmd_tx,
+            video.enc_cmd_tx,
             input_tx,
-            cap_select_tx,
-            fps_tx,
-            scale_tx,
-            cursor_tx,
+            video.select_tx,
+            video.fps_tx,
+            video.scale_tx,
+            video.cursor_tx,
             clip_apply_tx,
             clip_change_rx,
         )
@@ -1609,7 +1487,6 @@ fn capture_loop(
     fps_rx: std::sync::mpsc::Receiver<u32>,
     scale_rx: std::sync::mpsc::Receiver<u32>,
     cursor_rx: std::sync::mpsc::Receiver<bool>,
-    port: Arc<std::sync::atomic::AtomicU16>,
     force_frame: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     // capture スレッドで COM/MF を初期化する (Windows のみ実体あり)。
@@ -1641,10 +1518,11 @@ fn capture_loop(
     // 無いとホスト画面が動くまでクライアントが黒いままになる (実機: 2 台構成で再現)。
     let mut last_frame: Option<Frame> = None;
 
-    // 持続的なキャプチャ固着がこの時間続いたら、プロセスを再起動して回復する (re-exec)。
-    // 一過性の ACCESS_LOST (UAC・解像度変更・短時間ロック) は安価な再構築で数秒以内に戻るため、
-    // それらを巻き込まないよう猶予を取る。実機で復帰不能と判明した HDR ロック遷移はこれを超える。
-    const REEXEC_AFTER: Duration = Duration::from_secs(8);
+    // 持続的なキャプチャ固着がこの時間続いたら、ワーカーを作り直して回復する。一過性の ACCESS_LOST
+    // (解像度変更・フルスクリーン切替) は安価な再構築で 1 秒程度で戻るため、それを巻き込まない最小限に
+    // する。作り直してもクライアントとの接続は切れない (映像が 1 秒前後止まるだけ) ので、長く待つ
+    // 理由は無い (本体ごと作り直していた頃は切断を避けるため 8 秒待っていた)。
+    const REEXEC_AFTER: Duration = Duration::from_secs(2);
     // テイクオーバー中の永続固着の救済猶予。テイクオーバー中は re-exec を抑止する (CCD 直後の
     // 一過性 ACCESS_LOST で点滅ループになるため) が、永続固着すると物理を巻き込んだ暗転が
     // 「きれいな切断 or ホスト再起動」まで治らない。この猶予を超えたら capture スレッド自身が
@@ -1746,8 +1624,8 @@ fn capture_loop(
                     && &now != prev
                     && !crate::display::is_takeover_active()
                 {
-                    tracing::info!(from = %prev, to = %now, error = %e, "input desktop changed; restarting host to capture it");
-                    reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
+                    tracing::info!(from = %prev, to = %now, error = %e, "input desktop changed; restarting capture worker to capture it");
+                    restart_capture_worker();
                 }
                 // ロック画面・UAC セキュアデスクトップ中の ACCESS_LOST は、デスクトップが
                 // 戻れば復帰する正常動作。固着時間に数えると 8 秒を超える通常のロックや
@@ -1760,8 +1638,7 @@ fn capture_loop(
                 // ただしサービス配下ではロック中も数える。ロック画面をまたぐと DWM へのプロセス単位の
                 // 接続が壊れ (ACM 有効機で実機確認・2026-10-17)、Winlogon へ乗り換えて作り直しても
                 // ACCESS_LOST が続く。数えないとロック中は映像が止まったままになり (入力は届くので
-                // 遠隔からロック解除できない)、再起動 (= 新しい接続) まで回復しない。サービス配下の
-                // re-exec はサービスに作り直させるだけで、クライアントは自動再接続する。
+                // 遠隔からロック解除できない)、作り直し (= 新しい接続) まで回復しない。
                 if !capture::input_desktop_is_default() && !system::service::is_service_child() {
                     first_fail = None;
                     tracing::debug!(error = %e, name = %cur_name, "capture failed on lock/secure desktop; not counted as stuck");
@@ -1798,9 +1675,8 @@ fn capture_loop(
                             stuck_ms = stuck_for.as_millis() as u64,
                             "takeover capture stuck; restoring physical displays (end_takeover) to clear blackout"
                         );
-                        if let Err(e) = crate::display::end_takeover() {
-                            tracing::warn!(error = %e, "watchdog end_takeover failed");
-                        }
+                        // テイクオーバーを始めたのは本体なので、物理の復元も本体に依頼する。
+                        crate::video::request_takeover_restore();
                     }
                     // テイクオーバー中は re-exec を抑止する。CCD のトポロジ変更直後は仮想の複製が
                     // 一時的に ACCESS_LOST になるが、再起動するとトポロジ復元→再接続→再テイクオーバーの
@@ -1812,7 +1688,7 @@ fn capture_loop(
                         // プロセス内のどの再生成でも復帰しないと判断。再起動で回復する (戻らない)。
                         // 固着原因は Windows/DXGI 固有だが、再起動による回復自体は OS 非依存で、
                         // captured_ok ガードにより再起動ループにもならないため共通コードに置く。
-                        reexec_self(port.load(std::sync::atomic::Ordering::Relaxed));
+                        restart_capture_worker();
                     }
                 }
                 // テイクオーバー中は、解像度変更後に Windows が仮想ディスプレイの GDI 名を振り直し、
@@ -2018,7 +1894,7 @@ fn recover_encoder_after_poll_nal_failure(
     max_bitrate_bps: u32,
     encode_gpu: Option<&str>,
     codec_status_tx: &mpsc::Sender<net::CodecStatus>,
-    tray_bus: &tray::SharedTrayBus,
+    on_stall: &dyn Fn(),
     stall_notified: &mut bool,
     err: anyhow::Error,
 ) {
@@ -2050,7 +1926,7 @@ fn recover_encoder_after_poll_nal_failure(
         "encoder recreation exhausted retries after poll_nal failure; video delivery stalled"
     );
     if !*stall_notified {
-        tray_bus.on_encode_stalled();
+        on_stall();
         *stall_notified = true;
     }
 }
@@ -2065,7 +1941,7 @@ fn encode_loop(
     max_bitrate_bps: u32,
     encode_gpu: Option<String>,
     codec_status_tx: mpsc::Sender<net::CodecStatus>,
-    tray_bus: tray::SharedTrayBus,
+    on_stall: &dyn Fn(),
 ) -> Result<()> {
     // 後続のコーデック切替/フォールバック時の再構築用に device を保持する (最初の create は
     // 所有権を消費するため clone しておく)。
@@ -2147,7 +2023,7 @@ fn encode_loop(
                                 max_bitrate_bps,
                                 encode_gpu.as_deref(),
                                 &codec_status_tx,
-                                &tray_bus,
+                                on_stall,
                                 &mut poll_stall_notified,
                                 e,
                             );
@@ -2204,7 +2080,7 @@ fn encode_loop(
                             max_bitrate_bps,
                             encode_gpu.as_deref(),
                             &codec_status_tx,
-                            &tray_bus,
+                            on_stall,
                             &mut poll_stall_notified,
                             e,
                         );
@@ -2257,7 +2133,7 @@ fn encode_loop(
                                 max_bitrate_bps,
                                 encode_gpu.as_deref(),
                                 &codec_status_tx,
-                                &tray_bus,
+                                on_stall,
                                 &mut poll_stall_notified,
                                 e,
                             );

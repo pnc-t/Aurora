@@ -3,26 +3,17 @@
 //! 二重起動すると、2 つ目はキャプチャ/エンコーダまで初期化して GPU を触ったうえで、待受ポートの
 //! bind で失敗して黙って終わっていた (トレイの「起動」を誤って押す・インストーラ完了画面の
 //! 「今すぐ起動」等で起きる)。名前付き Mutex の有無で、初期化に入る前に判定する。
-//!
-//! 例外は自分自身の再起動 (ACCESS_LOST 回復の re-exec・iGPU フォールバック) で、子は親がまだ
-//! 生きているうちに起動される。子は [`REEXEC_CHILD_ENV`] を持ち、親の終了を待ってから引き継ぐ。
-
-/// re-exec で起動した子である印。値は問わない (存在だけ見る)。
-pub const REEXEC_CHILD_ENV: &str = "AURORA_REEXEC_CHILD";
+//! (取り込みの固着からの回復は取り込みワーカーだけを作り直すので、本体が自分を起動し直して
+//! この判定と食い合うことは無い。)
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use std::time::{Duration, Instant};
-
     use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
     use windows::core::{HSTRING, w};
 
     const MUTEX_NAME: &str = "Local\\AuroraHostInstance";
-    /// re-exec の子が親の終了を待つ上限。親は子の生存を 750ms 確認してから終了する。
-    const REEXEC_WAIT: Duration = Duration::from_secs(10);
-    const POLL: Duration = Duration::from_millis(200);
 
     /// プロセス生存中ずっと保持する Mutex ハンドル。Drop (= プロセス終了時も OS が) で閉じる。
     pub struct InstanceGuard(HANDLE);
@@ -40,22 +31,7 @@ mod imp {
 
     /// 他に host が居なければ `Some(guard)`。居れば `None` (呼び出し側は起動をやめる)。
     pub fn acquire() -> Option<InstanceGuard> {
-        let reexec_child = std::env::var_os(super::REEXEC_CHILD_ENV).is_some();
-        acquire_named(MUTEX_NAME, reexec_child, REEXEC_WAIT)
-    }
-
-    fn acquire_named(name: &str, reexec_child: bool, wait: Duration) -> Option<InstanceGuard> {
-        let name = HSTRING::from(name);
-        let deadline = Instant::now() + wait;
-        loop {
-            if let Some(g) = try_create(&name) {
-                return Some(g);
-            }
-            if !reexec_child || Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(POLL);
-        }
+        try_create(&HSTRING::from(MUTEX_NAME))
     }
 
     fn try_create(name: &HSTRING) -> Option<InstanceGuard> {
@@ -63,7 +39,7 @@ mod imp {
         let h = unsafe { CreateMutexW(None, false, name) }.ok()?;
         // SAFETY: 直前の CreateMutexW のエラー状態を読むだけ。
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            // 自分のハンドルを残すと、先行プロセスが終わってもオブジェクトが消えず待ちが明けない。
+            // 自分のハンドルを残すと、先行プロセスが終わってもオブジェクトが消えず次の起動が弾かれる。
             // SAFETY: 直前に得た有効なハンドルを閉じる。
             let _ = unsafe { CloseHandle(h) };
             return None;
@@ -98,24 +74,11 @@ mod imp {
         /// 2 つ目は弾かれ、先行が終われば取れる。
         #[test]
         fn second_instance_is_rejected_until_first_exits() {
-            let name = unique_name("basic");
-            let first = acquire_named(&name, false, Duration::ZERO).expect("first");
-            assert!(acquire_named(&name, false, Duration::ZERO).is_none());
+            let name = HSTRING::from(unique_name("basic"));
+            let first = try_create(&name).expect("first");
+            assert!(try_create(&name).is_none());
             drop(first);
-            assert!(acquire_named(&name, false, Duration::ZERO).is_some());
-        }
-
-        /// re-exec の子は、親が待ち時間内に終われば引き継げる。
-        #[test]
-        fn reexec_child_waits_for_parent_exit() {
-            let name = unique_name("reexec");
-            let parent = acquire_named(&name, false, Duration::ZERO).expect("parent");
-            let releaser = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                drop(parent);
-            });
-            assert!(acquire_named(&name, true, Duration::from_secs(5)).is_some());
-            releaser.join().unwrap();
+            assert!(try_create(&name).is_some());
         }
     }
 }
