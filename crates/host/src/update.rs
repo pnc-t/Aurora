@@ -234,7 +234,7 @@ fn apply(av: &AvailableUpdate) -> Result<()> {
     // 間に差し替えられ、昇格実行される (インストール先を per-machine にした理由と同じ)。
     if !crate::display::process_is_elevated() {
         anyhow::bail!(
-            "host is not elevated; update requires the logon task (or run as administrator)"
+            "host is not elevated; update requires the service (or run as administrator)"
         );
     }
     let exe = std::env::current_exe().context("current_exe failed")?;
@@ -277,7 +277,8 @@ fn apply(av: &AvailableUpdate) -> Result<()> {
 
     // 実行中の自 exe は Windows 上でロックされ setup から上書きできないため、spawn できたら
     // 待たずに (detached) 自プロセスを速やかに終了する。setup 起動直後の失敗は検知できないが、
-    // トランザクションの成否は NSIS 側の責任とする (別タスク)。
+    // トランザクションの成否は NSIS 側の責任とする (別タスク)。サービス配下ではサービスが本体を
+    // すぐ起動し直すが、setup が上書き前にサービスごと止める (aurora-host.nsi StopRunningHost)。
     match std::process::Command::new(&setup).arg("/S").spawn() {
         Ok(_child) => {
             // プロセス終了 (exit) は Drop を走らせないため、投影ドライブを明示的に掃除する。

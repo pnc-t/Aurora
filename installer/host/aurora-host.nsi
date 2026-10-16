@@ -7,13 +7,20 @@
 ;
 ; 設計方針:
 ;   - 本体は per-machine (%ProgramFiles%\Aurora Host) に置き、インストーラ全体を昇格で動かす。
-;     自動起動タスクは /RL HIGHEST (昇格) でこの exe を毎ログオン実行するため、ユーザー権限で
+;     host は SYSTEM サービス "AuroraHost" としてこの exe を実行するため、ユーザー権限で
 ;     書き換えられる場所 (旧: %LOCALAPPDATA%\Programs) に置くと、同一ユーザーの非昇格コードが
-;     exe を差し替えるだけで UAC 無しに管理者権限を得られてしまう。昇格スクリプト (VDD 導入/削除)
+;     exe を差し替えるだけで SYSTEM 権限を得られてしまう。昇格スクリプト (VDD 導入/削除)
 ;     も同じ理由で管理者専用の $INSTDIR から実行し、$TEMP は経由しない。
-;   - クリーンアンインストール最優先。痕跡 = exe / スケジュールタスク "Aurora Host" /
-;     %LOCALAPPDATA%\Aurora (port / password.bin) / ショートカット / レジストリ。全部消す。
-;   - 自動起動タスクの登録/解除は host 自身の --install / --uninstall に委譲 (二重実装しない)。
+;   - SYSTEM サービス化 (UAC / ロック画面 / サインイン画面の遠隔操作のため)。サービスが本体を
+;     対話セッションへ SYSTEM で、トレイをログオンユーザー権限で起動する。exe を上書きする前に
+;     必ずサービスを止める (止めないとサービスが本体を即座に起動し直し、exe がロックされ続ける)。
+;   - 旧版 (ONLOGON タスク + %LOCALAPPDATA%\Aurora) からの移行: --migrate-user-state を
+;     **インストールした利用者として** 実行して設定/パスワードを %ProgramData%\Aurora\host へ移し
+;     (旧パスワードはその利用者でしか復号できない)、--install-service がタスクを削除する。
+;   - クリーンアンインストール最優先。痕跡 = exe / サービス "AuroraHost" / 旧スケジュールタスク
+;     "Aurora Host" / %ProgramData%\Aurora\host (設定・パスワード・ログ) / %LOCALAPPDATA%\Aurora
+;     (旧版の設定・トレイのログ) / ショートカット / レジストリ。全部消す。
+;   - サービス/タスクの登録・解除は host 自身の --install-service 等に委譲 (二重実装しない)。
 ;   - ProjFS は共有システム機能なのでアンインストールでは無効化しない。
 
 Unicode true
@@ -46,9 +53,12 @@ VIAddVersionKey "FileDescription" "${APPNAME} Installer"
 
 !define MUI_ICON   "..\..\crates\client\src-tauri\icons\icon.ico"
 !define MUI_UNICON "..\..\crates\client\src-tauri\icons\icon.ico"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${EXENAME}"
+; サービス運用では「今すぐ起動」で何も起動しない (サービスが既に本体を起動している。ここで
+; 昇格した本体を起動すると、サービスの本体より先に単一インスタンスを取って居座りうる)。
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchHostIfNoService
 !define MUI_FINISHPAGE_RUN_TEXT "Aurora Host を今すぐ起動する"
-!define MUI_FINISHPAGE_TEXT "接続パスワードは未設定です。トレイアイコン右クリック →「パスワード変更」、$\nまたは端末で `aurora-host --set-password` を一度実行してください。"
+!define MUI_FINISHPAGE_TEXT "接続パスワードが未設定の場合は、トレイアイコン右クリック →「パスワードを変更」で設定してください。$\n(サービスとして登録した場合、Aurora Host は既に起動しています)"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
@@ -66,11 +76,13 @@ VIAddVersionKey "FileDescription" "${APPNAME} Installer"
 Var RetryCount
 
 ; ---------------------------------------------------------------------------
-; サイレント更新時のみ呼ぶ。update.rs は setup 起動後に自プロセスを exit するが、
-; ファイルハンドル解放に一瞬ラグがあるため、taskkill 後に「自分自身へのリネーム」で
-; ロック解除を確認しながら最大 2 秒 (200ms x 10) だけ待つ (対話インストールでは
-; InstFiles ページの表示自体が数百ms のバッファになるため、この待機は不要)。
+; exe を上書きする前に呼ぶ。サービスを先に止める (止めないとサービスが本体を起動し直して
+; exe をロックし続ける。net stop はサービスが本体とトレイを止め終えるまで待つ)。その後で
+; 残ったプロセス (旧版の ONLOGON 運用・手動起動) を taskkill し、ファイルハンドル解放の
+; ラグを「自分自身へのリネーム」でロック解除を確認しながら最大 2 秒 (200ms x 10) だけ待つ。
 Function StopRunningHost
+  nsExec::Exec '"$SYSDIR\net.exe" stop AuroraHost'
+  Pop $0
   nsExec::Exec 'taskkill /IM ${EXENAME} /F'
   Pop $0
 
@@ -87,24 +99,33 @@ Function StopRunningHost
   stoprunninghost_done:
 FunctionEnd
 
-; サイレント (自己更新) 時は MUI_FINISHPAGE_RUN のページ自体が出ないため、
-; インストール成功後にここで明示的に再起動する。対話インストールでは
-; フィニッシュページの「今すぐ起動する」に任せるので何もしない。
-Function .onInstSuccess
-  IfSilent 0 +2
+Function LaunchHostIfNoService
+  ReadRegDWORD $0 HKLM "${REGROOT}" "Service"
+  ${If} $0 != 1
     Exec '"$INSTDIR\${EXENAME}"'
+  ${EndIf}
+FunctionEnd
+
+; サイレント (自己更新) 時は MUI_FINISHPAGE_RUN のページ自体が出ないため、
+; インストール成功後にここで明示的に再起動する。サービス運用ならサービスの開始 (SecService の
+; --install-service) が本体を起動するので何もしない。対話インストールではフィニッシュページの
+; 「今すぐ起動する」(LaunchHostIfNoService) に任せる。
+Function .onInstSuccess
+  IfSilent 0 onsuccess_done
+  ReadRegDWORD $0 HKLM "${REGROOT}" "Service"
+  ${If} $0 != 1
+    Exec '"$INSTDIR\${EXENAME}"'
+  ${EndIf}
+  onsuccess_done:
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
 Section "Aurora Host 本体" SecCore
   SectionIn RO
 
-  ; サイレント更新時のみ: 旧プロセスを止めてから配置し、確実に上書きできるようにする。
-  ; 対話インストールでは何もしない (従来通り InstFiles ページでそのまま上書き)。
-  IfSilent seccore_stop_running seccore_after_stop
-  seccore_stop_running:
-    Call StopRunningHost
-  seccore_after_stop:
+  ; 旧プロセス (サービス・本体・トレイ) を止めてから配置し、確実に上書きできるようにする。
+  ; サービス運用では対話インストールでも止めないと上書きできない。
+  Call StopRunningHost
 
   SetOutPath "$INSTDIR"
   File "..\..\target\release\${EXENAME}"
@@ -132,18 +153,28 @@ Section "Aurora Host 本体" SecCore
   SetShellVarContext current
 SectionEnd
 
-Section "ログオン時に自動起動 (推奨)" SecAutostart
-  ; サイレント更新契約: 自己更新は無人実行前提のため UAC を一切出さない。既存インストールの
-  ; スケジュールタスクは exe パス固定で登録済みなので再登録は不要。Autostart レジストリの
-  ; 既存フラグもここで丸ごとスキップすることで書き換えず、ユーザー設定を保持する。
-  IfSilent secautostart_skip secautostart_run
-  secautostart_run:
-    ; ONLOGON /RL HIGHEST タスクの登録は host 自身の --install に委譲する (インストーラは
-    ; 昇格済みなので追加の UAC は出ない)。タスク名は "Aurora Host" (autostart.rs)。
-    ExecShellWait "" "$INSTDIR\${EXENAME}" "--install" SW_HIDE
-    ; アンインストール時に --uninstall を呼ぶべきか判定するためのフラグ。
-    WriteRegDWORD HKLM "${REGROOT}" "Autostart" 1
-  secautostart_skip:
+Section "サービスとして常駐 (推奨・UAC / ロック画面も操作可)" SecService
+  ; サイレント更新契約: 自己更新は無人実行前提で UAC を出さない (setup は昇格済みの host から
+  ; 起動される)。既にサービス運用なら登録し直して開始するだけ。旧版の ONLOGON 運用
+  ; (Autostart=1) からの更新はここでサービスへ移行する。どちらでもないサイレント実行
+  ; (手動起動のみの運用) は利用者の選択を保持して何もしない。
+  IfSilent 0 secservice_run
+    ReadRegDWORD $0 HKLM "${REGROOT}" "Service"
+    ReadRegDWORD $1 HKLM "${REGROOT}" "Autostart"
+    ${If} $0 != 1
+    ${AndIf} $1 != 1
+      Goto secservice_skip
+    ${EndIf}
+  secservice_run:
+    ; 旧版の設定/パスワードを移す。旧パスワードはインストールした利用者でしか復号できないので、
+    ; この (利用者として昇格した) インストーラから呼ぶ。移行先に既にあれば何もしない。
+    ExecShellWait "" "$INSTDIR\${EXENAME}" "--migrate-user-state" SW_HIDE
+    ; サービス登録 (既存なら設定更新) + 旧 ONLOGON タスク削除 + 開始は host に委譲する。
+    ExecShellWait "" "$INSTDIR\${EXENAME}" "--install-service" SW_HIDE
+    ; アンインストール時に --uninstall-service を呼ぶべきか判定するためのフラグ。
+    WriteRegDWORD HKLM "${REGROOT}" "Service" 1
+    DeleteRegValue HKLM "${REGROOT}" "Autostart"
+  secservice_skip:
 SectionEnd
 
 Section /o "仮想ディスプレイドライバ (VDD) をインストール" SecVDD
@@ -201,24 +232,27 @@ SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      "aurora-host 本体を %ProgramFiles% に配置します (必須)。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecAutostart} "ログオン時に自動起動する ONLOGON タスクを登録します。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecService}   "SYSTEM サービスとして登録し、PC 起動時から常駐します。UAC の確認画面・ロック画面・サインイン画面も遠隔で操作できます。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecVDD}       "仮想ディスプレイドライバ (MttVDD) をインストールします。RDP 風の仮想画面で接続するのに必要です。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecProjFS}    "RDP 風ファイル転送に使う Windows 機能 Client-ProjFS を有効化します。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ---------------------------------------------------------------------------
 Section "Uninstall"
-  ; 1) 常駐プロセスを停止 (起動中だと exe を消せない)。
+  ; 1) サービスを停止・削除する (サービスが本体とトレイを止める)。登録が無ければ何もしない。
+  ExecShellWait "" "$INSTDIR\${EXENAME}" "--uninstall-service" SW_HIDE
+
+  ; 2) 残った常駐プロセスを停止 (起動中だと exe を消せない)。
   nsExec::Exec 'taskkill /IM ${EXENAME} /F'
   Pop $0
 
-  ; 2) 自動起動タスクを登録していたら解除 (アンインストーラは昇格済み)。
+  ; 3) 旧版の自動起動タスクを登録していたら解除 (アンインストーラは昇格済み)。
   ReadRegDWORD $0 HKLM "${REGROOT}" "Autostart"
   ${If} $0 == 1
     ExecShellWait "" "$INSTDIR\${EXENAME}" "--uninstall" SW_HIDE
   ${EndIf}
 
-  ; 3) VDD ドライバを削除 (インストールした場合のみ)。
+  ; 4) VDD ドライバを削除 (インストールした場合のみ)。
   ;    デバイス削除・ドライバストア削除・C:\ProgramData\Aurora\vdd 削除を一括で行う。
   ReadRegDWORD $0 HKLM "${REGROOT}" "VDDInstalled"
   ${If} $0 == 1
@@ -226,7 +260,7 @@ Section "Uninstall"
       '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\remove_vdd.ps1"' SW_HIDE
   ${EndIf}
 
-  ; 4) ファイル / ショートカットを削除。
+  ; 5) ファイル / ショートカットを削除。
   Delete "$INSTDIR\${EXENAME}"
   Delete "$INSTDIR\remove_vdd.ps1"
   Delete "$INSTDIR\uninstall.exe"
@@ -235,10 +269,15 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Aurora Host.lnk"
   SetShellVarContext current
 
-  ; 5) 設定・暗号化パスワード・ログを完全削除 (インストール先と違いこれらは per-user)。
+  ; 6) 設定・暗号化パスワード・ログを完全削除。host の状態は PC 単位 (%ProgramData%\Aurora\host)。
+  ;    親の Aurora は VDD (vdd\) と共用なので空のときだけ消す。旧版の状態とトレイのログは per-user。
+  SetShellVarContext all
+  RMDir /r "$APPDATA\Aurora\host"
+  RMDir "$APPDATA\Aurora"
+  SetShellVarContext current
   RMDir /r "$LOCALAPPDATA\Aurora"
 
-  ; 6) レジストリを掃除。
+  ; 7) レジストリを掃除。
   DeleteRegKey HKLM "${UNINSTKEY}"
   DeleteRegKey HKLM "${REGROOT}"
 SectionEnd

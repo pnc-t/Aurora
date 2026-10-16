@@ -68,11 +68,10 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 `installer/host/aurora-host.nsi` がインストーラ定義。client と同じ NSIS で、
 **per-machine インストール (起動時に UAC 1 回)** + Apps & features 登録の
-クリーンアンインストーラを備える。per-machine にしているのは、自動起動タスクが
-`/RL HIGHEST` (昇格) で exe を毎ログオン実行するため。ユーザー権限で書き換えられる
-場所に置くと、同一ユーザーの非昇格コードが exe を差し替えるだけで UAC 無しに管理者
-権限を得られてしまう。自動起動タスクの登録/解除は host 自身の
-`--install` / `--uninstall` に委譲する。
+クリーンアンインストーラを備える。per-machine にしているのは、SYSTEM サービスが
+この exe を実行するため。ユーザー権限で書き換えられる場所に置くと、同一ユーザーの
+非昇格コードが exe を差し替えるだけで SYSTEM 権限を得られてしまう。サービスの
+登録/解除は host 自身の `--install-service` / `--uninstall-service` に委譲する。
 
 前提ツール: makensis。**client を一度 `cargo tauri build` していれば** Tauri が
 取得した NSIS (`%LOCALAPPDATA%\tauri\NSIS`) を自動再利用するので追加導入は不要。
@@ -88,27 +87,31 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 インストーラの挙動:
 - `aurora-host.exe` を `%ProgramFiles%\Aurora Host\` に配置 (per-machine・インストーラ起動時に UAC 1 回)。
-- コンポーネント「ログオン時に自動起動」(既定 ON) → `aurora-host --install` で
-  ONLOGON / RL HIGHEST のスケジュールタスク "Aurora Host" を、**インストーラを昇格させた
-  ユーザー**に登録する (標準ユーザーが別の管理者アカウントで昇格するとそちらに登録される)。
+- コンポーネント「サービスとして常駐」(既定 ON) → `aurora-host --migrate-user-state`
+  (旧版の設定/パスワードを **インストーラを昇格させたユーザー** の `%LOCALAPPDATA%\Aurora`
+  から `%ProgramData%\Aurora\host` へ移す) → `aurora-host --install-service` で SYSTEM
+  サービス "AuroraHost" を登録・開始 (旧 ONLOGON タスクは削除)。exe を上書きする前に
+  サービスを止める (`net stop AuroraHost`)。
 - コンポーネント「ファイル転送機能を有効化」(既定 OFF) → `Client-ProjFS` を有効化
   (再起動が必要な場合あり)。不要なら OFF のまま。
-- 自己更新は昇格して動く host (= 自動起動タスク経由) でのみ行える。スタートメニューから
-  非昇格で起動した host は更新要求をログに残して中止する。
+- 自己更新は昇格して動く host (= サービス経由、または旧 ONLOGON タスク経由) でのみ行える。
+  旧 ONLOGON 運用からのサイレント更新はサービスへ自動移行する。
 
 **接続パスワード**はインストーラでは設定しない。インストール後にトレイアイコン
-右クリック →「パスワード変更」、または端末から `aurora-host --set-password` を
+右クリック →「パスワードを変更」、または管理者の端末から `aurora-host --set-password` を
 一度実行する (未設定だと起動ごとにランダム生成される)。
 
 ### クリーンアンインストール
 
 「アプリと機能」または同梱アンインストーラから削除。痕跡を残さない:
-1. 常駐プロセス (`aurora-host.exe`) を停止。
-2. 自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
+1. `aurora-host --uninstall-service` でサービス "AuroraHost" を停止・削除 (本体とトレイも止まる)。
+2. 残った常駐プロセス (`aurora-host.exe`) を停止。
+3. 旧版で自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
    を解除。
-3. exe / インストール先フォルダ / スタートメニューのショートカットを削除。
-4. `%LOCALAPPDATA%\Aurora\` (port / password.bin) を削除。
-5. HKLM のアンインストール登録を削除。
+4. exe / インストール先フォルダ / スタートメニューのショートカットを削除。
+5. `%ProgramData%\Aurora\host\` (設定・password.bin・ログ) と `%LOCALAPPDATA%\Aurora\`
+   (旧版の設定・トレイのログ) を削除 (`%ProgramData%\Aurora` は VDD と共用なので空のときだけ消す)。
+6. HKLM のアンインストール登録を削除。
 
 ProjFS (`Client-ProjFS`) は他用途でも使う共有システム機能のため、
 アンインストールでは**無効化しない**。手動で戻す場合:

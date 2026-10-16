@@ -25,9 +25,13 @@ crates/
 │   ├── security/  接続を許可する相手の制御 (secret=パスワードの DPAPI 暗号保存 /
 │   │              devices=デバイスピン留め=クライアント静的鍵の許可リスト)
 │   ├── system/    OS 統合とローカル永続化 (settings=待受ポート等の平文保存 /
-│   │              autostart=ログオン時自動起動タスクの登録・解除)
+│   │              state=%ProgramData%\Aurora\host の解決と ACL 保護 /
+│   │              service=SYSTEM サービスと対話セッションへの本体・トレイ起動 /
+│   │              desktop=UAC・ロック画面のデスクトップ追従 / user=ログオンユーザー偽装 /
+│   │              autostart=旧方式のログオン時自動起動タスクの登録・解除)
 │   ├── perf.rs    エンコード遅延・ソースビットレートの計測 (--perf)
-│   ├── tray.rs    トレイ常駐 UI
+│   ├── tray/      トレイ (mod=状態バス / control=操作と特権ガード / ui=Win32 /
+│   │              ipc=サービス運用時のユーザー権限トレイとの名前付きパイプ)
 │   └── main.rs    エントリ・CLI・スレッド配線
 ├── wol/        WoL 中継デーモン (aurora-wol、素のバイナリ)。自宅 LAN の Raspberry Pi 等で
 │               常駐し、Tailnet 経由の client からの `WolMsg::Wake` を Noise ハンドシェイク後に

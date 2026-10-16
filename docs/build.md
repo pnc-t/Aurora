@@ -45,8 +45,10 @@ cargo run -p aurora-host -- --set-password
 |------|------|
 | `--port N` | 待ち受けポート (既定 7000) |
 | `--bind ADDR` | 待ち受けアドレス。未指定なら Tailscale IP を自動採用し、無ければ `127.0.0.1` (loopback) に fail-closed。LAN テストや公開は明示指定 (LAN IP、または全 NIC なら `--bind 0.0.0.0`) |
-| `--set-password` / `--clear-password` | 接続パスワードの設定 / 削除 (DPAPI 保存)。接続中は拒否・現在のパスワード照合あり |
-| `--install` / `--uninstall` | ログオン時自動起動タスク "Aurora Host" の登録 / 解除 (`--install` は他の引数をタスクへ転送) |
+| `--set-password` / `--clear-password` | 接続パスワードの設定 / 削除 (DPAPI 保存、`%ProgramData%\Aurora\host`・管理者権限)。接続中は拒否・現在のパスワード照合あり |
+| `--install-service` / `--uninstall-service` | SYSTEM サービス "AuroraHost" の登録・開始 / 停止・削除 (管理者権限、`--install-service` は他の引数をサービスへ転送し旧ログオン時タスクを削除) |
+| `--migrate-user-state` | 旧版の設定/パスワード (`%LOCALAPPDATA%\Aurora`) を `%ProgramData%\Aurora\host` へ移す (保存したユーザーの管理者権限で一度だけ。インストーラが自動実行) |
+| `--install` / `--uninstall` | 旧方式: ログオン時自動起動タスク "Aurora Host" の登録 / 解除 (UAC / ロック画面は操作できない) |
 | `--fps N` | 送出 fps 上限 (0 = 無制限) |
 | `--max-bitrate N` | ビットレート上限 (Mbps、0 = 無制限) |
 | `--encode-gpu NAME` | エンコードに使う GPU を名前の部分一致で指定 (ハイブリッド GPU ノートでキャプチャ/エンコード GPU がずれる場合に使う)。`auto` で保存値を消し既定 (キャプチャと同一 GPU) に戻す。明示指定は永続化される |
@@ -57,7 +59,7 @@ cargo run -p aurora-host -- --set-password
 診断用の追加オプションとして `--list-displays` (DXGI アダプタ/出力の列挙) もあります。
 
 > ログは既定で `aurora=info`。優先順位は `--log-level` > `RUST_LOG` > 既定。トレイ常駐
-> (コンソールなし) では `%LOCALAPPDATA%\Aurora\logs\host.<日付>.log` に日次ローテ
+> (コンソールなし) では `%ProgramData%\Aurora\host\logs\host.<日付>.log` に日次ローテ
 > (7 世代保持) で書きます。
 
 ## クライアント (操作する側)
