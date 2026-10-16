@@ -153,28 +153,37 @@ Section "Aurora Host 本体" SecCore
   SetShellVarContext current
 SectionEnd
 
-Section "サービスとして常駐 (推奨・UAC / ロック画面も操作可)" SecService
-  ; サイレント更新契約: 自己更新は無人実行前提で UAC を出さない (setup は昇格済みの host から
-  ; 起動される)。既にサービス運用なら登録し直して開始するだけ。旧版の ONLOGON 運用
-  ; (Autostart=1) からの更新はここでサービスへ移行する。どちらでもないサイレント実行
-  ; (手動起動のみの運用) は利用者の選択を保持して何もしない。
-  IfSilent 0 secservice_run
-    ReadRegDWORD $0 HKLM "${REGROOT}" "Service"
-    ReadRegDWORD $1 HKLM "${REGROOT}" "Autostart"
-    ${If} $0 != 1
-    ${AndIf} $1 != 1
-      Goto secservice_skip
+Section "サービスとして常駐 (必須・UAC / ロック画面も操作可)" SecService
+  ; 必須: host の設定・パスワードは %ProgramData%\Aurora\host (SYSTEM / 管理者専用) に置くため、
+  ; 非昇格で手動起動した host は状態を読み書きできない。常にサービスで動かす。サイレント更新
+  ; (setup は昇格済みの host から起動され UAC を出さない) でも毎回登録し直し、旧版の ONLOGON
+  ; 運用や手動起動のみの運用もここでサービスへ移行する。
+  SectionIn RO
+
+  ; 旧版の設定/パスワードを移す。旧パスワードはインストールした利用者でしか復号できないので、
+  ; この (利用者として昇格した) インストーラから呼ぶ。移行先に既にあれば何もしない。失敗しても
+  ; サービス登録は続ける (パスワードはトレイから設定し直せる) が、黙って失わないよう知らせる。
+  ExecWait '"$INSTDIR\${EXENAME}" --migrate-user-state' $0
+  ${If} $0 != 0
+    DetailPrint "旧版の設定・パスワードの移行に失敗しました (終了コード $0)"
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONEXCLAMATION|MB_OK "旧版の設定・パスワードを移行できませんでした。$\nインストール後、トレイアイコンからパスワードを設定し直してください。"
     ${EndIf}
-  secservice_run:
-    ; 旧版の設定/パスワードを移す。旧パスワードはインストールした利用者でしか復号できないので、
-    ; この (利用者として昇格した) インストーラから呼ぶ。移行先に既にあれば何もしない。
-    ExecShellWait "" "$INSTDIR\${EXENAME}" "--migrate-user-state" SW_HIDE
-    ; サービス登録 (既存なら設定更新) + 旧 ONLOGON タスク削除 + 開始は host に委譲する。
-    ExecShellWait "" "$INSTDIR\${EXENAME}" "--install-service" SW_HIDE
-    ; アンインストール時に --uninstall-service を呼ぶべきか判定するためのフラグ。
+  ${EndIf}
+
+  ; サービス登録 (既存なら設定更新) + 旧 ONLOGON タスク削除 + 開始は host に委譲する。
+  ; Service=1 は成功したときだけ書く (失敗時はフィニッシュ/サイレント後に従来どおり本体を直接起動する)。
+  ExecWait '"$INSTDIR\${EXENAME}" --install-service' $0
+  ${If} $0 == 0
     WriteRegDWORD HKLM "${REGROOT}" "Service" 1
     DeleteRegValue HKLM "${REGROOT}" "Autostart"
-  secservice_skip:
+  ${Else}
+    DetailPrint "サービスの登録に失敗しました (終了コード $0)"
+    DeleteRegValue HKLM "${REGROOT}" "Service"
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONSTOP|MB_OK "Aurora Host をサービスとして登録できませんでした (終了コード $0)。$\nUAC の確認画面・ロック画面は遠隔操作できません。%ProgramData%\Aurora\host\logs を確認してください。"
+    ${EndIf}
+  ${EndIf}
 SectionEnd
 
 Section /o "仮想ディスプレイドライバ (VDD) をインストール" SecVDD
@@ -232,7 +241,7 @@ SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      "aurora-host 本体を %ProgramFiles% に配置します (必須)。"
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecService}   "SYSTEM サービスとして登録し、PC 起動時から常駐します。UAC の確認画面・ロック画面・サインイン画面も遠隔で操作できます。"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecService}   "SYSTEM サービスとして登録し、PC 起動時から常駐します (必須)。UAC の確認画面・ロック画面・サインイン画面も遠隔で操作できます。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecVDD}       "仮想ディスプレイドライバ (MttVDD) をインストールします。RDP 風の仮想画面で接続するのに必要です。"
   !insertmacro MUI_DESCRIPTION_TEXT ${SecProjFS}    "RDP 風ファイル転送に使う Windows 機能 Client-ProjFS を有効化します。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
