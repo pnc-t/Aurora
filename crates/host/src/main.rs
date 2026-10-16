@@ -91,6 +91,12 @@ struct Args {
     align_vdd: bool,
     /// 使い方を表示して終了する (`--help` / `-h`)。
     help: bool,
+    /// SCM から起動されたサービス本体として動く (`--service`)。
+    service: bool,
+    /// SYSTEM サービスを登録して開始し終了する (`--install-service`)。
+    install_service: bool,
+    /// SYSTEM サービスを停止・削除して終了する (`--uninstall-service`)。
+    uninstall_service: bool,
 }
 
 /// `--help` で出す使い方。フラグを増やしたらここも足す。
@@ -116,6 +122,8 @@ OPTIONS:
 サブコマンド (実行して終了する):
         --install           ログオン時自動起動を登録する
         --uninstall         自動起動を解除する
+        --install-service   SYSTEM サービスとして登録・開始する (UAC/ロック画面対応、管理者)
+        --uninstall-service SYSTEM サービスを停止・削除する (管理者)
         --set-password      接続パスワードを対話入力して暗号化保存する
         --clear-password    保存済みパスワードを削除する
         --list-displays     ディスプレイ一覧を表示する
@@ -150,6 +158,9 @@ impl Default for Args {
             encode_gpu: None,
             align_vdd: false,
             help: false,
+            service: false,
+            install_service: false,
+            uninstall_service: false,
         }
     }
 }
@@ -236,6 +247,11 @@ fn parse_args() -> Result<Args, String> {
                 args.encode_gpu = Some(take_value(&mut it, "--encode-gpu")?);
             }
             "--align-vdd" => args.align_vdd = true,
+            "--service" => args.service = true,
+            "--install-service" => args.install_service = true,
+            "--uninstall-service" => args.uninstall_service = true,
+            // サービスが本体に付ける印。挙動は `system::service::is_service_child` が直接見る。
+            system::service::SERVICE_CHILD_ARG => {}
             "--help" | "-h" => args.help = true,
             other => {
                 // 未知の引数は fail-closed で弾く。従来は警告を出して**そのまま起動**していたが、
@@ -295,6 +311,8 @@ fn main() -> Result<()> {
     // (トレイ常駐) で、リリースでは GUI サブシステムのためコンソールが無い。
     let needs_console = args.install
         || args.uninstall
+        || args.install_service
+        || args.uninstall_service
         || args.set_password
         || args.clear_password
         || args.dump_bmp
@@ -316,8 +334,11 @@ fn main() -> Result<()> {
     // コンソールが無いバックグラウンドサーバ (リリース) はログをファイルへ。それ以外
     // (CLI / デバッグ) は従来どおりコンソールへ出す。_log_guard は非ブロッキング writer の
     // ワーカーを生かすため main 終了まで保持する (drop すると以降のログが失われる)。
+    // サービス (Session 0) は本体と別ファイルに書く (同じ日次ファイルへの 2 プロセス同時書込を避ける)。
+    // デバッグビルドでもコンソールが無いので常にファイルへ。
     let _log_guard = init_tracing(
-        !needs_console && !cfg!(debug_assertions),
+        if args.service { "service" } else { "host" },
+        args.service || (!needs_console && !cfg!(debug_assertions)),
         args.log_level.as_deref(),
     );
 
@@ -328,6 +349,15 @@ fn main() -> Result<()> {
         "aurora-host starting"
     );
 
+    if args.service {
+        return system::service::run_dispatcher();
+    }
+    if args.install_service {
+        return system::service::install_service(&system::service::current_service_forward_args());
+    }
+    if args.uninstall_service {
+        return system::service::uninstall_service();
+    }
     if args.install {
         // --install / --uninstall 自体を除いた起動引数を、登録するタスクへ転送する。
         return system::install(&system::current_forward_args());
@@ -374,7 +404,10 @@ fn main() -> Result<()> {
     // ガードはプロセス終了まで保持する (run_server は通常戻らず、トレイ終了は exit する)。
     let Some(_instance) = system::instance::acquire() else {
         tracing::info!("another aurora-host server is already running; exiting");
-        system::instance::notify_already_running();
+        // サービス配下は SYSTEM なので対話デスクトップへ UI を出さない (サービスが待って再試行する)。
+        if !system::service::is_service_child() {
+            system::instance::notify_already_running();
+        }
         return Ok(());
     };
 
@@ -446,9 +479,13 @@ fn build_log_filter(level: Option<&str>) -> EnvFilter {
 /// コンソール (stdout) にも出す。ファイル出力先が用意できない場合はコンソールへフォール
 /// バックする。フィルタの優先順位は `--log-level` 引数 > `RUST_LOG` 環境変数 > 既定
 /// (`aurora=info`)。戻り値のガードは main 終了まで保持すること。
-fn init_tracing(to_file: bool, level: Option<&str>) -> aurora_common::logging::LogGuard {
+fn init_tracing(
+    file_stem: &'static str,
+    to_file: bool,
+    level: Option<&str>,
+) -> aurora_common::logging::LogGuard {
     aurora_common::logging::init(aurora_common::logging::LogOptions {
-        file_stem: "host",
+        file_stem,
         filter: build_log_filter(level),
         dir: if to_file {
             aurora_common::logging::default_log_dir()
@@ -584,6 +621,12 @@ fn reopen_std_to_console() {
 /// 起動に成功したら現プロセスを `exit(0)` で終える (戻らない)。spawn 自体に失敗した場合のみ戻り、
 /// 呼び出し側はキャプチャのリトライを続ける (動いている可能性を残すため自殺はしない)。
 fn reexec_self(current_port: u16) {
+    // サービス配下では子を産まずに終了し、サービスに作り直させる (孫はサービスから監視できず、
+    // 単一インスタンスガードで次の起動とも食い合う)。保存ポートは再起動後に読み直される。
+    if system::service::is_service_child() {
+        tracing::warn!("capture stuck unrecoverably; exiting so the service restarts the host");
+        std::process::exit(3);
+    }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -674,6 +717,11 @@ fn maybe_reexec_for_igpu_capture(target_name: &str) {
         exe = %exe_str,
         "hybrid GPU: desktop not duplicable on current GPU; set iGPU (power-saving) preference and re-exec"
     );
+    // サービス配下は reexec_self と同じくサービスに作り直させる。プリファレンスは永続化済みなので
+    // 次の起動はプローブが通る。通らなくてもサービス側の短命終了バックオフで暴走しない。
+    if system::service::is_service_child() {
+        std::process::exit(3);
+    }
     // 起動引数はそのまま引き継ぐ (startup 時点なので tray のポート変更は未発生=書換え不要)。
     let args: Vec<String> = std::env::args().skip(1).collect();
     match std::process::Command::new(&exe)
