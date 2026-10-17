@@ -159,6 +159,8 @@ mod imp {
     /// インスタンスを握り続け、再起動したサービスの本体が即終了するバックオフに陥る。
     /// 本体が起こす孫 (自己更新の setup 等) はジョブに入れない (SILENT_BREAKAWAY_OK)。
     /// 入れると、更新中にサービスを止めた時点で setup ごと殺されてしまう。
+    /// ジョブ内のプロセスは全て同じセッションでなければならない (最初に入れたプロセスの
+    /// セッションに固定される) ので、セッションごとに作り直す ([`job_for`])。
     struct Job(OwnedHandle);
 
     impl Job {
@@ -179,6 +181,20 @@ mod imp {
             }?;
             Ok(Self(job))
         }
+    }
+
+    /// `session` 用のジョブを返す。別セッション用のジョブを持っていたら作り直す (サインアウトで
+    /// コンソールが新しいセッションになると、旧ジョブには入れられない: 0x80070005)。旧ジョブを
+    /// 閉じると中に残った旧セッションのプロセス (トレイ) も終わるが、どのみち付け替えで止める対象。
+    /// 作れなくても起動は続ける (サービスが落ちたときの後始末が効かなくなるだけ)。
+    fn job_for(slot: &mut Option<(u32, Job)>, session: u32) -> Option<&Job> {
+        if slot.as_ref().map(|(s, _)| *s) != Some(session) {
+            *slot = Job::new()
+                .inspect_err(|e| tracing::warn!(error = %e, session, "failed to create job object; children may outlive the service"))
+                .ok()
+                .map(|j| (session, j));
+        }
+        slot.as_ref().map(|(_, j)| j)
     }
 
     /// サービスが起動して見張っている本体。
@@ -280,10 +296,7 @@ mod imp {
             .into_iter()
             .filter(|a| a != "--service")
             .collect::<Vec<_>>();
-        // ジョブを作れなくても起動は続ける (サービスが落ちたときの後始末が効かなくなるだけ)。
-        let job = Job::new()
-            .inspect_err(|e| tracing::warn!(error = %e, "failed to create job object; children may outlive the service"))
-            .ok();
+        let mut job: Option<(u32, Job)> = None;
         let stop_event = StopEvent::create()
             .inspect_err(|e| tracing::warn!(error = %e, "failed to create host stop event; stopping will skip cleanup"))
             .ok();
@@ -351,7 +364,7 @@ mod imp {
                 if let Some(ev) = &stop_event {
                     ev.reset();
                 }
-                match spawn_in_session(target, &forward, job.as_ref()) {
+                match spawn_in_session(target, &forward, job_for(&mut job, target)) {
                     Ok(c) => {
                         tracing::info!(pid = c.pid, session = c.session, "host process started");
                         child = Some(c);
@@ -393,7 +406,7 @@ mod imp {
                 && tray_closed_in != Some(target)
                 && Instant::now() >= next_tray
             {
-                match spawn_tray(target, job.as_ref()) {
+                match spawn_tray(target, job_for(&mut job, target)) {
                     Ok(TraySpawn::Started(t)) => {
                         tracing::info!(pid = t.pid, session = t.session, "tray started");
                         tray = Some(t);
