@@ -107,6 +107,8 @@ mod imp {
     /// 停止処理にかかりうる上限として SCM へ伝える目安 (本体の自主終了待ち + 強制終了の待ち)。
     /// 伝えないと、シャットダウン猶予の短い環境で SCM が停止中のサービスを強制終了しうる。
     const STOP_WAIT_HINT: Duration = Duration::from_secs(15);
+    /// 受信を許可するファイアウォール規則の名前。登録・削除ともこの名前で引く。
+    const FIREWALL_RULE_NAME: &str = "Aurora Host";
 
     /// Drop で CloseHandle するカーネルハンドル (トークン / プロセス)。
     struct OwnedHandle(HANDLE);
@@ -720,6 +722,7 @@ mod imp {
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
         )
         .context("open service manager (run as administrator)")?;
+        let exe = std::env::current_exe().context("get current exe path")?;
         let mut launch_arguments = vec![OsString::from("--service")];
         launch_arguments.extend(forward_args.iter().map(OsString::from));
         let info = ServiceInfo {
@@ -728,7 +731,7 @@ mod imp {
             service_type: SERVICE_TYPE,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
-            executable_path: std::env::current_exe().context("get current exe path")?,
+            executable_path: exe.clone(),
             launch_arguments,
             dependencies: vec![],
             account_name: None, // LocalSystem
@@ -767,6 +770,7 @@ mod imp {
         if crate::system::is_installed() {
             crate::system::uninstall().context("remove legacy logon task")?;
         }
+        allow_through_firewall(&exe);
 
         let running = service
             .query_status()
@@ -786,6 +790,7 @@ mod imp {
 
     /// `--uninstall-service`: サービスを停止して削除する。未登録なら何もしない。
     pub fn uninstall() -> Result<()> {
+        remove_firewall_rule();
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .context("open service manager (run as administrator)")?;
         let service = match manager.open_service(
@@ -819,6 +824,57 @@ mod imp {
         service.delete().context("delete service")?;
         println!("removed service \"{SERVICE_NAME}\"");
         Ok(())
+    }
+
+    /// 本体の受信をファイアウォールで許可する (既存の同名規則は作り直す)。SYSTEM サービスの本体が
+    /// 待ち受けても Windows は「アクセスを許可しますか」を出さず黙って遮断するので、登録時に
+    /// 明示的に許可しないと外 (Tailnet 含む) から一切つながらない。公開範囲は待受アドレス
+    /// (既定は Tailscale IP) が絞るので、規則はプログラム単位・全プロファイルにする。
+    /// 失敗してもサービス登録は失敗扱いにしない (ファイアウォール無効の環境等) が、知らせる。
+    fn allow_through_firewall(exe: &std::path::Path) {
+        remove_firewall_rule();
+        let name = format!("name={FIREWALL_RULE_NAME}");
+        let program = format!("program={}", exe.display());
+        let added = netsh(&[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &name,
+            "dir=in",
+            "action=allow",
+            &program,
+            "enable=yes",
+            "profile=any",
+        ]);
+        if added {
+            println!("added firewall rule \"{FIREWALL_RULE_NAME}\"");
+        } else {
+            tracing::warn!("failed to add firewall rule; inbound connections may be blocked");
+            eprintln!(
+                "warning: could not add firewall rule \"{FIREWALL_RULE_NAME}\";                  allow {} manually if clients cannot connect",
+                exe.display()
+            );
+        }
+    }
+
+    /// 同名の規則を全て消す。無ければ何もしない (netsh は失敗を返すが無視してよい)。
+    fn remove_firewall_rule() {
+        let name = format!("name={FIREWALL_RULE_NAME}");
+        netsh(&["advfirewall", "firewall", "delete", "rule", &name]);
+    }
+
+    fn netsh(args: &[&str]) -> bool {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        Command::new("netsh")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 
