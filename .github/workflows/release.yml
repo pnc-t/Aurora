@@ -2,7 +2,7 @@ name: release
 
 # main 系で安定したコミットに `v1.2.3` のようなタグを push したときだけ動く。
 # 通常の dev/main マージではビルドしない (gitflow: main = リリーススナップショット)。
-#   例) git checkout main && git tag v0.1.0 && git push origin v0.1.0
+#   例) git checkout main && git tag v1.0.0 && git push origin v1.0.0
 on:
   push:
     tags:

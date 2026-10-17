@@ -29,7 +29,7 @@ Unicode true
 !include "LogicLib.nsh"
 
 !ifndef APPVERSION
-  !define APPVERSION "0.1.0"
+  !define APPVERSION "1.0.0"
 !endif
 !define APPNAME    "Aurora Host"
 !define PUBLISHER  "Aurora"

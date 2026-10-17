@@ -18,9 +18,9 @@ Aurora は配布物が 4 つに分かれる。生成物はすべて **`installer
 ```
 
 出力:
-- `installer\dist\Aurora_0.1.0_x64-setup.exe` (client)
-- `installer\dist\aurora-host-setup-0.1.0.exe` (host)
-- `installer\dist\aurora-wol-0.1.0-aarch64` (wol / raspi 用)
+- `installer\dist\Aurora_1.0.0_x64-setup.exe` (client)
+- `installer\dist\aurora-host-setup-1.0.0.exe` (host)
+- `installer\dist\aurora-wol-1.0.0-aarch64` (wol / raspi 用)
 
 Android は既定ではビルドしない (前提が重いため opt-in)。含める場合:
 
@@ -29,7 +29,7 @@ Android は既定ではビルドしない (前提が重いため opt-in)。含�
 ```
 
 出力に以下が加わる:
-- `installer\dist\Aurora_0.1.0-arm64.apk` (android / `-Android` 指定時のみ)
+- `installer\dist\Aurora_1.0.0-arm64.apk` (android / `-Android` 指定時のみ)
 
 個別に作る場合は以下の各節を参照 (出力先は同じ `installer\dist\`)。
 
@@ -55,7 +55,7 @@ Android は既定ではビルドしない (前提が重いため opt-in)。含�
 pushd crates/client/src-tauri; cargo tauri build; popd
 ```
 
-Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
+Tauri の生出力は `target\release\bundle\nsis\Aurora_1.0.0_x64-setup.exe`
 (初回は makensis / WebView2 ブートストラッパを自動取得)。`build-all.ps1` は
 これを `installer\dist\` へコピーする。
 
@@ -83,7 +83,7 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 .\installer\host\build.ps1
 ```
 
-出力: `installer\dist\aurora-host-setup-0.1.0.exe`
+出力: `installer\dist\aurora-host-setup-1.0.0.exe`
 
 インストーラの挙動:
 - `aurora-host.exe` を `%ProgramFiles%\Aurora Host\` に配置 (per-machine・インストーラ起動時に UAC 1 回)。
@@ -139,7 +139,7 @@ Windows インストーラは作らない。`aurora-wol-<ver>-aarch64` は musl 
 を内蔵している。raspi へ 1 ファイル持ち込んで:
 
 ```bash
-sudo ./aurora-wol-0.1.0-aarch64 install
+sudo ./aurora-wol-1.0.0-aarch64 install
 ```
 
 するだけで systemd 常駐化まで完結する (ファイル名は任意。install が
