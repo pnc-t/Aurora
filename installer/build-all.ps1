@@ -1,4 +1,4 @@
-# Aurora 配布インストーラ 一括ビルド
+﻿# Aurora 配布インストーラ 一括ビルド
 #
 # client (Tauri NSIS) と host (NSIS) の両インストーラ、および
 # wol (raspi 向け静的バイナリ) を生成し、すべて installer\dist\ に集約する。
@@ -160,7 +160,11 @@ if ($Android) {
     # tauri CLI は --manifest-path 非対応なので src-tauri 直下で実行する。
     Push-Location (Join-Path $repo 'crates\client\src-tauri')
     try {
-        cargo tauri android build --apk --target aarch64
+        # tauri.conf.json に version が無いと Tauri は APK を常に 1.0 (versionCode 1) にするため、
+        # Cargo のバージョンを Android のビルドにだけ渡す (desktop の version の出所は変えない)。
+        $verConf = Join-Path $env:TEMP 'aurora-android-version.json'
+        Set-Content -Path $verConf -Value "{`"version`":`"$version`"}" -Encoding ascii
+        cargo tauri android build --apk --target aarch64 --config $verConf
         if ($LASTEXITCODE -ne 0) { throw "cargo tauri android build failed ($LASTEXITCODE)" }
     }
     finally {

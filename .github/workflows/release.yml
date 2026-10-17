@@ -2,7 +2,7 @@ name: release
 
 # main 系で安定したコミットに `v1.2.3` のようなタグを push したときだけ動く。
 # 通常の dev/main マージではビルドしない (gitflow: main = リリーススナップショット)。
-#   例) git checkout main && git tag v0.1.0 && git push origin v0.1.0
+#   例) git checkout main && git tag v1.0.0 && git push origin v1.0.0
 on:
   push:
     tags:
@@ -93,9 +93,15 @@ jobs:
         run: git checkout -- crates/client/src-tauri/gen/android
 
       # --target 4 種を並べると Tauri CLI が全 ABI を含む universal APK を 1 本出力する。
+      # tauri.conf.json に version が無いと Tauri は APK を常に 1.0 (versionCode 1) にするため、
+      # root Cargo.toml の [workspace.package] version を Android のビルドにだけ渡す。
       - name: Build Android APK (unsigned)
         working-directory: crates/client/src-tauri
-        run: cargo tauri android build --apk --target aarch64 armv7 i686 x86_64
+        run: |
+          set -eu
+          ver="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' ../../../Cargo.toml)"
+          test -n "$ver"
+          cargo tauri android build --apk --target aarch64 armv7 i686 x86_64 --config "{\"version\":\"$ver\"}"
 
       # gen/android は再生成されるため gradle の signingConfigs にキーストアを設定しても
       # 消えてしまう。そのためビルドは unsigned のまま出し、Android SDK build-tools の

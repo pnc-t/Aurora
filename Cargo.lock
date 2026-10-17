@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aurora-common",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "argon2",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-host"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-wol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aurora-common",
