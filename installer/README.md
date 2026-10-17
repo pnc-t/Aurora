@@ -93,7 +93,9 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 - コンポーネント「サービスとして常駐」(必須。サイレント更新でも毎回) → (旧版からの更新時のみ) `aurora-host --migrate-user-state`
   (旧版の設定/パスワードを **インストーラを昇格させたユーザー** の `%LOCALAPPDATA%\Aurora`
   から `%ProgramData%\Aurora\host` へ移す) → `aurora-host --install-service` で SYSTEM
-  サービス "AuroraHost" を登録・開始 (旧 ONLOGON タスクは削除)。exe を上書きする前に
+  サービス "AuroraHost" を登録・開始 (旧 ONLOGON タスクは削除、受信許可のファイアウォール規則
+  "Aurora Host" を exe 単位で作成。SYSTEM で動く本体には Windows の許可確認が出ず黙って遮断される
+  ため)。exe を上書きする前に
   サービスを止める (`net stop AuroraHost`)。必須にしているのは、状態 (`%ProgramData%\Aurora\host`)
   が SYSTEM / 管理者専用で、非昇格で手動起動した host からは読み書きできないため。移行・登録の
   失敗は終了コードで検知し、対話インストールではメッセージで知らせる (登録に失敗したら
@@ -111,6 +113,7 @@ Tauri の生出力は `target\release\bundle\nsis\Aurora_0.1.0_x64-setup.exe`
 
 「アプリと機能」または同梱アンインストーラから削除。痕跡を残さない:
 1. `aurora-host --uninstall-service` でサービス "AuroraHost" を停止・削除 (本体とトレイも止まる)。
+   ファイアウォール規則 "Aurora Host" も削除する。
 2. 残った常駐プロセス (`aurora-host.exe`) を停止。
 3. 旧版で自動起動を入れていた場合のみ `aurora-host --uninstall` でタスク "Aurora Host"
    を解除。
