@@ -204,7 +204,8 @@ WoL タブのカードにある操作:
 
 1. （PC が落ちているなら）client の WoL タブから「起動」または「起動して接続」を実行し、
    自宅 PC を起こす（手順 5 参照。常時オン運用なら不要）
-2. 自宅 PC がログオンすると host が自動起動し、保存済みパスワードで待ち受ける
+2. 自宅 PC が起動すると、サインイン前でもサービスが host を起動し、保存済みパスワードで
+   待ち受ける (サインイン画面のまま接続し、遠隔でサインインできる)
 3. 出先の PC で client を起動（「起動して接続」を使った場合はこの後の操作は不要）
 4. 接続先に `100.x.x.x:<port>`、パスワードに手順 2 で設定した値を入力して接続
 
@@ -214,7 +215,7 @@ WoL タブのカードにある操作:
 
 | 症状 | 確認点 |
 |------|--------|
-| 接続できない | `tailscale status` で双方がオンラインか。`<port>` が host の `--port` と一致しているか |
+| 接続できない | `tailscale status` で双方がオンラインか。`<port>` が host の `--port` と一致しているか。ファイアウォール規則 "Aurora Host" があるか (`--install-service` が作る。[troubleshooting.md](troubleshooting.md) 参照) |
 | パスワードが通らない | `%ProgramData%\Aurora\host\password.bin` があるか。CLI で変えたならサービスを再起動したか。client 側の入力値と一致しているか |
 | サービスは動くが映像が来ない | `Get-Service AuroraHost` が Running か。host ログ (`%ProgramData%\Aurora\host\logs\`) の `service.<日付>.log` / `host.<日付>.log`。GPU ドライバ |
 | `--install-service` が失敗する | 管理者権限で実行しているか |

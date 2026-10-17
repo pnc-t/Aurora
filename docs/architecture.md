@@ -8,8 +8,10 @@ Aurora は「**Port & Adapter (Hexagonal)**」風の構成です。OS 依存部�
 
 ```
 crates/
-├── common/     共有: プロトコル型 (proto)、Noise 暗号化 (noise)、
-│               UDP/TCP フレーミング (framing)、クリップボード (clipboard)
+├── common/     共有: プロトコル型 (proto)、Noise 暗号化 (noise)、認証前の枠 (preauth)、
+│               UDP/TCP フレーミング (framing)、クリップボード (clipboard)、
+│               DPAPI (dpapi)、ログ初期化 (logging)、保存先パス (paths)、
+│               受信ファイル名のサニタイズ (fsname)、更新物の署名検証 (update_sig)
 ├── host/       操作される側 (サーバ・素のバイナリ)
 │   ├── capture/   画面キャプチャ Port + OS 別 Adapter (device/convert を含む)
 │   ├── encode/    映像エンコード Port + Adapter (mf=SW H.264 / mf_hw=HW H.264/HEVC/AV1 / ffmpeg)。
@@ -28,8 +30,10 @@ crates/
 │   │              state=%ProgramData%\Aurora\host の解決と ACL 保護 /
 │   │              service=SYSTEM サービスと対話セッションへの本体・トレイ起動 /
 │   │              desktop=UAC・ロック画面のデスクトップ追従 / user=ログオンユーザー偽装 /
+│   │              instance=単一インスタンス /
 │   │              autostart=旧方式のログオン時自動起動タスクの登録・解除)
 │   ├── perf.rs    エンコード遅延・ソースビットレートの計測 (--perf)
+│   ├── update.rs  自己アップデート (latest-host.json の署名検証・setup の取得と実行)
 │   ├── video/     画面取り込み+エンコードを子プロセス (取り込みワーカー) で動かす
 │   │              (supervisor=本体側の起動・監視・中継 / worker=子側 / wire=パイプの枠付け)。
 │   │              DXGI の固着はワーカーだけ作り直し、クライアントとの接続は切らない
@@ -42,11 +46,13 @@ crates/
 └── client/     操作する側 (Tauri v2 + Vanilla TypeScript)
     ├── src-tauri/  Rust 側: ネットワーク、Webview への NALU 受け渡し、設定
     └── src/        フロント
-        ├── core/   ブリッジ・ランタイム (a11y / codec / decoder / fullscreen / input / ipc /
-        │           log / session / shortcuts / video-presets / webview-guard)
-        ├── ui/     UI コンポーネント (avatar / connect-dialog / file-transfer / icons /
-        │           launcher / reconnect-badge / stats-overlay / tabs / toast / toolbar /
-        │           window-controls / wol-panel)
+        ├── core/   ブリッジ・ランタイム (a11y / audio-player / codec / decoder / fullscreen /
+        │           input / ipc / log / session / shortcuts / soft-keyboard / sticky-modifiers /
+        │           touch-input / update / video-presets / webview-guard)
+        ├── ui/     UI コンポーネント (avatar / capture-overlay / connect-dialog / file-transfer /
+        │           icons / launcher / reconnect-badge / select-menu / stats-overlay / tabs /
+        │           toast / toolbar / window-controls / wol-panel、Android 向けの mobile-* /
+        │           pull-to-refresh)
         └── styles/ 横断スタイル (base.css)
 ```
 
@@ -91,16 +97,21 @@ client↔wol は同じく `common` の `WolMsg` (別チャネル・別プロト�
 
 | スレッド/タスク | 役割 | 入出力 |
 |------|------|------|
-| `capture` | 選択ディスプレイをキャプチャし、fps 上限でペーシング | → `Frame` チャネル |
-| `encode` | H.264/HEVC/AV1 エンコード (ネゴシエーション結果に従う)、キーフレーム要求/ビットレート変更/コーデック変更を反映 | `Frame` → `EncodedNal` チャネル、実効コーデックは `CodecStatus` で net へ報告 |
+| `capture` (取り込みワーカー内) | 選択ディスプレイをキャプチャし、fps 上限でペーシング | → `Frame` チャネル |
+| `encode` (取り込みワーカー内) | H.264/HEVC/AV1 エンコード (ネゴシエーション結果に従う)、キーフレーム要求/ビットレート変更/コーデック変更を反映 | `Frame` → `EncodedNal` (パイプで本体へ)、実効コーデックも本体経由で net へ報告 |
+| video supervisor | 取り込みワーカー (子プロセス `--capture-worker`) を起動・監視し、指示と出力をパイプで中継。ワーカーが落ちたら状態を送り直して作り直す | net の指示 → ワーカー、ワーカーの `EncodedNal` → net |
 | `input` | `SendInput` 等で入力注入 (同期 API なので tokio の外) | `InputCmd` チャネル ← |
 | audio capture | WASAPI ループバック → Opus | → `EncodedAudio` チャネル |
 | `net` (tokio, `net/`) | TCP 制御受信 + UDP 映像/音声送信、ハンドシェイク、適応制御、コーデックネゴシエーション | 各チャネルを束ねる |
-| `tray` (UI) | システムトレイ常駐、パスワード/ポート変更を net へ反映 | `Arc` 共有 + `Notify` |
+| `tray` (UI) | システムトレイ。サービス運用では別プロセス (`--tray`、ログオンユーザーの昇格権限) で動き、名前付きパイプ経由で本体にパスワード/ポート変更などを頼む | `Arc` 共有 + `Notify` |
 
 ポイント:
 
-- **ディスプレイ切替**は制御スレッド → capture スレッドへ id を送り、capturer を作り直します。
+- **プロセス構成 (サービス運用)**: サービス (Session 0) → 本体 (対話セッション・SYSTEM) →
+  取り込みワーカー、と別にトレイ。画面取り込みとエンコードだけを子プロセスに分けているのは、
+  DXGI がプロセス単位で壊れる (UAC/ロック画面への切替など) ときにワーカーだけ作り直し、
+  クライアントとの接続を保つためです。
+- **ディスプレイ切替**は制御スレッド → (supervisor 経由で) capture スレッドへ id を送り、capturer を作り直します。
 - **fps 上限 / ビットレート上限**はクライアントの `SetVideoParams` で実行時に変更でき、
   それぞれ capture スレッド (ペーシング) と encode スレッド (エンコーダ目標) に伝わります。
 - **コーデックネゴシエーション**は `net/codec.rs` の `negotiate_codec` (純関数) が host 能力

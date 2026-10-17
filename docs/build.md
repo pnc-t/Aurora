@@ -33,8 +33,10 @@ cargo run -p aurora-host -- --set-password
 
 既定で TCP/UDP ともポート `7000` を待ち受けます。bind 先は既定で Tailscale インターフェース
 のみ (未導入時は `127.0.0.1` loopback に fail-closed。LAN/インターネットへは到達不能で、公開は
-`--bind <ip>` で明示)。リリースビルドはコンソール無しでバックグラウンド + システム
-トレイ常駐になり、トレイアイコンからパスワード変更・終了ができます。
+`--bind <ip>` で明示)。設定とパスワードは `%ProgramData%\Aurora\host` (SYSTEM と
+Administrators だけが読み書きできる) に置くため、手動で起動するなら管理者として実行します。
+常用するときは `--install-service` で SYSTEM サービスとして登録し (配布インストーラは自動で
+行う)、トレイアイコンからパスワード変更などを操作します。
 
 無人起動 (自動起動 + 固定パスワード + WoL) の構成は
 [remote-access-setup.md](remote-access-setup.md) を参照してください。
@@ -75,7 +77,7 @@ pushd crates/client/src-tauri; cargo tauri build; popd
 ```
 
 接続はランチャーで接続先 (Tailnet IP / ホスト名 / `localhost`)、ポート、パスワードを入力して
-行います。接続後、上端のツールバーから全画面・マウスキャプチャ・ファイル転送・統計 HUD・
+行います。接続後、ツールバー (既定は上端。位置は変更可) から全画面・マウスキャプチャ・ファイル転送・統計 HUD・
 ディスプレイ切替・画質プリセットを操作できます。
 
 ### フロントエンド単体 (UI 開発時)
@@ -129,8 +131,7 @@ host/client とも GitHub Releases から自動アップデートします。
   だけでなく version/URL を含む manifest 本体を署名し、書き込み権限のみの攻撃者による
   ダウングレード誘導を防ぐため)。取得または検証に失敗した場合は fail-closed で
   チェック自体をエラーとし、更新を適用しません (「更新なし」とは区別してログに残します)。
-  **移行注意**: `.sig` を同梱した次のリリースが出るまでは、この対応後の host は
-  自己更新チェックが常に失敗します (旧リリースに `latest-host.json.sig` が無いため)。
+  リリース CI (`.github/workflows/release.yml`) は `latest-host.json.sig` を必ず添付します。
 
 ## Tailscale 接続確認
 
