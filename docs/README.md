@@ -13,7 +13,7 @@ Aurora は Tailscale (Tailnet) 直結を前提にした、自作の軽量リモ�
 | [security.md](security.md) | 暗号化・認証・ネットワーク露出・脅威モデルと既知の制約 |
 | [build.md](build.md) | 必要環境、ホスト/クライアントのビルドと実行、CLI オプション、WoL リレー (aurora-wol) のビルド、自動アップデート |
 | [mobile.md](mobile.md) | Android クライアントの入手・インストールとビルド、リリース署名 |
-| [remote-access-setup.md](remote-access-setup.md) | 出先から自宅 PC へ接続する無人起動セットアップ (自動起動・WoL) |
+| [remote-access-setup.md](remote-access-setup.md) | 出先から自宅 PC へ接続する無人起動セットアップ (サービス常駐・WoL) |
 | [troubleshooting.md](troubleshooting.md) | 接続できない・映像が来ない等の切り分け |
 
 配布インストーラの作り方は [`installer/README.md`](../installer/README.md) にあります。

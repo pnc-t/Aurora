@@ -104,6 +104,11 @@ cargo tauri android build --apk --debug
 .\installer\build-all.ps1 -Android
 ```
 
+APK のバージョン (versionName / versionCode) は root `Cargo.toml` の
+`[workspace.package] version` から取ります。`tauri.conf.json` に `version` が無いため、
+`build-all.ps1` と CI は `--config` でこれを渡しています。`cargo tauri android build` を
+直接実行すると Tauri の既定どおり 1.0 (versionCode 1) になるので、配布用には使わないでください。
+
 `build-all.ps1 -Android` の出力は `installer\dist\Aurora_<ver>-arm64.apk` です。
 ローカルビルドは実機で使われる arm64-v8a 単体、CI (GitHub Release) は universal
 4 ABI という違いがあります。

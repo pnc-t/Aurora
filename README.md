@@ -41,13 +41,13 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 | **映像・音声** | H.264 / HEVC / AV1 のコーデックネゴシエーション<br>GPU ハードウェアエンコード + WebCodecs GPU デコード<br>Opus 音声 / 画質プリセット<br>解像度追従 (RDP 風) と仮想ディスプレイ |
 | **入力** | マウス / キー入力注入<br>IME 日本語入力<br>キーボード占有 (Win キーや Alt+Tab をホストへ送る) |
 | **ファイル・クリップボード** | クリップボード同期<br>ファイル転送<br>ProjFS によるドライブ投影 |
-| **運用** | マルチタブ接続 / クライアント設定ページ<br>ネットワーク切替時のシームレス再接続<br>Wake-on-LAN によるリモート起動<br>自動アップデート (新版を通知しワンクリックで更新) |
+| **運用** | Windows サービスとして常駐 (UAC の確認画面・ロック画面・サインイン画面も遠隔操作できる)<br>マルチタブ接続 / クライアント設定ページ<br>ネットワーク切替時のシームレス再接続<br>Wake-on-LAN によるリモート起動<br>自動アップデート (新版を通知しワンクリックで更新) |
 
 ---
 
 ## はじめかた
 
-1. **操作される PC (ホスト)**: [Releases](https://github.com/pnc-t/Aurora/releases/latest) から `aurora-host-setup-<ver>.exe` を実行してインストールし、タスクトレイのアイコンから接続パスワードを設定します
+1. **操作される PC (ホスト)**: [Releases](https://github.com/pnc-t/Aurora/releases/latest) から `aurora-host-setup-<ver>.exe` を実行してインストールし、初回に出るダイアログ (またはタスクトレイのアイコン) から接続パスワードを設定します。ホストは Windows サービスとして PC 起動時から常駐します
 2. **両方の PC**: [Tailscale](https://tailscale.com/) をインストールし、同じ Tailnet に参加させます (`tailscale ip -4` でホストの `100.x.x.x` を控えておきます)
 3. **操作する PC (クライアント)**: `Aurora_<ver>_x64-setup.exe` を実行してインストールし、ランチャーの ＋ からホストの `100.x.x.x` / ポート (既定 7000) / パスワードを登録して接続します
 
@@ -66,6 +66,7 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 | `Aurora_<ver>_x64-setup.exe` | クライアント (操作する側) の NSIS インストーラ |
 | `aurora-host-setup-<ver>.exe` | ホスト (操作される側) の NSIS インストーラ |
 | `aurora-wol-<ver>-aarch64` | Wake-on-LAN リレー (Raspberry Pi / aarch64 Linux 向けバイナリ) |
+| `Aurora_<ver>.apk` | Android クライアント (7.0 以上。[docs/mobile.md](docs/mobile.md)) |
 
 `main` に `v*` タグを push すると GitHub Actions が上記を自動ビルドして Release に添付します
 (まだ初回リリース未公開のため、公開後にリンクが有効になります)。ソースからビルドする場合は
@@ -137,6 +138,8 @@ cargo tauri build        # 本番ビルド
 |--|---------|-------|-------|
 | ホスト | ✅ 主対象 (キャプチャ/エンコード/入力/音声/ファイル) | 🚧 移植途上 | 🚧 移植途上 |
 | クライアント | ✅ | (Tauri 依存) | (Tauri 依存) |
+
+クライアントは Android (7.0 以上) にも対応しています。iOS は未対応です。
 
 Windows を優先して完成させ、Mac/Linux は OS ポート (`cfg` 分岐の追加) でまとめて対応する方針です。
 

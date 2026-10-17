@@ -11,7 +11,7 @@ Aurora は自宅 PC の画面・入力をネットワーク越しに開放する
 - **Tailscale (Tailnet) 直結が前提**。NAT 越え・シグナリング・中継サーバは実装しません。
   通信は Tailnet 内 (`100.x.x.x`) に閉じ、外側からは Tailscale の認証・ACL で守られます。
 - ホストは既定で **Tailscale インターフェースのみに bind** します (`--bind` 未指定なら
-  `main.rs` の `resolve_bind_spec` が `Auto` を選び、実 IP は bind 時に `net.rs` の
+  `main.rs` の `resolve_bind_spec` が `Auto` を選び、実 IP は bind 時に `net/mod.rs` の
   `resolve_bind_ip` が解決)。優先順位は `--bind` 明示 > Tailscale IP 自動検出 > `127.0.0.1`
   (loopback)。**Tailscale IP の解決は bind ループ内で行い、起動が `tailscaled` より先でも
   IP が出るまで待ってから bind します** (ホストは PC 起動時にサービスとして立ち上がるため起動レースが常態。
@@ -156,6 +156,10 @@ host は UAC の確認画面・ロック画面・サインイン画面を操作�
   照合の失敗が続くと待ち時間を延ばします (1 秒から倍々、上限 5 分)。
 - **ファイルはユーザーとして扱う**: ファイル転送 (受信・送出) と ProjFS の投影は、SYSTEM ではなく
   ログオンユーザーのトークンで開きます。サインイン前は使えません。
+- **ファイアウォール**: SYSTEM で動く本体には Windows の許可確認が出ないため、`--install-service`
+  がインストール先の exe に対する受信許可規則 "Aurora Host" を全プロファイルに作り、
+  `--uninstall-service` で消します。規則はプログラム単位なので、どこから受け付けるかは待受アドレス
+  (既定は Tailscale IP のみ) が決めます。
 
 ### リモートからの締め出し/乗っ取り防止
 
@@ -206,9 +210,10 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
 
 暗号化キー・パスワードはログに出しません。保存済みパスワードを使う場合も値は表示せず、
 "(from secure store)" とだけ記録します。ファイルログは host/client/aurora-wol とも
-`crates/common/src/logging.rs` に集約した共通初期化で、`%LOCALAPPDATA%\Aurora\logs\`
-(非 Windows は `~/.local/share/Aurora/logs`) に `host.<日付>.log` / `client.<日付>.log` /
-`wol.<日付>.log` を日次ローテーション + 7 世代保持で残します。
+`crates/common/src/logging.rs` に集約した共通初期化で、日次ローテーション + 7 世代保持で
+残します。出力先は host が `%ProgramData%\Aurora\host\logs\` (`service` / `host` / `capture`。
+SYSTEM と Administrators だけが読める)、トレイと client が `%LOCALAPPDATA%\Aurora\logs\`
+(`tray` / `client`)、aurora-wol が `~/.local/share/Aurora/logs` (`wol`) です。
 
 ## 脅威モデル (何を守り、何を守らないか)
 
@@ -271,9 +276,9 @@ Wake-on-LAN で自宅 PC を起こす機能は、自宅 LAN に常駐する別�
 | 同時接続数の上限 (2 段セマフォ: ハンドシェイク枠 `PREAUTH_SLOTS`=32 + 確立セッション枠 `MAX_CLIENTS`=4) | `crates/host/src/net/mod.rs` |
 | 接続中ガード (名前付きイベント `Local\AuroraSessionActive`) | `crates/host/src/net/session.rs` |
 | bind アドレス解決 (Tailscale-only 既定) | `crates/host/src/main.rs` (`resolve_bind_spec`) → `crates/host/src/net/mod.rs` (`resolve_bind_ip`, bind 時に Tailscale IP を待つ) |
-| パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray.rs` |
+| パスワード変更ガード | `crates/host/src/main.rs` / `crates/host/src/tray/control.rs` |
 | パスワード最低長・認証失敗遅延 | `crates/common/src/noise.rs` (`MIN_PASSWORD_LEN`) / `crates/host/src/net/auth.rs` (`AuthThrottle`) / `crates/wol/src/main.rs` (`WolThrottle`) |
-| デバイスピン留め (静的鍵許可リスト) | `crates/host/src/security/devices.rs` / `crates/host/src/net/client.rs` (`remote_static` 照合) / `crates/host/src/tray.rs` |
+| デバイスピン留め (静的鍵許可リスト) | `crates/host/src/security/devices.rs` / `crates/host/src/net/client.rs` (`remote_static` 照合) / `crates/host/src/tray/` |
 | `FileRequest` (パス制限なし、by-design) | `crates/host/src/net/client.rs` (`ControlMsg::FileRequest` ハンドラ) / `crates/host/src/net/files.rs` (`stream_file_to_client`) |
 | クライアント永続 ID 鍵 (静的鍵) | `crates/common/src/noise.rs` (`generate_static_keypair`/`remote_static`) / `crates/client/src-tauri/src/secret.rs` |
 | 受信ファイル名サニタイズ | `crates/common/src/fsname.rs` |

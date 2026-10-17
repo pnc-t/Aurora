@@ -9,6 +9,7 @@
 |------|------|
 | 接続できない | `tailscale status` で双方がオンラインか。client の接続先 `<port>` が host の `--port` と一致しているか |
 | host に届かない (Tailnet 経由) | host が Tailscale IP に bind しているか (起動ログで確認)。Tailscale 未導入だと `127.0.0.1` (loopback) に fail-closed し外部から到達不能。LAN 公開するなら `--bind <LAN IP>`、全 NIC なら `--bind 0.0.0.0` を明示する |
+| ポートには届くはずなのに繋がらない | Windows ファイアウォールの受信許可規則 "Aurora Host" があるか (`Get-NetFirewallRule -DisplayName "Aurora Host"`)。サービスで動く host には Windows の許可確認が出ないため、規則が無いと黙って遮断される。無ければ管理者で `aurora-host --install-service` を実行し直すか、インストーラを再実行する |
 | パスワードが通らない | client の入力値が host の保存値と一致しているか。`%ProgramData%\Aurora\host\password.bin` があるか。CLI (`--set-password`) で変えたならサービスを再起動したか (`Restart-Service AuroraHost`) |
 | ハンドシェイクで切れる | パスワード (PSK) 不一致が最有力。各ステップ 10 秒でタイムアウトするため、無応答だと切断される |
 | 5 台目から接続できない | host の同時接続は最大 4。上限到達時は新規接続が拒否される (host ログに `client limit reached`)。不要なセッションを切ってから接続する |
@@ -18,9 +19,10 @@
 
 | 症状 | 確認点 |
 |------|------|
-| 接続はできるが映像が来ない | ログオンセッションがアクティブか (ロック画面のみでは DXGI が止まる構成あり)。GPU ドライバ。host ログ (`%ProgramData%\Aurora\host\logs\host.<日付>.log`) を確認 |
+| 接続はできるが映像が来ない | サービス "AuroraHost" が動いているか (`Get-Service AuroraHost`)。GPU ドライバ。host ログ (`%ProgramData%\Aurora\host\logs\host.<日付>.log`) を確認 |
 | ノート PC を host にすると映像が真っ暗 / エンコーダ初期化に失敗する | ハイブリッド GPU (Optimus 等) 構成でキャプチャ GPU とエンコード GPU が食い違っている可能性。`--encode-gpu <名前の一部>` でエンコードに使う GPU を明示指定する (既定はキャプチャと同一 GPU) |
 | カクつく / 遅延が増える | 高リフレッシュレートモニタでデコードが溢れている可能性。`--fps` で送出上限を下げる。帯域が細いなら `--max-bitrate` を下げる |
+| UAC やロック画面に切り替わった瞬間に 1〜2 秒止まる | 正常。デスクトップが切り替わると画面取り込み用の子プロセス (取り込みワーカー) を作り直すため。接続は切れず、そのまま続く |
 | 画面が乱れて戻らない | パケットロスでキーフレーム待ち。ツールバーから再要求するか、一時的なら次のキーフレームで回復する |
 | 映像が眩しい/白飛びする | HDR 有効ディスプレイの既知制約 (SDR トーンマップ)。ディスプレイの HDR を切ると回避できる |
 | 1440p 等の高解像度で HDR 有効時にカクつく | ハードウェアエンコーダがビットレート上限を尊重せずフレームレートが落ちる既知制約。ディスプレイの HDR を切った SDR 運用を推奨 |
