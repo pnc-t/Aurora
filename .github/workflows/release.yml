@@ -315,8 +315,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # 起動トリガのタグ (v1.2.3) がそのままリリース名/タグになる
+          # host setup は aurora-host-setup-<ver>.exe で *-setup.exe に合わないため別に列挙する
+          # (fail_on_unmatched_files はパターン単位なので、合わないと黙って添付されない)。
           files: |
             dist-release/*-setup.exe
+            dist-release/aurora-host-setup-*.exe
             dist-release/latest.json
             dist-release/latest.json.sig
             dist-release/latest-host.json
