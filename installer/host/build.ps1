@@ -126,6 +126,8 @@ try {
 }
 
 Write-Host "==> NSIS でコンパイル ($makensis)" -ForegroundColor Cyan
+# OutFile の出力先 installer\dist は git 管理外で、makensis は親フォルダを作らない (クリーンな CI で失敗する)。
+New-Item -ItemType Directory -Force (Join-Path $here '..\dist') | Out-Null
 & $makensis "/DAPPVERSION=$version" (Join-Path $here 'aurora-host.nsi')
 if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
 
