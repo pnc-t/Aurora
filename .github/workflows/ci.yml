@@ -68,7 +68,11 @@ jobs:
 
       - name: Build aurora-client (Tauri NSIS)
         working-directory: crates/client/src-tauri
-        run: cargo tauri build
+        # 更新用署名 (.sig) はリリース (release.yml) だけで作る。CI は検証用なので
+        # 署名鍵 Secrets を渡さず、updater 成果物の生成を切って鍵なしでバンドルする。
+        # pwsh はネイティブ引数の " 渡しが版で変わるため、JSON を渡すこの行は bash で実行する。
+        shell: bash
+        run: cargo tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Collect artifacts
         shell: pwsh
