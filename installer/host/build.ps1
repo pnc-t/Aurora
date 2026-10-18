@@ -52,9 +52,25 @@ $vddSource = if ($env:VDD_SOURCE) { $env:VDD_SOURCE } else {
         "$env:LOCALAPPDATA\VirtualDisplayDriver"
     ) | Where-Object { Test-Path (Join-Path $_ 'MttVDD.inf') } | Select-Object -First 1
 }
+# 手元に無ければ (CI 等) 上流の署名済みドライバを固定版で取得する。installer/host/vdd/ は
+# git 管理外のため、取得しないと aurora-host.nsi の SecVDD の File 命令でコンパイルが止まる。
+# 署名済みバイナリを丸ごと同梱するので、差し替え検知のため zip の SHA256 を固定して照合する。
+$vddTmp = $null
 if (-not $vddSource) {
-    Write-Warning "VDD ドライバが見つかりません。SecVDD セクションはスキップしてください。`n  VDD_SOURCE 環境変数でパスを指定できます (例: MttVDD.inf が入ったフォルダ)"
-} else {
+    $vddVer = '24.12.24'
+    $vddUrl = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$vddVer/Signed-Driver-v$vddVer-x64.zip"
+    $vddSha256 = 'f93e7ce3d640c83c419b1b72d2c83b2d8e34d83e8b7ba11f3328a40d2da82fa4'
+    Write-Host "==> VDD ドライバを取得中 ($vddUrl)" -ForegroundColor Cyan
+    $vddTmp = Join-Path $env:TEMP "vdd_$vddVer"
+    New-Item -ItemType Directory -Force $vddTmp | Out-Null
+    $vddZip = Join-Path $vddTmp 'vdd.zip'
+    Invoke-WebRequest -Uri $vddUrl -OutFile $vddZip -Headers @{ 'User-Agent' = 'Aurora-Installer' }
+    $actual = (Get-FileHash $vddZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $vddSha256) { throw "VDD ドライバの SHA256 が一致しません: $actual" }
+    Expand-Archive -Path $vddZip -DestinationPath $vddTmp -Force
+    $vddSource = $vddTmp
+}
+try {
     Write-Host "==> VDD ファイルをコピー中 ($vddSource)" -ForegroundColor Cyan
     $vddDest = Join-Path $here 'vdd'
     New-Item -ItemType Directory -Force $vddDest | Out-Null
@@ -105,6 +121,8 @@ if (-not $vddSource) {
         }
         if (-not (Test-Path $nefconDest)) { throw "nefconw.exe の取得に失敗しました" }
     }
+} finally {
+    if ($vddTmp) { Remove-Item $vddTmp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host "==> NSIS でコンパイル ($makensis)" -ForegroundColor Cyan
