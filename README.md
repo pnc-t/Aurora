@@ -68,9 +68,8 @@ RDP / VNC / RustDesk 等を使わず、Rust でゼロから実装しています
 | `aurora-wol-<ver>-aarch64` | Wake-on-LAN リレー (Raspberry Pi / aarch64 Linux 向けバイナリ) |
 | `Aurora_<ver>.apk` | Android クライアント (7.0 以上。[docs/mobile.md](docs/mobile.md)) |
 
-`main` に `v*` タグを push すると GitHub Actions が上記を自動ビルドして Release に添付します
-(まだ初回リリース未公開のため、公開後にリンクが有効になります)。ソースからビルドする場合は
-[docs/build.md](docs/build.md) を参照してください。
+`main` に `v*` タグを push すると GitHub Actions が上記を自動ビルドして Release に添付します。
+ソースからビルドする場合は [docs/build.md](docs/build.md) を参照してください。
 
 > ⚠️ 配布インストーラ自体は Authenticode コード署名がされておらず、SmartScreen / Defender に
 > 警告される場合があります (詳細は [docs/security.md](docs/security.md))。一方、host/client の
@@ -157,5 +156,15 @@ Windows を優先して完成させ、Mac/Linux は OS ポート (`cfg` 分岐�
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 `SPDX-License-Identifier: MIT OR Apache-2.0`
+
+### 同梱しているサードパーティソフトウェア
+
+ホストのインストーラは以下を同梱して再配布しています (ライセンス本文は
+[installer/host/THIRD-PARTY-NOTICES.txt](installer/host/THIRD-PARTY-NOTICES.txt)、インストール先にも同じファイルを置きます)。
+
+| ソフトウェア | 用途 | ライセンス |
+|---|---|---|
+| [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (MttVDD) | 仮想ディスプレイ | MIT |
+| [nefcon](https://github.com/nefarius/nefcon) (nefconw.exe) | 仮想ディスプレイのデバイス登録 | MIT |
 
 アイコン画像は ChatGPT (OpenAI) で生成したものです。

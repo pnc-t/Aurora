@@ -171,6 +171,8 @@ Section "Aurora Host 本体" SecCore
   File "..\..\target\release\${EXENAME}"
   ; VDD 削除スクリプトを同梱しておく (アンインストール時に使用)。
   File "remove_vdd.ps1"
+  ; 同梱する VDD / nefconw (MIT) の著作権表示とライセンス本文。再配布の条件として添える。
+  File "THIRD-PARTY-NOTICES.txt"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -316,6 +318,7 @@ Section "Uninstall"
   ; 5) ファイル / ショートカットを削除。
   Delete "$INSTDIR\${EXENAME}"
   Delete "$INSTDIR\remove_vdd.ps1"
+  Delete "$INSTDIR\THIRD-PARTY-NOTICES.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir  "$INSTDIR"
   SetShellVarContext all
