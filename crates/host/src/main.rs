@@ -2195,7 +2195,7 @@ fn write_bmp(path: &str, width: u32, height: u32, bgra: &[u8]) -> Result<()> {
     for y in (0..h as usize).rev() {
         let row = &bgra[y * stride..y * stride + w as usize * 4];
         let mut bgr = Vec::with_capacity(w as usize * 3);
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             bgr.push(px[0]);
             bgr.push(px[1]);
             bgr.push(px[2]);

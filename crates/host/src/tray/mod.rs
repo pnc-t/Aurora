@@ -104,7 +104,7 @@ impl TrayBus {
         // 飽和減算で 0 未満にしない (確立/切断は対で呼ぶが、防御的に floor する)。
         let prev = self
             .connected
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .unwrap_or(0);
