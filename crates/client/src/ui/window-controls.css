@@ -1,0 +1,11 @@
+/* フレームレスウィンドウ用の自前ウィンドウ操作ボタン (window-controls.ts)。
+ * launcher のタイトルバーと接続中ツールバーの両方が mountWindowControls で使う共有部分。
+ * topbar 内での配置・サイズ上書きは toolbar.css の #topbar スコープ側にある。 */
+
+.window-controls { position: absolute; top: 0; right: 0; display: flex; height: 34px; }
+.winctl {
+  width: 44px; height: 34px; border: none; background: transparent; color: var(--muted);
+  cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center;
+}
+.winctl:hover { background: var(--winctl-hover); color: var(--fg); }
+.winctl.close:hover { background: var(--danger); color: #fff; }

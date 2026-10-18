@@ -1,0 +1,20 @@
+# audiopus_sys (opus 依存) が同梱する libopus の CMakeLists は古い
+# cmake_minimum_required を宣言しており、CMake 4.x は互換性を削除したため
+# そのままでは configure に失敗する。policy 最小バージョンを 3.5 に固定して回避する。
+# (cmake は winget で導入し、PATH に通っている前提)
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# MSVC ランタイム (vcruntime140.dll 等) を静的リンクする。
+#
+# 素の Windows には VC++ 再頒布可能パッケージが入っておらず、動的リンクのままだと
+# aurora-host.exe は起動すらできない (0xC0000135 STATUS_DLL_NOT_FOUND)。しかも
+# ローダが落とすためエラーダイアログもログファイルも出ず、利用者からは「インストール
+# したのに何も起きない」としか見えない。2026-08-07 にクリーンな Win11 VM で実証済み。
+#
+# 開発機には他アプリ経由でランタイムが入っているため、この不具合は素のマシンでしか
+# 再現しない。ビルド経路ごとにフラグを付ける方式だと付け忘れが同じ事故を再発させるので、
+# **ここに置いて全ビルド経路 (cargo build / cargo tauri build / CI) へ一律に効かせる**。
+# ターゲット指定なので Android (aarch64-linux-android 等) と wol (linux-musl) には影響しない。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

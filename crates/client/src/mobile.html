@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- ブラウザ側のピンチズーム/二重タップズームを殺す: 映像のズームは TouchInput に一元化し、
+         ページ全体がズームされると座標変換の前提が崩れるため。
+         interactive-widget=resizes-content: ソフトキーボード表示時にビューポート自体を縮め、
+         フォームの入力欄/送信ボタンがキーボードの下に隠れて押せなくなるのを防ぐ (Chromium 108+ /
+         Android WebView)。効かない古い WebView 向けのフォールバックはフォーム側の overflow-y:auto
+         (ui/mobile-launcher.css) で担保する。 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>Aurora Mobile</title>
+    <!-- スタイルは TS 側で import する: 共通土台は styles/base.css、シェル固有は mobile-main.css、
+         各 UI コンポーネントは ui/<component>.css。 -->
+  </head>
+  <body>
+    <!-- 未接続時: 接続履歴 + 新規接続フォーム (TS が中身を構築)。 -->
+    <div id="launcher-view"></div>
+
+    <!-- 接続中: 単一セッションのリモート画面。デスクトップ版と違いタブ/複数窓は持たない。 -->
+    <div id="remote-view" class="hidden">
+      <div id="screen-wrap">
+        <canvas id="screen" tabindex="0" width="1920" height="1080"></canvas>
+      </div>
+      <div id="conn-status"></div>
+      <div id="reconnect-badge"></div>
+      <div id="toast-container"></div>
+      <!-- Android IME (ソフトキーボード) の隠し input を置く器。文字入力はこちら。 -->
+      <div id="soft-keyboard-root"></div>
+      <!-- 操作用オンスクリーンキーボード (修飾/ショートカット/ファンクション)。中身は
+           ui/mobile-keyboard.ts が構築する。 -->
+      <div id="mobile-keyboard"></div>
+      <!-- オンスクリーンコントローラ (TS が中身を構築)。下部バーより下のレイヤーに置く。 -->
+      <div id="mobile-pad"></div>
+      <!-- 下部操作バー (TS が中身を構築)。 -->
+      <div id="mobile-controls"></div>
+    </div>
+
+    <script type="module" src="./mobile-main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,308 @@
+/* モバイル版ランチャー (mobile-launcher.ts)。見た目の大半は launcher.css を再利用する
+ * (host-card/dialog/setting-row 等はグローバルセレクタなのでそのまま効く)。ここには
+ * デスクトップの「サイドバー + コンテンツ」を「コンテンツ + 下部タブバー」へ組み替える
+ * 差分と、モバイル固有のタブバー自体のスタイルだけを書く。
+ * 幅ブレークポイントは 3 段構成: 常時適用 (幅を問わない差分) → @media (max-width: 480px)
+ * (スマホ幅の崩れ対策) → @media (min-width: 700px) (タブレット幅の全幅化 + 行内幅の抑制)。
+ * 狭い方の例外は広い方のブロックに混ぜず別メディアクエリに分離し、対象幅を取り違えないようにする。 */
+
+.ml-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  position: relative; /* #dialog-backdrop の absolute inset:0 の基準 (launcher.css の .launcher と同役) */
+}
+
+/* デスクトップの .content はタイトルバー分の上余白 (44px) + サイドバー隣接前提の左余白のみ
+ * (右は host-list 側の padding-right で確保) だが、モバイルはウィンドウが無いので通常の余白にする。
+ * host-list/settings-body 側のスクロールバー用ガター (padding-right) もデスクトップ専用の見た目
+ * (太いスクロールバー) 前提なので、taps 主体のモバイルでは詰めて画面を広く使う。
+ * WoL タブは mobile-wol.ts (`.mwol-list`) が自前で padding を持つためここには含めない。 */
+.ml-app .content {
+  padding: 16px 16px 0;
+}
+.ml-app .page-head {
+  padding-right: 0;
+}
+.ml-app .host-list,
+.ml-app .settings-body {
+  padding-right: 0;
+  padding-bottom: 16px;
+  scrollbar-gutter: auto;
+}
+
+/* 下部タブバー: サイドバーの置き換え。アイコン+ラベルを縦積みにし、タップ領域を 56px 確保する。
+ * ジェスチャーバーぶんの余白 env(safe-area-inset-bottom) は、バーではなく **タブ自身** が持つ。
+ * バー側の padding にすると、タップ時のハイライト (.ml-tab:active の背景) がボタンの箱までしか
+ * 広がらず、バー下端の余白ぶんだけ光らない帯が残る (実機で指摘を受けた)。タブ側の padding なら
+ * ボタンの箱が下端まで届いてハイライトが最後まで塗られ、アイコン/ラベルはパディングぶん押し
+ * 上げられるので位置は変わらない。
+ * #launcher-view 側 (mobile-main.css) は下パディングを持たない。両方で取ると余白が二重になる。 */
+.ml-tabbar {
+  display: flex;
+  flex-shrink: 0;
+  border-top: 1px solid var(--panel-border);
+  background: var(--sidebar);
+}
+.ml-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  /* 高さはタップ領域 56px + ジェスチャーバーぶんを足して確保するが、padding では取らない。
+   * padding-bottom にすると中身がそのぶん上へ寄り、下だけ余白が大きい非対称な見た目になる
+   * (実機で指摘を受けた)。min-height だけ増やして justify-content: center に任せると、中身が
+   * バー全高の中央に来て上下が揃い、かつ箱は下端まで広がるのでタップ時のハイライトも下まで
+   * 塗られる。ラベル下端とジェスチャーバーの間隔もこの高さで確保できている。 */
+  min-height: calc(56px + env(safe-area-inset-bottom));
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.ml-tab .icon {
+  font-size: 20px;
+}
+.ml-tab:active {
+  background: var(--raised-faint);
+}
+.ml-tab.active {
+  color: var(--accent);
+}
+
+/* page-head のアイコンボタン (更新/追加、WoL の追加) にラベルを併記する。タッチ環境はホバーが
+ * 無く title 属性 (a11y 用に残す) が常時見えないため、アイコンだけでは意味が伝わらない。
+ * .icon-btn 本来の固定 34x34 の正方形は崩し、テキスト分だけ横に伸ばす。min-height:44px を
+ * ここで直接持たせているため、モバイル画面上の .icon-btn は現状すべて本クラス経由でタップ領域を
+ * 満たしており、ラベル無し版向けの別ルールは (使われないため) 用意していない。 */
+.ml-app .ml-icon-btn-labeled {
+  width: auto;
+  height: auto;
+  min-height: 44px; /* ラベル付きにするため 34px 固定は解く。タップ領域は最初から 44px 確保する */
+  padding: 0 14px;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* アクセントカラー <input type=color> を包む <label> (タップ領域拡張用、下の @media で
+ * padding/margin を足す)。label 自体は既定 display:inline のままだと setting-row の flex 行内で
+ * レイアウトが崩れるため、幅を問わず常に inline-flex にしておく (padding/margin は幅依存の
+ * タップ領域確保の一部なのでここでは付けない)。 */
+.ml-app .ml-tap44 {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* ホスト編集ダイアログの「詳細設定」折りたたみ。中身 (仮想ディスプレイ/画質/コーデック) は
+ * dialog 内の label 要素をそのまま流用するので、ここでは summary の見た目と開閉インジケータだけ書く。 */
+.ml-app .ml-host-adv {
+  margin-top: 4px;
+}
+.ml-app .ml-host-adv summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 8px 0;
+  list-style: none; /* 既定のマーカー三角を消し、自前の chevron に統一する */
+}
+.ml-app .ml-host-adv summary::-webkit-details-marker {
+  display: none;
+}
+.ml-app .ml-host-adv summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s;
+}
+.ml-app .ml-host-adv[open] summary::before {
+  transform: rotate(90deg);
+}
+.ml-app .ml-host-adv label {
+  margin-top: 10px;
+}
+
+/* 端末ID表示 (タップでコピー)。launcher.css の .s-desc (span 前提) を button へ流用しているため、
+ * button 既定の背景/枠線/paddingだけリセットし、フォント/色は .s-desc のまま引き継ぐ。 */
+.ml-app .ml-fingerprint-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: right;
+}
+.ml-app .ml-fingerprint-btn:active {
+  color: var(--accent);
+}
+
+/* グローバルの .hidden (mobile-main.css) は display: none !important で、ページ全体の表示/非表示
+ * 切替専用のため、行単位の表示制御に流用すると !important 同士の優先度で意図せず衝突しうる
+ * (.mp-hidden / .mkb-hidden と同じ理由)。カスタムプリセット以外のときに fps/Mbps 行を隠す専用クラス。 */
+.ml-hidden {
+  display: none;
+}
+
+/* デスクトップ由来の文字サイズ (launcher.css) は 11-12px 台が多く、タッチ・高 DPI のスマホ画面では
+ * 物理的に小さすぎるため、モバイル (.ml-app 配下) だけ 1 段上げる。 */
+.ml-app .host-card .meta .label {
+  font-size: 16px;
+}
+.ml-app .setting-row .s-desc {
+  font-size: 13px;
+  line-height: 1.45;
+}
+.ml-app .setting-group {
+  font-size: 12px;
+}
+.ml-app .host-card .avatar-wrap .presence {
+  width: 12px;
+  height: 12px;
+}
+
+/* font-size: 13px は上の「文字サイズ底上げ」の一環 (addr の宣言をここへ統合し、同セレクタが
+ * ファイル内に重複しないようにしている)。overflow/ellipsis は host:port が長い場合に
+ * カード幅からはみ出さないようにするための溢れ対策。
+ * 320px 幅では「100.xx.xx.xxx:7000 · たった今」の自然幅 189px がこの行の使える幅 164px を
+ * 超えて末尾が ellipsis で切れる (360px=204px/412px=256px では収まる) が、削られるのは末尾の
+ * 相対時刻側で IP:port 自体は読めるため許容している。 */
+.ml-app .host-card .meta .addr {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ダイアログのボタンはタッチの主要動線 (接続/削除/追加) なので、既存の 44px タップ領域確保より
+ * 一段大きく確保する。 */
+.ml-app .dialog .dlg-actions button {
+  min-height: 48px;
+}
+
+/* スマホ幅 (~320-480px) 専用の崩れ対策。タブレット幅 (481px 以上) の見た目は変えないため
+ * 必ずこのメディアクエリ内に閉じ込め、セレクタは .ml-app 配下にスコープする。
+ * launcher.css / select-menu.css はデスクトップ版ランチャーと共有しておりここでは編集できない
+ * ため、直接編集の代わりにここで .ml-app 配下だけを上書きする。 */
+@media (max-width: 480px) {
+  /* 設定行を縦積みに: 説明文 (.s-desc) がラベル分の幅しか使えず数文字で折り返す問題を解消する。
+   * コントロール類は 2 行目・右寄せにして、右側に寄った操作感を保つ。 */
+  .ml-app .setting-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .ml-app .setting-row > .sel-wrap,
+  .ml-app .setting-row > .num-input,
+  .ml-app .setting-row > .ml-tap44,
+  .ml-app .setting-row > .switch,
+  .ml-app .setting-row > .select-input {
+    align-self: flex-end;
+  }
+
+  /* .sel-wrap は select-menu.css で flex-shrink: 0 のため、横幅を圧迫する犯人の一つ。
+   * 縦積みにした上でトリガの最大幅を親幅に抑え、長いラベルは既存の ellipsis で省略させる。 */
+  .ml-app .sel-wrap {
+    flex-shrink: 1;
+    max-width: 100%;
+  }
+  .ml-app .sel-trigger {
+    max-width: 100%;
+  }
+
+  /* Hosts カード末尾 (⋮ のみ) の固定幅 72px は過剰。中身に合わせて縮める。 */
+  .ml-app .host-card .card-tail {
+    flex: 0 0 auto;
+  }
+  /* host:port の溢れ対策は常時適用の .addr 自身 (overflow/ellipsis) で完結しているため、
+   * ここには何も置かない。 */
+
+  /* タップ領域確保 (配色/角丸/フォント/アイコンは変えず padding のみで高さを稼ぐ)。 */
+  .ml-app .num-input,
+  .ml-app .select-input,
+  .ml-app .sel-trigger {
+    padding-top: 10px;
+    padding-bottom: 10px;
+    box-sizing: border-box;
+    min-height: 44px;
+  }
+
+  /* Hosts カードの ⋮ (card-btn は launcher.css 側で背景透明・hover のみ着色のため、
+   * padding 拡張しても待機時の見た目は変わらない)。box-sizing はプロジェクト既定の
+   * border-box のまま (content-box を明示すると padding が外側に足されず 40x40 止まりになる。
+   * mwol-card .card-btn と同じ min-width/min-height で 44px を保証する)。 */
+  .ml-app .host-card .card-btn {
+    padding: 12px;
+    margin: -12px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* .color-input (input[type=color], 42x28 固定) は置換要素なので疑似要素で当たり判定を
+   * 重ねられない (ブラウザが要素自身の描画だけをヒットテストする)。代わりに mobile-launcher.ts
+   * 側で <label class="ml-tap44"> に包み、label の余白タップをネイティブの「ラベル→紐付く
+   * コントロールへのクリック転送」に委ねる。swatch (.color-input) 自体には触れないため
+   * 42x28 の見た目はそのまま (display:inline-flex は幅を問わず上で常時適用済み)。 */
+  .ml-app .ml-tap44 {
+    padding: 8px;
+    margin: -8px;
+  }
+
+  /* .switch (42x24) はスイッチの見た目 (.slider) を変えない、と明示要求されている。
+   * .slider は親 (.switch) の position:relative を基準に inset:0 で敷き詰められているため、
+   * 素直に .switch へ padding を足すと slider ごと拡大してしまう。padding 分だけ slider の
+   * inset をずらして元の 42x24 の見た目位置に固定し直す。 */
+  .ml-app .switch {
+    padding: 10px;
+    margin: -10px;
+    box-sizing: content-box;
+  }
+  .ml-app .switch .slider {
+    inset: 10px;
+  }
+
+  /* .settings-tab は下端に active タブの下線 (::after, bottom:0) があるため、下方向へ padding を
+   * 足すと下線の位置がずれる。上方向だけ広げて高さを稼ぎ、見た目 (下線位置・文字位置は
+   * padding-bottom 側で維持) を変えない。 */
+  .ml-app .settings-tab {
+    padding-top: 18px;
+    margin-top: -8px;
+  }
+
+  /* トグル (.switch) 行だけ縦積みを解除し「ラベル左 / スイッチ右」の 1 行に戻す。縦に離すと
+   * どの説明文がどのスイッチに対応するか分かりにくくなるため。値選択系 (select/数値/カラー) は
+   * 選択肢ラベルが長く 1 行では潰れるので縦積みのまま維持する。タップ領域 44px 確保
+   * (.ml-app .switch の padding:10px / margin:-10px、.slider の inset:10px) はそのまま残す。 */
+  .ml-app .setting-row.ml-row-toggle {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+  .ml-app .setting-row.ml-row-toggle > .s-meta {
+    flex: 1;
+    min-width: 0;
+  }
+  .ml-app .setting-row.ml-row-toggle > .switch {
+    align-self: center;
+    flex-shrink: 0;
+  }
+}
+
+/* タブレット幅の全幅化。481px から「タブレット」扱いだが、2 カラム化は撤回済み
+ * (2 列にすると左右に視線が飛び、設定項目の並び順が追いにくくなったため)。ここでやるのは
+ * 1 カラムのまま画面を全幅で使う (760px 上限解除) ことだけで、行内のレイアウト
+ * (ラベル左 / コントロール右端) は launcher.css のデスクトップ既定をそのまま使う。
+ * 一度 `.s-meta` に上限幅を与えてコントロールをラベル側へ寄せたが、コントロールが行の中央付近に
+ * 浮いて右に大きな余白が残る見た目になったため撤回した (右端揃えの方が行間で位置が揃い読みやすい)。
+ * launcher.css はデスクトップと共有で編集禁止のため、打ち消しは必ずこちら側の上書きで行う
+ * (既存の @media (max-width: 480px) と同じ流儀)。セレクタは全て .ml-app 配下にスコープし、
+ * デスクトップ版ランチャー (`.launcher` 配下、こちらは対象外) に影響しないようにする。 */
+@media (min-width: 700px) {
+  /* デスクトップのウィンドウ幅想定の 760px 上限はタブレット全画面表示には合わないため外す。 */
+  .ml-app .settings-tabs,
+  .ml-app .settings-sect {
+    max-width: none;
+  }
+}

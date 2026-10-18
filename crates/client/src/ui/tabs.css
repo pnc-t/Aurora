@@ -1,0 +1,407 @@
+/* capture ウィンドウ上部のタブストリップ。toolbar とは別の常時表示バー。 */
+
+#tabbar {
+  position: fixed;
+  z-index: 4000;
+  /* 既定は上配置 (pos-top が付くまでのフォールバック)。配置は pos-* で切り替える。 */
+  top: 0;
+  left: 0;
+  right: 0;
+}
+
+/* --- 配置: 上/下 (横帯) --- */
+#tabbar.pos-top {
+  top: 0; left: 0; right: 0; bottom: auto; width: auto; height: auto;
+}
+#tabbar.pos-bottom {
+  bottom: 0; left: 0; right: 0; top: auto; width: auto; height: auto;
+}
+/* --- 配置: 左/右 (縦サイドタブ) --- */
+#tabbar.pos-left {
+  left: 0; top: 0; bottom: 0; right: auto; width: var(--tabstrip-w, 200px);
+}
+#tabbar.pos-right {
+  right: 0; top: 0; bottom: 0; left: auto; width: var(--tabstrip-w, 200px);
+}
+
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  height: 36px;
+  padding: 0;
+  /* 不透明にする (--toolbar-bg は 4% 透過)。格納中のツールバーは自身の寸法基準 (-130%) で
+   * しか退避せず、タブ帯の inset 分だけ帯の裏に残留するため、透過だと裏のバーが透けて見える。 */
+  background: var(--panel);
+  border-bottom: 1px solid var(--panel-border);
+  box-shadow: 0 1px 4px var(--shadow);
+}
+
+/* 縦サイドタブ (左/右) は不透明な帯が映像と重なる。フルスクリーン以外では映像エリアを
+ * その厚み分だけ内側へ寄せ、リモート画面が隠れないようにする。フルスクリーン中 (body.tab-fs)
+ * は自動格納されるため寄せず端まで映す。 */
+body.tab-left:not(.tab-fs) #screen-wrap {
+  left: var(--tabstrip-w, 200px);
+}
+body.tab-right:not(.tab-fs) #screen-wrap {
+  right: var(--tabstrip-w, 200px);
+}
+
+/* 下配置: 区切り線と影を下端側へ。 */
+#tabbar.pos-bottom .tabstrip {
+  border-bottom: none;
+  border-top: 1px solid var(--panel-border);
+  box-shadow: 0 -1px 4px var(--shadow);
+}
+
+/* 左/右配置: Brave 風サイドバー。ストリップ全体を縦に積み、全高を占める。
+ * gap は横帯の 0 (一体型の帯) とは目的が違い、行同士が呼吸できる最小限の隙間として入れる。 */
+#tabbar.pos-left .tabstrip,
+#tabbar.pos-right .tabstrip {
+  flex-direction: column;
+  height: 100%;
+  align-items: stretch;
+  padding: 6px;
+  gap: 2px;
+  border-bottom: none;
+}
+#tabbar.pos-left .tabstrip {
+  border-right: 1px solid var(--panel-border);
+  box-shadow: 1px 0 4px var(--shadow);
+}
+#tabbar.pos-right .tabstrip {
+  border-left: 1px solid var(--panel-border);
+  box-shadow: -1px 0 4px var(--shadow);
+}
+#tabbar.pos-left .tabstrip-list,
+#tabbar.pos-right .tabstrip-list {
+  flex-direction: column;
+  gap: 2px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.tabstrip svg.icon {
+  display: block;
+}
+
+.tabstrip-list {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  /* flex:1 にしない。「+」をタブ列の直後に置くため、余白は tabstrip-spacer が引き受ける。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabstrip-list::-webkit-scrollbar {
+  display: none;
+}
+
+/* タブ以外の余白 = ウィンドウを掴むドラッグ領域。 */
+.tabstrip-spacer {
+  flex: 1;
+  min-width: 24px;
+}
+#tabbar.pos-left .tabstrip-spacer,
+#tabbar.pos-right .tabstrip-spacer {
+  min-width: 0;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 200px;
+  min-width: 100px;
+  padding: 0 10px;
+  border-right: 1px solid var(--panel-border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.tab:hover {
+  background: var(--control-hover);
+}
+.tab.active {
+  background: var(--raised);
+  color: var(--fg);
+}
+/* 一体型の帯: アクティブタブが「接している」側 (映像に近い端) にアクセントラインを引く。 */
+#tabbar.pos-top .tab.active {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+#tabbar.pos-bottom .tab.active {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+.tab-dot.connecting {
+  background: var(--accent);
+  animation: tab-pulse 1.2s ease-in-out infinite;
+}
+.tab-dot.connected {
+  background: var(--ok);
+}
+.tab-dot.error {
+  background: var(--danger);
+}
+
+@keyframes tab-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.7;
+}
+.tab-close:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+  opacity: 1;
+}
+
+/* ドラッグ中の元タブは半透明スロットに、分身 (clone) がカーソルへ追従する。 */
+.tab.tab-dragging {
+  opacity: 0.4;
+}
+.tab-drag-clone {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0.9;
+  box-shadow: 0 6px 16px var(--shadow);
+  /* クローンは body 直下に浮くため、タブの transparent 背景のままだと見えなくなる。 */
+  background: var(--raised);
+  color: var(--fg);
+  border-radius: 6px;
+}
+
+/* 横配置: タブ列直後の小さな正方ゴースト。 */
+.tab-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  margin: 3px 4px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+}
+.tab-add:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+.tab-add-label {
+  display: none;
+}
+
+/* 折りたたみトグルは縦配置専用。横配置では出さない。 */
+.tab-collapse {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.tab-collapse:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+
+/* --- 縦配置 (左/右): Brave 風サイドバー --- */
+#tabbar.pos-left .tab-collapse,
+#tabbar.pos-right .tab-collapse {
+  display: flex;
+  margin-bottom: 2px;
+}
+#tabbar.pos-left .tab-collapse {
+  align-self: flex-end;
+}
+#tabbar.pos-right .tab-collapse {
+  align-self: flex-start;
+}
+/* chevron (右向き) を「しまう方向」へ回す。pos-left は左が閉じる方向、pos-right は右。 */
+#tabbar.pos-left .tab-collapse svg {
+  transform: rotate(180deg);
+  transition: transform 0.15s;
+}
+#tabbar.pos-left.collapsed .tab-collapse svg {
+  transform: rotate(0deg);
+}
+#tabbar.pos-right .tab-collapse svg {
+  transform: rotate(0deg);
+  transition: transform 0.15s;
+}
+#tabbar.pos-right.collapsed .tab-collapse svg {
+  transform: rotate(180deg);
+}
+
+/* 縦配置では各タブを行スタイルにする (横並び前提の border-right/max-width を打ち消す)。
+ * min-width も打ち消さないと折りたたみ (内寸 32px) でタブが溢れ、ドットが列の
+ * overflow-x: hidden に刈られて見えなくなる。 */
+#tabbar.pos-left .tab,
+#tabbar.pos-right .tab {
+  max-width: none;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 8px;
+  border-right: none;
+  border-radius: 6px;
+}
+#tabbar.pos-left .tab.active,
+#tabbar.pos-right .tab.active {
+  box-shadow: none;
+}
+
+/* 縦配置の「+」: Brave の「＋ 新しいタブ」行。全幅の中央に + だけを置く従来スタイルをやめ、
+ * ラベル付きの行としてタブと並べる。 */
+#tabbar.pos-left .tab-add,
+#tabbar.pos-right .tab-add {
+  width: auto;
+  min-height: 32px;
+  margin: 0;
+  padding: 0 8px;
+  justify-content: flex-start;
+  gap: 8px;
+  border-radius: 6px;
+}
+#tabbar.pos-left .tab-add-label,
+#tabbar.pos-right .tab-add-label {
+  display: inline;
+  font-size: 12px;
+}
+
+/* 折りたたみ (縦配置のみ): ラベル類を隠し、状態ドットだけの行にする。 */
+#tabbar.collapsed.pos-left .tab-label,
+#tabbar.collapsed.pos-right .tab-label,
+#tabbar.collapsed.pos-left .tab-close,
+#tabbar.collapsed.pos-right .tab-close,
+#tabbar.collapsed.pos-left .tab-add-label,
+#tabbar.collapsed.pos-right .tab-add-label {
+  display: none;
+}
+#tabbar.collapsed.pos-left .tab,
+#tabbar.collapsed.pos-right .tab,
+#tabbar.collapsed.pos-left .tab-add,
+#tabbar.collapsed.pos-right .tab-add {
+  justify-content: center;
+  padding: 0;
+}
+#tabbar.collapsed.pos-left .tab-collapse,
+#tabbar.collapsed.pos-right .tab-collapse {
+  align-self: center;
+}
+
+/* ツールバー帯 (#topbar) とタブストリップの重なり回避。同じ端だけでなく直交する配置
+ * (例: ツールバー上 × タブ右) でも、タブストリップの厚み分だけ帯自体を inset する。
+ * ピルの margin でなく帯を寄せることで、横帯の中央寄せも「タブを除いた映像エリア」基準に
+ * なり、ピルが伸びてもタブ列に重ならない (id+class でセレクタ優先度を確保)。
+ * フルスクリーン中 (body.tab-fs) はタブストリップが display:none になるので、寄せると
+ * ピルだけが端から内側へずれて見える。tab-fs では寄せない (#screen-wrap と同じ扱い)。 */
+body.tab-top:not(.tab-fs) #topbar.pos-top,
+body.tab-top:not(.tab-fs) #topbar.vertical {
+  top: var(--tabstrip-h, 37px);
+}
+body.tab-bottom:not(.tab-fs) #topbar.pos-bottom,
+body.tab-bottom:not(.tab-fs) #topbar.vertical {
+  bottom: var(--tabstrip-h, 37px);
+}
+body.tab-left:not(.tab-fs) #topbar.pos-left,
+body.tab-left:not(.tab-fs) #topbar.pos-top,
+body.tab-left:not(.tab-fs) #topbar.pos-bottom {
+  left: var(--tabstrip-w, 200px);
+}
+body.tab-right:not(.tab-fs) #topbar.pos-right,
+body.tab-right:not(.tab-fs) #topbar.pos-top,
+body.tab-right:not(.tab-fs) #topbar.pos-bottom {
+  right: var(--tabstrip-w, 200px);
+}
+
+/* --- タブ/隙間の右クリックメニュー --- */
+.tab-ctx-menu {
+  position: fixed;
+  z-index: 10001; /* ドラッグクローン (10000) より前面 */
+  display: none;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border-radius: 8px;
+  background: var(--control);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 8px 24px var(--shadow);
+}
+.tab-ctx-menu.visible {
+  display: flex;
+}
+.tab-ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+.tab-ctx-item:hover {
+  background: var(--menu-hover);
+}
+.tab-ctx-item.danger {
+  color: var(--danger-fg);
+}
+.tab-ctx-item svg.icon {
+  display: block;
+  font-size: 14px;
+}
+
+/* フルスクリーン中はタブストリップを完全に隠す。常時表示のままだと不透明な帯が
+ * リモート映像を覆い画面端に黒帯が残るうえ、没入時にタブは不要なため、端ホバーでも
+ * 出さず単純に display:none にする (ツールバーピルだけが端ホバーで一時表示される)。 */
+#tabbar.hidden {
+  display: none;
+}

@@ -1,0 +1,186 @@
+/* 接続中の操作ツールバー (toolbar.ts)。
+ * フローティングのピル型: 上端に張り付く全幅バーではなく、透明な帯 (#topbar) の中に
+ * 角丸+影のピル (.tb-pill) を 1 枚浮かせて中央に配置する。既定で常時表示。
+ * Ctrl+Alt+Shift+B で隠す/戻すときだけ transform で帯ごとスライドする。
+ * 操作はフラットなアイコンボタン (.tb-btn) を機能ごとに .tb-group へまとめ、.tb-sep で区切る。 */
+
+/* 透明な帯。ピルを浮かべるだけのコンテナ。背景・枠は持たない。
+ * 帯の余白部分も data-tauri-drag-region でウィンドウ移動の掴みどころにする。
+ * 配置 (上下左右) は pos-* クラスで切り替える。left/right は .vertical で縦並びになる。 */
+#topbar {
+  position: fixed; z-index: 30;
+  display: flex;
+  background: none; border: none;
+  transition: transform 0.2s ease;
+  /* 帯 (ピル以外の余白) はクリックを素通しさせ、背後の映像 canvas (リモート操作) へ
+   * 届かせる。これが無いと帯がポインタを食い、端でリモートを操作できず、
+   * ドラッグ領域指定と相まってウィンドウ移動になってしまう。操作可なのはピルのみ。 */
+  pointer-events: none;
+}
+
+/* --- 配置: 上/下 (横帯) --- */
+#topbar.pos-top, #topbar.pos-bottom {
+  left: 0; right: 0; padding: 8px 12px;
+  justify-content: center;
+}
+#topbar.pos-top { top: 0; align-items: flex-start; transform: translateY(-130%); }
+#topbar.pos-bottom { bottom: 0; align-items: flex-end; transform: translateY(130%); }
+
+/* --- 配置: 左/右 (縦サイドバー) --- */
+#topbar.pos-left, #topbar.pos-right {
+  top: 0; bottom: 0; padding: 12px 8px;
+  flex-direction: column; justify-content: center;
+}
+#topbar.pos-left { left: 0; align-items: flex-start; transform: translateX(-130%); }
+#topbar.pos-right { right: 0; align-items: flex-end; transform: translateX(130%); }
+
+/* 表示時は元位置へ (各軸でスライドイン)。 */
+#topbar.visible { transform: translate(0, 0); }
+
+/* 浮島ピル本体。角丸 + 影 + 薄い枠で映像の上にふわっと浮かせる。 */
+.tb-pill {
+  pointer-events: auto; /* 帯は素通しだがピル自身は操作/ドラッグ移動可 */
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 5px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px var(--shadow), 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+
+/* 機能グループと区切り線 (ピル内なので短く控えめに) */
+.tb-group { display: inline-flex; align-items: center; gap: 2px; }
+.tb-sep { width: 1px; height: 18px; align-self: center; margin: 0 4px; background: var(--panel-border); opacity: 0.8; }
+
+/* --- 縦サイドバー (left/right 配置) ---
+ * ピルと内部の並び方向を縦にし、区切り線も横線へ向きを変える。 */
+#topbar.vertical .tb-pill { flex-direction: column; }
+#topbar.vertical .tb-group { flex-direction: column; }
+#topbar.vertical .tb-sep { width: 18px; height: 1px; margin: 4px 0; }
+#topbar.vertical .window-controls { flex-direction: column; }
+
+/* --- ポップオーバー化するコントロール群 (画質/解像度/ディスプレイ) ---
+ * テキストを持つコントロールはどの向きでもピルを長くするため、全配置でアイコン
+ * (.tb-pop-trigger) に畳み、クリックでバー脇にパネル (.tb-pop-panel) を開く。
+ * これでピルはアイコンボタンだけの一定幅になる (カスタム時の fps/Mbps 入力も
+ * パネル内に収まり、ピル幅が状況で伸縮しない)。 */
+.tb-popgroup { display: inline-flex; align-items: center; justify-content: center; position: relative; }
+.tb-pop-trigger { display: inline-flex; }
+.tb-pop-panel {
+  position: absolute; z-index: 40;
+  display: none; /* .pop-open まで隠す */
+  align-items: center; gap: 6px;
+  padding: 8px 10px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px var(--shadow);
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+.tb-popgroup.pop-open .tb-pop-panel { display: inline-flex; }
+/* 保険: 帯が格納中 (.visible なし) はパネルを描画しない。JS はバー非表示化で
+ * ポップオーバーを畳むが、状態遷移の取りこぼしがあっても浮いたパネルだけが
+ * 画面に残る事故をここで確実に防ぐ。 */
+#topbar:not(.visible) .tb-pop-panel { display: none; }
+/* 開く向き: 帯の反対側へ。横帯はトリガ中心の下/上、縦バーは脇 (左バー→右・右バー→左)。 */
+#topbar.pos-top .tb-pop-panel { top: 100%; margin-top: 10px; left: 50%; transform: translateX(-50%); }
+#topbar.pos-bottom .tb-pop-panel { bottom: 100%; margin-bottom: 10px; left: 50%; transform: translateX(-50%); }
+#topbar.pos-left .tb-pop-panel { left: 100%; margin-left: 10px; top: 0; }
+#topbar.pos-right .tb-pop-panel { right: 100%; margin-right: 10px; top: 0; }
+#topbar.vertical .tb-popgroup { width: 100%; }
+
+/* メニュー型パネル: パネル自体が選択肢リスト (アイコン → 一段で選択肢)。 */
+.tb-pop-panel.tb-menu { flex-direction: column; align-items: stretch; padding: 6px; min-width: 190px; }
+.tb-menu-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border: none; border-radius: 8px;
+  background: transparent; color: var(--fg);
+  font-size: 12px; text-align: left; white-space: nowrap; cursor: pointer;
+}
+.tb-menu-item:hover { background: var(--menu-hover); }
+/* チェック列は常に幅を確保し、非選択でも項目のラベル位置を揃える。 */
+.tb-menu-check { width: 16px; display: inline-flex; color: var(--accent); visibility: hidden; }
+.tb-menu-item[aria-checked="true"] .tb-menu-check { visibility: visible; }
+.tb-custom { display: none; align-items: center; gap: 4px; padding: 6px 10px; font-size: 12px; color: var(--muted); }
+
+/* フラットなアイコンボタン: 既定は枠なし・透明、ホバー時だけ淡い背景。 */
+.tb-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 30px; padding: 0; font-size: 17px;
+  background: transparent; color: var(--fg);
+  border: none; border-radius: 9px; cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.tb-btn:hover { background: var(--menu-hover); }
+.tb-btn:active { background: var(--control-hover); }
+.tb-btn.toggled { background: var(--accent); color: var(--accent-fg); }
+.tb-btn.toggled:hover { background: var(--accent); filter: brightness(1.08); }
+.tb-btn.danger { color: var(--danger-fg); }
+.tb-btn.danger:hover { background: var(--danger); color: #fff; }
+
+/* --- 音量ポップ (音声ボタンのホバーで開く) ---
+ * クリックは従来通りミュートトグルに割り当て済みのため、既存の .tb-popgroup (クリック開閉)
+ * とは別に、ホバーのみで開閉する軽量な実装にする。CSS の :hover だけで完結させ、JS 側で
+ * 開閉状態を持たない (display は audioAvailable の切替のみ JS が行う)。
+ * 向き: 横帯 (top/bottom) は下/上に開く。縦サイドバー (left/right) は反対側の脇に開く
+ * (他の .tb-pop-panel と同じ規約)。 */
+.tb-audiogroup { display: inline-flex; align-items: center; position: relative; }
+.tb-audio-pop {
+  position: absolute; z-index: 40;
+  display: none; /* 既定非表示。:hover でのみ出す */
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px var(--shadow);
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+.tb-audiogroup:hover .tb-audio-pop { display: inline-flex; }
+#topbar:not(.visible) .tb-audio-pop { display: none; } /* バー格納中は保険で必ず隠す */
+/* ポップは必ずトリガー (.tb-audiogroup) に接して開く。隙間 (margin) を空けると、
+ * ポップは absolute で親の hover ボックスを広げないため、ボタン→スライダーへ
+ * カーソルを動かす途中の隙間で :hover が切れてポップが消え、スライダーに届かない
+ * (実機で「さわれない」バグの原因)。視覚的余白は各要素の影/内側 padding で足りる。
+ * 接する側に見た目の間を作るため透明ボーダーで数 px だけ離す (hover は途切れない)。 */
+#topbar.pos-top .tb-audio-pop { top: 100%; border-top: 6px solid transparent; left: 50%; transform: translateX(-50%); }
+#topbar.pos-bottom .tb-audio-pop { bottom: 100%; border-bottom: 6px solid transparent; left: 50%; transform: translateX(-50%); }
+#topbar.pos-left .tb-audio-pop { left: 100%; border-left: 6px solid transparent; top: 0; }
+#topbar.pos-right .tb-audio-pop { right: 100%; border-right: 6px solid transparent; top: 0; }
+/* #topbar 側の `input { cursor: text }` (fps/Mbps 用) を打ち消すため #topbar を含めて
+ * 詳細度を上げる (ID セレクタには詳細度で勝つ必要がある)。 */
+#topbar .tb-audio-pop input[type="range"] {
+  width: 100px; accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ディスプレイ切替 (複数ディスプレイ時のみ表示。display は JS が制御) */
+#display-wrap { display: none; align-items: center; gap: 4px; margin-left: 2px; }
+
+/* 画質プリセット + (カスタム時のみ) fps/Mbps 手動入力 */
+.tb-custom input {
+  width: 42px; text-align: right; background: var(--control); color: var(--fg);
+  border: 1px solid transparent; border-radius: 7px; padding: 4px 6px;
+}
+.tb-custom input:focus { outline: none; border-color: var(--accent); }
+
+/* ドラッグ可能領域は移動カーソルにして掴めることを示す。 */
+[data-tauri-drag-region] { cursor: grab; }
+/* 操作要素はドラッグ領域内でも通常カーソルに戻す。 */
+.tb-btn, #topbar input, .winctl { cursor: pointer; }
+#topbar input { cursor: text; }
+
+/* ピル右端のウィンドウ操作 (フレームレス用)。共有 .winctl の見た目を打ち消し、
+ * ボタンと同じフラットな佇まいに揃える。 */
+#topbar .window-controls { position: static; display: flex; height: auto; margin-left: 2px; gap: 2px; }
+#topbar .winctl {
+  width: 34px; height: 30px; padding: 0; border: none; border-radius: 9px;
+  background: transparent; color: var(--muted);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+#topbar .winctl:hover { background: var(--winctl-hover); color: var(--fg); }
+#topbar .winctl.close:hover { background: var(--danger); color: #fff; }

@@ -1,0 +1,111 @@
+/* 自作ドロップダウン (ネイティブ select の置き換え)。
+ * 見た目はツールバーの .tb-menu と揃え、トリガは従来の .select-input と同じ
+ * 枠・角丸にして設定行やダイアログのレイアウトを変えない。 */
+
+.sel-wrap {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+/* 元の select は値の保持と change 伝播のために DOM に残し、視覚的にだけ消す。 */
+.sel-wrap > select.select-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sel-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  background: var(--control);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.sel-trigger:hover {
+  background: var(--control-hover);
+}
+.sel-trigger:focus-visible,
+.sel-wrap.open .sel-trigger {
+  outline: none;
+  border-color: var(--accent);
+}
+.sel-trigger-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.sel-trigger-caret {
+  display: inline-flex;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+/* パネルは body 直下に出す (position: fixed)。ダイアログや設定ページは
+ * overflow: auto のスクロール領域で、内側に置くと下端で切れてしまうため。
+ * 位置は JS がトリガの矩形から算出して left/top/min-width を直接指定する。 */
+.sel-panel {
+  position: fixed;
+  z-index: 60;
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px var(--shadow);
+}
+.sel-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sel-item:hover,
+.sel-item:focus-visible {
+  outline: none;
+  background: var(--menu-hover);
+}
+/* チェック列は常に幅を取り、非選択でもラベル位置を揃える (.tb-menu と同じ規約)。 */
+.sel-item-check {
+  width: 16px;
+  display: inline-flex;
+  color: var(--accent);
+  visibility: hidden;
+}
+.sel-item[aria-selected="true"] .sel-item-check {
+  visibility: visible;
+}
+
+/* ダイアログ内は 1 行 1 コントロールなので幅いっぱいに広げる。 */
+.dialog .sel-wrap {
+  display: flex;
+  width: 100%;
+}
+.dialog .sel-trigger {
+  width: 100%;
+  box-sizing: border-box;
+}

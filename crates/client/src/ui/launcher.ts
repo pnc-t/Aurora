@@ -1,0 +1,1663 @@
+// 未接続時のランチャー画面。
+// 左サイドバー (ブランド + Hosts/Settings ナビ + 接続ステータス) と、
+// 右に「保存ホストのカード一覧」/「設定」ページを切り替えて表示する。
+// ＋追加はパスワード無しで即一覧へ保存。カード押下で接続。
+//
+// パスワードは接続成功時に DPAPI で暗号化保存される (Rust 側 secret.rs)。保存済みの
+// host は鍵マーク付きで、カード押下時にダイアログを出さず即接続する (平文はフロントに
+// 載せず Rust が復号して使う)。未保存の host は従来どおりパスワード入力ダイアログ。
+// recent_hosts.json (config.rs) には引き続き { label, host, port } のみ保持する。
+
+import {
+  MAX_MBPS,
+  connectedHosts,
+  disconnectHost,
+  deleteRecentHost,
+  deleteHostPassword,
+  DEFAULT_SETTINGS,
+  focusHostWindow,
+  loadRecentHosts,
+  loadSettings,
+  probeHosts,
+  saveRecentHost,
+  savedPasswordHosts,
+  setRecentHosts,
+  saveSettings,
+  openLogsFolder,
+  exportLogsZip,
+  myDeviceFingerprint,
+  type ClientSettings,
+  type HostEntry,
+  type HostOverrides,
+  type StatsPosition,
+  type ThemeId,
+  type ToolbarPosition,
+} from "../core/ipc";
+import { getVersion } from "@tauri-apps/api/app";
+import { probeSupportedCodecs, type CodecChoice } from "../core/codec";
+import { logger } from "../core/log";
+import { checkForUpdate, installPendingUpdate } from "../core/update";
+import { emit, listen } from "@tauri-apps/api/event";
+import {
+  findPreset,
+  matchPreset,
+  presetOptionsHtml,
+  VIDEO_PRESETS,
+  CUSTOM_PRESET_ID,
+} from "../core/video-presets";
+import { mountWindowControls } from "./window-controls";
+import { applyAriaLabels, trapFocus } from "../core/a11y";
+import {
+  SHORTCUTS,
+  applyShortcutBindings,
+  bindingFromEvent,
+  bindingLabel,
+  bindingsEqual,
+  defaultBinding,
+  effectiveBinding,
+  formatBinding,
+  isModifierOnlyCode,
+  setRecordingActive,
+  validateBinding,
+  type LocalHotkey,
+} from "../core/shortcuts";
+import { icon } from "./icons";
+import { avatarColor, hasImageIcon, imageToIconDataUrl } from "./avatar";
+import { mountWolPanel } from "./wol-panel";
+import { enhanceSelects } from "./select-menu";
+import "./launcher.css";
+
+// password に null を渡すと Rust 側が保存済みパスワード (DPAPI) を使って接続する。
+// newWindow=true は接続中ホストへ「新しいウィンドウで接続」した場合 (通常接続は false)。
+type ConnectCallback = (
+  entry: HostEntry,
+  password: string | null,
+  save: boolean,
+  newWindow: boolean,
+) => Promise<void>;
+type ConnState = "idle" | "connecting" | "connected" | "error";
+
+export type LauncherHandle = {
+  show: () => void;
+  hide: () => void;
+  setConnecting: (connecting: boolean) => void;
+  setConnState: (text: string, kind?: ConnState) => void;
+  refreshHosts: () => Promise<void>;
+  getSettings: () => ClientSettings;
+};
+
+/** コーデック select の表示ラベル。 */
+const CODEC_LABELS: Record<Exclude<CodecChoice, "auto">, string> = {
+  h264: "H.264",
+  hevc: "HEVC",
+  av1: "AV1",
+};
+
+// ブラウザ (WebCodecs) が実際に対応するコーデック一覧。起動時に 1 回プローブしてここへ反映し、
+// select の非対応選択肢を disabled にする (probeSupportedCodecs 自体もモジュールスコープで
+// キャッシュされるので、ランチャー/ホスト編集ダイアログ間で再プローブは走らない)。
+let supportedCodecs: CodecChoice[] = [];
+
+/** コーデック `<select>` の option 一覧。includeDefault=true でホスト別 override 用の
+ *  「既定に従う」を先頭に足す。非対応コーデックは disabled + 「(非対応)」表記にする。 */
+function codecOptionsHtml(includeDefault: boolean): string {
+  const items: string[] = [];
+  if (includeDefault) items.push(`<option value="default">既定に従う</option>`);
+  items.push(`<option value="auto">自動</option>`);
+  (["h264", "hevc", "av1"] as const).forEach((c) => {
+    const ok = supportedCodecs.includes(c);
+    items.push(`<option value="${c}"${ok ? "" : " disabled"}>${CODEC_LABELS[c]}${ok ? "" : " (非対応)"}</option>`);
+  });
+  return items.join("");
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c,
+  );
+}
+
+/** 数値入力の検証結果。ok なら value がそのまま使える整数。 */
+type NumValidation = { ok: true; value: number } | { ok: false; message: string };
+
+/** fps 上限: 0 以上の整数 (0 = 無制限)。 */
+function validateFps(raw: string): NumValidation {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) return { ok: false, message: "0 以上の整数を入れてください" };
+  return { ok: true, value: n };
+}
+/** ビットレート上限 (Mbps): 1〜MAX_MBPS の整数。 */
+function validateMbps(raw: string): NumValidation {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > MAX_MBPS) {
+    return { ok: false, message: `1〜${MAX_MBPS} の整数を入れてください` };
+  }
+  return { ok: true, value: n };
+}
+/** ポート番号: 1〜65535 の整数。 */
+function validatePort(raw: string): NumValidation {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    return { ok: false, message: "1〜65535 の数値を入れてください" };
+  }
+  return { ok: true, value: n };
+}
+
+/** 数秒だけ表示して自動で消える行内エラー (既存の .shortcut-error 体裁を流用)。 */
+function flashInlineError(el: HTMLElement | null, message: string): void {
+  if (!el) return;
+  el.textContent = message;
+  window.setTimeout(() => {
+    if (el.textContent === message) el.textContent = "";
+  }, 3000);
+}
+
+/** アクセント色を CSS 変数へ反映する (全 UI へ波及)。 */
+function applyAccent(color: string): void {
+  document.documentElement.style.setProperty("--accent", color);
+}
+
+/**
+ * 配色テーマを <html data-theme> へ反映する (styles/base.css が配色を切り替える)。
+ * どのテーマでもユーザー設定のアクセント色を効かせる (legacy のグレー調も含む)。
+ */
+function applyTheme(theme: ThemeId, accent: string): void {
+  document.documentElement.dataset.theme = theme;
+  applyAccent(accent);
+}
+
+export function mountLauncher(opts: { root: HTMLElement; onConnect: ConnectCallback }): LauncherHandle {
+  // ショートカット一覧の行は単一定義 (core/shortcuts.ts) から生成する。
+  // desc は静的定数なので HTML へ直接埋め込んでよい (ホスト由来データではない)。
+  // キー表記はボタン化し、クリックで新しい組合せを記録できる (割当は #set-shortcuts 以下で配線)。
+  const shortcutRows = SHORTCUTS.map(
+    (s) => `
+            <div class="setting-row" data-shortcut-id="${s.id}">
+              <div class="s-meta"><div class="s-title">${s.desc}</div></div>
+              <div class="shortcut-edit">
+                <span class="shortcut-error" data-shortcut-error></span>
+                ${s.id === "toggle-fullscreen" ? `<span class="kbd">F11</span><span class="shortcut-slash">/</span>` : ""}
+                <button type="button" class="kbd kbd-btn" data-shortcut-btn title="クリックしてキーを変更"></button>
+                <button type="button" class="icon-btn shortcut-reset" data-shortcut-reset title="既定に戻す">${icon("refresh")}</button>
+              </div>
+            </div>`,
+  ).join("");
+
+  opts.root.innerHTML = `
+    <div class="launcher">
+      <div class="titlebar" data-tauri-drag-region>
+        <div class="window-controls" id="win-controls"></div>
+      </div>
+      <aside class="sidebar">
+        <button class="nav-item active" data-page="hosts" title="Hosts"><span class="ico">${icon("hosts")}</span></button>
+        <button class="nav-item" data-page="wol" title="Wake on LAN"><span class="ico">${icon("bolt")}</span></button>
+        <div class="sidebar-spacer"></div>
+        <button class="nav-item" data-page="settings" title="Settings"><span class="ico">${icon("settings")}</span></button>
+      </aside>
+      <main class="content">
+        <div class="update-banner" id="update-banner" hidden>
+          <span class="update-icon"></span>
+          <span class="update-text" id="update-text"></span>
+          <button type="button" class="update-btn" id="update-install">今すぐ更新</button>
+          <button type="button" class="update-dismiss" id="update-dismiss" title="閉じる">×</button>
+        </div>
+        <section class="page active" id="page-hosts">
+          <div class="page-head">
+            <h2>Hosts</h2>
+            <div class="actions">
+              <button class="icon-btn" id="probe-refresh" title="オンライン状態を更新">${icon("refresh")}</button>
+              <button class="icon-btn" id="add-host" title="ホストを追加">${icon("add")}</button>
+            </div>
+          </div>
+          <div class="host-list" id="host-list"></div>
+        </section>
+        <section class="page" id="page-wol"></section>
+        <section class="page" id="page-settings">
+          <div class="page-head"><h2>Settings</h2></div>
+          <div class="settings-tabs">
+            <button type="button" class="settings-tab active" data-sect="av">映像・接続</button>
+            <button type="button" class="settings-tab" data-sect="display">表示</button>
+            <button type="button" class="settings-tab" data-sect="other">その他</button>
+          </div>
+          <div class="settings-body">
+            <div class="settings-sect active" data-sect="av">
+              <div class="setting-group">映像 (接続時にホストへ適用)</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">画質プリセット</div>
+                  <div class="s-desc">fps とビットレートをまとめて設定。手動で変えるとカスタムになる</div>
+                </div>
+                <select id="set-preset" class="select-input">${presetOptionsHtml()}</select>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">送出 fps 上限</div>
+                  <div class="s-desc">0 で無制限。高リフレッシュレートで遅延が増えるのを防ぐ</div>
+                </div>
+                <span class="shortcut-error" data-num-error="fps"></span>
+                <input type="text" inputmode="numeric" id="set-fps" class="num-input" />
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">ビットレート上限 (Mbps)</div>
+                  <div class="s-desc">この値を上限に、輻輳時は自動で下げる (適応制御)</div>
+                </div>
+                <span class="shortcut-error" data-num-error="mbps"></span>
+                <input type="text" inputmode="numeric" id="set-mbps" class="num-input" />
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">映像コーデック</div>
+                  <div class="s-desc">自動はホストと対応コーデックを相談して選ぶ。手動でこの端末が非対応のものを選ぶと H.264 にフォールバックする</div>
+                </div>
+                <select id="set-codec" class="select-input">${codecOptionsHtml(false)}</select>
+              </div>
+              </div>
+              <div class="setting-group">接続</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">切断時に自動で再接続</div>
+                  <div class="s-desc">通信断などで切れたとき、間隔を空けて自動的に接続し直す</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-reconnect" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">接続時に自動フルスクリーン</div>
+                  <div class="s-desc">接続が成立したら全画面表示にする</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-fullscreen" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">統計 HUD を表示</div>
+                  <div class="s-desc">接続時に fps / ビットレート / RTT / loss を右上に表示</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-stats" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">マウスキャプチャを自動で有効化</div>
+                  <div class="s-desc">接続時にポインタロック (相対マウス) を有効化。Esc で解除</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-capture" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">キャプチャ中にキーボードを占有</div>
+                  <div class="s-desc">Win キーや Alt+Tab もリモートへ送る。OFF にすると手元の Windows に効く</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-grab-keyboard" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">仮想ディスプレイを使う (RDP 風)</div>
+                  <div class="s-desc">ホストに仮想ディスプレイがあれば、それをキャプチャしウィンドウに解像度を合わせる (黒帯解消)。物理画面とは別の空のデスクトップになる点に注意</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-virtual" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">クリップボードを同期</div>
+                  <div class="s-desc">この端末とホストの間でコピーした内容を相互に同期する。接続中はツールバーからも切り替えできる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-clipboard-sync" /><span class="slider"></span></label>
+              </div>
+              </div>
+              <div class="setting-group">音声</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">音声をミュート</div>
+                  <div class="s-desc">接続直後の音声をミュートで始める。ツールバーで切り替えるとここにも反映され、次の接続へ引き継がれる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-audio-muted" /><span class="slider"></span></label>
+              </div>
+              </div>
+            </div>
+            <div class="settings-sect" data-sect="display">
+              <div class="setting-group">ツールバー</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">配置</div>
+                  <div class="s-desc">操作バーを画面のどの端に置くか。左右に置くと縦並びのサイドバーになる</div>
+                </div>
+                <select id="set-tb-position" class="select-input">
+                  <option value="top">上</option>
+                  <option value="bottom">下</option>
+                  <option value="left">左</option>
+                  <option value="right">右</option>
+                </select>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">最初からピン留め (常時表示)</div>
+                  <div class="s-desc">OFF だと接続時は格納され、配置した端にカーソルを合わせると出てくる</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-tb-pinned" /><span class="slider"></span></label>
+              </div>
+              </div>
+              <div class="setting-group">タブ</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">配置</div>
+                  <div class="s-desc">接続先タブを画面のどの端に置くか。左右に置くと縦並びのサイドタブになる</div>
+                </div>
+                <select id="set-tab-position" class="select-input">
+                  <option value="top">上</option>
+                  <option value="bottom">下</option>
+                  <option value="left">左</option>
+                  <option value="right">右</option>
+                </select>
+              </div>
+              </div>
+              <div class="setting-group">統計 HUD</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">位置</div>
+                  <div class="s-desc">統計 HUD (fps/ビットレート/RTT/loss) を表示する隅</div>
+                </div>
+                <select id="set-stats-pos" class="select-input">
+                  <option value="tl">左上</option>
+                  <option value="tr">右上</option>
+                  <option value="bl">左下</option>
+                  <option value="br">右下</option>
+                </select>
+              </div>
+              </div>
+              <div class="setting-group">外観・既定値</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">テーマ</div>
+                  <div class="s-desc">配色。auto は OS のダーク/ライト設定に追従。legacy はグレーのクラシック調</div>
+                </div>
+                <select id="set-theme" class="select-input">
+                  <option value="auto">システム連動</option>
+                  <option value="dark">ダーク</option>
+                  <option value="light">ライト</option>
+                  <option value="legacy">レガシー</option>
+                </select>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">アクセントカラー</div>
+                  <div class="s-desc">ボタンや選択中の表示に使う色</div>
+                </div>
+                <input type="color" id="set-accent" class="color-input" />
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">新規ホストの既定ポート</div>
+                  <div class="s-desc">「＋追加」ダイアログの port 欄の初期値</div>
+                </div>
+                <span class="shortcut-error" data-num-error="port"></span>
+                <input type="text" inputmode="numeric" id="set-port" class="num-input" />
+              </div>
+              </div>
+            </div>
+            <div class="settings-sect" data-sect="other">
+              <div class="setting-group">ファイル共有</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">この PC をドライブとして共有</div>
+                  <div class="s-desc">接続中、<b>この PC の This PC 全体 (全ドライブ)</b> がホスト側に仮想ドライブとして現れ、ホストの Explorer から閲覧・コピーできる。安全のため、ホストに<b>登録済みの端末</b>のときだけドライブが出る</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-share-files" /><span class="slider"></span></label>
+              </div>
+              <div class="setting-row" id="row-share-writable">
+                <div class="s-meta">
+                  <div class="s-title">ホストからの書き込みを許可</div>
+                  <div class="s-desc">ホストの Explorer での作成・編集・削除をこの PC に反映する。OFF (読み取り専用) のときホスト側の変更は反映されない。<b>ホストが乗っ取られていると、この PC 上でプログラムを実行される</b>おそれがあるため、必要なときだけ ON にする</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="set-share-writable" /><span class="slider"></span></label>
+              </div>
+              </div>
+              <div class="setting-group">ショートカット (接続中のローカル操作)</div>
+              <div class="setting-card">
+              ${shortcutRows}
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">マウスキャプチャ解除</div>
+                  <div class="s-desc">キャプチャ中にポインタロックを抜ける</div>
+                </div>
+                <span class="kbd">Esc</span>
+              </div>
+              </div>
+              <div class="shortcut-note">割り当てたキーはリモート側へ送信されなくなります</div>
+              <div class="setting-group">端末情報</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">この端末の端末ID</div>
+                  <div class="s-desc">ホストのデバイスピン留めで承認するとき、ホスト側に表示される端末IDとこの値が一致することを確認してください</div>
+                </div>
+                <span id="device-fingerprint" class="s-desc" style="font-family:monospace">…</span>
+              </div>
+              </div>
+              <div class="setting-group">診断</div>
+              <div class="setting-card">
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">ログ</div>
+                  <div class="s-desc">不具合の調査用。フォルダを開くか、まとめて ZIP に書き出して共有できる</div>
+                </div>
+                <div class="s-actions">
+                  <button class="btn-secondary" id="open-logs">フォルダを開く</button>
+                  <button class="btn-secondary" id="export-logs">ZIP 出力</button>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="s-meta">
+                  <div class="s-title">バージョン</div>
+                </div>
+                <span id="app-version" class="s-desc">…</span>
+              </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+      <footer class="statusbar" id="statusbar">
+        <span class="sb-dot"></span>
+        <span class="sb-text" id="statusbar-text">未接続</span>
+      </footer>
+      <div id="card-menu" class="card-menu"></div>
+      <div id="dialog-backdrop"></div>
+    </div>
+  `;
+
+  // 設定ページの select を自作ドロップダウンへ (設定値の反映より前に済ませる)。
+  enhanceSelects(opts.root);
+
+  const $ = <T extends HTMLElement>(sel: string) => opts.root.querySelector<T>(sel);
+  const statusBar = $("#statusbar") as HTMLElement;
+  const statusText = $("#statusbar-text") as HTMLElement;
+  const hostList = $("#host-list") as HTMLElement;
+  const backdrop = $("#dialog-backdrop") as HTMLElement;
+  const cardMenu = $("#card-menu") as HTMLElement;
+  // パスワード保存済みの host(小文字) 集合。refreshHosts で更新し、カードの
+  // 鍵マーク表示・即接続・「忘れる」メニューの出し分けに使う。
+  let savedSet = new Set<string>();
+  const hasSaved = (host: string): boolean => savedSet.has(host.trim().toLowerCase());
+  // 現在接続中の host(小文字) 集合。`aurora://connections` イベント (Rust 発) で更新し、
+  // カードの「接続中」表示・切断ボタンの出し分けに使う。
+  let connectedSet = new Set<string>();
+  const isConnected = (host: string): boolean => connectedSet.has(host.trim().toLowerCase());
+  const fullscreenToggle = $<HTMLInputElement>("#set-fullscreen");
+  const statsToggle = $<HTMLInputElement>("#set-stats");
+  const captureToggle = $<HTMLInputElement>("#set-capture");
+  const reconnectToggle = $<HTMLInputElement>("#set-reconnect");
+  const virtualToggle = $<HTMLInputElement>("#set-virtual");
+  const tbPositionSelect = $<HTMLSelectElement>("#set-tb-position");
+  const tabPositionSelect = $<HTMLSelectElement>("#set-tab-position");
+  const tbPinnedToggle = $<HTMLInputElement>("#set-tb-pinned");
+  const accentInput = $<HTMLInputElement>("#set-accent");
+  const themeSelect = $<HTMLSelectElement>("#set-theme");
+  const portInput = $<HTMLInputElement>("#set-port");
+  const presetSelect = $<HTMLSelectElement>("#set-preset");
+  const fpsInput = $<HTMLInputElement>("#set-fps");
+  const mbpsInput = $<HTMLInputElement>("#set-mbps");
+  const codecSelect = $<HTMLSelectElement>("#set-codec");
+  const shareFilesToggle = $<HTMLInputElement>("#set-share-files");
+  const shareWritableToggle = $<HTMLInputElement>("#set-share-writable");
+  const shareWritableRow = $("#row-share-writable");
+  // 書き込み許可は共有 ON のときだけ意味を持つため、OFF の間は操作できない見た目にする。
+  const syncShareWritable = (): void => {
+    if (shareWritableToggle) shareWritableToggle.disabled = !settings.share_files;
+    shareWritableRow?.classList.toggle("is-disabled", !settings.share_files);
+  };
+  const audioMutedToggle = $<HTMLInputElement>("#set-audio-muted");
+  const grabKeyboardToggle = $<HTMLInputElement>("#set-grab-keyboard");
+  const clipboardSyncToggle = $<HTMLInputElement>("#set-clipboard-sync");
+  const statsPosSelect = $<HTMLSelectElement>("#set-stats-pos");
+
+  const winControls = $("#win-controls");
+  if (winControls) mountWindowControls(winControls);
+
+  // Wake on LAN タブ: 中継 (raspi) 経由でマジックパケットを送るパネル。接続実行は
+  // launcher と同じ onConnect (open_capture_window 呼び出し) を共有する。
+  const wolRoot = $("#page-wol") as HTMLElement;
+  mountWolPanel(wolRoot, { onConnect: opts.onConnect });
+
+  // ナビ (Hosts/Settings) や ＋追加 などアイコンのみボタンに aria-label を補う。
+  applyAriaLabels(opts.root);
+  /**
+   * `.setting-row` のコントロール (input/select) に同じ行の `.s-title` を aria-labelledby で
+   * 紐付ける (A-8)。id はコントロール自身の id から導出するため、id を持たない行 (ショートカット
+   * 編集ボタン等、input/select を持たない行) は対象外。ホスト編集ダイアログ等の label で包まれた
+   * コントロールは元々名前が付いているため、この関数は呼ばない (対象は設定ページのみ)。
+   */
+  function linkSettingRowLabels(root: ParentNode): void {
+    root.querySelectorAll<HTMLElement>(".setting-row").forEach((row) => {
+      const titleEl = row.querySelector<HTMLElement>(".s-title");
+      const control = row.querySelector<HTMLElement>("input, select");
+      if (!titleEl || !control || !control.id) return;
+      const titleId = `${control.id}-label`;
+      titleEl.id = titleId;
+      control.setAttribute("aria-labelledby", titleId);
+    });
+  }
+  // 設定ページの各行: コントロールへ同じ行のタイトルを aria-labelledby で紐付ける。
+  linkSettingRowLabels(opts.root);
+
+  // 端末情報: この端末の識別子 (フィンガープリント)。host のデバイスピン留め承認時に
+  // host トレイ表示と照合するための読み取り専用表示。
+  const fingerprintEl = $("#device-fingerprint");
+  if (fingerprintEl) {
+    myDeviceFingerprint()
+      .then((fp) => {
+        fingerprintEl.textContent = fp;
+      })
+      .catch((e) => {
+        logger.warn("device fingerprint fetch failed", e);
+        fingerprintEl.textContent = "取得できませんでした";
+      });
+  }
+
+  // 診断: アプリのバージョン表示。
+  const versionEl = $("#app-version");
+  if (versionEl) {
+    void getVersion()
+      .then((v) => {
+        versionEl.textContent = v;
+      })
+      .catch((e) => {
+        logger.warn("app version fetch failed", e);
+        versionEl.textContent = "取得できませんでした";
+      });
+  }
+
+  // 診断: ログフォルダを開く / ログを ZIP 出力。
+  $("#open-logs")?.addEventListener("click", () => {
+    void openLogsFolder().catch((e) => logger.warn("open logs folder failed", e));
+  });
+  // 一時メッセージ (ログ出力完了など) が接続状態表示を占有し続けないよう自動で戻すタイマー。
+  let statusRevertTimer: number | null = null;
+  $("#export-logs")?.addEventListener("click", () => {
+    void exportLogsZip()
+      .then((path) => {
+        statusText.textContent = `ログを出力しました: ${path}`;
+        if (statusRevertTimer !== null) clearTimeout(statusRevertTimer);
+        statusRevertTimer = window.setTimeout(() => {
+          statusRevertTimer = null;
+          updateStatusBar();
+        }, 5000);
+      })
+      .catch((e) => logger.warn("export logs failed", e));
+  });
+
+  let settings: ClientSettings = { ...DEFAULT_SETTINGS };
+
+  function persist(): void {
+    // 保存の成否を待たずに同報すると、保存失敗時も他窓が新設定で動き続け、
+    // 次回起動時に未保存の古い設定へ巻き戻ってユーザーには「戻った」ように見える。
+    void saveSettings(settings)
+      .then(() => {
+        // capture 窓の設定コピー (再接続時の映像パラメータ等が参照) にも即反映させる。
+        void emit("aurora://settings-changed", settings);
+      })
+      .catch((e) => {
+        logger.error("save settings failed", e);
+        statusText.textContent = "設定の保存に失敗しました";
+        if (statusRevertTimer !== null) clearTimeout(statusRevertTimer);
+        statusRevertTimer = window.setTimeout(() => {
+          statusRevertTimer = null;
+          updateStatusBar();
+        }, 5000);
+      });
+  }
+
+  // --- ショートカットの編集 (「その他」タブ) ---
+  // 行ごとに現在のバインディング表記/「既定に戻す」ボタンの表示を最新化する。
+  const shortcutRowEls = new Map<LocalHotkey, HTMLElement>();
+  opts.root.querySelectorAll<HTMLElement>("[data-shortcut-id]").forEach((el) => {
+    const id = el.dataset.shortcutId as LocalHotkey;
+    shortcutRowEls.set(id, el);
+  });
+  function refreshShortcutRow(id: LocalHotkey): void {
+    const row = shortcutRowEls.get(id);
+    if (!row) return;
+    const btn = row.querySelector<HTMLButtonElement>("[data-shortcut-btn]");
+    const resetBtn = row.querySelector<HTMLButtonElement>("[data-shortcut-reset]");
+    const current = effectiveBinding(id, settings.shortcuts);
+    if (btn) btn.textContent = bindingLabel(current);
+    if (resetBtn) {
+      resetBtn.style.display = bindingsEqual(current, defaultBinding(id)) ? "none" : "inline-flex";
+    }
+  }
+  function refreshAllShortcutRows(): void {
+    for (const s of SHORTCUTS) refreshShortcutRow(s.id);
+  }
+  function showShortcutError(id: LocalHotkey, message: string): void {
+    const errEl = shortcutRowEls.get(id)?.querySelector<HTMLElement>("[data-shortcut-error]");
+    if (!errEl) return;
+    errEl.textContent = message;
+    window.setTimeout(() => {
+      if (errEl.textContent === message) errEl.textContent = "";
+    }, 3000);
+  }
+
+  // 記録中の操作 id (null = 記録していない)。同時に 1 つだけ記録できる。
+  let recordingId: LocalHotkey | null = null;
+  function stopRecording(): void {
+    if (!recordingId) return;
+    setRecordingActive(false);
+    recordingId = null;
+    refreshAllShortcutRows();
+  }
+  function startRecording(id: LocalHotkey, btn: HTMLButtonElement): void {
+    stopRecording();
+    recordingId = id;
+    setRecordingActive(true);
+    btn.classList.add("recording");
+    btn.textContent = "キーを押してください…";
+  }
+  for (const s of SHORTCUTS) {
+    const row = shortcutRowEls.get(s.id);
+    const btn = row?.querySelector<HTMLButtonElement>("[data-shortcut-btn]");
+    const resetBtn = row?.querySelector<HTMLButtonElement>("[data-shortcut-reset]");
+    btn?.addEventListener("click", () => startRecording(s.id, btn));
+    resetBtn?.addEventListener("click", () => {
+      if (recordingId === s.id) stopRecording();
+      const rest = { ...settings.shortcuts };
+      delete rest[s.id];
+      settings = { ...settings, shortcuts: rest };
+      applyShortcutBindings(settings.shortcuts);
+      persist();
+      refreshAllShortcutRows();
+    });
+  }
+  // 記録中のキー捕捉。webview-guard の window capture リスナー (F5/F11/devtools 等の抑止) より
+  // 後段の document capture で握るため、記録開始時に setRecordingActive(true) して
+  // webview-guard 側の matchHotkey を無効化し、既存割当と同じキーでも記録側へ届くようにする。
+  // stopPropagation でダイアログの Esc クローズ (line 494 の document keydown) 等とも競合させない。
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (!recordingId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      if (e.code === "Escape") {
+        stopRecording();
+        return;
+      }
+      if (isModifierOnlyCode(e.code)) return; // 修飾キー単体はまだ確定しない
+      const id = recordingId;
+      const binding = bindingFromEvent(e);
+      stopRecording();
+      const err = validateBinding(id, binding, settings.shortcuts);
+      if (err) {
+        showShortcutError(id, err);
+        return;
+      }
+      settings = { ...settings, shortcuts: { ...settings.shortcuts, [id]: formatBinding(binding) } };
+      applyShortcutBindings(settings.shortcuts);
+      persist();
+      refreshAllShortcutRows();
+    },
+    true,
+  );
+  refreshAllShortcutRows();
+
+  // --- ページ切替 ---
+  opts.root.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      // 記録中に別ページへ移ると capture リスナーが全キーを飲み込み続け、遷移先の入力欄が無反応になる。
+      stopRecording();
+      const page = btn.dataset.page;
+      opts.root.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b === btn));
+      opts.root.querySelectorAll(".page").forEach((p) => {
+        p.classList.toggle("active", p.id === `page-${page}`);
+      });
+    });
+  });
+
+  // --- Settings サブタブ切替 ---
+  opts.root.querySelectorAll<HTMLButtonElement>(".settings-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      // 記録中にサブタブを切ると capture リスナーが全キーを飲み込み続け、遷移先の入力欄が無反応になる。
+      stopRecording();
+      const sect = btn.dataset.sect;
+      opts.root.querySelectorAll(".settings-tab").forEach((b) => b.classList.toggle("active", b === btn));
+      opts.root.querySelectorAll(".settings-sect").forEach((s) => {
+        s.classList.toggle("active", (s as HTMLElement).dataset.sect === sect);
+      });
+      // スクロール位置は settings-body 共有のため、前タブの位置を引き継ぐと途中から表示される。
+      opts.root.querySelector(".settings-body")?.scrollTo({ top: 0 });
+    });
+  });
+
+  // --- ダイアログ ---
+  // 開いているダイアログのフォーカストラップ解除関数 (開くたびに張り、閉じると外す)。
+  let releaseTrap: (() => void) | null = null;
+  function openBackdrop(): void {
+    // 記録中にダイアログを開くと capture リスナーが全キーを飲み込み続け、ダイアログ内の入力欄が無反応になる。
+    stopRecording();
+    backdrop.classList.add("visible");
+    applyAriaLabels(backdrop);
+    // 呼び出し側が select.value を入れるより前に差し替える (setter でラベルが追従するため)。
+    enhanceSelects(backdrop);
+    releaseTrap?.();
+    releaseTrap = trapFocus(backdrop);
+  }
+  function closeDialog(): void {
+    releaseTrap?.();
+    releaseTrap = null;
+    backdrop.classList.remove("visible");
+    backdrop.innerHTML = "";
+  }
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) closeDialog();
+  });
+  // Esc で開いているダイアログを閉じる (カードメニューは別途下で閉じる)。
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && backdrop.classList.contains("visible")) closeDialog();
+  });
+
+  /** 削除などの確認ダイアログ。OK で onConfirm を実行する。 */
+  function openConfirmDialog(message: string, onConfirm: () => Promise<void>): void {
+    backdrop.innerHTML = `
+      <div class="dialog">
+        <h3>削除の確認</h3>
+        <div class="s-desc">${message}</div>
+        <div class="dlg-actions">
+          <button type="button" class="btn-ghost" id="c-cancel">cancel</button>
+          <button type="button" class="btn-danger" id="c-ok">削除</button>
+        </div>
+      </div>
+    `;
+    openBackdrop();
+    // 誤 Enter で削除確定にならないよう、既定フォーカスは cancel 側へ置く (A-6)。
+    backdrop.querySelector<HTMLButtonElement>("#c-cancel")?.focus();
+    backdrop.querySelector("#c-cancel")?.addEventListener("click", closeDialog);
+    backdrop.querySelector("#c-ok")?.addEventListener("click", () => {
+      void onConfirm().finally(closeDialog);
+    });
+  }
+
+  // --- カードの ⋯ メニュー ---
+  // 開いているメニューのアンカー (⋯ ボタン)。同じボタンの再クリックで閉じるトグル判定に使う。
+  let cardMenuAnchor: HTMLElement | null = null;
+  function closeCardMenu(): void {
+    cardMenu.classList.remove("visible");
+    cardMenu.innerHTML = "";
+    cardMenuAnchor = null;
+  }
+  // メニュー表示中は ↑↓ で項目間フォーカスを移動する (Esc/外クリックは既存の document リスナーで閉じる)。
+  cardMenu.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(cardMenu.querySelectorAll<HTMLButtonElement>(".menu-item"));
+    if (items.length === 0) return;
+    e.preventDefault();
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = e.key === "ArrowDown" ? (idx + 1) % items.length : (idx - 1 + items.length) % items.length;
+    items[next]?.focus();
+  });
+  /** ⋯ ボタン (anchor) の下にメニューを開く (編集は直接ボタンへ移した)。
+   *  パスワード保存済みなら「忘れる」項目も出す。同じ anchor での再呼び出しはトグルで閉じる。 */
+  function openCardMenu(anchor: HTMLElement, entry: HostEntry): void {
+    if (cardMenuAnchor === anchor) {
+      closeCardMenu();
+      return;
+    }
+    // 記録中にメニューを開くと capture リスナーが全キーを飲み込み続け、↑↓ 等の操作が効かなくなる。
+    stopRecording();
+    const newWinItem = isConnected(entry.host)
+      ? `<button class="menu-item" data-m="newwin">${icon("add")} 新しいウィンドウで接続</button>`
+      : "";
+    const forgetItem = hasSaved(entry.host)
+      ? `<button class="menu-item" data-m="forget">${icon("key")} パスワードを忘れる</button>`
+      : "";
+    cardMenu.innerHTML = `
+      ${newWinItem}
+      ${forgetItem}
+      <button class="menu-item danger" data-m="del">${icon("delete")} 削除</button>
+    `;
+    cardMenu.classList.add("visible");
+    cardMenuAnchor = anchor;
+    // 表示してから幅を測り、ボタン右端に揃えて配置する。
+    const r = anchor.getBoundingClientRect();
+    cardMenu.style.top = `${r.bottom + 4}px`;
+    cardMenu.style.left = `${Math.max(8, r.right - cardMenu.offsetWidth)}px`;
+    cardMenu.querySelector<HTMLButtonElement>(".menu-item")?.focus();
+    cardMenu.querySelector('[data-m="newwin"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      if (hasSaved(entry.host)) {
+        handle.setConnecting(true);
+        // 保存済み: 即接続 (password=null は Rust が DPAPI 復号)。newWindow=true で必ず新窓。
+        void opts
+          .onConnect(entry, null, false, true)
+          .then(() => updateStatusBar())
+          .catch((e) => {
+            logger.warn("open new window failed", e);
+            updateStatusBar();
+            openConnectDialog(entry, true, String(e));
+          });
+      } else {
+        openConnectDialog(entry, true);
+      }
+    });
+    cardMenu.querySelector('[data-m="forget"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      void (async () => {
+        await deleteHostPassword(entry.host);
+        await handle.refreshHosts();
+      })().catch((e) => logger.warn("forget host password failed", e));
+    });
+    cardMenu.querySelector('[data-m="del"]')?.addEventListener("click", () => {
+      closeCardMenu();
+      const name = entry.label || entry.host;
+      openConfirmDialog(`「${escapeHtml(name)}」を一覧から削除しますか?`, async () => {
+        // 一覧から消すときは保存済みパスワードも一緒に消す (孤立を防ぐ)。
+        await deleteHostPassword(entry.host);
+        await deleteRecentHost(entry.host);
+        await handle.refreshHosts();
+      });
+    });
+  }
+  // メニュー外クリック / スクロール / Esc で閉じる。
+  document.addEventListener("click", () => closeCardMenu());
+  hostList.addEventListener("scroll", () => closeCardMenu());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeCardMenu();
+  });
+
+  /** ホスト追加/編集ダイアログ (label/host/port を保存。接続はしない)。entry=null で新規。 */
+  function openHostDialog(entry: HostEntry | null): void {
+    const isAdd = entry === null;
+    const e: HostEntry = entry ?? { label: "", host: "", port: settings.default_port };
+    const o: HostOverrides = e.overrides ?? {};
+    const hasQuality = o.fps != null && o.max_mbps != null;
+    const qualityId = hasQuality ? matchPreset(o.fps as number, o.max_mbps as number) : "default";
+    // 手で JSON を編集した等でプリセット外の値が入っている場合は現値ラベルで残す (保存時は維持)。
+    const customOpt =
+      qualityId === CUSTOM_PRESET_ID
+        ? `<option value="${CUSTOM_PRESET_ID}">カスタム (${o.fps}fps / ${o.max_mbps}Mbps)</option>`
+        : "";
+    const presetOpts =
+      `<option value="default">既定に従う</option>` +
+      VIDEO_PRESETS.map((p) => `<option value="${p.id}">${p.label}</option>`).join("") +
+      customOpt;
+    backdrop.innerHTML = `
+      <form class="dialog" autocomplete="off">
+        <h3>${isAdd ? "ホストを追加" : "ホストを編集"}</h3>
+        <div class="icon-picker">
+          <div class="icon-preview" id="h-icon-preview"></div>
+          <div class="icon-picker-actions">
+            <button type="button" class="btn-secondary" id="h-icon-pick">画像を選択</button>
+            <button type="button" class="btn-ghost" id="h-icon-clear">解除</button>
+          </div>
+          <input type="file" id="h-icon-file" accept="image/*" hidden />
+        </div>
+        <label>表示名 (任意)<input id="h-label" type="text" value="${escapeHtml(e.label)}" placeholder="home-pc" /></label>
+        <label>host (Tailscale IP / hostname)<input id="h-host" type="text" value="${escapeHtml(e.host)}" placeholder="100.x.x.x" required /></label>
+        <label>port
+          <input id="h-port" type="text" inputmode="numeric" value="${e.port}" />
+          <span class="shortcut-error" data-h-port-error></span>
+        </label>
+        <div class="dlg-sub">このホストだけの設定 (既定を上書き)</div>
+        <label>仮想ディスプレイ
+          <select id="h-virtual" class="select-input">
+            <option value="default">既定に従う</option>
+            <option value="on">使う</option>
+            <option value="off">使わない</option>
+          </select>
+        </label>
+        <label>画質プリセット<select id="h-preset" class="select-input">${presetOpts}</select></label>
+        <label>コーデック<select id="h-codec" class="select-input">${codecOptionsHtml(true)}</select></label>
+        <div class="dlg-actions">
+          <button type="button" class="btn-ghost" id="h-cancel">cancel</button>
+          <button type="submit" class="btn-primary">${isAdd ? "add" : "save"}</button>
+        </div>
+      </form>
+    `;
+    openBackdrop();
+
+    const virtualSel = backdrop.querySelector<HTMLSelectElement>("#h-virtual");
+    const presetSel = backdrop.querySelector<HTMLSelectElement>("#h-preset");
+    const codecSel = backdrop.querySelector<HTMLSelectElement>("#h-codec");
+    if (virtualSel)
+      virtualSel.value = o.use_virtual_display == null ? "default" : o.use_virtual_display ? "on" : "off";
+    if (presetSel) presetSel.value = qualityId;
+    if (codecSel) codecSel.value = o.codec == null ? "default" : o.codec;
+
+    // --- アイコン (画像) 選択 ---
+    // 画像未設定なら label/host 由来の頭文字アバターをプレビューに出し、選択中は画像を出す。
+    let currentIcon = e.icon ?? "";
+    const labelInput = backdrop.querySelector<HTMLInputElement>("#h-label");
+    const hostInput = backdrop.querySelector<HTMLInputElement>("#h-host");
+    const preview = backdrop.querySelector<HTMLElement>("#h-icon-preview");
+    const fileInput = backdrop.querySelector<HTMLInputElement>("#h-icon-file");
+    const clearBtn = backdrop.querySelector<HTMLButtonElement>("#h-icon-clear");
+    function renderIconPreview(): void {
+      if (!preview) return;
+      if (hasImageIcon(currentIcon)) {
+        preview.style.background = "";
+        const img = document.createElement("img");
+        img.src = currentIcon; // 自前生成の data URL
+        img.alt = "";
+        img.draggable = false;
+        preview.replaceChildren(img);
+      } else {
+        const nm = labelInput?.value.trim() || hostInput?.value.trim() || "?";
+        preview.style.background = avatarColor(nm);
+        preview.textContent = (nm[0] ?? "?").toUpperCase();
+      }
+      if (clearBtn) clearBtn.style.display = currentIcon ? "" : "none";
+    }
+    renderIconPreview();
+    // 画像未設定のときは頭文字が label/host に追従するよう再描画。
+    labelInput?.addEventListener("input", () => {
+      if (!hasImageIcon(currentIcon)) renderIconPreview();
+    });
+    hostInput?.addEventListener("input", () => {
+      if (!hasImageIcon(currentIcon)) renderIconPreview();
+    });
+    backdrop.querySelector("#h-icon-pick")?.addEventListener("click", () => fileInput?.click());
+    fileInput?.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      fileInput.value = ""; // 同じファイルを選び直しても change が出るようリセット
+      if (!file) return;
+      void imageToIconDataUrl(file)
+        .then((url) => {
+          currentIcon = url;
+          renderIconPreview();
+        })
+        .catch((err) => logger.warn("icon load failed", err));
+    });
+    clearBtn?.addEventListener("click", () => {
+      currentIcon = "";
+      renderIconPreview();
+    });
+
+    backdrop.querySelector<HTMLInputElement>("#h-host")?.focus();
+    backdrop.querySelector("#h-cancel")?.addEventListener("click", closeDialog);
+    backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const host = backdrop.querySelector<HTMLInputElement>("#h-host")?.value.trim() ?? "";
+      const label = backdrop.querySelector<HTMLInputElement>("#h-label")?.value.trim() ?? "";
+      if (!host) return;
+      // port 不正値 (u16 範囲外など) を無言で既定値へ丸めず、submit を中断してエラーを出す
+      // (以前は解析失敗が握り潰され「add が無反応」に見えるバグがあった)。
+      const portV = validatePort(backdrop.querySelector<HTMLInputElement>("#h-port")?.value ?? "");
+      if (!portV.ok) {
+        flashInlineError(backdrop.querySelector<HTMLElement>("[data-h-port-error]"), portV.message);
+        return;
+      }
+      const port = portV.value;
+      const ov: HostOverrides = {};
+      if (virtualSel?.value === "on") ov.use_virtual_display = true;
+      else if (virtualSel?.value === "off") ov.use_virtual_display = false;
+      if (codecSel?.value && codecSel.value !== "default") ov.codec = codecSel.value as CodecChoice;
+      const pv = presetSel?.value ?? "default";
+      if (pv === CUSTOM_PRESET_ID) {
+        // プリセット外の既存値をそのまま維持
+        ov.fps = o.fps;
+        ov.max_mbps = o.max_mbps;
+      } else {
+        const p = findPreset(pv);
+        if (p) {
+          ov.fps = p.fps;
+          ov.max_mbps = p.mbps;
+        }
+      }
+      void (async () => {
+        // host を変えた編集なら旧エントリを消してから保存する (新 host で重複排除される)。
+        const hostChanged = e.host.localeCompare(host, undefined, { sensitivity: "accent" }) !== 0;
+        if (!isAdd && hostChanged) {
+          await deleteRecentHost(e.host);
+        }
+        // overrides は空オブジェクトも送る: Rust 側が「既定に従う」への明示リセットとして
+        // None へ正規化する (undefined だと「情報なし」扱いで既存値が残ってしまう)。
+        await saveRecentHost({ label: label || host, host, port, icon: currentIcon, overrides: ov });
+        closeDialog();
+        await handle.refreshHosts();
+      })().catch((e) => logger.warn("save host failed", e));
+    });
+  }
+
+  /**
+   * 接続ダイアログ (パスワードのみ)。カード押下から呼ぶ。newWindow は接続中ホストへの追加窓接続時に true。
+   * initialError は保存済みパスワードでの即接続が失敗した直後のフォールバック表示用 (A-2)。
+   * Rust から返る日本語エラー文字列をそのまま textContent へ入れる (innerHTML には流さない)。
+   */
+  function openConnectDialog(entry: HostEntry, newWindow = false, initialError?: string): void {
+    backdrop.innerHTML = `
+      <form class="dialog" autocomplete="off">
+        <h3>${escapeHtml(entry.label || entry.host)}</h3>
+        <div class="s-desc" style="font-family:monospace">${escapeHtml(entry.host)}:${entry.port}</div>
+        <label>password
+          <span class="pass-wrap">
+            <input id="d-pass" type="password" required />
+            <button type="button" class="pass-eye" id="d-eye" title="パスワードを表示">${icon("eye")}</button>
+          </span>
+        </label>
+        <label class="dlg-check"><input id="d-save" type="checkbox" checked /> このパスワードを保存する</label>
+        <div class="dlg-status" id="d-status"></div>
+        <div class="dlg-actions">
+          <button type="button" class="btn-ghost" id="d-cancel">cancel</button>
+          <button type="submit" class="btn-primary" id="d-ok">connect</button>
+        </div>
+      </form>
+    `;
+    openBackdrop();
+    const passInput = backdrop.querySelector<HTMLInputElement>("#d-pass");
+    const okBtn = backdrop.querySelector<HTMLButtonElement>("#d-ok");
+    const statusEl = backdrop.querySelector<HTMLElement>("#d-status");
+    if (initialError && statusEl) {
+      statusEl.textContent = `保存済みパスワードで接続できませんでした: ${initialError}`;
+      statusEl.classList.add("error");
+    }
+    const eyeBtn = backdrop.querySelector<HTMLButtonElement>("#d-eye");
+    eyeBtn?.addEventListener("click", () => {
+      if (!passInput) return;
+      const show = passInput.type === "password";
+      passInput.type = show ? "text" : "password";
+      eyeBtn.innerHTML = icon(show ? "eye-off" : "eye");
+      eyeBtn.title = show ? "パスワードを隠す" : "パスワードを表示";
+      passInput.focus();
+    });
+    passInput?.focus();
+    backdrop.querySelector("#d-cancel")?.addEventListener("click", closeDialog);
+    backdrop.querySelector<HTMLFormElement>(".dialog")?.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const password = passInput?.value ?? "";
+      if (!password) return;
+      const save = backdrop.querySelector<HTMLInputElement>("#d-save")?.checked ?? true;
+      if (okBtn) {
+        okBtn.disabled = true;
+        okBtn.textContent = "connecting…";
+      }
+      if (statusEl) statusEl.textContent = `connecting to ${entry.host}…`;
+      void opts
+        .onConnect(entry, password, save, newWindow)
+        // 解決 = capture ウィンドウが開いた。ランチャーは残るのでダイアログだけ閉じる。
+        .then(() => closeDialog())
+        .catch((err) => {
+          if (statusEl) {
+            statusEl.textContent = `error: ${String(err)}`;
+            statusEl.classList.add("error");
+          }
+          if (okBtn) {
+            okBtn.disabled = false;
+            okBtn.textContent = "connect";
+          }
+        });
+    });
+  }
+
+  // --- ホスト一覧の描画 ---
+  // 現在表示中の並び (ドラッグ並べ替えの基準)。
+  let currentHosts: HostEntry[] = [];
+
+  // ドラッグ中かどうか。renderHosts は hostList.innerHTML を丸ごと再構築するため、
+  // ドラッグ中に呼ばれると掴んでいるカード (startDrag のクロージャが握る DOM) が
+  // ツリーから孤立し、重複行/浮いたカードになる。ドラッグ中は再構築を保留する。
+  let isDragging = false;
+  // ドラッグ中に renderHosts が呼ばれたかどうか。プローブ結果や他ウィンドウの接続状態変化を
+  // 取りこぼさないよう、ドラッグ終了時にまとめて1回だけ反映する。
+  let pendingRenderHosts = false;
+
+  // 到達性プローブ結果 (host 小文字 → online)。未判定はドット非表示。
+  const probeMap = new Map<string, boolean>();
+  let probing = false;
+  const refreshBtn = $("#probe-refresh");
+  /** 未接続の保存ホストへ並列 TCP プローブし、結果をカードのドットへ反映する。
+   *  更新ボタンのアイコンを回して「更新している」ことを見せる (最低 500ms は回す)。 */
+  async function runProbe(): Promise<void> {
+    if (probing) return;
+    const targets = currentHosts
+      .filter((h) => !isConnected(h.host))
+      .map((h) => ({ host: h.host, port: h.port }));
+    probing = true;
+    refreshBtn?.classList.add("spinning");
+    const started = Date.now();
+    try {
+      if (targets.length > 0) {
+        const results = await probeHosts(targets);
+        for (const r of results) probeMap.set(r.host.trim().toLowerCase(), r.online);
+        renderHosts(currentHosts);
+      }
+    } catch (e) {
+      logger.warn("probe hosts failed", e);
+    } finally {
+      // 一瞬で終わると「押しても何も起きない」感になるため、最低 500ms は回転を見せる。
+      const wait = Math.max(0, 500 - (Date.now() - started));
+      window.setTimeout(() => {
+        refreshBtn?.classList.remove("spinning");
+        probing = false;
+      }, wait);
+    }
+  }
+
+  /** ドラッグ中に保留された renderHosts があれば、ドラッグ終了時に1回だけ反映する。 */
+  function flushPendingRenderHosts(): void {
+    if (pendingRenderHosts) {
+      pendingRenderHosts = false;
+      renderHosts(currentHosts);
+    }
+  }
+
+  /** from の要素を to の位置へ移動し、保存して再描画する。 */
+  function reorder(from: number, to: number): void {
+    if (from === to || from < 0 || to < 0) return;
+    const arr = [...currentHosts];
+    const [moved] = arr.splice(from, 1);
+    arr.splice(to, 0, moved);
+    currentHosts = arr;
+    renderHosts(arr);
+    void setRecentHosts(arr).catch((e) => logger.warn("reorder hosts failed", e));
+  }
+
+  /**
+   * カード追従ドラッグ並べ替え。掴んだカードの分身 (clone) がカーソルに追従し、
+   * 元カードは空きスロット (placeholder) として他カードの間を移動する。
+   * HTML5 DnD は WebView2 で不安定なため pointer イベントで自前実装する。
+   */
+  function startDrag(from: number, downEvent: PointerEvent, card: HTMLElement): void {
+    isDragging = true;
+    const rect = card.getBoundingClientRect();
+    const offsetY = downEvent.clientY - rect.top;
+    let targetPos = from;
+
+    // カーソル追従用の分身。
+    const clone = card.cloneNode(true) as HTMLElement;
+    clone.classList.add("drag-clone");
+    clone.style.width = `${rect.width}px`;
+    clone.style.left = `${rect.left}px`;
+    clone.style.top = `${rect.top}px`;
+    opts.root.appendChild(clone);
+    // 元カードは空きスロットにする。
+    card.classList.add("drag-placeholder");
+
+    const onMove = (ev: PointerEvent): void => {
+      // 分身がホスト一覧の領域外 (タイトルバーや画面外) へ出ないよう上下をクランプする。
+      const listRect = hostList.getBoundingClientRect();
+      const desiredTop = ev.clientY - offsetY;
+      const maxTop = Math.max(listRect.top, listRect.bottom - rect.height);
+      const top = Math.min(Math.max(desiredTop, listRect.top), maxTop);
+      clone.style.top = `${top}px`;
+      // placeholder 以外のカードの中点と比較して挿入位置を決め、元カードを移動する。
+      const others = Array.from(hostList.querySelectorAll<HTMLElement>(".host-card")).filter(
+        (c) => c !== card,
+      );
+      let pos = others.length;
+      for (let i = 0; i < others.length; i++) {
+        const r = others[i].getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) {
+          pos = i;
+          break;
+        }
+      }
+      targetPos = pos;
+      if (pos >= others.length) hostList.appendChild(card);
+      else hostList.insertBefore(card, others[pos]);
+    };
+    // リスナ解除とクローン/placeholder の後始末だけを共通化する。並べ替えの確定は onUp 側のみで行う。
+    const cleanup = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      clone.remove();
+      card.classList.remove("drag-placeholder");
+      // ここで確実に false へ戻す (pointerup/pointercancel どちらの経路でも通る)。
+      isDragging = false;
+    };
+    const onUp = (): void => {
+      cleanup();
+      reorder(from, targetPos); // 並べ替え確定 (from === to なら内部で何もせず戻る)
+      // reorder が描画済みでも、そこで使われた並びより後に来た保留分だけを反映する
+      // (先に flush すると並べ替え前の順序で描き直してしまうため、必ず reorder の後に置く)。
+      flushPendingRenderHosts();
+    };
+    // pointercancel は pointerup が来ないまま中断されるため、確定はせず後始末のみ行い
+    // 見た目 (カード位置) は元の並び順で再描画して戻す (この呼び出しで pendingRenderHosts も消費される)。
+    const onCancel = (): void => {
+      cleanup();
+      renderHosts(currentHosts);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+  }
+
+  /** 最終接続日時 (unix 秒) を「たった今/N分前/N時間前/N日前」に整形する。 */
+  function formatRelativeConnected(unixSec: number): string {
+    const diffSec = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+    if (diffSec < 60) return "たった今";
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}分前`;
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return `${diffHour}時間前`;
+    const diffDay = Math.floor(diffHour / 24);
+    return `${diffDay}日前`;
+  }
+
+  function renderHosts(hosts: HostEntry[]): void {
+    currentHosts = hosts;
+    if (isDragging) {
+      // 保留: 掴んでいるカードを孤立させないよう再構築せず、ドラッグ終了時に描画し直す。
+      pendingRenderHosts = true;
+      return;
+    }
+    pendingRenderHosts = false;
+    if (hosts.length === 0) {
+      // 手順3行の説教くさいガイドは不評だったため撤廃し、見出し+一行ヒントのみにする
+      // (.empty-hint は wol-panel と共有のため触らず新クラスにする)。
+      hostList.innerHTML = `<div class="empty-guide">
+        <div class="empty-guide-icon">${icon("hosts")}</div>
+        <div class="empty-guide-title">まだホストがありません</div>
+        <div class="empty-guide-hint">右上の ＋ からホストを登録できます</div>
+      </div>`;
+      return;
+    }
+    hostList.innerHTML = hosts
+      .map((h, i) => {
+        const name = h.label || h.host;
+        const initial = escapeHtml((name[0] ?? "?").toUpperCase());
+        const connected = isConnected(h.host);
+        // 画像アイコンがあれば img、無ければ頭文字 + 自動生成色。data URL は自前生成
+        // (canvas.toDataURL) のみだが、icon の出所が増えても属性注入にならないよう
+        // 埋め込み時にエスケープする (正規の base64 data URL はエスケープで不変)。
+        const avatar = hasImageIcon(h.icon)
+          ? `<div class="avatar avatar-img"><img src="${escapeHtml(h.icon)}" alt="" draggable="false" /></div>`
+          : `<div class="avatar" style="background:${avatarColor(name)}">${initial}</div>`;
+        // 接続中は緑扱い。プローブ未判定はドットを出さない。
+        const online = connected ? true : probeMap.get(h.host.trim().toLowerCase());
+        const presence =
+          online === undefined ? "" : `<span class="presence ${online ? "online" : "offline"}"></span>`;
+        const saved = hasSaved(h.host)
+          ? `<span class="saved-badge" title="パスワード保存済み (押すと即接続)">${icon("key")}</span>`
+          : "";
+        // 接続中: 緑ピル + 切断ボタン。並べ替えグリップは編集系ボタンと同列なので残す。
+        const connPill = connected ? `<span class="conn-pill">接続中</span>` : "";
+        const tailBtn = connected
+          ? `<button class="card-btn danger" data-act="disconnect" title="切断">${icon("power")}</button>`
+          : `<span class="chevron">${icon("chevron")}</span>`;
+        return `
+          <div class="host-card${connected ? " connected" : ""}" data-idx="${i}" tabindex="0" role="button">
+            <span class="grip" data-act="grip" title="ドラッグで並べ替え">${icon("grip")}</span>
+            <div class="avatar-wrap">${avatar}${presence}</div>
+            <div class="meta">
+              <div class="label-row">
+                <span class="label">${escapeHtml(name)}</span>
+                ${connPill}
+                ${saved}
+              </div>
+              <div class="addr">${escapeHtml(h.host)}:${h.port}${
+                h.last_connected != null
+                  ? `<span class="last-connected"> · ${formatRelativeConnected(h.last_connected)}</span>`
+                  : ""
+              }</div>
+            </div>
+            <button class="card-btn" data-act="edit" title="編集">${icon("edit")}</button>
+            <button class="card-btn" data-act="menu" title="メニュー">${icon("more")}</button>
+            <div class="card-tail">${tailBtn}</div>
+          </div>`;
+      })
+      .join("");
+    applyAriaLabels(hostList); // grip/編集/メニュー/切断 などアイコンのみボタンに付与
+
+    hostList.querySelectorAll<HTMLElement>(".host-card").forEach((card) => {
+      const idx = Number(card.dataset.idx);
+      card.addEventListener("click", (e) => {
+        // SVG 内クリックでも拾えるよう data-act を持つ最近接要素から判定する。
+        const actEl = (e.target as HTMLElement).closest<HTMLElement>("[data-act]");
+        const act = actEl?.dataset.act;
+        if (act === "grip") {
+          e.stopPropagation(); // 掴むだけのクリックでは接続しない
+        } else if (act === "edit") {
+          e.stopPropagation();
+          openHostDialog(hosts[idx]);
+        } else if (act === "menu") {
+          e.stopPropagation();
+          openCardMenu(actEl as HTMLElement, hosts[idx]);
+        } else if (act === "disconnect") {
+          e.stopPropagation();
+          const host = hosts[idx].host;
+          // 該当 host のタブを持つ開いている capture ウィンドウへ切断を依頼する (UI のタブ除去)。
+          void emit("aurora://disconnect-host", { host });
+          // さらに Rust 側で host 単位に直接停止する。接続中にウィンドウを閉じた等で
+          // 残った「窓の無い孤児セッション」(emit が届かず host を占有し続ける) も確実に切る。
+          void disconnectHost(host);
+        } else if (isConnected(hosts[idx].host)) {
+          // 接続中カードは 2 本目の接続を張らず、既存セッションの窓を前面化+タブ活性化する。
+          void focusHostWindow(hosts[idx].host)
+            .then((found) => {
+              // 見つからない = 接続中表示が古い (窓が閉じた直後など)。一覧を取り直す。
+              if (!found) void handle.refreshHosts();
+            })
+            .catch((e) => logger.warn("focus host window failed", e));
+        } else if (hasSaved(hosts[idx].host)) {
+          // パスワード保存済み: ダイアログを出さず即接続 (平文はフロントに載らない)。
+          // 保存値が拒否された等で失敗したら入力ダイアログへフォールバックする。
+          const entry = hosts[idx];
+          handle.setConnecting(true);
+          // 保存済み即接続: password=null (Rust が DPAPI 復号)。再保存は不要なので save=false。
+          void opts
+            .onConnect(entry, null, false, false)
+            // capture ウィンドウが開いたら一時的な connecting 表示を解き、実際の接続中集計へ戻す
+            // (接続成立は別窓側で起き、`aurora://connections` 経由でドットが緑になる)。
+            .then(() => updateStatusBar())
+            .catch((e) => {
+              logger.warn("open capture window failed", e);
+              updateStatusBar();
+              openConnectDialog(entry, false, String(e));
+            });
+        } else {
+          openConnectDialog(hosts[idx]);
+        }
+      });
+
+      // マウスなし操作: Enter/Space でクリックと同じ分岐へ (target=card なので接続系の分岐に落ちる)。
+      card.addEventListener("keydown", (e) => {
+        // 子ボタン (編集/メニュー/切断) からのバブリングで接続まで発火しないようカード自身のみ。
+        if (e.target !== card) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          card.click();
+        }
+      });
+
+      // grip を掴んでドラッグ並べ替え (カードがカーソルに追従、他カードが隙間を空ける)。
+      card.querySelector<HTMLElement>(".grip")?.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        closeCardMenu();
+        startDrag(idx, e, card);
+      });
+    });
+  }
+
+  // --- アクション配線 ---
+  $("#add-host")?.addEventListener("click", () => openHostDialog(null));
+  $("#probe-refresh")?.addEventListener("click", () => void runProbe());
+
+  fullscreenToggle?.addEventListener("change", () => {
+    settings = { ...settings, default_fullscreen: fullscreenToggle.checked };
+    persist();
+  });
+  statsToggle?.addEventListener("change", () => {
+    settings = { ...settings, show_stats: statsToggle.checked };
+    persist();
+  });
+  captureToggle?.addEventListener("change", () => {
+    settings = { ...settings, default_capture: captureToggle.checked };
+    persist();
+  });
+  reconnectToggle?.addEventListener("change", () => {
+    settings = { ...settings, auto_reconnect: reconnectToggle.checked };
+    persist();
+  });
+  virtualToggle?.addEventListener("change", () => {
+    settings = { ...settings, use_virtual_display: virtualToggle.checked };
+    persist();
+  });
+  tbPositionSelect?.addEventListener("change", () => {
+    settings = { ...settings, toolbar_position: tbPositionSelect.value as ToolbarPosition };
+    persist();
+  });
+  tabPositionSelect?.addEventListener("change", () => {
+    settings = { ...settings, tab_position: tabPositionSelect.value as ToolbarPosition };
+    persist();
+  });
+  tbPinnedToggle?.addEventListener("change", () => {
+    settings = { ...settings, toolbar_pinned: tbPinnedToggle.checked };
+    persist();
+  });
+  // ドラッグ中の input では保存/全窓ブロードキャストを連打しない。プレビューのみ即時反映し、
+  // 保存は指を離した (色を確定した) change で 1 回だけ行う (A-7)。
+  accentInput?.addEventListener("input", () => {
+    applyAccent(accentInput.value);
+  });
+  accentInput?.addEventListener("change", () => {
+    settings = { ...settings, accent_color: accentInput.value };
+    persist();
+  });
+  themeSelect?.addEventListener("change", () => {
+    const theme = themeSelect.value as ThemeId;
+    settings = { ...settings, theme };
+    applyTheme(theme, settings.accent_color);
+    persist();
+  });
+  const portError = $<HTMLElement>('[data-num-error="port"]');
+  const fpsError = $<HTMLElement>('[data-num-error="fps"]');
+  const mbpsError = $<HTMLElement>('[data-num-error="mbps"]');
+  portInput?.addEventListener("change", () => {
+    const v = validatePort(portInput.value);
+    if (!v.ok) {
+      flashInlineError(portError, v.message);
+      portInput.value = String(settings.default_port); // 不正値は保存せず直前の値へ戻す
+      return;
+    }
+    settings = { ...settings, default_port: v.value };
+    portInput.value = String(v.value);
+    persist();
+  });
+  /** fps/mbps の現在値からプリセット選択を一致させる (手動値なら「カスタム」)。 */
+  function syncPresetSelect(): void {
+    if (presetSelect) presetSelect.value = matchPreset(settings.fps, settings.max_mbps);
+  }
+  presetSelect?.addEventListener("change", () => {
+    const p = findPreset(presetSelect.value);
+    if (!p) return; // カスタム: fps/Mbps の手動値を維持する
+    settings = { ...settings, fps: p.fps, max_mbps: p.mbps };
+    if (fpsInput) fpsInput.value = String(p.fps);
+    if (mbpsInput) mbpsInput.value = String(p.mbps);
+    persist();
+  });
+  fpsInput?.addEventListener("change", () => {
+    const v = validateFps(fpsInput.value);
+    if (!v.ok) {
+      flashInlineError(fpsError, v.message);
+      fpsInput.value = String(settings.fps);
+      return;
+    }
+    settings = { ...settings, fps: v.value };
+    fpsInput.value = String(v.value);
+    syncPresetSelect();
+    persist();
+  });
+  mbpsInput?.addEventListener("change", () => {
+    const v = validateMbps(mbpsInput.value);
+    if (!v.ok) {
+      flashInlineError(mbpsError, v.message);
+      mbpsInput.value = String(settings.max_mbps);
+      return;
+    }
+    settings = { ...settings, max_mbps: v.value };
+    mbpsInput.value = String(v.value);
+    syncPresetSelect();
+    persist();
+  });
+  shareFilesToggle?.addEventListener("change", () => {
+    settings = { ...settings, share_files: shareFilesToggle.checked };
+    syncShareWritable();
+    persist();
+  });
+  shareWritableToggle?.addEventListener("change", () => {
+    settings = { ...settings, share_files_writable: shareWritableToggle.checked };
+    persist();
+  });
+  audioMutedToggle?.addEventListener("change", () => {
+    settings = { ...settings, audio_muted: audioMutedToggle.checked };
+    persist();
+  });
+  grabKeyboardToggle?.addEventListener("change", () => {
+    settings = { ...settings, grab_keyboard: grabKeyboardToggle.checked };
+    persist();
+  });
+  clipboardSyncToggle?.addEventListener("change", () => {
+    settings = { ...settings, clipboard_sync: clipboardSyncToggle.checked };
+    persist();
+  });
+  statsPosSelect?.addEventListener("change", () => {
+    settings = { ...settings, stats_position: statsPosSelect.value as StatsPosition };
+    persist();
+  });
+  codecSelect?.addEventListener("change", () => {
+    settings = { ...settings, codec: codecSelect.value as CodecChoice };
+    persist();
+  });
+
+  /** コーデック select の option を最新のプローブ結果で作り直し、現在値を反映する。 */
+  function syncCodecSelect(): void {
+    if (!codecSelect) return;
+    codecSelect.innerHTML = codecOptionsHtml(false);
+    codecSelect.value = settings.codec;
+  }
+  // 起動時に 1 回だけプローブし、select の非対応表記を更新する (loadSettings と非同期で競合
+  // してもどちらが先でも syncCodecSelect が現在の settings.codec を反映するので問題ない)。
+  void probeSupportedCodecs().then((list) => {
+    supportedCodecs = list;
+    syncCodecSelect();
+  });
+
+  // 下端ステータスバーを実際の接続中 host 数に追従させる。マルチウィンドウでは接続は capture
+  // 窓側で起きるため、launcher は `aurora://connections` の集計 (connectedSet) だけを映す。
+  function updateStatusBar(): void {
+    const n = connectedSet.size;
+    handle.setConnState(n > 0 ? `接続中 ${n} 件` : "未接続", n > 0 ? "connected" : "idle");
+  }
+
+  const handle: LauncherHandle = {
+    show(): void {
+      opts.root.classList.remove("hidden");
+    },
+    hide(): void {
+      opts.root.classList.add("hidden");
+      closeDialog();
+    },
+    setConnecting(connecting: boolean): void {
+      if (connecting) handle.setConnState("接続中…", "connecting");
+    },
+    setConnState(text: string, kind: ConnState = "idle"): void {
+      // 下端ステータスバーにドット色 + テキストで状態を出す。
+      statusText.textContent = text;
+      statusBar.classList.remove("connecting", "connected", "error");
+      if (kind !== "idle") statusBar.classList.add(kind);
+    },
+    async refreshHosts(): Promise<void> {
+      try {
+        // 鍵マーク/即接続の判定用に、保存済みパスワードの host 集合も更新する。
+        try {
+          savedSet = new Set(await savedPasswordHosts());
+        } catch {
+          savedSet = new Set();
+        }
+        // 接続中表示・切断ボタンの判定用に、接続中 host 集合も更新する。
+        try {
+          connectedSet = new Set((await connectedHosts()).map((h) => h.trim().toLowerCase()));
+        } catch {
+          connectedSet = new Set();
+        }
+        renderHosts(await loadRecentHosts());
+        updateStatusBar();
+        void runProbe();
+      } catch {
+        // 履歴は補助機能。失敗しても致命的ではない。
+      }
+    },
+    getSettings(): ClientSettings {
+      return settings;
+    },
+  };
+
+  /** 現在の settings を設定フォームの各コントロールへ反映する (テーマ/アクセント色は即適用)。 */
+  function applySettingsToForm(): void {
+    if (fullscreenToggle) fullscreenToggle.checked = settings.default_fullscreen;
+    if (statsToggle) statsToggle.checked = settings.show_stats;
+    if (captureToggle) captureToggle.checked = settings.default_capture;
+    if (reconnectToggle) reconnectToggle.checked = settings.auto_reconnect;
+    if (virtualToggle) virtualToggle.checked = settings.use_virtual_display;
+    if (tbPositionSelect) tbPositionSelect.value = settings.toolbar_position;
+    if (tabPositionSelect) tabPositionSelect.value = settings.tab_position;
+    if (tbPinnedToggle) tbPinnedToggle.checked = settings.toolbar_pinned;
+    if (accentInput) accentInput.value = settings.accent_color;
+    if (themeSelect) themeSelect.value = settings.theme;
+    if (portInput) portInput.value = String(settings.default_port);
+    if (fpsInput) fpsInput.value = String(settings.fps);
+    if (mbpsInput) mbpsInput.value = String(settings.max_mbps);
+    if (shareFilesToggle) shareFilesToggle.checked = settings.share_files;
+    if (shareWritableToggle) shareWritableToggle.checked = settings.share_files_writable;
+    syncShareWritable();
+    if (audioMutedToggle) audioMutedToggle.checked = settings.audio_muted;
+    if (grabKeyboardToggle) grabKeyboardToggle.checked = settings.grab_keyboard;
+    if (clipboardSyncToggle) clipboardSyncToggle.checked = settings.clipboard_sync;
+    if (statsPosSelect) statsPosSelect.value = settings.stats_position;
+    syncPresetSelect();
+    syncCodecSelect();
+    applyTheme(settings.theme, settings.accent_color);
+    applyShortcutBindings(settings.shortcuts);
+    refreshAllShortcutRows();
+  }
+
+  // 初期ロード: 設定を読み込んでコントロールへ反映。
+  void (async () => {
+    try {
+      settings = await loadSettings();
+    } catch {
+      settings = { ...DEFAULT_SETTINGS };
+    }
+    applySettingsToForm();
+  })();
+
+  // 他ウィンドウ (capture のツールバー等) が設定を保存したら、この窓のコピーとフォームを
+  // 追従させる。古いコピーのまま persist() すると他窓の変更を巻き戻すため必須。
+  // 自分の persist() の同報も受けるが、同値の再反映になるだけで無害。
+  void listen<ClientSettings>("aurora://settings-changed", (e) => {
+    settings = e.payload;
+    applySettingsToForm();
+  });
+  void handle.refreshHosts();
+
+  // 起動時 + 6h ごとに更新をチェックし、新版があればバナーを表示する。
+  const updateBanner = opts.root.querySelector<HTMLElement>("#update-banner");
+  const updateText = opts.root.querySelector<HTMLElement>("#update-text");
+  const updateInstallBtn = opts.root.querySelector<HTMLButtonElement>("#update-install");
+  const updateDismissBtn = opts.root.querySelector<HTMLButtonElement>("#update-dismiss");
+
+  async function runUpdateCheck(): Promise<void> {
+    const status = await checkForUpdate();
+    if (status.kind === "available" && updateBanner && updateText) {
+      // version は自 GitHub 由来だが安全側で textContent を使う (XSS 回避規約)。
+      updateText.textContent = `新しいバージョン ${status.version} が利用できます`;
+      updateBanner.hidden = false;
+    }
+  }
+  updateInstallBtn?.addEventListener("click", () => {
+    updateInstallBtn.disabled = true;
+    updateInstallBtn.textContent = "更新中...";
+    void installPendingUpdate().catch((e) => {
+      logger.error(`update install failed: ${String(e)}`);
+      updateInstallBtn.disabled = false;
+      updateInstallBtn.textContent = "今すぐ更新";
+    });
+  });
+  updateDismissBtn?.addEventListener("click", () => {
+    if (updateBanner) updateBanner.hidden = true;
+  });
+  void runUpdateCheck();
+  window.setInterval(() => {
+    void runUpdateCheck();
+  }, 6 * 60 * 60 * 1000);
+
+  // 接続中 host の変化 (capture ウィンドウでの接続/切断/ウィンドウ破棄) を購読し、
+  // 接続中表示・切断ボタン・保存バッジ (接続成功で新規保存された分) を更新する。
+  void listen<string[]>("aurora://connections", (e) => {
+    connectedSet = new Set(e.payload.map((h) => h.trim().toLowerCase()));
+    // 保存バッジ (新規保存) の反映も兼ねて履歴ごと再描画する。
+    void handle.refreshHosts();
+  });
+
+  return handle;
+}

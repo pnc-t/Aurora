@@ -1,0 +1,124 @@
+/* Wake on LAN パネル (wol-panel.ts)。launcher の「Wake on LAN」タブに埋め込む。
+ * page-head / host-card 相当の共通クラス (.card-btn, .btn-secondary, .empty-hint, .dialog 系)
+ * は launcher.css 側の既存定義を再利用し、ここでは wol 固有のセレクタのみ持つ (重複回避)。 */
+
+/* scrollbar-gutter で常時バー分の溝を確保し、出現/非表示でカード幅が変わらないようにする。
+ * padding-right はその溝込みで content の右余白 (26px) と揃うよう補正 (24 + 8 = 32 = 6 + 26)。 */
+.wol-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; padding-bottom: 36px; scrollbar-gutter: stable; }
+
+/* ダイアログ用バックドロップ (launcher.css の #dialog-backdrop と同じ見た目)。#page-wol は
+ * position 指定が無いため fixed で全面に被せ、中央配置する。 */
+#wol-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  display: none; align-items: center; justify-content: center;
+  background: var(--backdrop); backdrop-filter: blur(2px);
+}
+#wol-dialog-backdrop.visible { display: flex; }
+
+.wol-card {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 16px; border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--panel-border);
+}
+/* Hosts の host-card と同じホバー挙動に揃える。 */
+.wol-card:hover { border-color: var(--card-hover-border); background: var(--raised-faint); }
+
+/* アバター (頭文字 or 画像)。host-card .avatar と同じ体裁。 */
+.wol-card .avatar {
+  width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 700; color: #fff;
+}
+.wol-card .avatar.avatar-img { background: var(--control); overflow: hidden; }
+.wol-card .avatar.avatar-img img { width: 100%; height: 100%; object-fit: cover; }
+
+/* 並べ替えグリップ (host-card .grip と同じ)。 */
+.wol-card .grip {
+  display: inline-flex; align-items: center; color: var(--grip);
+  font-size: 18px; cursor: grab; padding: 2px; margin-right: 2px; flex-shrink: 0;
+  touch-action: none;
+}
+.wol-card .grip svg { pointer-events: none; }
+.wol-card .grip:hover { color: var(--fg); }
+.wol-card .grip:active { cursor: grabbing; }
+/* ドラッグ中: 元カードは空きスロット、分身がカーソルに追従 (host-card と同じ)。 */
+.wol-card.drag-placeholder { opacity: 0; }
+.wol-card.drag-clone {
+  position: fixed; z-index: 70; margin: 0; pointer-events: none;
+  box-sizing: border-box; cursor: grabbing; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  border-color: var(--accent);
+}
+
+.wol-card .meta { flex: 1; min-width: 0; }
+/* ラベル + 保存バッジの行 (Hosts の label-row と同配置。バッジは base.css の .saved-badge)。 */
+.wol-card .meta .label-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.wol-card .meta .label {
+  font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wol-card .meta .mac {
+  font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px;
+}
+.wol-card .meta .link {
+  font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 編集/⋯/末尾枠の間隔は Hosts (host-card の gap: 14px) と揃える。
+ * WoL は actions を .wol-actions ラッパーに包む都合上ここで明示しないと Hosts とずれる。 */
+.wol-card .wol-actions { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+
+/* アクションはアイコンのみ。Hosts の host-card .card-btn と同じ体裁に揃える
+ * (WoL カードには専用スタイルが無く既定ボタン表示になっていたのを合わせる)。 */
+.wol-card .card-btn {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 16px; padding: 6px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.wol-card .card-btn:hover { background: var(--menu-hover); color: var(--fg); }
+.wol-card .card-btn.danger { color: var(--danger); }
+.wol-card .card-btn.danger:hover { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
+/* 起こす系は主要アクションなので少し目立たせる。起こして接続 (accent) は稲妻+chevron。 */
+.wol-card .card-btn.wake { color: var(--fg); }
+.wol-card .card-btn.wake.accent { color: var(--accent); }
+.wol-card .card-btn.wake.accent:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.wol-card .card-btn.wake.accent .icon + .icon { margin-left: -3px; } /* 稲妻と chevron を1つの記号のように詰める */
+/* 末尾アクション枠 (起動 + 起動して接続、最大2個)。Hosts と同じ固定幅を右寄せで共有し、
+ * 編集/⋯ の位置を両タブ・全カードで揃える。 */
+.wol-card .card-tail {
+  flex: 0 0 var(--card-tail-w); display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+}
+
+/* 起こして接続中の進捗表示 (アクションボタン群と入れ替わりで表示)。
+ * display:flex は UA の [hidden]{display:none} より優先されるため、hidden 時を明示的に消す
+ * (でないと非ポーリング時もキャンセルボタンが常時見える)。 */
+.wol-card .wol-progress {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  font-size: 13px; color: var(--muted);
+}
+.wol-card .wol-progress[hidden] { display: none; }
+.wol-card .wol-actions[hidden] { display: none; }
+/* 進行中の文言は本文色 + 太字。muted のままだと押した実感が薄かった。
+ * 秒数が伸び縮みして行が揺れないよう等幅数字にする。 */
+.wol-card .wol-progress-text {
+  white-space: nowrap; color: var(--fg); font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+/* キャンセルは他のカードアクションと同じアイコンのみボタン。hover で危険色。
+ * .card-btn の display:inline-flex は UA の [hidden]{display:none} より優先されるため、
+ * 単発の「起こす」フィードバック (cancel=false) で消えるよう hidden 時を明示する。 */
+.wol-card .wol-progress-cancel:hover { color: var(--danger); }
+.wol-card .wol-progress-cancel[hidden] { display: none; }
+/* 「起こす」送信完了フィードバック。 */
+.wol-card .wol-progress-text.done { color: var(--ok); font-weight: 600; }
+/* 進行中スピナー (完了表示のときは JS が hidden にする)。 */
+.wol-card .wol-spinner {
+  width: 14px; height: 14px; flex-shrink: 0; border-radius: 50%;
+  border: 2px solid var(--panel-border); border-top-color: var(--accent);
+  animation: wol-spin 0.9s linear infinite;
+}
+.wol-card .wol-spinner[hidden] { display: none; }
+@keyframes wol-spin {
+  to { transform: rotate(360deg); }
+}
+/* 進行中のカードはアクセント枠で「今このカードが動いている」ことを示す。 */
+.wol-card:has(.wol-progress:not([hidden])) { border-color: var(--accent); }

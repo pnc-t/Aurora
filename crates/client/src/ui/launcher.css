@@ -1,0 +1,422 @@
+/* 未接続時のランチャー (launcher.ts)。サイドバー + ホスト一覧 / 設定ページ。
+ * フレームレスの自前タイトルバーを持つ。ウィンドウ操作ボタン自体の見た目は
+ * window-controls.css 側 (共有)。ここではタイトルバーの配置のみ扱う。 */
+
+#connect-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: var(--bg);
+}
+#connect-overlay.hidden { display: none; }
+.launcher { display: flex; height: 100%; position: relative; }
+
+/* 自前タイトルバー (フレームレス): 上端のドラッグ領域 + 右上のウィンドウ操作 */
+.titlebar {
+  position: absolute; top: 0; left: 0; right: 0; height: 34px; z-index: 55;
+}
+
+/* サイドバー: アイコンのみの細いレール (ブランド非表示。上端はタイトルバー分あける)。
+ * 各項目の名称はボタンの title 属性 (ホバー) で表示する。
+ * 下 padding はステータスバー (absolute 全幅 26px) の高さ分を含めて確保し、
+ * 最下部の設定アイコンがバーの裏に隠れないようにする。 */
+.sidebar {
+  width: 60px; flex-shrink: 0;
+  display: flex; flex-direction: column; align-items: center;
+  padding: 42px 8px 40px; gap: 6px;
+  background: var(--sidebar); border-right: 1px solid var(--panel-border);
+}
+.nav-item {
+  display: flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; padding: 0; border-radius: 10px;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+}
+.nav-item .ico { display: inline-flex; align-items: center; font-size: 19px; opacity: 0.9; }
+.nav-item:hover { background: var(--raised-faint); color: var(--fg); }
+.nav-item.active { background: var(--raised); color: var(--fg); }
+.sidebar-spacer { flex: 1; }
+
+/* 下端ステータスバー: ウィンドウ全幅の細い帯にドット + 状態テキストを出す
+ * (未接続=グレー / 接続中=琥珀 / 接続済=緑 / エラー=赤)。VS Code 下部のような形。 */
+.statusbar {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 26px; z-index: 56;
+  display: flex; align-items: center; gap: 8px; padding: 0 14px;
+  background: var(--sidebar); border-top: 1px solid var(--panel-border);
+  font-size: 12px; color: var(--muted);
+}
+.statusbar .sb-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.statusbar.connecting .sb-dot { background: #d6a83a; }
+.statusbar.connected .sb-dot { background: var(--ok); }
+.statusbar.error .sb-dot { background: var(--danger); }
+.statusbar.connected .sb-text { color: var(--fg); }
+
+/* コンテンツ領域。下端の余白は各スクロールコンテナ側 (host-list/settings-body/wol-list)
+ * の padding-bottom に持たせ、スクロールバー自体はウィンドウ下端 (status bar 上) まで
+ * 伸ばす。ここで padding-bottom を付けるとバーがその分手前で切れてしまう。 */
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 44px 0 0 26px; overflow: hidden; }
+
+/* 更新通知バナー: content 先頭に控えめな 1 行で出す (テーマ/アクセント色に追従)。 */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 26px 12px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.update-banner[hidden] { display: none; }
+.update-text { flex: 1; }
+.update-btn {
+  padding: 4px 12px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+.update-btn:disabled { opacity: .6; cursor: default; }
+.update-dismiss {
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; line-height: 1; color: inherit; opacity: .6;
+}
+.update-dismiss:hover { opacity: 1; }
+.page { display: none; flex-direction: column; min-height: 0; flex: 1; }
+.page.active { display: flex; }
+/* スクロールバー分の溝は各スクロールコンテナ側で確保するため、見出し行は content の
+ * 右 padding が 0 になった分をここで補って右端の余白を維持する。 */
+.page-head { display: flex; align-items: center; margin-bottom: 16px; padding-right: 26px; }
+.page-head h2 { margin: 0; font-size: 22px; font-weight: 700; }
+.page-head .actions { margin-left: auto; display: flex; gap: 8px; }
+.icon-btn {
+  width: 34px; height: 34px; border-radius: 8px;
+  background: var(--raised); border: 1px solid var(--panel-border); color: var(--fg);
+  cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center;
+}
+.icon-btn:hover { background: var(--menu-hover); }
+/* 更新ボタン: プローブ中はアイコンを回して「更新している」ことを見せる。 */
+.icon-btn.spinning { color: var(--accent); pointer-events: none; }
+.icon-btn.spinning .icon { animation: icon-spin 0.7s linear infinite; }
+@keyframes icon-spin { to { transform: rotate(360deg); } }
+
+/* スリムなスクロールバー (ダークテーマ用、OS 標準の太いバーを置換)。
+ * .wol-list も含める: 外すと既定幅 (~15px) の溝が scrollbar-gutter で確保され、カード位置が他ページとずれる。 */
+.host-list, .wol-list, .settings-body, .content {
+  scrollbar-width: thin;                       /* Firefox 系 */
+  scrollbar-color: var(--track) transparent;
+}
+.host-list::-webkit-scrollbar,
+.wol-list::-webkit-scrollbar,
+.settings-body::-webkit-scrollbar,
+.content::-webkit-scrollbar { width: 8px; height: 8px; }
+.host-list::-webkit-scrollbar-track,
+.wol-list::-webkit-scrollbar-track,
+.settings-body::-webkit-scrollbar-track,
+.content::-webkit-scrollbar-track { background: transparent; }
+.host-list::-webkit-scrollbar-thumb,
+.wol-list::-webkit-scrollbar-thumb,
+.settings-body::-webkit-scrollbar-thumb,
+.content::-webkit-scrollbar-thumb {
+  background: var(--track); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box;
+}
+.host-list:hover::-webkit-scrollbar-thumb,
+.wol-list:hover::-webkit-scrollbar-thumb,
+.settings-body:hover::-webkit-scrollbar-thumb { background: var(--track-hover); background-clip: padding-box; }
+.host-list::-webkit-scrollbar-thumb:hover,
+.wol-list::-webkit-scrollbar-thumb:hover,
+.settings-body::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+
+/* ホスト一覧 */
+/* scrollbar-gutter で常時バー分の溝を確保し、出現/非表示でカード幅が変わらないようにする。
+ * padding-right はその溝込みで content の右余白 (26px) と揃うよう補正 (24 + 8 = 32 = 6 + 26)。 */
+.host-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 24px; padding-bottom: 36px; scrollbar-gutter: stable; }
+.host-card {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 16px; border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--panel-border); cursor: pointer;
+}
+.host-card:hover { border-color: var(--card-hover-border); background: var(--raised-faint); }
+/* キーボード操作のフォーカスリング */
+.host-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.host-card .avatar {
+  width: 42px; height: 42px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 700; color: #fff;
+}
+/* 画像アバター: 角丸内に収め、はみ出しを隠す (中央クロップ済みだが念のため cover)。 */
+.host-card .avatar.avatar-img { background: var(--control); overflow: hidden; }
+.host-card .avatar.avatar-img img { width: 100%; height: 100%; object-fit: cover; }
+/* 到達性ドット: アバター右下に重ねる (avatar-img の overflow:hidden で切れないようラッパー側)。 */
+.host-card .avatar-wrap { position: relative; flex-shrink: 0; display: flex; }
+.host-card .avatar-wrap .presence {
+  position: absolute; right: -2px; bottom: -2px; width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid var(--panel); box-sizing: border-box;
+}
+.host-card .avatar-wrap .presence.online { background: var(--ok); }
+.host-card .avatar-wrap .presence.offline { background: var(--muted); }
+.host-card .meta { flex: 1; min-width: 0; }
+/* 接続中ピル / 保存バッジは meta 内 (ラベル行) に置き、右のアクション列 (編集/⋯/末尾) を
+ * 全カードで同じ位置に揃える (これらを列に混ぜると接続中カードだけ左へずれる)。 */
+.host-card .meta .label-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.host-card .meta .label { font-size: 15px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.host-card .meta .addr { font-size: 12px; color: var(--muted); font-family: monospace; margin-top: 2px; }
+/* 最終接続日時 (addr 行の右に控えめに添える)。数値由来の生成文字列のため innerHTML でも安全。 */
+.host-card .meta .addr .last-connected { opacity: 0.7; }
+.host-card .card-btn {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 16px; padding: 6px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.host-card .card-btn:hover { background: var(--menu-hover); color: var(--fg); }
+/* 鍵マーク (押すと即接続) の共通スタイルは base.css の .saved-badge を使う。 */
+/* 末尾の chevron は card-btn (切断ボタン) と同じ箱サイズ (20px 字 + 4px padding = 28px) にする。 */
+.host-card .chevron {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 20px; padding: 4px;
+}
+/* 末尾アクション枠 (chevron/切断)。WoL の起動系 (最大2個) と同じ固定幅を右寄せで共有し、
+ * 編集/⋯ の位置を両タブ・全カードで揃える。 */
+.host-card .card-tail {
+  flex: 0 0 var(--card-tail-w); display: flex; align-items: center; justify-content: flex-end;
+}
+/* 接続中: 緑ピル + 切断 (danger) ボタン。 */
+.host-card.connected { border-color: color-mix(in srgb, var(--ok) 45%, var(--panel-border)); }
+.host-card .conn-pill {
+  display: inline-flex; align-items: center; flex-shrink: 0;
+  padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  color: var(--ok); background: color-mix(in srgb, var(--ok) 18%, transparent);
+}
+.host-card .card-btn.danger { color: var(--danger); }
+.host-card .card-btn.danger:hover { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
+/* 並べ替え (grip を掴んでドラッグ) */
+.host-card .grip {
+  display: inline-flex; align-items: center; color: var(--grip);
+  font-size: 18px; cursor: grab; padding: 2px; margin-right: 2px; flex-shrink: 0;
+  touch-action: none;
+}
+.host-card .grip svg { pointer-events: none; }
+.host-card .grip:hover { color: var(--fg); }
+.host-card .grip:active { cursor: grabbing; }
+/* ドラッグ中: 元カードは空きスロット、分身がカーソルに追従 */
+.host-card.drag-placeholder { opacity: 0; }
+.host-card.drag-clone {
+  position: fixed; z-index: 70; margin: 0; pointer-events: none;
+  box-sizing: border-box;   /* rect.width(=border-box) と一致させ横の膨らみを防ぐ */
+  cursor: grabbing; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  border-color: var(--accent);
+}
+.empty-hint { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
+
+/* 初回利用者向け空状態ガイド (.empty-hint とは別クラス。wol-panel は使わない前提)。
+ * 枠/バッジ/手順が「主張しすぎ・説教くさい」と不評だったため、枠なし・見出し+一行ヒント
+ * のみの控えめな表示にする。 */
+.empty-guide { text-align: center; }
+/* ホストが 0 件のときだけ一覧領域の縦横中央に寄せたい。通常時 (カード一覧) の
+ * flex-start レイアウトを壊さないよう、host-list 自体ではなく :has() で空状態の
+ * 子要素が居るときだけ効かせる。 */
+.host-list:has(.empty-guide) { flex: 1; justify-content: center; align-items: center; }
+/* アイコンは base.css の `.launcher svg.icon { display: block }` でブロック化されるため
+ * 親の text-align では中央に寄らない。デスクトップだけ左に寄るのを避けて flex で中央に置く。 */
+.empty-guide-icon {
+  display: flex; justify-content: center; margin-bottom: 12px;
+  font-size: 48px; color: var(--muted); opacity: 0.5;
+}
+.empty-guide-title { font-size: 14px; font-weight: 500; color: var(--fg); margin-bottom: 6px; }
+.empty-guide-hint { font-size: 13px; color: var(--muted); }
+
+/* 設定ページ: 間延び防止のため 1 カラムに幅上限を設ける。スクロールバーは画面右端に
+ * 出したいので #page-settings 全体ではなく、幅を持つ内側の要素 (タブバー/各セクション)
+ * 側に max-width を付ける (settings-body 自体は右端まで広げてバーを寄せる)。 */
+/* タブバー: 下線インジケータ型。ピル背景は廃止し、選択中タブの下にアクセント色の下線を出す。
+ * 下線はタブバー全幅の区切り線に重ねる (区切り線は擬似要素、下線は各タブの ::after)。 */
+.settings-tabs {
+  display: flex; gap: 4px; margin-bottom: 0; flex-shrink: 0;
+  border-bottom: 1px solid var(--panel-border);
+  max-width: 760px;
+}
+.settings-tab {
+  position: relative;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; font-weight: 600; padding: 10px 14px; margin-bottom: -1px;
+}
+.settings-tab:hover { color: var(--fg); }
+.settings-tab.active { color: var(--fg); }
+.settings-tab.active::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--accent); border-radius: 2px 2px 0 0;
+}
+/* scrollbar-gutter で溝を常時確保し、バー出現時にカードが縮むのを防ぐ。
+ * padding-right は溝込みで content の右余白 (26px) と揃うよう補正 (18 + 8 = 26)。 */
+.settings-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 18px; padding-bottom: 36px; scrollbar-gutter: stable; }
+.settings-sect { display: none; flex-direction: column; max-width: 760px; }
+.settings-sect.active { display: flex; }
+.setting-group {
+  font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+  margin: 24px 2px 6px; font-weight: 600;
+}
+.setting-group:first-child { margin-top: 4px; }
+/* 設定カード: グループ見出し直下の設定行をまとめて 1 枚のカードに囲う (Windows 11 設定風)。
+ * 行間の区切りはカード内側の細線にし、ページ全幅の border-bottom はカード内スタイルへ置き換える。 */
+.setting-card {
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
+  padding: 0 14px; overflow: hidden;
+}
+.setting-card .setting-row { border-bottom: 1px solid var(--panel-border); padding: 14px 2px; }
+.setting-card .setting-row:last-child { border-bottom: none; }
+.color-input {
+  width: 42px; height: 28px; padding: 0; border: 1px solid var(--panel-border);
+  border-radius: 6px; background: var(--control); cursor: pointer; flex-shrink: 0;
+}
+.num-input {
+  width: 80px; flex-shrink: 0; text-align: right;
+  background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px;
+}
+.num-input:focus { outline: none; border-color: var(--accent); }
+/* テーマ選択などのプルダウン */
+.select-input {
+  flex-shrink: 0; background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 8px; font-size: 14px; cursor: pointer;
+}
+.select-input:focus { outline: none; border-color: var(--accent); }
+/* 診断セクションのアクションボタン群 (ログフォルダを開く / ZIP 出力) */
+.s-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.btn-secondary {
+  background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 10px;
+  font-size: 14px; cursor: pointer;
+}
+.btn-secondary:hover { background: var(--menu-hover); border-color: var(--accent); }
+/* ショートカット一覧のキー表記 (読み取り専用) */
+.kbd {
+  flex-shrink: 0; font-family: ui-monospace, monospace; font-size: 12px;
+  color: var(--muted); background: var(--control);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 4px 8px;
+  white-space: nowrap;
+}
+/* ショートカット一覧: 編集可能なキー表記ボタン */
+.shortcut-edit { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.shortcut-slash { color: var(--muted); font-size: 12px; }
+.kbd-btn { cursor: pointer; }
+.kbd-btn:hover { border-color: var(--accent); }
+.kbd-btn.recording { color: var(--accent); border-color: var(--accent); }
+.shortcut-reset { width: 28px; height: 28px; }
+.shortcut-error {
+  font-size: 12px; color: #ff8b8b; text-align: right;
+}
+.shortcut-error:empty { display: none; }
+.shortcut-note { font-size: 12px; color: var(--muted); padding: 10px 2px 16px; }
+/* number 入力の上下スピナーを消す (port などは text+inputmode を使うが念のため) */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; }
+.setting-row {
+  display: flex; align-items: center; gap: 16px;
+  padding: 16px 2px;
+}
+.setting-row .s-meta { flex: 1; }
+.setting-row .s-title { font-size: 14px; }
+.setting-row .s-desc { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+/* トグルスイッチ */
+.switch { position: relative; width: 42px; height: 24px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .slider {
+  position: absolute; inset: 0; border-radius: 24px;
+  background: var(--toggle-off); transition: background 0.15s; cursor: pointer;
+}
+.switch .slider::before {
+  content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+  border-radius: 50%; background: #fff; transition: transform 0.15s;
+}
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(18px); }
+.setting-row.is-disabled { opacity: 0.5; }
+.setting-row.is-disabled .switch .slider { cursor: default; }
+
+/* ダイアログ (接続 / ホスト編集) */
+#dialog-backdrop {
+  position: absolute; inset: 0; z-index: 60;
+  display: none; align-items: center; justify-content: center;
+  background: var(--backdrop); backdrop-filter: blur(2px);
+}
+#dialog-backdrop.visible { display: flex; }
+.dialog {
+  width: 340px; max-width: calc(100vw - 32px); max-height: calc(100vh - 40px);
+  padding: 18px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+  display: flex; flex-direction: column; gap: 8px;
+  scrollbar-width: thin; scrollbar-color: var(--track) transparent;
+}
+.dialog::-webkit-scrollbar { width: 8px; }
+.dialog::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+.dialog h3 { margin: 0 0 2px; font-size: 16px; font-weight: 600; }
+/* アイコン (画像) 選択行: 左にプレビュー、右に「画像を選択」/「解除」。 */
+.dialog .icon-picker { display: flex; align-items: center; gap: 12px; margin-bottom: 2px; }
+.dialog .icon-preview {
+  width: 48px; height: 48px; border-radius: 10px; flex-shrink: 0; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; font-weight: 700; color: #fff; background: var(--control);
+}
+.dialog .icon-preview img { width: 100%; height: 100%; object-fit: cover; }
+.dialog .icon-picker-actions { display: flex; gap: 8px; }
+.dialog .icon-picker-actions button { padding: 6px 11px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.dialog label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.dialog input {
+  background: var(--control); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 8px; padding: 7px 10px; font-size: 14px;
+}
+.dialog input:focus { outline: none; border-color: var(--accent); }
+/* 横並びの入力行 (host + port など)。縦の行数を減らしてモーダルを低くする。 */
+.dialog .dlg-row { display: flex; gap: 10px; align-items: flex-start; }
+.dialog .dlg-row > label { flex: 1; min-width: 0; }
+.dialog .dlg-row > label.port { flex: 0 0 84px; }
+/* WebView2 (Edge) が password 入力に足す標準の目アイコンを消す (自前の目トグルと二重になる)。 */
+.dialog input[type="password"]::-ms-reveal,
+.dialog input[type="password"]::-ms-clear { display: none; }
+/* 「保存する」チェックボックスは横並び。テキスト欄用の縦積み/全幅スタイルを打ち消す。 */
+.dialog label.dlg-check { flex-direction: row; align-items: center; gap: 8px; cursor: pointer; }
+.dialog label.dlg-check input { width: auto; padding: 0; }
+.dialog .dlg-status { min-height: 14px; font-size: 12px; font-family: monospace; color: var(--muted); }
+.dialog .dlg-status.error { color: var(--danger-fg); }
+/* ダイアログ内の小見出し (ホスト別設定) */
+.dialog .dlg-sub {
+  font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: 600; margin-top: 4px;
+}
+.dialog .select-input { width: 100%; box-sizing: border-box; }
+/* パスワード表示トグル */
+.dialog .pass-wrap { display: flex; align-items: center; gap: 6px; }
+.dialog .pass-wrap input { flex: 1; min-width: 0; }
+.dialog .pass-eye {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 16px; padding: 6px; border-radius: 6px; display: inline-flex; align-items: center;
+}
+.dialog .pass-eye:hover { color: var(--fg); background: var(--menu-hover); }
+.dialog .dlg-actions { display: flex; gap: 8px; margin-top: 6px; }
+.dialog .dlg-actions button {
+  flex: 1; padding: 9px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
+}
+.dialog .btn-primary { background: var(--accent); color: var(--accent-fg); }
+.dialog .btn-primary:disabled { opacity: 0.6; cursor: default; }
+.dialog .btn-ghost { background: var(--control); color: var(--fg); border: 1px solid var(--panel-border) !important; }
+.dialog .btn-danger { background: var(--danger); color: #fff; }
+
+/* カードの ⋯ メニュー (編集 / 削除) */
+.card-menu {
+  position: fixed; z-index: 58; display: none; min-width: 130px;
+  flex-direction: column; gap: 2px; padding: 6px;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+.card-menu.visible { display: flex; }
+.card-menu .menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; border: none; background: transparent; color: var(--fg);
+  font-size: 14px; text-align: left; cursor: pointer; border-radius: 6px;
+}
+.card-menu .menu-item:hover { background: var(--menu-hover); }
+.card-menu .menu-item.danger { color: var(--danger-fg); }
+.card-menu .menu-item.danger:hover { background: var(--danger); color: #fff; }

@@ -1,0 +1,89 @@
+name: ci
+
+# dev への push と、dev/main 宛ての PR で検証する。
+# fmt/clippy/test に加え host・client を実際にビルドし、成果物を Run の
+# Artifacts に添付する (Release は作らない。リリースは release.yml がタグで担当)。
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+# 同一ブランチで新しい push が来たら古い Run を打ち切る
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust (stable + clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/client/pnpm-lock.yaml
+
+      - name: Install tauri-cli (prebuilt)
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
+      - run: cargo binstall -y tauri-cli
+
+      - name: Install frontend deps
+        working-directory: crates/client
+        run: pnpm install --frozen-lockfile
+
+      # tauri-build (client の build script) は frontendDist=../dist の存在を要求する。
+      # clippy/test を通すために先にフロントをビルドしておく。
+      - name: Build frontend (dist)
+        working-directory: crates/client
+        run: pnpm build
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build aurora-host
+        run: cargo build --release -p aurora-host
+
+      - name: Build aurora-client (Tauri NSIS)
+        working-directory: crates/client/src-tauri
+        # 更新用署名 (.sig) はリリース (release.yml) だけで作る。CI は検証用なので
+        # 署名鍵 Secrets を渡さず、updater 成果物の生成を切って鍵なしでバンドルする。
+        # pwsh はネイティブ引数の " 渡しが版で変わるため、JSON を渡すこの行は bash で実行する。
+        shell: bash
+        run: cargo tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-ci | Out-Null
+          Copy-Item target/release/aurora-host.exe dist-ci/
+          Copy-Item target/release/bundle/nsis/*-setup.exe dist-ci/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurora-dev-build
+          path: dist-ci/*
+          retention-days: 14

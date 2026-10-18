@@ -1,0 +1,11 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "url": "mobile.html",
+        "title": "Aurora"
+      }
+    ]
+  }
+}

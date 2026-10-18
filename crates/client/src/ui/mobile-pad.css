@@ -1,0 +1,135 @@
+/* オンスクリーンコントローラ (トラックパッド + マウスボタンの 2 枚カード)。mobile-controls.css
+ * の見た目の言語 (半透明パネル・角丸・ボタンサイズ・--accent 等の CSS 変数) に揃える。
+ * 位置は mobile-pad.ts が各カードの left/top を px で直接当てる (グリップドラッグ + 比率位置の復元)。 */
+
+.mp-pad-card,
+.mp-btn-card {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 25; /* mobile-controls.css の .mc-root(30)/.mc-display-pop(31) より下に置き衝突させない */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  box-shadow: 0 2px 10px var(--shadow);
+  padding: 4px 8px 8px;
+}
+
+/* グローバルの .hidden (mobile-main.css) は display: none !important 付きで、詳細度に関係なく
+ * 上書きできない。visibility:hidden を当てても効かず display:none になってしまうため、
+ * このコンポーネント専用のクラス名で畳む (寸法が測れなくなる問題は mobile-pad.ts 側の
+ * applyRatio ガード + setVisible(true) 時の当て直しで吸収する)。 */
+.mp-pad-card.mp-hidden,
+.mp-btn-card.mp-hidden {
+  display: none;
+}
+
+.mp-pad-card {
+  width: 160px;
+}
+
+.mp-btn-card {
+  width: 200px;
+}
+
+.mp-grip {
+  width: 48px;
+  height: 20px;
+  margin: 2px 0 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* ブラウザのスクロール/ズームジェスチャにグリップのドラッグを奪われないようにする。 */
+  touch-action: none;
+}
+.mp-grip svg {
+  width: 20px;
+  height: 20px;
+}
+
+.mp-pad {
+  position: relative; /* スティックの土台/ノブの絶対配置の基準にする */
+  width: 100%;
+  height: 140px;
+  border-radius: 10px;
+  /* 暗い映像の上でも領域がはっきり分かるよう、実線枠 + 不透明な背景にする
+   * (以前の点線枠+半透明はほぼ見えなかった)。 */
+  border: 2px solid var(--panel-border);
+  background: var(--panel);
+  /* ブラウザのスクロール/ピンチにジェスチャを奪われないようにする。 */
+  touch-action: none;
+}
+
+/* スティックの土台。サイズと初期位置は mobile-pad.ts が px で指定する (パッド面の実寸依存のため)。 */
+.mp-stick-base {
+  position: absolute;
+  /* mobile-pad.ts が半径から算出した px を width/left にそのまま入れるため、枠線を寸法に
+   * 含めないと枠の太さぶん中心がずれる (既定の content-box では 2px ずれていた)。 */
+  box-sizing: border-box;
+  border: 2px solid var(--panel-border);
+  background: var(--raised);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+/* スティックのノブ。中心からの移動量は mobile-pad.ts が transform: translate() で当てる。 */
+.mp-stick-knob {
+  position: absolute;
+  /* 土台と同じ理由 (JS が px を直接入れるため、枠線を寸法へ含める)。 */
+  box-sizing: border-box;
+  background: var(--control);
+  border: 1px solid var(--panel-border);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+/* pad モード中はスティックの土台/ノブを畳む。グローバルの .hidden は使えない
+ * (mobile-main.css の .hidden が display:none !important で他の詳細度を無視するため)。 */
+.mp-stick-hidden {
+  display: none;
+}
+
+.mp-pad-actions {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  margin-top: 6px;
+}
+.mp-pad-actions .mp-btn {
+  flex: 1;
+}
+
+.mp-btns {
+  display: grid;
+  grid-template-columns: 1.25fr 0.9fr 1.25fr;
+  gap: 6px;
+}
+
+.mp-btn {
+  min-width: 44px;
+  min-height: 56px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mp-btn svg {
+  width: 20px;
+  height: 20px;
+}
+.mp-btn.toggled {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}

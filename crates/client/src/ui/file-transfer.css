@@ -1,0 +1,36 @@
+/* ファイル転送ポップオーバー (file-transfer.ts)。AnyDesk 風グルーピング。 */
+
+#file-panel {
+  position: fixed; top: 46px; right: 10px; z-index: 35;
+  display: none; flex-direction: column; gap: 8px;
+  padding: 12px; border-radius: 10px; width: 300px;
+  background: var(--panel); border: 1px solid var(--panel-border);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+#file-panel.visible { display: flex; }
+
+/* タブストリップ (z-index 4000) と重なる配置ではその厚み分だけ逃がす
+ * (stats-overlay.css の body.tab-* 規則と同じパターン)。フルスクリーン中は帯が消えるので寄せない。 */
+body.tab-top:not(.tab-fs) #file-panel { top: calc(var(--tabstrip-h, 37px) + 46px); }
+body.tab-right:not(.tab-fs) #file-panel { right: calc(var(--tabstrip-w, 200px) + 10px); }
+#file-panel .row { display: flex; gap: 6px; align-items: center; }
+#file-panel .section-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+#file-panel input[type="text"] { flex: 1; min-width: 0; }
+#file-panel input { background: var(--control); color: var(--fg); border: 1px solid var(--panel-border); border-radius: 6px; padding: 4px 6px; }
+#file-panel button { background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+#file-panel button:disabled { opacity: 0.5; cursor: default; }
+#file-panel .progress { font-family: monospace; font-size: 11px; color: var(--muted); min-width: 64px; text-align: right; }
+#file-panel .hint { font-size: 12px; color: var(--muted); }
+
+/* 転送進捗バー (FileProgress で伸びる)。 */
+#file-panel .transfer-bar {
+  flex: 1; height: 6px; border-radius: 3px;
+  background: var(--control); border: 1px solid var(--panel-border);
+  overflow: hidden;
+}
+#file-panel .transfer-bar-fill {
+  height: 100%; width: 0;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+#file-panel .transfer-bar-row[hidden] { display: none; }

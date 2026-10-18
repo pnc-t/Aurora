@@ -1,0 +1,16 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      Aurora の Web UI は既定で暗い配色なので、端末がライトモードでもシステムバーは
+      「暗い背景向け」= 白アイコン + 暗いナビゲーションバーに固定する。
+      DayNight 既定のまま (カスタマイズ無し) だとライトモード端末では黒アイコンが選ばれ、
+      暗い画面に対して時計・日付が読めず、下端にも明るい帯が残る
+      (実機 SM-X230 / Android 16 / Night mode: no で確認)。
+
+      このファイルは gen/ 配下だが、再生成で消えると上記の表示が壊れるため .gitignore で
+      例外的に追跡している (経緯はルート .gitignore のコメント参照)。
+    -->
+    <style name="Theme.aurora_client" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>

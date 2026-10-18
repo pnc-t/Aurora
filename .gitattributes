@@ -1,0 +1,8 @@
+# cargo / tauri がツールとして LF で書き戻すファイルは LF に固定する。
+# こうしないと core.autocrlf=true (Windows) が CRLF へ変換しようとして、
+# 中身が同じでも毎回 modified 扱いになり churn する。
+Cargo.toml      text eol=lf
+Cargo.lock      text eol=lf
+tauri.conf.json text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf

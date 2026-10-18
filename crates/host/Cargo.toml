@@ -1,0 +1,111 @@
+[package]
+name = "aurora-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aurora-host"
+path = "src/main.rs"
+
+[[example]]
+name = "handshake_smoke"
+path = "examples/handshake_smoke.rs"
+
+[[example]]
+name = "reconnect_probe"
+path = "examples/reconnect_probe.rs"
+
+[build-dependencies]
+# Windows exe にアイコン (とバージョン情報) を埋め込む。トレイ/エクスプローラ/タスクバーで
+# aurora アイコンを表示するため。非 Windows ターゲットでは build.rs 側で no-op にする。
+winresource = "0.1"
+
+[dependencies]
+aurora-common = { path = "../common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+snow = { workspace = true }
+rand = "0.8"
+cpal = "0.15"
+opus = "0.3"
+mac_address = "1.1"
+ureq = { version = "2.10", features = ["json"] }
+serde_json = "1.0"
+semver = "1.0"
+
+# SYSTEM サービス (`--service`) の SCM 定型処理 (ディスパッチャ・制御ハンドラ・登録/削除)。
+# 自前の unsafe FFI を増やさないため採用 (PLAN.md「SYSTEM サービス化」決定事項 2)。
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_Media_MediaFoundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_ProjectedFileSystem",
+]
+
+# --- Linux / macOS 共通: H.264 エンコードは ffmpeg-next 経由 ---
+# Linux: h264_nvenc / libx264、macOS: h264_videotoolbox を実行時に選択する。
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+ffmpeg-next = "7.1"
+
+# --- Linux: PipeWire キャプチャ + xdg-desktop-portal + uinput 入力 ---
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.8"
+libspa = "0.8"
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+evdev = "0.12"
+libc = "0.2"
+
+# --- macOS: ScreenCaptureKit キャプチャ + CGEvent 入力 ---
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSError", "NSThread"] }
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCStream",
+    "SCShareableContent",
+    "SCError",
+    "block2",
+    "dispatch2",
+] }
+objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMFormatDescription", "CMTime", "CMBase"] }
+objc2-core-video = { version = "0.3", features = ["CVPixelBuffer", "CVImageBuffer", "CVReturn", "CVBuffer", "CVBase"] }
+block2 = "0.6"
+dispatch2 = "0.3"

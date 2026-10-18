@@ -1,0 +1,49 @@
+/* 統計 HUD (stats-overlay.ts)。Parsec/Moonlight 風。既定は右上・オフ。設定 (stats_position) で
+ * 四隅 (pos-tl/tr/bl/br) を切り替えられる (stats-overlay.ts の setStatsPosition が付け替える)。 */
+
+#stats-hud {
+  position: fixed; z-index: 25;
+  display: none;
+  transition: top 0.18s ease, left 0.18s ease, right 0.18s ease, bottom 0.18s ease;
+  padding: 6px 10px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  font-family: monospace; font-size: 12px; line-height: 1.5;
+  color: #d8d8d8; pointer-events: none;
+  white-space: pre;
+}
+#stats-hud.visible { display: block; }
+
+/* 四隅の基本位置。 */
+#stats-hud.pos-tl { top: 8px; left: 8px; right: auto; bottom: auto; }
+#stats-hud.pos-tr { top: 8px; right: 8px; left: auto; bottom: auto; }
+#stats-hud.pos-bl { bottom: 8px; left: 8px; right: auto; top: auto; }
+#stats-hud.pos-br { bottom: 8px; right: 8px; left: auto; top: auto; }
+
+/* 常時表示のタブストリップ (不透明・z-index 4000) とツールバー (半透明ピル) に潜って見えなくなる
+ * のを防ぐため、占有された端から逃がす。フルスクリーン中 (tab-fs) はタブが隠れるので tab 系は
+ * 適用しない。上下端は既存の --topbar-h / --tabstrip-h (共に「帯の厚み」相当) でその分ずらし、
+ * 左右端はツールバー (ピル) なら反対側へ逃がし、タブストリップ (幅固定・不透明) なら
+ * --tabstrip-w ぶん内側へ押し出す (タブの不透明帯に隠れるのを避ける)。 */
+
+/* 上端バー回避 (pos-tl/tr)。--topbar-h は toolbar.ts が「上端からバー下端まで」で設定するため、
+ * タブ上配置で帯が inset されていてもタブ厚込みの値になる。 */
+body.tab-top:not(.tab-fs) #stats-hud.pos-tl,
+body.tab-top:not(.tab-fs) #stats-hud.pos-tr { top: calc(var(--tabstrip-h, 37px) + 8px); }
+body.bar-open.bar-top #stats-hud.pos-tl,
+body.bar-open.bar-top #stats-hud.pos-tr { top: calc(var(--topbar-h, 44px) + 8px); }
+
+/* 下端バー回避 (pos-bl/br)。タブのみ対応 (toast/reconnect-badge と同じ既存の制約に揃える)。 */
+body.tab-bottom:not(.tab-fs) #stats-hud.pos-bl,
+body.tab-bottom:not(.tab-fs) #stats-hud.pos-br { bottom: calc(var(--tabstrip-h, 37px) + 8px); }
+
+/* 左端占有 (pos-tl/bl): ツールバーは反対側へ逃がし、タブストリップは幅ぶん押し出す。 */
+body.bar-open.bar-left #stats-hud.pos-tl,
+body.bar-open.bar-left #stats-hud.pos-bl { left: auto; right: 8px; }
+body.tab-left:not(.tab-fs) #stats-hud.pos-tl,
+body.tab-left:not(.tab-fs) #stats-hud.pos-bl { left: calc(var(--tabstrip-w, 200px) + 8px); }
+
+/* 右端占有 (pos-tr/br): 同上。 */
+body.bar-open.bar-right #stats-hud.pos-tr,
+body.bar-open.bar-right #stats-hud.pos-br { right: auto; left: 8px; }
+body.tab-right:not(.tab-fs) #stats-hud.pos-tr,
+body.tab-right:not(.tab-fs) #stats-hud.pos-br { right: calc(var(--tabstrip-w, 200px) + 8px); }

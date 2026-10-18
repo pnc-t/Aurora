@@ -1,0 +1,201 @@
+/* 全 UI 共通の土台。
+ * テーマ変数 (:root)、リセット、最背面の映像 canvas、横断的なアイコン表示など、
+ * 特定コンポーネントに属さないものだけを置く。各コンポーネント固有のスタイルは
+ * ui/<component>.css に co-locate する。main.ts が最初に import する。
+ *
+ * テーマ: <html data-theme="..."> で切り替える (launcher.ts が設定値から付与)。
+ *   未指定 / "dark" = 既定 (:root の値)、"light" / "legacy" (グレーのクラシック調) は上書き、
+ *   "auto" は OS の prefers-color-scheme に追従 (下部の media query)。
+ * 各コンポーネント CSS は生の色を持たず、必ずここで定義した変数を参照すること。 */
+
+:root {
+  /* 基本 */
+  --bg: #111;             /* ウィンドウ背景 */
+  --fg: #eee;             /* 主要テキスト */
+  --muted: #9a9a9e;       /* 補助テキスト */
+  --panel: #1c1c1e;       /* カード / ダイアログ / パネル面 */
+  --panel-border: #333;   /* 枠線 */
+  --accent: #3a82f7;      /* アクセント (ユーザー設定で上書き可) */
+  --accent-fg: #fff;      /* アクセント面上のテキスト */
+  --danger: #e5484d;      /* 危険操作 / エラー枠 */
+  --danger-fg: #ff8a8d;   /* 危険テキスト (淡い赤) */
+  --ok: #3fb950;          /* 正常 */
+  /* 面の階層 (暗→明) */
+  --sidebar: #161618;       /* サイドバー背景 */
+  --raised: #232327;        /* 一段浮いた面: nav 選択中 / icon ボタン / カード hover */
+  --raised-faint: #1f1f22;  /* 控えめに浮いた面: nav hover / ステータスカード */
+  --control: #2c2c2e;       /* 入力欄 / ボタン / メニュー面 */
+  --control-hover: #3a3a3c; /* ボタン hover */
+  --menu-hover: #2d2d31;    /* メニュー項目 / 小ボタン hover */
+  /* 細部 */
+  --track: #3a3a3e;            /* スクロールバー */
+  --track-hover: #56565c;     /* スクロールバー hover */
+  --toggle-off: #3a3a3e;      /* トグル off 時のトラック (off と分かる地味色) */
+  --card-hover-border: #4a4a4e;
+  --grip: #6a6a70;            /* ドラッグつまみ */
+  /* カード右端の主アクション枠の固定幅。Hosts(接続/切断=1個) と WoL(起動+起動して接続=2個)
+   * でこの枠を共有し右寄せすることで、編集/⋯ の位置を両タブ・全カードで揃える。 */
+  --card-tail-w: 72px;
+  --toolbar-bg: rgba(28, 28, 30, 0.96);
+  --toast-bg: rgba(40, 40, 44, 0.96);
+  --backdrop: rgba(8, 8, 10, 0.6);       /* ダイアログ背後 */
+  --overlay-bg: rgba(14, 16, 22, 0.92);  /* capture の全画面ステータス (背後の映像を隠すためほぼ不透明) */
+  --winctl-hover: rgba(255, 255, 255, 0.1);
+  --shadow: rgba(0, 0, 0, 0.5);
+  /* 文字 */
+  --font: system-ui, sans-serif;
+}
+
+/* --- ライト --- */
+:root[data-theme="light"] {
+  --bg: #f5f5f7;
+  --fg: #1c1c1e;
+  --muted: #6b6b70;
+  --panel: #ffffff;
+  --panel-border: #d8d8dc;
+  --accent: #3a82f7;
+  --accent-fg: #fff;
+  --danger: #e5484d;
+  --danger-fg: #c0282c;
+  --ok: #2f9e44;
+  --sidebar: #ececf0;
+  --raised: #e2e2e8;
+  --raised-faint: #ededf1;
+  --control: #ffffff;
+  --control-hover: #e8e8ec;
+  --menu-hover: #ededf1;
+  --track: #c4c4cc;
+  --track-hover: #a0a0a8;
+  --toggle-off: #c4c4cc;
+  --card-hover-border: #c0c0c8;
+  --grip: #b0b0b8;
+  --toolbar-bg: rgba(245, 245, 247, 0.96);
+  --toast-bg: rgba(255, 255, 255, 0.97);
+  --backdrop: rgba(0, 0, 0, 0.25);
+  --overlay-bg: rgba(245, 245, 247, 0.94);
+  --winctl-hover: rgba(0, 0, 0, 0.06);
+  --shadow: rgba(0, 0, 0, 0.18);
+}
+
+/* --- レガシー (ニュートラルなダークグレーのクラシック調) ---
+ * 旧来のデスクトップアプリ風。やや青みのあるグレーで彩度を抑え、面の階層も
+ * グレーの濃淡だけで表現する。アクセント色は --accent を上書きしないので、
+ * ユーザー設定のアクセント色 (既定の青) が選択中ナビ/プライマリボタンに効く。 */
+:root[data-theme="legacy"] {
+  --bg: #1e1e1e;
+  --fg: #e4e4e4;
+  --muted: #9d9d9d;
+  --panel: #252526;
+  --panel-border: #3c3c3c;
+  --accent-fg: #fff;
+  --danger: #e5484d;
+  --danger-fg: #f0888b;
+  --ok: #4ec96a;
+  --sidebar: #1b1b1b;
+  --raised: #2d2d2e;
+  --raised-faint: #262627;
+  --control: #2a2a2b;
+  --control-hover: #37373a;
+  --menu-hover: #2f2f31;
+  --track: #4a4a4d;
+  --track-hover: #5e5e62;
+  --toggle-off: #4a4a4d;
+  --card-hover-border: #505053;
+  --grip: #6a6a6e;
+  --toolbar-bg: rgba(37, 37, 38, 0.96);
+  --toast-bg: rgba(45, 45, 48, 0.96);
+  --backdrop: rgba(0, 0, 0, 0.5);
+  --overlay-bg: rgba(30, 30, 30, 0.93);
+  --winctl-hover: rgba(255, 255, 255, 0.09);
+  --shadow: rgba(0, 0, 0, 0.5);
+}
+
+/* --- システム連動 (auto): OS がライトのときだけライト配色へ --- */
+@media (prefers-color-scheme: light) {
+  :root[data-theme="auto"] {
+    --bg: #f5f5f7;
+    --fg: #1c1c1e;
+    --muted: #6b6b70;
+    --panel: #ffffff;
+    --panel-border: #d8d8dc;
+    --accent: #3a82f7;
+    --accent-fg: #fff;
+    --danger: #e5484d;
+    --danger-fg: #c0282c;
+    --ok: #2f9e44;
+    --sidebar: #ececf0;
+    --raised: #e2e2e8;
+    --raised-faint: #ededf1;
+    --control: #ffffff;
+    --control-hover: #e8e8ec;
+    --menu-hover: #ededf1;
+    --track: #c4c4cc;
+    --track-hover: #a0a0a8;
+    --toggle-off: #c4c4cc;
+    --card-hover-border: #c0c0c8;
+    --grip: #b0b0b8;
+    --toolbar-bg: rgba(245, 245, 247, 0.96);
+    --toast-bg: rgba(255, 255, 255, 0.97);
+    --backdrop: rgba(0, 0, 0, 0.25);
+    --overlay-bg: rgba(245, 245, 247, 0.94);
+    --winctl-hover: rgba(0, 0, 0, 0.06);
+    --shadow: rgba(0, 0, 0, 0.18);
+  }
+}
+
+html, body {
+  margin: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font); overflow: hidden; overscroll-behavior: none;
+}
+/* ネイティブアプリ感: テキスト選択/コールアウト/ドラッグを無効化。入力欄のみ選択可。 */
+* { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-user-drag: none; }
+input, textarea { user-select: text; -webkit-user-select: text; }
+button { font: inherit; }
+
+/* --- フォーカス可視化 (キーボード操作) ---
+ * 各コンポーネントは `:focus` で outline:none にしているが、キーボード操作時
+ * (:focus-visible) は今どこにいるか分かるアクセント色のリングを必ず出す。
+ * マウス操作のクリックフォーカスでは出ない (:focus-visible の仕様)。
+ * 映像 canvas はプログラムからフォーカスを当てるためリングを出さない。 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#screen:focus-visible { outline: none; }
+
+/* --- モーションを減らす設定への配慮 ---
+ * OS で「視差効果を減らす」等が有効なときはアニメ/トランジションを実質無効化する
+ * (タブのパルス、トースト/バーのスライド等で酔う・気が散るのを防ぐ)。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* --- 全面 canvas (最背面) --- */
+/* 映像エリアは常にウィンドウ全体を占める。フローティングのツールバー (ピル) は
+ * 場所を予約せず映像の上端に重ねて浮かせる (自動格納される floating バー本来の挙動)。
+ * 高さを予約すると映像エリアが 16:9 より横長になり、16:9 映像が左右にレターボックス
+ * されて横黒帯が出るため予約しない。 */
+#screen-wrap {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #000;
+}
+/* アスペクト比を保ったまま映像エリア全体にフィットさせる (フレームがウィンドウより
+ * 小さくても拡大する)。max-width/height だけだと縮小のみで、フルスクリーンや低解像度
+ * 送出時にネイティブサイズのまま中央に小さく表示されてしまうため object-fit で拡縮する。 */
+#screen { width: 100%; height: 100%; object-fit: contain; background: #000; outline: none; }
+
+/* --- アイコン共通 (icons.ts の出力。launcher / topbar 双方で使用) --- */
+/* SVG アイコン共通: ベースライン隙間を消し、サイズは font-size 継承 (currentColor) */
+.launcher svg.icon, #topbar svg.icon { display: block; }
+/* 画像アイコン (assets/icons の png/jpg 等): 1em の正方形に収める */
+.icon-img { width: 1em; height: 1em; object-fit: contain; display: block; }
+
+/* パスワード保存済みカードの鍵マーク。アクセント色で控えめに示す (Hosts=即接続 / WoL=中継先保存済み)。 */
+.saved-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent); font-size: 14px; flex-shrink: 0; opacity: 0.85;
+}

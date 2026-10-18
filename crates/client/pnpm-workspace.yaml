@@ -1,0 +1,4 @@
+# vite が使う esbuild の postinstall を許可する (Windows バイナリ配置のため)。
+# これがないと pnpm がビルドスクリプトを無視して install が非ゼロ終了し、pnpm build が止まる。
+allowBuilds:
+  esbuild: true

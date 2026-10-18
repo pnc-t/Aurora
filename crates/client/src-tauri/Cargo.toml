@@ -1,0 +1,64 @@
+[package]
+name = "aurora-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aurora_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "aurora-client"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+aurora-common = { path = "../../common" }
+tauri = { version = "2.0", features = [] }
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+snow = { workspace = true }
+serde_json = "1.0"
+socket2 = "0.5"
+
+# cpal (音声出力)・opus (デコード)・updater/process プラグインは Android/iOS 向け NDK
+# クロスコンパイルでビルドできない (ネイティブ C 依存 or デスクトップ専用機能)。
+# デスクトップのみで有効化する。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+cpal = "0.15"
+opus = "0.3"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# 更新マニフェスト自体の署名検証で latest.json / .sig を取得する (update_manifest.rs)。host と同じ版。
+ureq = "2.10"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+]
+
+# Android Keystore を直接 JNI で叩くための依存 (secret::android)。Kotlin プラグインは
+# gen/android が git 管理外で再生成のたびに消えるため使わず、Rust から JNI 呼び出しする。
+# JavaVM の取得は ndk-context を使わず自前の JNI_OnLoad で行う (ndk-context は未初期化時に
+# panic する実装で、Tauri のスタック(tao/wry)はこれを初期化しないため実機で確実に落ちる)。
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

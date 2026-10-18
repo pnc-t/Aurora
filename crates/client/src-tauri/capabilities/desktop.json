@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop",
+  "description": "デスクトップ限定の権限 (自動更新・再起動)。updater/process プラグインは Cargo.toml で Android/iOS から除外しているため、この capability も同じ範囲に絞る。",
+  "platforms": ["linux", "macOS", "windows"],
+  "windows": ["main", "capture-*"],
+  "permissions": ["updater:default", "process:default"]
+}

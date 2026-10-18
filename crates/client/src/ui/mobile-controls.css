@@ -1,0 +1,287 @@
+/* リモート画面の操作バー (モバイル専用)。既定は隠れており、端 (配置による) 中央のハンドルを
+ * タップしたときだけせり上がる (映像を覆う面積を減らすため)。ボタン数が少ないため帯ではなく
+ * 中央寄せの丸いピルにして占有面積を絞る。ディスプレイ切替は浮動ポップオーバーを持つ。
+ * デスクトップの toolbar.css とは配色変数を共有するが、レイアウトはタッチ操作前提で作り直す。
+ * 配置は data-pos="top|bottom|left|right" (デスクトップの ToolbarPosition と共通) で切り替える。 */
+
+/* ハンドルはバー (.mc-panel) と一体で .mc-root ごとスライドする。格納時も画面端から
+ * ハンドルだけが常に覗いている状態にする (--mc-peek はハンドル寸法ちょうど。詳細は
+ * --mc-peek 定義側のコメント参照)。Android のジェスチャーナビゲーション/システムバーと
+ * 重ならないための余白は translate (peek) 側ではなく .mc-root 自体の bottom/top/left/right
+ * (器の位置) 側で確保する。
+ * 端からの逆スワイプはシステムジェスチャーと衝突するので、引き出しはタップのみ (スワイプでは開かない)。
+ * ハンドルは常にピルの「画面中央側」に置く。DOM 順 (ハンドル→パネル) は固定のまま、
+ * 配置ごとに flex-direction を反転させて見た目の順序を入れ替える。
+ *   bottom (既定): column          → ハンドルが上 (中央側)
+ *   top          : column-reverse  → ハンドルが下 (中央側)
+ *   left         : row-reverse     → ハンドルが右 (中央側)
+ *   right        : row             → ハンドルが左 (中央側) */
+.mc-handle {
+  margin: 6px;
+  width: 72px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background: var(--toolbar-bg);
+  /* 暗い映像の上では 0.55 だと見つけにくいため少し上げる。 */
+  opacity: 0.7;
+  pointer-events: auto;
+  flex: none;
+  /* 格納時だけ本体との間に空ける逃げ (下の :not(.expanded) 側) を、器のスライドと同じ速さで
+   * 詰める。合わせないと展開の瞬間にハンドルだけ段差でずれて見える。 */
+  transition: margin 0.18s ease-out;
+}
+.mc-handle::before {
+  content: "";
+  display: block;
+  width: 32px;
+  height: 4px;
+  margin: auto;
+  border-radius: 2px;
+  background: var(--fg);
+}
+.mc-handle.toggled {
+  opacity: 1;
+}
+
+.mc-root {
+  position: absolute;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  /* 器自体は透明にする (背景/枠線は .mc-panel 側)。格納時はこの器が画面端からはみ出た
+   * 状態で常駐しており、タッチを拾うとその面積ぶん映像の操作を横取りしてしまうため
+   * pointer-events は無効化し、実際に反応させたいハンドル/パネルだけ auto に戻す。 */
+  pointer-events: none;
+  transition: transform 0.18s ease-out;
+}
+
+/* 上下配置: 横帯いっぱいに広がり、中身は水平中央寄せ (align-items が横軸を揃える)。 */
+.mc-root[data-pos="bottom"],
+.mc-root[data-pos="top"] {
+  left: 0;
+  right: 0;
+}
+/* 左右配置: 縦いっぱいに広がり、中身は垂直中央寄せ。 */
+.mc-root[data-pos="left"],
+.mc-root[data-pos="right"] {
+  top: 0;
+  bottom: 0;
+}
+
+/* 100% は要素自身の高さ/幅が基準になるため、内容の増減があっても
+ * この式を再計算する必要がない (常にハンドルぶんだけ覗く)。
+ *
+ * 格納時に画面へ残るのは「要素の端から peek ぶん」で、その中身は DOM 順 (ハンドル→パネル) と
+ * flex-direction で決まる。つまり peek をハンドル寸法より大きくすると、超過ぶんだけパネル
+ * 本体が覗く。一方でハンドルを画面端 (システムバー) から浮かせたいので、peek はハンドル寸法
+ * + inset にしたうえで、**ハンドルのパネル側に同じ inset の margin を入れて「空白」を作る**。
+ * こうして初めて「見える帯 = ハンドル + 空白」になる。
+ *
+ * .mc-root 自体を bottom/top/left/right でずらす方式では直らない: transform は要素自身の
+ * サイズ基準なので、器を内側へずらしても見える量は inset + peek に増えるだけだった
+ * (実機で確認済みの失敗。同じ方式へ戻さないこと)。 */
+/* 自前キーボード (ui/mobile-keyboard.ts) は開いている間 --mkb-height (px) を document 直下に
+ * 設定する。下部バーはそのぶん上へ逃がさないとキーボードに隠れて押せなくなるため、bottom を
+ * この変数ぶん足す。閉じているとき/他配置の未設定時は 0px にフォールバックする。 */
+.mc-root[data-pos="bottom"] {
+  /* env(safe-area-inset-*) だけでは Android のナビゲーションバーぶんが 0 になる
+   * (mobile-main.css の --sysbar-inset-* 定義コメント参照)。 */
+  --mc-peek: calc(34px + var(--sysbar-inset-bottom));
+  bottom: var(--mkb-height, 0px);
+  flex-direction: column;
+  transform: translateY(calc(100% - var(--mc-peek)));
+}
+.mc-root[data-pos="top"] {
+  --mc-peek: calc(34px + var(--sysbar-inset-top));
+  top: 0;
+  flex-direction: column-reverse;
+  transform: translateY(calc(-100% + var(--mc-peek)));
+}
+.mc-root[data-pos="left"] {
+  --mc-peek: calc(28px + var(--sysbar-inset-left));
+  left: 0;
+  flex-direction: row-reverse;
+  transform: translateX(calc(-100% + var(--mc-peek)));
+}
+.mc-root[data-pos="right"] {
+  --mc-peek: calc(28px + var(--sysbar-inset-right));
+  right: 0;
+  flex-direction: row;
+  transform: translateX(calc(100% - var(--mc-peek)));
+}
+
+/* 格納時にハンドルを画面端から浮かせるための「空白」。ハンドルのパネル側へ inset ぶんの
+ * margin を置くことで、見える帯が「ハンドル + 空白」になる。これが無いと peek の超過ぶんに
+ * パネル本体が入り込む (上のコメント参照)。
+ *
+ * 格納時 (:not(.expanded)) だけに効かせる。展開時まで残すとハンドルがバー本体から離れて
+ * 浮いて見える (実機で指摘を受けた)。peek/translate は展開時に使わない (translate(0,0) に
+ * なる) ので、状態で高さが変わっても格納位置の計算は破綻しない。 */
+.mc-root[data-pos="bottom"]:not(.expanded) .mc-handle {
+  margin-bottom: var(--sysbar-inset-bottom);
+}
+.mc-root[data-pos="top"]:not(.expanded) .mc-handle {
+  margin-top: var(--sysbar-inset-top);
+}
+.mc-root[data-pos="left"]:not(.expanded) .mc-handle {
+  margin-left: var(--sysbar-inset-left);
+}
+.mc-root[data-pos="right"]:not(.expanded) .mc-handle {
+  margin-right: var(--sysbar-inset-right);
+}
+
+.mc-root.expanded {
+  transform: translate(0, 0);
+}
+
+/* 左右配置ではハンドルを縦長にし、握り線も縦向きにする。 */
+.mc-root[data-pos="left"] .mc-handle,
+.mc-root[data-pos="right"] .mc-handle {
+  width: 28px;
+  height: 72px;
+}
+.mc-root[data-pos="left"] .mc-handle::before,
+.mc-root[data-pos="right"] .mc-handle::before {
+  width: 4px;
+  height: 32px;
+}
+
+.mc-panel {
+  /* 帯 (全幅) ではなく、ボタン分の大きさしか持たない中央寄せのピルにする。ボタンが少ない
+   * ため、全幅の帯にすると占有面積に対してできることが少なすぎる。 */
+  display: flex;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 22px;
+  box-shadow: 0 2px 10px var(--shadow);
+  pointer-events: auto;
+}
+/* 展開時に本体がシステムバー/画面端へ食い込まないための余白。配置に応じた「画面の外側」の
+ * 辺だけに付ける (ピル自体の大きさは一定に保つ)。格納時の逃げは .mc-handle の margin 側で
+ * 別に確保しており、役割が違うので二重取りにはならない。 */
+.mc-root[data-pos="bottom"] .mc-panel {
+  margin-bottom: var(--sysbar-inset-bottom);
+}
+.mc-root[data-pos="top"] .mc-panel {
+  margin-top: var(--sysbar-inset-top);
+}
+.mc-root[data-pos="left"] .mc-panel {
+  margin-left: var(--sysbar-inset-left);
+}
+.mc-root[data-pos="right"] .mc-panel {
+  margin-right: var(--sysbar-inset-right);
+}
+
+.mc-bar {
+  display: flex;
+  align-items: center;
+  height: 44px;
+  gap: 2px;
+  padding: 0 4px;
+}
+/* 左右配置ではボタンを縦に並べる。 */
+.mc-root[data-pos="left"] .mc-bar,
+.mc-root[data-pos="right"] .mc-bar {
+  flex-direction: column;
+  height: auto;
+  width: 44px;
+  padding: 4px 0;
+}
+
+.mc-btn {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-size: 18px;
+  width: 44px;
+  height: 44px;
+}
+.mc-btn.toggled {
+  color: var(--accent);
+}
+.mc-btn:disabled {
+  opacity: 0.4;
+}
+
+/* ディスプレイ選択ポップオーバー。バーの「反対側へはみ出さない」よう、配置ごとに
+ * 出る辺を変える (上下配置なら反対の上下、左右配置ならバーより中央寄りの左右)。 */
+.mc-display-pop {
+  display: none;
+  position: absolute;
+  z-index: 31;
+  min-width: 220px;
+  max-width: min(280px, calc(100vw - 24px));
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 4px 16px var(--shadow);
+  pointer-events: auto;
+}
+.mc-display-pop.visible {
+  display: block;
+}
+/* ポップオーバーはバーに追従する別要素なので、こちらにも同じ --mkb-height ぶんの逃がしを足す
+ * (足さないと下部バーの直上に浮かせたつもりがキーボードの下に埋もれる)。 */
+.mc-root[data-pos="bottom"] ~ .mc-display-pop {
+  right: 8px;
+  bottom: calc(44px + 8px + var(--sysbar-inset-bottom) + var(--mkb-height, 0px));
+}
+.mc-root[data-pos="top"] ~ .mc-display-pop {
+  right: 8px;
+  top: calc(44px + 8px + var(--sysbar-inset-top));
+}
+.mc-root[data-pos="left"] ~ .mc-display-pop {
+  left: calc(64px + var(--sysbar-inset-left));
+  bottom: 24px;
+}
+.mc-root[data-pos="right"] ~ .mc-display-pop {
+  right: calc(64px + var(--sysbar-inset-right));
+  bottom: 24px;
+}
+
+.mc-display-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-size: 14px;
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+.mc-display-item.active {
+  color: var(--accent);
+}
+
+/* 音量ポップオーバー (長押しで開く)。幅 160px と狭く、ディスプレイ選択ポップ (幅広で
+ * right:8px 固定でも目立たない) と同じ「画面右端固定」を流用するとツールバー中央のボタンから
+ * 大きく離れて浮いて見えるため、これだけは音声ボタンの矩形を起点に JS (mobile-controls.ts の
+ * positionAudioPop) で left/top を都度計算する。position: absolute だと祖先要素 (#remote-view)
+ * の座標系に依存するが、getBoundingClientRect はビューポート基準の値を返すため fixed にして
+ * 座標系を合わせる。 */
+.mc-audio-pop {
+  display: none;
+  position: fixed;
+  z-index: 31;
+  width: 160px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 4px 16px var(--shadow);
+  pointer-events: auto;
+}
+.mc-audio-pop.visible {
+  display: block;
+}
+.mc-audio-pop input[type="range"] {
+  width: 100%;
+}

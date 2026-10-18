@@ -1,0 +1,173 @@
+/* capture ウィンドウ内「+」の接続ピッカー (モーダル)。 */
+
+#picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 6000;
+  display: none;
+  place-items: center;
+  background: var(--backdrop);
+}
+#picker-backdrop.visible {
+  display: grid;
+}
+
+#picker-backdrop svg.icon {
+  display: block;
+}
+
+.picker {
+  width: min(440px, 86vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 20px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 12px 40px var(--shadow);
+}
+
+.picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.picker-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.picker-x {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.picker-x:hover {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+
+.picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  max-height: 38vh;
+}
+
+.pk-host-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--control);
+  color: var(--fg);
+  cursor: pointer;
+  text-align: left;
+}
+.pk-host-row:hover {
+  background: var(--control-hover);
+  border-color: var(--card-hover-border);
+}
+.pk-host-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.pk-host-addr {
+  color: var(--muted);
+  font-size: 11px;
+  font-family: monospace;
+}
+.pk-host-key {
+  color: var(--accent);
+  font-size: 13px;
+}
+.pk-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 2px;
+  line-height: 1.5;
+}
+
+.picker-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--panel-border);
+  padding-top: 12px;
+}
+.picker-sub {
+  color: var(--muted);
+  font-size: 12px;
+}
+.pk-row {
+  display: flex;
+  gap: 8px;
+}
+.picker-form input[type="text"],
+.picker-form input[type="password"] {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 7px;
+  background: var(--control);
+  color: var(--fg);
+  font-size: 13px;
+}
+.pk-port {
+  flex: 0 0 84px;
+}
+.pk-pass-wrap { display: flex; align-items: center; gap: 6px; }
+.pk-pass-wrap input { flex: 1; min-width: 0; }
+.picker-form .pass-eye {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 15px; padding: 6px; border-radius: 6px; display: inline-flex; align-items: center;
+}
+.picker-form .pass-eye:hover { color: var(--fg); background: var(--control-hover); }
+.pk-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pk-status {
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 1em;
+}
+.pk-status.error {
+  color: var(--danger-fg);
+}
+.pk-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.pk-connect {
+  padding: 8px 18px;
+  border: none;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  cursor: pointer;
+  font-size: 13px;
+}
+.pk-connect:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aurora Remote Desktop</title>
+    <!-- スタイルは TS 側で import する: 共通土台は styles/base.css、各 UI は ui/<component>.css。 -->
+  </head>
+  <body>
+    <!-- ランチャー (未接続) 専用ウィンドウ。接続すると別の capture ウィンドウが開く。 -->
+    <div id="connect-overlay"></div>
+
+    <script type="module" src="./launcher-main.ts"></script>
+  </body>
+</html>
