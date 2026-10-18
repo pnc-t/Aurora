@@ -207,8 +207,7 @@ jobs:
       # --- ホスト: NSIS インストーラ (生 exe 配布は廃止し client と対称にする) ---
       # build.ps1 が内部で `cargo build -p aurora-host --release` + makensis 呼び出しまで
       # 行い、installer\dist\aurora-host-setup-<ver>.exe を生成する。VDD ドライバ一式は
-      # installer/host/vdd/ にコミット済みのため、build.ps1 の VDD_SOURCE 未検出 Warning は
-      # 無害 (同梱済みファイルでそのままコンパイルできる)。
+      # git 管理外のため、build.ps1 が上流の署名済み固定版を取得し SHA256 照合して同梱する。
       - name: Build aurora-host (NSIS installer)
         shell: pwsh
         run: .\installer\host\build.ps1
